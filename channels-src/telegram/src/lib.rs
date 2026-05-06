@@ -2793,12 +2793,14 @@ mod tests {
         let json = r#"{
             "bot_username": "my_bot",
             "owner_id": 42,
-            "respond_to_all_group_messages": true
+            "respond_to_all_group_messages": true,
+            "allowed_chat_ids": [-5263819573]
         }"#;
         let config: TelegramConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.bot_username, Some("my_bot".to_string()));
         assert_eq!(config.owner_id, Some("42".to_string()));
         assert!(config.respond_to_all_group_messages);
+        assert_eq!(config.allowed_chat_ids, Some(vec![-5263819573]));
     }
 
     #[test]
@@ -3475,8 +3477,14 @@ mod tests {
 
     #[test]
     fn test_parse_allowed_chat_ids_valid() {
-        assert_eq!(parse_allowed_chat_ids("[-5263819573]"), Some(vec![-5263819573]));
-        assert_eq!(parse_allowed_chat_ids("[-1, -2, -3]"), Some(vec![-1, -2, -3]));
+        assert_eq!(
+            parse_allowed_chat_ids("[-5263819573]"),
+            Some(vec![-5263819573])
+        );
+        assert_eq!(
+            parse_allowed_chat_ids("[-1, -2, -3]"),
+            Some(vec![-1, -2, -3])
+        );
     }
 
     #[test]
@@ -3487,7 +3495,10 @@ mod tests {
     #[test]
     fn test_parse_allowed_chat_ids_whitespace() {
         // Whitespace in JSON should still parse correctly
-        assert_eq!(parse_allowed_chat_ids(" [ -5263819573 ] "), Some(vec![-5263819573]));
+        assert_eq!(
+            parse_allowed_chat_ids(" [ -5263819573 ] "),
+            Some(vec![-5263819573])
+        );
     }
 
     #[test]
