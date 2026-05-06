@@ -3913,7 +3913,6 @@ dependencies = [
  "ironclaw_engine",
  "ironclaw_gateway",
  "ironclaw_host_api",
- "ironclaw_host_runtime",
  "ironclaw_llm",
  "ironclaw_runtime_policy",
  "ironclaw_safety",

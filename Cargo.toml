@@ -238,10 +238,6 @@ insta = { version = "1.46.3", features = ["yaml"] }
 # Pull the LLM crate's `testing` feature in only for tests so `StubLlm` and
 # fault-injection helpers don't ship in release binaries.
 ironclaw_llm = { path = "crates/ironclaw_llm", version = "0.1.0", features = ["testing"] }
-# Used by tests/e2e_trace_runtime_policy_security_properties.rs to drive
-# the planner directly for defense-in-depth coverage. Production code in
-# the root crate does not depend on `ironclaw_host_runtime`.
-ironclaw_host_runtime = { path = "crates/ironclaw_host_runtime", version = "0.1.0" }
 
 [features]
 default = ["postgres", "libsql", "html-to-markdown", "tui"]
