@@ -16,6 +16,7 @@ The `reborn-integration` branch currently exposes Reborn structure primarily thr
 | Architecture dependency guardrails | `crates/ironclaw_architecture/` |
 | Reborn dependency-boundary tests | `crates/ironclaw_architecture/tests/reborn_dependency_boundaries.rs` |
 | Events substrate | `crates/ironclaw_events/` |
+| Standalone durable event/audit stores | `crates/ironclaw_reborn_event_store/` |
 | Transport adapter contract | `crates/ironclaw_transport/` |
 | v1 channel transport bridge | `src/channels/transport_adapter.rs` |
 | Reborn transport runtime composition | `src/reborn/transport.rs` |
