@@ -306,7 +306,7 @@ The webhook secret is only relevant when `polling_enabled` is `false`. If you ar
 
 Use `allowed_chat_ids` to restrict group participation to specific Telegram groups while keeping direct-message policy separate. When the list is empty or omitted, all groups keep the previous behavior. When the list contains group IDs, messages from other groups are ignored. Direct messages are still controlled by `dm_policy`.
 
-Allowed groups bypass `dm_policy` for group messages, so a bot can require pairing for DMs while still allowing anyone in an approved group to mention it. Mention handling still follows `respond_to_all_group_messages` and `bot_username`.
+Allowed groups bypass `dm_policy` for group messages, so a bot can require pairing for DMs while still allowing anyone in an approved group to mention it. If `owner_id` is set, the owner restriction still takes precedence. Mention handling still follows `respond_to_all_group_messages` and `bot_username`.
 
 ```json
 {

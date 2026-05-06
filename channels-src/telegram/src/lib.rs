@@ -297,6 +297,15 @@ fn check_group_allowed(chat_id: i64, allowed_ids: &[i64]) -> Option<bool> {
     Some(allowed_ids.contains(&chat_id))
 }
 
+/// Returns whether a sender may proceed through an owner_id restriction.
+/// When owner_id is configured it is stricter than group allowlists or dm_policy.
+fn owner_allows_sender(owner_id: Option<i64>, sender_id: i64) -> bool {
+    match owner_id {
+        Some(owner) => owner == sender_id,
+        None => true,
+    }
+}
+
 /// Parse allowed_chat_ids from raw workspace JSON.
 /// Returns None if no data or invalid JSON (no filter configured).
 /// Returns Some(Vec) — empty vec means "allow all", non-empty means filter.
@@ -2174,17 +2183,10 @@ fn download_and_store_documents(attachments: &mut [InboundAttachment]) {
 
 /// Process a single message.
 fn handle_message(message: TelegramMessage) {
-    // Extract attachments from media fields (pure data mapping, no host calls)
+    // Extract attachments from media fields (pure data mapping, no host calls).
+    // Downloading/storing attachment bytes must wait until after authorization
+    // and group-trigger checks so ignored messages cannot cause side effects.
     let mut attachments = extract_attachments(&message);
-
-    // Download and store voice attachments for host-side transcription
-    download_and_store_voice(&attachments);
-
-    // Download and store image attachments for host-side vision pipeline
-    download_and_store_images(&attachments);
-
-    // Download and store document attachments for host-side text extraction
-    download_and_store_documents(&mut attachments);
 
     // Use text or caption (for media messages)
     let has_voice = message.voice.is_some();
@@ -2245,6 +2247,14 @@ fn handle_message(message: TelegramMessage) {
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse::<i64>().ok());
     let is_owner = owner_id == Some(from.id);
+
+    if !owner_allows_sender(owner_id, from.id) {
+        channel_host::log(
+            channel_host::LogLevel::Debug,
+            &format!("Dropping message from non-owner user {}", from.id),
+        );
+        return;
+    }
 
     if !is_owner && !is_allowed_group {
         // Non-owner senders remain guests. Apply authorization based on
@@ -2373,6 +2383,13 @@ fn handle_message(message: TelegramMessage) {
         None if !attachments.is_empty() => String::new(),
         None => return,
     };
+
+    // Download and store attachment bytes only after all authorization and
+    // group-trigger checks pass. Disallowed/ignored groups must not cause
+    // Telegram file downloads or host-side attachment storage.
+    download_and_store_voice(&attachments);
+    download_and_store_images(&attachments);
+    download_and_store_documents(&mut attachments);
 
     // Emit the message to the agent
     channel_host::emit_message(&EmittedMessage {
@@ -2801,6 +2818,32 @@ mod tests {
         assert_eq!(config.owner_id, Some("42".to_string()));
         assert!(config.respond_to_all_group_messages);
         assert_eq!(config.allowed_chat_ids, Some(vec![-5263819573]));
+    }
+
+    #[test]
+    fn test_owner_id_takes_precedence_over_allowed_group_bypass() {
+        let owner_id = Some(42_i64);
+        let sender_id = 7_i64;
+        let is_allowed_group = true;
+
+        assert!(!owner_allows_sender(owner_id, sender_id));
+        assert!(
+            is_allowed_group,
+            "allowed group should not override owner_id"
+        );
+    }
+
+    #[test]
+    fn test_attachment_downloads_are_after_authorization_comment_guard() {
+        let source = include_str!("lib.rs");
+        let auth_pos = source
+            .find("if !owner_allows_sender(owner_id, from.id)")
+            .expect("owner authorization guard should exist");
+        let download_pos = source
+            .find("Download and store attachment bytes only after all authorization")
+            .expect("post-auth attachment download block should exist");
+
+        assert!(download_pos > auth_pos);
     }
 
     #[test]
