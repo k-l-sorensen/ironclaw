@@ -107,6 +107,7 @@ blocked_approval
 blocked_auth
 waiting_tool
 waiting_process
+recovery_required
 completed
 failed
 cancelled

@@ -386,8 +386,8 @@ impl TurnRunTransitionPort for InMemoryTurnStateStore {
         let mut inner = self.lock_inner()?;
         let mut record = inner.take_record(request.run_id)?;
         let result = (|| {
-            ensure_lease(&record, request.runner_id, request.lease_token)?;
             let now = Utc::now();
+            ensure_active_lease(&record, request.runner_id, request.lease_token, now)?;
             record.last_heartbeat_at = Some(now);
             record.lease_expires_at = Some(inner.next_lease_expiry(now));
             record.event_cursor = inner.next_cursor();
@@ -411,14 +411,14 @@ impl TurnRunTransitionPort for InMemoryTurnStateStore {
         let mut inner = self.lock_inner()?;
         let mut record = inner.take_record(request.run_id)?;
         let result = (|| {
-            ensure_lease(&record, request.runner_id, request.lease_token)?;
+            let now = Utc::now();
+            ensure_active_lease(&record, request.runner_id, request.lease_token, now)?;
             if !matches!(record.status, TurnStatus::Running) {
                 return Err(TurnError::InvalidTransition {
                     from: record.status,
                     to: request.reason.status(),
                 });
             }
-            let now = Utc::now();
             record.status = request.reason.status();
             record.checkpoint_id = Some(request.checkpoint_id);
             record.gate_ref = Some(request.reason.gate_ref().clone());
@@ -545,7 +545,10 @@ impl Inner {
             .records
             .iter()
             .filter_map(|(run_id, record)| {
-                if record.status != TurnStatus::Running {
+                if !matches!(
+                    record.status,
+                    TurnStatus::Running | TurnStatus::CancelRequested
+                ) {
                     return None;
                 }
                 if request
@@ -570,25 +573,19 @@ impl Inner {
             let Some(mut record) = self.records.remove(&run_id) else {
                 continue;
             };
-            if record.status == TurnStatus::Running
-                && record
-                    .lease_expires_at
-                    .is_some_and(|expires_at| expires_at <= request.now)
-            {
-                record.status = TurnStatus::RecoveryRequired;
-                record.runner_id = None;
-                record.lease_token = None;
-                record.lease_expires_at = None;
-                record.event_cursor = self.next_cursor();
-                self.update_active_lock(&record, request.now);
-                let state = record.state();
-                self.push_event(
-                    &record,
-                    TurnEventKind::RecoveryRequired,
-                    Some("lease_expired".to_string()),
-                );
-                recovered.push(state);
-            }
+            record.status = TurnStatus::RecoveryRequired;
+            record.runner_id = None;
+            record.lease_token = None;
+            record.lease_expires_at = None;
+            record.event_cursor = self.next_cursor();
+            self.update_active_lock(&record, request.now);
+            let state = record.state();
+            self.push_event(
+                &record,
+                TurnEventKind::RecoveryRequired,
+                Some("lease_expired".to_string()),
+            );
+            recovered.push(state);
             self.records.insert(run_id, record);
         }
         RecoverExpiredLeasesResponse { recovered }
@@ -835,7 +832,7 @@ impl Inner {
     ) -> Result<TurnRunState, TurnError> {
         let mut record = self.take_record(run_id)?;
         let result = (|| {
-            ensure_lease(&record, runner_id, lease_token)?;
+            ensure_active_lease(&record, runner_id, lease_token, Utc::now())?;
             if record.status != TurnStatus::CancelRequested {
                 return Err(TurnError::InvalidTransition {
                     from: record.status,
@@ -871,7 +868,7 @@ impl Inner {
     ) -> Result<TurnRunState, TurnError> {
         let mut record = self.take_record(run_id)?;
         let result = (|| {
-            ensure_lease(&record, runner_id, lease_token)?;
+            ensure_active_lease(&record, runner_id, lease_token, Utc::now())?;
             if record.status == TurnStatus::CancelRequested || record.status.is_terminal() {
                 return Err(TurnError::InvalidTransition {
                     from: record.status,
@@ -1154,13 +1151,22 @@ fn cancel_idempotency_record(
     }
 }
 
-fn ensure_lease(
+fn ensure_active_lease(
     record: &RunRecord,
     runner_id: crate::TurnRunnerId,
     lease_token: crate::TurnLeaseToken,
+    now: crate::TurnTimestamp,
 ) -> Result<(), TurnError> {
     if record.runner_id != Some(runner_id) || record.lease_token != Some(lease_token) {
         return Err(TurnError::LeaseMismatch);
+    }
+    if record
+        .lease_expires_at
+        .is_some_and(|expires_at| expires_at <= now)
+    {
+        return Err(TurnError::Conflict {
+            reason: "turn run lease expired".to_string(),
+        });
     }
     Ok(())
 }
