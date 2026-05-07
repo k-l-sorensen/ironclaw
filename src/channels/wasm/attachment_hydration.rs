@@ -492,12 +492,9 @@ async fn run_silk_decoder(
             ));
         }
     };
-    if let Err(error) = writer
+    writer
         .await
-        .map_err(|e| format!("decoder stdin task panicked: {e}"))?
-    {
-        return Err(error);
-    }
+        .map_err(|e| format!("decoder stdin task panicked: {e}"))??;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -900,11 +897,10 @@ mod tests {
         assert!(error.contains("no data"), "error: {error}");
     }
 
-    #[test]
-    fn decoded_wav_cap_matches_attachment_cap_documentation() {
-        // Sanity-check the documented relationship between input and output caps.
-        // SILK→PCM expansion is ~25× at 24 kHz mono; 50 MiB output cap is
-        // generous compared to the 20 MiB input cap (60 s of voice → ~3 MiB).
-        assert!(MAX_DECODED_WAV_BYTES >= super::MAX_ATTACHMENT_BYTES);
-    }
+    // Compile-time check that the decoded-WAV cap is at least as large as
+    // the inbound-attachment cap. SILK→PCM expansion is ~25× at 24 kHz
+    // mono; 60 s of voice is ~3 MiB. A 50 MiB output cap leaves generous
+    // headroom over the 20 MiB input cap. const_assert form keeps the
+    // invariant near the constants without spending a runtime test slot.
+    const _: () = assert!(MAX_DECODED_WAV_BYTES >= super::MAX_ATTACHMENT_BYTES);
 }
