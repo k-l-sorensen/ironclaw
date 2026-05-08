@@ -97,9 +97,13 @@ pub(crate) fn legacy_attachment_relative_path(
         .as_deref()
         .map(sanitize_attachment_segment)
         .unwrap_or_else(|| fallback_attachment_filename(attachment_index, &attachment.mime_type));
+    // Per-attachment index directory disambiguates filenames that collide
+    // after sanitization (e.g. "a b.png" and "a_b.png" both become
+    // "a_b.png"). Without the index segment, the second persist overwrites
+    // the first on disk and the refresh fetch returns the wrong bytes.
     format!(
-        "{}/{}/{}/{}/{}",
-        ATTACHMENT_PATH_PREFIX, owner, LEGACY_SUBDIR, msg_id, filename
+        "{}/{}/{}/{}/{}/{}",
+        ATTACHMENT_PATH_PREFIX, owner, LEGACY_SUBDIR, msg_id, attachment_index, filename
     )
 }
 
@@ -216,12 +220,11 @@ mod tests {
     fn legacy_relative_path_uses_legacy_subdir_and_sanitizes_segments() {
         let att = image_attachment("photo.png", b"\x89PNG");
         let path = legacy_attachment_relative_path("alice", "msg-123", 0, &att);
-        // Layout: <prefix>/<owner>/.legacy/<msg>/<file> — same as v2's
-        // `<prefix>/<owner>/<project>/<date>/<file>` so the same HTTP route
-        // can serve both.
+        // Layout: <prefix>/<owner>/.legacy/<msg>/<index>/<file> — the index
+        // directory disambiguates filenames that collide after sanitization.
         assert_eq!(
             path,
-            ".ironclaw/attachments/alice/.legacy/msg-123/photo.png"
+            ".ironclaw/attachments/alice/.legacy/msg-123/0/photo.png"
         );
     }
 
@@ -232,9 +235,21 @@ mod tests {
         let path = legacy_attachment_relative_path("alice", "msg-1", 2, &att);
         // Index is offset by 1 in fallback_attachment_filename → "attachment-3.png".
         assert!(
-            path.ends_with("/.legacy/msg-1/attachment-3.png"),
+            path.ends_with("/.legacy/msg-1/2/attachment-3.png"),
             "unexpected synthesized path: {path}",
         );
+    }
+
+    #[test]
+    fn legacy_relative_path_disambiguates_filenames_that_sanitize_to_same_string() {
+        // `a b.png` and `a_b.png` both sanitize to `a_b.png`. Without the
+        // per-attachment index segment, the second persist would overwrite
+        // the first on disk.
+        let att_a = image_attachment("a b.png", b"\x89PNG");
+        let att_b = image_attachment("a_b.png", b"\x89PNG");
+        let path_a = legacy_attachment_relative_path("alice", "msg-1", 0, &att_a);
+        let path_b = legacy_attachment_relative_path("alice", "msg-1", 1, &att_b);
+        assert_ne!(path_a, path_b, "collision: {path_a} == {path_b}");
     }
 
     #[test]

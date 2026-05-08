@@ -1016,7 +1016,16 @@ function renderMessageAttachments(container, attachments) {
       image.alt = att.filename || 'Attached image';
       strip.appendChild(image);
       fetchAttachmentAsBlobUrl(att.url)
-        .then((blobUrl) => { image.src = blobUrl; })
+        .then((blobUrl) => {
+          // Revoke after the browser has decoded the blob into the <img>
+          // (or failed to). Without this, every persisted image leaks a
+          // blob URL for the lifetime of the document — long sessions
+          // accumulate megabytes as history grows or threads switch.
+          const revoke = () => URL.revokeObjectURL(blobUrl);
+          image.addEventListener('load', revoke, { once: true });
+          image.addEventListener('error', revoke, { once: true });
+          image.src = blobUrl;
+        })
         .catch(() => {
           // Fetch failed (404, network, auth) — replace the empty <img>
           // with the file-card fallback so the bubble doesn't show a
