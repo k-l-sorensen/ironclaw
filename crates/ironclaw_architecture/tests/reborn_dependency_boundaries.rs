@@ -157,10 +157,22 @@ fn reborn_loop_support_llm_wiring_stays_out_of_root_src() {
     let reborn_manifest = std::fs::read_to_string(root.join("crates/ironclaw_reborn/Cargo.toml"))
         .expect("Reborn manifest must be readable");
     assert!(
-        reborn_manifest.contains("optional = true")
-            && reborn_manifest.contains("default-features = false")
-            && reborn_manifest.contains("root-llm-provider"),
-        "ironclaw_reborn may reuse root LLM code only behind an explicit feature, without enabling the root app's default postgres/libsql/tui feature set"
+        reborn_manifest.contains("ironclaw_llm"),
+        "ironclaw_reborn model gateway must depend on the extracted ironclaw_llm crate, not the root app crate"
+    );
+    assert!(
+        !reborn_manifest.contains("root-llm-provider")
+            && !reborn_manifest.contains("dep:ironclaw")
+            && !reborn_manifest.contains("ironclaw = { path = \"../..\""),
+        "ironclaw_reborn must not depend on root ironclaw just to reach LLM providers"
+    );
+    assert!(
+        reborn_gateway_source.contains("ironclaw_llm::"),
+        "Reborn model gateway wiring should import provider types from ironclaw_llm"
+    );
+    assert!(
+        !reborn_gateway_source.contains("ironclaw::llm"),
+        "Reborn model gateway wiring must not import provider types through root ironclaw::llm"
     );
 }
 

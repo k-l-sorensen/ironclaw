@@ -4248,6 +4248,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironclaw_llm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "insta",
+ "reqwest",
+ "rust_decimal",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "ironclaw_loop_support"
 version = "0.1.0"
 dependencies = [
@@ -4374,7 +4388,7 @@ name = "ironclaw_reborn"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "ironclaw",
+ "ironclaw_llm",
  "ironclaw_loop_support",
  "ironclaw_turns",
  "rust_decimal",

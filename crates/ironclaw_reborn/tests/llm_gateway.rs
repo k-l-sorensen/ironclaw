@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use ironclaw::llm::{
+use ironclaw_llm::{
     CompletionRequest, CompletionResponse, FinishReason, LlmError, LlmProvider,
     ToolCompletionRequest, ToolCompletionResponse,
 };
