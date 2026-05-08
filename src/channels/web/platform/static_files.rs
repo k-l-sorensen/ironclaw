@@ -999,11 +999,11 @@ pub(crate) async fn serve_user_attachment(
     let owner_dir = attachments_root.join(owner_segment);
     let file_path = owner_dir.join(path);
 
-    let canonical = match file_path.canonicalize() {
+    let canonical = match tokio::fs::canonicalize(&file_path).await {
         Ok(p) => p,
         Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
-    let owner_canonical = match owner_dir.canonicalize() {
+    let owner_canonical = match tokio::fs::canonicalize(&owner_dir).await {
         Ok(p) => p,
         Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
@@ -1023,9 +1023,21 @@ pub(crate) async fn serve_user_attachment(
     let mime_header = axum::http::HeaderValue::from_str(&mime)
         .unwrap_or_else(|_| axum::http::HeaderValue::from_static("application/octet-stream"));
     let mut response = Response::new(body);
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, mime_header);
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, mime_header);
+    // Per-user attachments behind Bearer auth: allow short-lived browser
+    // cache (avoids re-downloading every image on tab focus / thread switch)
+    // but block any shared / proxy cache. `Vary: Authorization` ensures the
+    // cache key includes the bearer so a token swap doesn't reuse another
+    // user's response from disk cache.
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("private, max-age=300"),
+    );
+    headers.insert(
+        header::VARY,
+        axum::http::HeaderValue::from_static("Authorization"),
+    );
     response
 }
 
@@ -1540,6 +1552,27 @@ mod tests {
             .unwrap_or_default()
             .to_string();
         assert!(ct.starts_with("image/"), "unexpected content-type: {ct}");
+        // Per-user attachments must be `private` so shared proxies don't
+        // cache them, and `Vary: Authorization` so the browser cache key
+        // includes the bearer token.
+        let cache_control = resp
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            cache_control.contains("private"),
+            "Cache-Control must be private, got: {cache_control}"
+        );
+        let vary = resp
+            .headers()
+            .get(header::VARY)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        assert!(
+            vary.eq_ignore_ascii_case("Authorization"),
+            "Vary must be Authorization, got: {vary}"
+        );
         let bytes = body_to_bytes(resp).await;
         assert_eq!(bytes, payload);
     }
