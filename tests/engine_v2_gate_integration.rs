@@ -1311,6 +1311,160 @@ async fn tool_info_does_not_gate_callable_tool_into_next_llm_callable_set() {
 }
 
 #[tokio::test]
+async fn approval_resolution_executes_pending_call_directly() {
+    let project_id = ProjectId::new();
+    let tools = Arc::new(ToolRegistry::new());
+    tools.register(Arc::new(ApprovalTool)).await;
+
+    let effects = Arc::new(EffectBridgeAdapter::new(
+        tools,
+        Arc::new(SafetyLayer::new(&SafetyConfig {
+            max_output_length: 10_000,
+            injection_check_enabled: false,
+        })),
+        Arc::new(HookRegistry::default()),
+    ));
+
+    let llm = ScriptedLlm::new(vec![
+        LlmOutput {
+            response: LlmResponse::ActionCalls {
+                calls: vec![ironclaw_engine::ActionCall {
+                    id: "call_approval_1".into(),
+                    action_name: "approval_test".into(),
+                    parameters: serde_json::json!({"value": "hello"}),
+                }],
+                content: None,
+            },
+            usage: TokenUsage::default(),
+        },
+        LlmOutput {
+            response: LlmResponse::Text("done".into()),
+            usage: TokenUsage::default(),
+        },
+    ]);
+
+    let store = TestStore::new();
+    let mgr = ThreadManager::new(
+        llm,
+        effects.clone(),
+        store.clone() as Arc<dyn Store>,
+        Arc::new(make_caps_with_approval_tool()),
+        Arc::new(LeaseManager::new()),
+        Arc::new(PolicyEngine::new()),
+    );
+
+    let tid = mgr
+        .spawn_thread(
+            "run the approval tool",
+            ThreadType::Foreground,
+            project_id,
+            ThreadConfig::default(),
+            None,
+            "test-user",
+        )
+        .await
+        .expect("spawn_thread");
+
+    let first = mgr.join_thread(tid).await.expect("first join");
+    match first {
+        ThreadOutcome::GatePaused {
+            gate_name,
+            action_name,
+            call_id,
+            parameters,
+            resume_kind,
+            ..
+        } => {
+            assert_eq!(gate_name, "approval");
+            assert_eq!(action_name, "approval_test");
+            assert_eq!(call_id, "call_approval_1");
+            assert_eq!(parameters["value"], "hello");
+            assert!(matches!(resume_kind, ResumeKind::Approval { .. }));
+        }
+        other => panic!("expected GatePaused approval, got {other:?}"),
+    }
+    assert_eq!(
+        store.load_thread(tid).await.unwrap().unwrap().state,
+        ThreadState::Waiting
+    );
+
+    let thread = store.load_thread(tid).await.unwrap().unwrap();
+    let lease = mgr
+        .leases
+        .find_lease_for_action(tid, "approval_test")
+        .await
+        .expect("lease for approval_test");
+    let exec_ctx = ironclaw_engine::ThreadExecutionContext {
+        thread_id: tid,
+        thread_type: thread.thread_type,
+        project_id: thread.project_id,
+        user_id: "test-user".into(),
+        step_id: ironclaw_engine::StepId::new(),
+        current_call_id: Some("call_approval_1".into()),
+        source_channel: None,
+        source_conversation_thread_id: None,
+        user_timezone: None,
+        thread_goal: Some(thread.goal.clone()),
+        available_actions_snapshot: None,
+        available_action_inventory_snapshot: None,
+    };
+
+    let tool_result = effects
+        .execute_resolved_pending_action(
+            "approval_test",
+            serde_json::json!({"value": "hello"}),
+            &lease,
+            &exec_ctx,
+            true,
+        )
+        .await
+        .expect("approved pending call should execute directly");
+    mgr.resume_thread(
+        tid,
+        "test-user",
+        Some(resumed_action_result_message(
+            "call_approval_1",
+            "approval_test",
+            &tool_result.output,
+        )),
+        Some(("call_approval_1".into(), true)),
+        Some("call_approval_1".into()),
+    )
+    .await
+    .expect("resume_thread");
+
+    let resumed = mgr.join_thread(tid).await.expect("second join");
+    assert!(
+        matches!(resumed, ThreadOutcome::Completed { .. }),
+        "expected Completed after approval retry, got {resumed:?}"
+    );
+
+    let saved = store.load_thread(tid).await.unwrap().unwrap();
+    assert_eq!(saved.state, ThreadState::Done);
+    let approval_requests = saved
+        .events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.kind,
+                ironclaw_engine::types::event::EventKind::ApprovalRequested { .. }
+            )
+        })
+        .count();
+    assert_eq!(
+        approval_requests, 1,
+        "resumed execution should not prompt for approval again"
+    );
+    assert!(
+        saved.events.iter().any(|event| matches!(
+            event.kind,
+            ironclaw_engine::types::event::EventKind::ApprovalReceived { .. }
+        )),
+        "resume should record ApprovalReceived"
+    );
+}
+
+#[tokio::test]
 async fn auth_resolution_retries_same_pending_action_without_second_pause() {
     let project_id = ProjectId::new();
     let effects = GateMockEffects::new(vec![], vec!["http".into()]);
@@ -1387,6 +1541,7 @@ async fn auth_resolution_retries_same_pending_action_without_second_pause() {
         step_id: ironclaw_engine::StepId::new(),
         current_call_id: Some("call_auth_1".into()),
         source_channel: None,
+        source_conversation_thread_id: None,
         user_timezone: None,
         thread_goal: Some(thread.goal.clone()),
         available_actions_snapshot: None,
@@ -1552,6 +1707,7 @@ async fn approval_chains_directly_into_auth_for_install_flow() {
         step_id: ironclaw_engine::StepId::new(),
         current_call_id: Some("call_install_1".into()),
         source_channel: None,
+        source_conversation_thread_id: None,
         user_timezone: None,
         thread_goal: Some(thread.goal.clone()),
         available_actions_snapshot: None,
@@ -1662,6 +1818,7 @@ async fn install_auth_resume_followed_by_aliased_tool_call_completes_without_han
         step_id: ironclaw_engine::StepId::new(),
         current_call_id: Some("call_install_1".into()),
         source_channel: None,
+        source_conversation_thread_id: None,
         user_timezone: None,
         thread_goal: Some(thread.goal.clone()),
         available_actions_snapshot: None,
