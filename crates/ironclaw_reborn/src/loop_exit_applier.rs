@@ -172,10 +172,54 @@ impl LoopExitApplier {
     }
 }
 
+/// Production-safe evidence port that never trusts driver-supplied evidence.
+///
+/// Use this as the fallback until a composition root wires durable transcript,
+/// checkpoint, gate, failure-diagnostic, and cancellation stores. It fails
+/// closed by mapping evidence-required exits to recovery instead of accepting
+/// unverifiable driver claims.
+pub struct FailClosedLoopExitEvidencePort;
+
+#[async_trait]
+impl LoopExitEvidencePort for FailClosedLoopExitEvidencePort {
+    async fn verify_completion_refs(
+        &self,
+        _scope: &TurnScope,
+        _run_id: TurnRunId,
+        _reply_refs: &[LoopMessageRef],
+        _result_refs: &[LoopResultRef],
+    ) -> Result<bool, TurnError> {
+        Ok(false)
+    }
+
+    async fn verify_blocked_evidence(
+        &self,
+        _scope: &TurnScope,
+        _run_id: TurnRunId,
+        _checkpoint_id: &TurnCheckpointId,
+        _gate_ref: &LoopGateRef,
+    ) -> Result<bool, TurnError> {
+        Ok(false)
+    }
+
+    async fn verify_failure_evidence(
+        &self,
+        _scope: &TurnScope,
+        _run_id: TurnRunId,
+    ) -> Result<bool, TurnError> {
+        Ok(false)
+    }
+
+    async fn is_cancellation_observed(&self, _run_id: TurnRunId) -> Result<bool, TurnError> {
+        Ok(false)
+    }
+}
+
 /// In-memory evidence port for tests.
 ///
 /// All evidence verification returns `Ok(false)` by default (most restrictive /
 /// untrusted). Use builder methods to override individual responses.
+#[cfg(test)]
 pub struct InMemoryLoopExitEvidencePort {
     completion_refs_verified: bool,
     blocked_evidence_verified: bool,
@@ -183,6 +227,7 @@ pub struct InMemoryLoopExitEvidencePort {
     cancellation_observed: bool,
 }
 
+#[cfg(test)]
 impl InMemoryLoopExitEvidencePort {
     /// Create a new in-memory evidence port with all evidence unverified.
     pub fn new() -> Self {
@@ -229,12 +274,14 @@ impl InMemoryLoopExitEvidencePort {
     }
 }
 
+#[cfg(test)]
 impl Default for InMemoryLoopExitEvidencePort {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(test)]
 #[async_trait]
 impl LoopExitEvidencePort for InMemoryLoopExitEvidencePort {
     async fn verify_completion_refs(

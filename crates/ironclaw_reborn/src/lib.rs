@@ -19,6 +19,9 @@ pub use loop_driver_host::{
     RebornLoopDriverHost, RebornLoopDriverHostError, RebornLoopDriverHostFactory,
     RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
 };
+pub use loop_exit_applier::{
+    FailClosedLoopExitEvidencePort, LoopExitApplier, LoopExitEvidencePort,
+};
 #[cfg(feature = "root-llm-provider")]
 pub use model_gateway::{
     LlmModelProfilePolicy, LlmProviderModelGateway, ThreadBackedLoopModelGateway,
