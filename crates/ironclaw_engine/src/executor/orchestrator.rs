@@ -56,6 +56,9 @@ pub const ORCHESTRATOR_TITLE: &str = "orchestrator:main";
 
 /// Well-known tag for orchestrator code docs.
 pub const ORCHESTRATOR_TAG: &str = "orchestrator_code";
+/// Thread metadata key for CodeAct action results that must survive into
+/// host-side history persistence without polluting the LLM-facing transcript.
+pub const PERSISTED_ACTION_RESULTS_METADATA_KEY: &str = "persisted_action_results_log";
 
 /// Result of running the orchestrator.
 pub struct OrchestratorResult {
@@ -3018,6 +3021,22 @@ fn sync_runtime_state(thread: &mut Thread, state: Option<&serde_json::Value>) {
         thread.internal_messages = messages;
         thread.updated_at = chrono::Utc::now();
     }
+    if let Some(action_results) = state
+        .get("_persisted_action_results_log")
+        .filter(|value| value.is_array())
+        .cloned()
+    {
+        if !thread.metadata.is_object() {
+            thread.metadata = serde_json::json!({});
+        }
+        if let Some(metadata) = thread.metadata.as_object_mut() {
+            metadata.insert(
+                PERSISTED_ACTION_RESULTS_METADATA_KEY.to_string(),
+                action_results,
+            );
+        }
+        thread.updated_at = chrono::Utc::now();
+    }
 }
 
 fn sync_visible_outcome(thread: &mut Thread, outcome: &ThreadOutcome) {
@@ -5355,6 +5374,50 @@ FINAL(batch_error_count)
                  this would cause 'No tool output found' from the LLM API"
             );
         }
+    }
+
+    #[test]
+    fn sync_runtime_state_copies_codeact_action_results_into_thread_metadata() {
+        let mut thread = Thread::new(
+            "goal",
+            crate::types::thread::ThreadType::Foreground,
+            ProjectId::new(),
+            "test-user",
+            crate::types::thread::ThreadConfig::default(),
+        );
+        let state = serde_json::json!({
+            "working_messages": [
+                {"role": "User", "content": "draw a cat"},
+                {"role": "Assistant", "content": "```repl\nimage_generate(prompt='cat')\n```"}
+            ],
+            "_persisted_action_results_log": [
+                {
+                    "call_id": "code_call_1",
+                    "action_name": "image_generate",
+                    "output": {
+                        "type": "image_generated",
+                        "data": "data:image/png;base64,abc123"
+                    },
+                    "is_error": false,
+                    "duration": 12
+                }
+            ]
+        });
+
+        sync_runtime_state(&mut thread, Some(&state));
+
+        let persisted = thread
+            .metadata
+            .get(PERSISTED_ACTION_RESULTS_METADATA_KEY)
+            .and_then(|value| value.as_array())
+            .expect("persisted action results metadata must be populated");
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0]["call_id"], "code_call_1");
+        assert_eq!(persisted[0]["action_name"], "image_generate");
+        assert_eq!(
+            persisted[0]["output"]["data"],
+            "data:image/png;base64,abc123"
+        );
     }
 
     // ── CodeExecutionFailed event emission (caller test) ────────

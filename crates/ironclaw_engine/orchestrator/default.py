@@ -923,6 +923,12 @@ def run_loop(context, goal, actions, state, config):
 
             # Execute code in nested Monty VM
             result = __execute_code_step__(code, state)
+            state["_persisted_action_results"] = result.get("action_results", [])
+            persisted_results_log = state.get("_persisted_action_results_log")
+            if not isinstance(persisted_results_log, list):
+                persisted_results_log = []
+            persisted_results_log.extend(result.get("action_results", []))
+            state["_persisted_action_results_log"] = persisted_results_log
 
             # Update persisted state with results
             if result.get("return_value") is not None:

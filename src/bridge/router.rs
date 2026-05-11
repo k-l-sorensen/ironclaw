@@ -11,7 +11,7 @@ use ironclaw_engine::{
     MissionManager, PolicyEngine, Project, Store, ThreadConfig, ThreadManager, ThreadOutcome,
 };
 
-use ironclaw_common::AppEvent;
+use ironclaw_common::{AppEvent, truncate_preview};
 use ironclaw_engine::types::{is_shared_owner, shared_owner_id};
 
 use crate::agent::Agent;
@@ -22,11 +22,13 @@ use crate::bridge::llm_adapter::LlmBridgeAdapter;
 use crate::bridge::store_adapter::HybridStore;
 use crate::channels::web::GATEWAY_CHANNEL_NAME;
 use crate::channels::web::sse::SseManager;
+use crate::channels::web::types::GeneratedImageInfo;
 use crate::channels::{IncomingMessage, OutgoingResponse, StatusUpdate};
 use crate::db::Database;
 use crate::error::Error;
 use crate::extensions::naming::legacy_extension_alias;
 use crate::gate::pending::{PendingGate, PendingGateKey};
+use crate::generated_images::GeneratedImageSentinel;
 
 /// Typed outcome from a v2 bridge handler.
 ///
@@ -351,6 +353,26 @@ async fn save_attachment_index_notes(
         if let Err(e) = store.save_memory_doc(&doc).await {
             tracing::warn!(error = %e, title = %doc.title, "engine v2: failed to save attachment index note");
         }
+    }
+}
+
+async fn persist_v1_assistant_response_for_message(
+    db: &Arc<dyn crate::db::Database>,
+    message: &IncomingMessage,
+    text: &str,
+) {
+    let v1_conv_id = if let Some(tid) = message.conversation_scope()
+        && let Ok(uuid) = uuid::Uuid::parse_str(tid)
+    {
+        Some(uuid)
+    } else {
+        db.get_or_create_assistant_conversation(&message.user_id, &message.channel)
+            .await
+            .ok()
+    };
+
+    if let Some(cid) = v1_conv_id {
+        let _ = db.add_conversation_message(cid, "assistant", text).await;
     }
 }
 
@@ -4269,7 +4291,7 @@ fn spawn_post_park_continuation(
     let user_id = message.user_id.clone();
     let channel_name = message.channel.clone();
     let metadata = message.metadata.clone();
-    let tid_str = thread_id.to_string();
+    let visible_thread_id = channel_visible_thread_id(&message, thread_id);
 
     tokio::spawn(async move {
         let mut event_rx = thread_manager.subscribe_events();
@@ -4286,7 +4308,7 @@ fn spawn_post_park_continuation(
                             if let Some(ref sse) = sse {
                                 let skip_verbose = !sse.has_verbose_receivers();
                                 let leak_detector = effect_adapter.safety().leak_detector();
-                                for mut app_event in thread_event_to_app_events(evt, &tid_str) {
+                                for mut app_event in thread_event_to_app_events(evt, &visible_thread_id) {
                                     if skip_verbose && app_event.is_verbose_only() {
                                         continue;
                                     }
@@ -4348,9 +4370,21 @@ fn spawn_post_park_continuation(
 
         let response_text: Option<String> = match &outcome {
             ThreadOutcome::Completed { response } => {
-                if let Some(ref db) = db {
-                    persist_v2_tool_calls(&store, db, thread_id, &message).await;
-                }
+                let generated_images = if let Some(ref db) = db {
+                    persist_v2_tool_calls(&store, db, thread_id, &message).await
+                } else {
+                    Vec::new()
+                };
+                emit_generated_images_for_completed_v2_thread(
+                    &channels,
+                    sse.as_ref(),
+                    &channel_name,
+                    &user_id,
+                    &visible_thread_id,
+                    &metadata,
+                    &generated_images,
+                )
+                .await;
                 response.clone()
             }
             ThreadOutcome::Stopped => Some("Thread was stopped.".into()),
@@ -4371,7 +4405,7 @@ fn spawn_post_park_continuation(
                         &user_id,
                         AppEvent::Error {
                             message: sanitized.clone(),
-                            thread_id: Some(tid_str.clone()),
+                            thread_id: Some(visible_thread_id.clone()),
                         },
                     );
                 }
@@ -4510,7 +4544,7 @@ fn spawn_post_park_continuation(
                     &user_id,
                     AppEvent::Response {
                         content: text.clone(),
-                        thread_id: tid_str.clone(),
+                        thread_id: visible_thread_id.clone(),
                     },
                 );
             }
@@ -4768,7 +4802,50 @@ async fn await_thread_outcome(
     // can still resolve it, and the resolver path will deliver the
     // resolution into the parked oneshot.
     if timed_out && state.thread_manager.is_running(thread_id).await {
-        return Ok(BridgeOutcome::Pending);
+        if state.pending_gates.peek(&pending_key).await.is_some() {
+            return Ok(BridgeOutcome::Pending);
+        }
+
+        tracing::warn!(
+            thread_id = %thread_id,
+            conversation_id = %conv_id,
+            user_id = %message.user_id,
+            "await_thread_outcome deadline elapsed without a pending gate; stopping stalled thread"
+        );
+
+        if let Err(e) = state
+            .thread_manager
+            .stop_thread(thread_id, &message.user_id)
+            .await
+        {
+            tracing::warn!(
+                thread_id = %thread_id,
+                user_id = %message.user_id,
+                error = %e,
+                "failed to stop stalled thread after await_thread_outcome timeout"
+            );
+        }
+
+        let timeout_error =
+            "This request timed out while waiting for a response. Please resend it.".to_string();
+        let timeout_outcome = ThreadOutcome::Failed {
+            error: timeout_error.clone(),
+            debug_detail: Some(
+                "await_thread_outcome deadline elapsed without a pending gate".to_string(),
+            ),
+        };
+
+        state
+            .conversation_manager
+            .record_thread_outcome(conv_id, thread_id, &timeout_outcome)
+            .await
+            .map_err(|e| engine_err("conversation error", e))?;
+
+        if let Some(ref db) = state.db {
+            persist_v1_assistant_response_for_message(db, message, &timeout_error).await;
+        }
+
+        return Ok(BridgeOutcome::Respond(timeout_error));
     }
 
     let outcome = state
@@ -4782,30 +4859,6 @@ async fn await_thread_outcome(
         .record_thread_outcome(conv_id, thread_id, &outcome)
         .await
         .map_err(|e| engine_err("conversation error", e))?;
-
-    // Helper: write the outcome response to the v1 DB so the history API
-    // shows it correctly for all outcomes that produce a response.
-    let write_v1_response = |db: &Arc<dyn crate::db::Database>, text: &str| {
-        let db = Arc::clone(db);
-        let scope = message.conversation_scope().map(String::from);
-        let user_id = message.user_id.clone();
-        let channel = message.channel.clone();
-        let text = text.to_string();
-        async move {
-            let v1_conv_id = if let Some(tid) = scope
-                && let Ok(uuid) = uuid::Uuid::parse_str(&tid)
-            {
-                Some(uuid)
-            } else {
-                db.get_or_create_assistant_conversation(&user_id, &channel)
-                    .await
-                    .ok()
-            };
-            if let Some(cid) = v1_conv_id {
-                let _ = db.add_conversation_message(cid, "assistant", &text).await;
-            }
-        }
-    };
 
     if let Some(ref sse) = state.sse
         && let ThreadOutcome::Completed {
@@ -4938,9 +4991,21 @@ async fn await_thread_outcome(
 
             // Persist tool_calls only for completed threads — not for
             // GatePaused (partial tools, would orphan rows on resume).
-            if let Some(ref db) = state.db {
-                persist_v2_tool_calls(&state.store, db, thread_id, message).await;
-            }
+            let generated_images = if let Some(ref db) = state.db {
+                persist_v2_tool_calls(&state.store, db, thread_id, message).await
+            } else {
+                Vec::new()
+            };
+            emit_generated_images_for_completed_v2_thread(
+                &agent.channels,
+                state.sse.as_ref(),
+                &message.channel,
+                &message.user_id,
+                &channel_visible_thread_id(message, thread_id),
+                &message.metadata,
+                &generated_images,
+            )
+            .await;
 
             match response {
                 Some(text) => Ok(BridgeOutcome::Respond(text)),
@@ -5084,7 +5149,7 @@ async fn await_thread_outcome(
     if let Ok(BridgeOutcome::Respond(ref text)) = result
         && let Some(ref db) = state.db
     {
-        write_v1_response(db, text).await;
+        persist_v1_assistant_response_for_message(db, message, text).await;
     }
 
     result
@@ -5329,6 +5394,130 @@ pub(crate) async fn handle_mission_notification(
     }
 }
 
+fn tool_result_preview_for_v2_persistence(result: &serde_json::Value) -> String {
+    if GeneratedImageSentinel::from_value(result).is_some() {
+        return "Generated image".to_string();
+    }
+
+    match result {
+        serde_json::Value::String(s) => truncate_preview(s, 500),
+        other => truncate_preview(&other.to_string(), 500),
+    }
+}
+
+fn generated_image_info_from_result(
+    result: &serde_json::Value,
+    event_id: String,
+) -> Option<GeneratedImageInfo> {
+    let sentinel = GeneratedImageSentinel::from_value(result)?;
+    Some(GeneratedImageInfo {
+        event_id,
+        data_url: sentinel
+            .data_url()
+            .filter(|data_url| !data_url.is_empty())
+            .map(str::to_string),
+        path: sentinel.path().map(str::to_string),
+    })
+}
+
+fn append_persisted_v2_tool_call(
+    calls: &mut Vec<serde_json::Value>,
+    generated_images: &mut Vec<GeneratedImageInfo>,
+    action_name: &str,
+    call_id: Option<&str>,
+    result: &serde_json::Value,
+    fallback_event_id: String,
+) {
+    let preview = tool_result_preview_for_v2_persistence(result);
+    let mut obj = serde_json::json!({
+        "name": action_name,
+        "result_preview": preview,
+    });
+    if let Some(call_id) = call_id.filter(|call_id| !call_id.is_empty()) {
+        obj["tool_call_id"] = serde_json::Value::String(call_id.to_string());
+    }
+    if let Some(sentinel) = GeneratedImageSentinel::from_value(result) {
+        obj["result"] = serde_json::Value::String(sentinel.record_content_for_persistence());
+        let event_id = call_id
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or(fallback_event_id);
+        if let Some(image) = generated_image_info_from_result(result, event_id) {
+            generated_images.push(image);
+        }
+    }
+    calls.push(obj);
+}
+
+fn channel_visible_thread_id(
+    message: &IncomingMessage,
+    engine_thread_id: ironclaw_engine::ThreadId,
+) -> String {
+    message
+        .thread_id
+        .as_ref()
+        .map(|thread_id| thread_id.to_string())
+        .or_else(|| {
+            message
+                .metadata
+                .get("thread_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| engine_thread_id.to_string())
+}
+
+async fn emit_generated_images_for_completed_v2_thread(
+    channels: &Arc<crate::channels::ChannelManager>,
+    sse: Option<&Arc<SseManager>>,
+    channel_name: &str,
+    user_id: &str,
+    thread_id: &str,
+    metadata: &serde_json::Value,
+    generated_images: &[GeneratedImageInfo],
+) {
+    if generated_images.is_empty() {
+        return;
+    }
+
+    if channel_name == GATEWAY_CHANNEL_NAME
+        && let Some(sse) = sse
+    {
+        for image in generated_images {
+            let Some(data_url) = image.data_url.clone() else {
+                continue;
+            };
+            sse.broadcast_for_user(
+                user_id,
+                AppEvent::ImageGenerated {
+                    event_id: image.event_id.clone(),
+                    data_url,
+                    path: image.path.clone(),
+                    thread_id: Some(thread_id.to_string()),
+                },
+            );
+        }
+        return;
+    }
+
+    for image in generated_images {
+        let Some(data_url) = image.data_url.clone() else {
+            continue;
+        };
+        let _ = channels
+            .send_status(
+                channel_name,
+                StatusUpdate::ImageGenerated {
+                    event_id: image.event_id.clone(),
+                    data_url,
+                    path: image.path.clone(),
+                },
+                metadata,
+            )
+            .await;
+    }
+}
+
 /// Persist v2 engine tool call metadata to the v1 conversation DB.
 ///
 /// Loads the completed thread from the v2 store, extracts ActionResult
@@ -5340,7 +5529,7 @@ async fn persist_v2_tool_calls(
     db: &std::sync::Arc<dyn Database>,
     thread_id: ironclaw_engine::ThreadId,
     message: &IncomingMessage,
-) {
+) -> Vec<GeneratedImageInfo> {
     // Load the thread -- it's still in the store after join_thread
     // (join only removes from the runtime running map, not the store).
     //
@@ -5353,47 +5542,64 @@ async fn persist_v2_tool_calls(
         Ok(Some(t)) => t,
         Ok(None) => {
             tracing::warn!(thread_id = %thread_id, "thread not found in store for tool_calls persist");
-            return;
+            return Vec::new();
         }
         Err(e) => {
             tracing::warn!(thread_id = %thread_id, "failed to load thread for tool_calls persist: {e}");
-            return;
+            return Vec::new();
         }
     };
 
     // Extract ActionResult messages from the thread's internal transcript.
     // `internal_messages` has the full execution chain including action
-    // results with actual tool output. `messages` only has user/assistant.
+    // results with actual tool output when the orchestrator records
+    // ActionResult messages directly. CodeAct tool executions are also
+    // mirrored into thread metadata so history persistence can recover the
+    // exact outputs without pushing extra tool messages back into the
+    // LLM-facing transcript on resume.
     let mut calls = Vec::new();
-    for msg in &thread.internal_messages {
+    let mut generated_images = Vec::new();
+    for (result_index, msg) in thread.internal_messages.iter().enumerate() {
         if msg.role != ironclaw_engine::MessageRole::ActionResult {
             continue;
         }
         let action_name = msg.action_name.as_deref().unwrap_or("unknown");
-        let preview = if msg.content.len() > 500 {
-            let end = msg
-                .content
-                .char_indices()
-                .take_while(|(i, _)| *i < 500)
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(0);
-            format!("{}...", &msg.content[..end]) // safety: end is char-boundary via char_indices
-        } else {
-            msg.content.clone()
-        };
-        let mut obj = serde_json::json!({
-            "name": action_name,
-            "result_preview": preview,
-        });
-        if let Some(ref call_id) = msg.action_call_id {
-            obj["tool_call_id"] = serde_json::Value::String(call_id.clone());
+        let result = serde_json::from_str::<serde_json::Value>(&msg.content)
+            .unwrap_or_else(|_| serde_json::Value::String(msg.content.clone()));
+        append_persisted_v2_tool_call(
+            &mut calls,
+            &mut generated_images,
+            action_name,
+            msg.action_call_id.as_deref(),
+            &result,
+            format!("v2-image-{result_index}"),
+        );
+    }
+    if let Some(persisted_results) = thread
+        .metadata
+        .get(ironclaw_engine::PERSISTED_ACTION_RESULTS_METADATA_KEY)
+        .and_then(|value| value.as_array())
+    {
+        for (result_index, result_entry) in persisted_results.iter().enumerate() {
+            let action_name = result_entry
+                .get("action_name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("unknown");
+            append_persisted_v2_tool_call(
+                &mut calls,
+                &mut generated_images,
+                action_name,
+                result_entry.get("call_id").and_then(|value| value.as_str()),
+                result_entry
+                    .get("output")
+                    .unwrap_or(&serde_json::Value::Null),
+                format!("v2-code-image-{result_index}"),
+            );
         }
-        calls.push(obj);
     }
 
     if calls.is_empty() {
-        return;
+        return generated_images;
     }
 
     let wrapper = serde_json::json!({ "calls": calls });
@@ -5401,7 +5607,7 @@ async fn persist_v2_tool_calls(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(thread_id = %thread_id, "failed to serialize v2 tool_calls: {e}");
-            return;
+            return generated_images;
         }
     };
 
@@ -5421,7 +5627,7 @@ async fn persist_v2_tool_calls(
                     thread_id = %thread_id,
                     "failed to resolve v1 conversation for tool_calls persist: {e}"
                 );
-                return;
+                return generated_images;
             }
         }
     };
@@ -5432,6 +5638,8 @@ async fn persist_v2_tool_calls(
     {
         tracing::warn!(thread_id = %thread_id, "failed to persist v2 tool_calls to v1 DB: {e}");
     }
+
+    generated_images
 }
 
 /// Forward an engine ThreadEvent to the channel as a StatusUpdate.
@@ -11637,6 +11845,356 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
+    async fn persist_v2_tool_calls_preserves_generated_image_results_for_history_rehydration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(TestStore::new());
+        let db: Arc<dyn crate::db::Database> = Arc::new(
+            crate::db::libsql::LibSqlBackend::new_local(&tmp.path().join("test.db"))
+                .await
+                .expect("local libsql"),
+        );
+        db.run_migrations().await.expect("migrations");
+
+        let mut thread = ironclaw_engine::Thread::new(
+            "goal",
+            ironclaw_engine::ThreadType::Foreground,
+            ironclaw_engine::ProjectId::new(),
+            "test-user",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        thread.add_internal_message(ironclaw_engine::ThreadMessage::action_result(
+            "call-img",
+            "image_generate",
+            r#"{"type":"image_generated","data":"data:image/png;base64,abc123","media_type":"image/png","path":"workspace/out.png"}"#,
+        ));
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let conv_id = db
+            .create_conversation("web", "test-user", None)
+            .await
+            .expect("create conversation");
+        let message =
+            IncomingMessage::new("web", "test-user", "draw").with_thread(conv_id.to_string());
+
+        let store_arc: Arc<dyn Store> = store;
+        let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
+        assert_eq!(generated_images.len(), 1);
+        assert_eq!(generated_images[0].event_id, "call-img");
+        assert_eq!(
+            generated_images[0].data_url.as_deref(),
+            Some("data:image/png;base64,abc123")
+        );
+
+        let messages = db
+            .list_conversation_messages(conv_id)
+            .await
+            .expect("list messages");
+        let tool_calls_msg = messages
+            .iter()
+            .find(|m| m.role == "tool_calls")
+            .expect("tool_calls row must be written");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tool_calls_msg.content).expect("valid JSON");
+        let calls = parsed["calls"].as_array().expect("calls array");
+        assert_eq!(calls[0]["result_preview"], "Generated image");
+        let persisted_result = calls[0]["result"]
+            .as_str()
+            .expect("image result should be persisted");
+        assert!(persisted_result.contains("\"type\":\"image_generated\""));
+        assert!(persisted_result.contains("data:image/png;base64,abc123"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persist_v2_tool_calls_preserves_non_ascii_python_repr_image_results() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(TestStore::new());
+        let db: Arc<dyn crate::db::Database> = Arc::new(
+            crate::db::libsql::LibSqlBackend::new_local(&tmp.path().join("test.db"))
+                .await
+                .expect("local libsql"),
+        );
+        db.run_migrations().await.expect("migrations");
+
+        let mut thread = ironclaw_engine::Thread::new(
+            "goal",
+            ironclaw_engine::ThreadType::Foreground,
+            ironclaw_engine::ProjectId::new(),
+            "test-user",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        thread.add_internal_message(ironclaw_engine::ThreadMessage::action_result(
+            "call-img",
+            "image_generate",
+            "{'data': 'data:image/png;base64,abc123', 'media_type': 'image/png', 'prompt': '生成小猫图片，狸花猫', 'type': 'image_generated'}",
+        ));
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let conv_id = db
+            .create_conversation("web", "test-user", None)
+            .await
+            .expect("create conversation");
+        let message =
+            IncomingMessage::new("web", "test-user", "draw").with_thread(conv_id.to_string());
+
+        let store_arc: Arc<dyn Store> = store;
+        let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
+        assert_eq!(generated_images.len(), 1);
+        assert_eq!(generated_images[0].event_id, "call-img");
+        assert_eq!(
+            generated_images[0].data_url.as_deref(),
+            Some("data:image/png;base64,abc123")
+        );
+
+        let messages = db
+            .list_conversation_messages(conv_id)
+            .await
+            .expect("list messages");
+        let tool_calls_msg = messages
+            .iter()
+            .find(|m| m.role == "tool_calls")
+            .expect("tool_calls row must be written");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tool_calls_msg.content).expect("valid JSON");
+        let calls = parsed["calls"].as_array().expect("calls array");
+        assert_eq!(calls[0]["result_preview"], "Generated image");
+        let persisted_result = calls[0]["result"]
+            .as_str()
+            .expect("image result should be persisted");
+        assert!(persisted_result.contains("\"type\":\"image_generated\""));
+        assert!(persisted_result.contains("data:image/png;base64,abc123"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persist_v2_tool_calls_preserves_image_edit_results_for_history_rehydration() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(TestStore::new());
+        let db: Arc<dyn crate::db::Database> = Arc::new(
+            crate::db::libsql::LibSqlBackend::new_local(&tmp.path().join("test.db"))
+                .await
+                .expect("local libsql"),
+        );
+        db.run_migrations().await.expect("migrations");
+
+        let mut thread = ironclaw_engine::Thread::new(
+            "goal",
+            ironclaw_engine::ThreadType::Foreground,
+            ironclaw_engine::ProjectId::new(),
+            "test-user",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        thread.add_internal_message(ironclaw_engine::ThreadMessage::action_result(
+            "call-edit",
+            "image_edit",
+            r#"{"type":"image_generated","data":"data:image/jpeg;base64,edited123","media_type":"image/jpeg","path":"workspace/edited.jpg"}"#,
+        ));
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let conv_id = db
+            .create_conversation("web", "test-user", None)
+            .await
+            .expect("create conversation");
+        let message =
+            IncomingMessage::new("web", "test-user", "edit").with_thread(conv_id.to_string());
+
+        let store_arc: Arc<dyn Store> = store;
+        let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
+        assert_eq!(generated_images.len(), 1);
+        assert_eq!(generated_images[0].event_id, "call-edit");
+        assert_eq!(
+            generated_images[0].data_url.as_deref(),
+            Some("data:image/jpeg;base64,edited123")
+        );
+        assert_eq!(
+            generated_images[0].path.as_deref(),
+            Some("workspace/edited.jpg")
+        );
+
+        let messages = db
+            .list_conversation_messages(conv_id)
+            .await
+            .expect("list messages");
+        let tool_calls_msg = messages
+            .iter()
+            .find(|m| m.role == "tool_calls")
+            .expect("tool_calls row must be written");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tool_calls_msg.content).expect("valid JSON");
+        let calls = parsed["calls"].as_array().expect("calls array");
+        assert_eq!(calls[0]["name"], "image_edit");
+        assert_eq!(calls[0]["result_preview"], "Generated image");
+        let persisted_result = calls[0]["result"]
+            .as_str()
+            .expect("image_edit result should be persisted");
+        assert!(persisted_result.contains("\"type\":\"image_generated\""));
+        assert!(persisted_result.contains("data:image/jpeg;base64,edited123"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persist_v2_tool_calls_reads_codeact_results_from_thread_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(TestStore::new());
+        let db: Arc<dyn crate::db::Database> = Arc::new(
+            crate::db::libsql::LibSqlBackend::new_local(&tmp.path().join("test.db"))
+                .await
+                .expect("local libsql"),
+        );
+        db.run_migrations().await.expect("migrations");
+
+        let mut thread = ironclaw_engine::Thread::new(
+            "goal",
+            ironclaw_engine::ThreadType::Foreground,
+            ironclaw_engine::ProjectId::new(),
+            "test-user",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        thread.metadata = serde_json::json!({
+            (ironclaw_engine::PERSISTED_ACTION_RESULTS_METADATA_KEY): [{
+                "call_id": "code_call_1",
+                "action_name": "image_generate",
+                "output": {
+                    "type": "image_generated",
+                    "data": "data:image/png;base64,code123",
+                    "media_type": "image/png",
+                    "path": "workspace/code.png"
+                },
+                "is_error": false,
+                "duration": 10
+            }]
+        });
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let conv_id = db
+            .create_conversation("web", "test-user", None)
+            .await
+            .expect("create conversation");
+        let message =
+            IncomingMessage::new("web", "test-user", "draw").with_thread(conv_id.to_string());
+
+        let store_arc: Arc<dyn Store> = store;
+        let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
+        assert_eq!(generated_images.len(), 1);
+        assert_eq!(generated_images[0].event_id, "code_call_1");
+        assert_eq!(
+            generated_images[0].data_url.as_deref(),
+            Some("data:image/png;base64,code123")
+        );
+
+        let messages = db
+            .list_conversation_messages(conv_id)
+            .await
+            .expect("list messages");
+        let tool_calls_msg = messages
+            .iter()
+            .find(|m| m.role == "tool_calls")
+            .expect("tool_calls row must be written");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tool_calls_msg.content).expect("valid JSON");
+        let calls = parsed["calls"].as_array().expect("calls array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "image_generate");
+        assert_eq!(calls[0]["tool_call_id"], "code_call_1");
+        assert_eq!(calls[0]["result_preview"], "Generated image");
+        let persisted_result = calls[0]["result"]
+            .as_str()
+            .expect("image result should be persisted");
+        assert!(persisted_result.contains("\"type\":\"image_generated\""));
+        assert!(persisted_result.contains("data:image/png;base64,code123"));
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn persist_v2_tool_calls_reads_python_repr_codeact_results_from_thread_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(TestStore::new());
+        let db: Arc<dyn crate::db::Database> = Arc::new(
+            crate::db::libsql::LibSqlBackend::new_local(&tmp.path().join("test.db"))
+                .await
+                .expect("local libsql"),
+        );
+        db.run_migrations().await.expect("migrations");
+
+        let mut thread = ironclaw_engine::Thread::new(
+            "goal",
+            ironclaw_engine::ThreadType::Foreground,
+            ironclaw_engine::ProjectId::new(),
+            "test-user",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        thread.metadata = serde_json::json!({
+            (ironclaw_engine::PERSISTED_ACTION_RESULTS_METADATA_KEY): [{
+                "call_id": "code_call_py_1",
+                "action_name": "image_generate",
+                "output": "{'type': 'image_generated', 'data': 'data:image/png;base64,codepy123', 'media_type': 'image/png', 'path': 'workspace/codepy.png'}",
+                "is_error": false,
+                "duration": 10
+            }]
+        });
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.unwrap();
+
+        let conv_id = db
+            .create_conversation("web", "test-user", None)
+            .await
+            .expect("create conversation");
+        let message =
+            IncomingMessage::new("web", "test-user", "draw").with_thread(conv_id.to_string());
+
+        let store_arc: Arc<dyn Store> = store;
+        let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
+        assert_eq!(generated_images.len(), 1);
+        assert_eq!(generated_images[0].event_id, "code_call_py_1");
+        assert_eq!(
+            generated_images[0].data_url.as_deref(),
+            Some("data:image/png;base64,codepy123")
+        );
+        assert_eq!(
+            generated_images[0].path.as_deref(),
+            Some("workspace/codepy.png")
+        );
+
+        let messages = db
+            .list_conversation_messages(conv_id)
+            .await
+            .expect("list messages");
+        let tool_calls_msg = messages
+            .iter()
+            .find(|m| m.role == "tool_calls")
+            .expect("tool_calls row must be written");
+        let parsed: serde_json::Value =
+            serde_json::from_str(&tool_calls_msg.content).expect("valid JSON");
+        let calls = parsed["calls"].as_array().expect("calls array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "image_generate");
+        assert_eq!(calls[0]["tool_call_id"], "code_call_py_1");
+        assert_eq!(calls[0]["result_preview"], "Generated image");
+        let persisted_result = calls[0]["result"]
+            .as_str()
+            .expect("image result should be persisted");
+        assert!(persisted_result.contains("\"type\":\"image_generated\""));
+        assert!(persisted_result.contains("data:image/png;base64,codepy123"));
+    }
+
+    #[test]
+    fn channel_visible_thread_id_prefers_incoming_message_scope() {
+        let engine_thread_id = ironclaw_engine::ThreadId::new();
+        let message =
+            IncomingMessage::new("web", "test-user", "draw").with_thread("gateway-thread");
+
+        assert_eq!(
+            channel_visible_thread_id(&message, engine_thread_id),
+            "gateway-thread"
+        );
+    }
+
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
     async fn persist_v2_tool_calls_skips_when_no_action_results() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let store = Arc::new(TestStore::new());
@@ -11683,11 +12241,9 @@ mod tests {
         );
     }
 
-    /// Regression: the truncation logic in `persist_v2_tool_calls` uses
-    /// `char_indices()` + `len_utf8()` to avoid slicing in the middle of a
-    /// multi-byte UTF-8 sequence. Exercise the path with a content string
-    /// that is well over 500 bytes and composed entirely of 3-byte chars,
-    /// where a naive `&s[..500]` would panic on a char boundary.
+    /// Regression: the preview truncation in `persist_v2_tool_calls` must
+    /// preserve UTF-8 boundaries even when the raw tool output exceeds the
+    /// 500-byte display cap.
     #[cfg(feature = "libsql")]
     #[tokio::test]
     async fn persist_v2_tool_calls_truncates_multibyte_content_on_char_boundary() {
@@ -11835,6 +12391,35 @@ mod tests {
                  the Completed marker and the call"
             );
         }
+    }
+
+    #[test]
+    fn timed_out_running_thread_without_gate_is_not_left_pending() {
+        let source = include_str!("router.rs");
+        let start = source
+            .find("if timed_out && state.thread_manager.is_running(thread_id).await {")
+            .expect("timed_out branch must exist");
+        let tail = &source[start..];
+        let (timeout_branch, _) = tail
+            .split_once("let outcome = state")
+            .expect("timed_out branch should precede join_thread");
+
+        assert!(
+            timeout_branch.contains("state.pending_gates.peek(&pending_key).await.is_some()"),
+            "timed_out branch must keep true pending gates resumable"
+        );
+        assert!(
+            timeout_branch.contains(".stop_thread(thread_id, &message.user_id)"),
+            "timed_out branch must stop a stalled running thread when no gate exists"
+        );
+        assert!(
+            timeout_branch.contains(".record_thread_outcome(conv_id, thread_id, &timeout_outcome)"),
+            "timed_out branch must untrack stalled threads from the conversation"
+        );
+        assert!(
+            timeout_branch.contains("BridgeOutcome::Respond(timeout_error)"),
+            "timed_out branch must surface a terminal response instead of staying pending"
+        );
     }
 
     // ── resume_lease_for_pending_gate tests ────────────────────

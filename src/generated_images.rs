@@ -33,7 +33,7 @@ pub(crate) fn image_tool_event_id(turn_number: usize, tool_call_id: &str) -> Str
 
 impl GeneratedImageSentinel {
     pub(crate) fn from_output(output: &str) -> Option<Self> {
-        let parsed = serde_json::from_str::<serde_json::Value>(output).ok()?;
+        let parsed = parse_embedded_json_string(output)?;
         Self::from_value(&parsed)
     }
 
@@ -149,12 +149,20 @@ impl GeneratedImageSentinel {
     }
 }
 
+fn parse_embedded_json_string(s: &str) -> Option<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(s)
+        .ok()
+        .or_else(|| {
+            coerce_python_repr_to_json(s).and_then(|coerced| serde_json::from_str(&coerced).ok())
+        })
+}
+
 fn normalize_embedded_json(value: &serde_json::Value) -> Option<Cow<'_, serde_json::Value>> {
     let serde_json::Value::String(s) = value else {
         return Some(Cow::Borrowed(value));
     };
 
-    let mut current = serde_json::from_str::<serde_json::Value>(s).ok()?;
+    let mut current = parse_embedded_json_string(s)?;
     // Generated-image sentinels may be serialized more than once as they flow
     // through tool output, DB persistence, and history reconstruction. Unwrap a
     // few layers to tolerate that pipeline, but stop after a small fixed number
@@ -162,7 +170,7 @@ fn normalize_embedded_json(value: &serde_json::Value) -> Option<Cow<'_, serde_js
     for _ in 1..MAX_EMBEDDED_JSON_STRING_LAYERS {
         match current {
             serde_json::Value::String(ref s) => {
-                current = serde_json::from_str::<serde_json::Value>(s).ok()?;
+                current = parse_embedded_json_string(s)?;
             }
             _ => return Some(Cow::Owned(current)),
         }
@@ -174,6 +182,110 @@ fn normalize_embedded_json(value: &serde_json::Value) -> Option<Cow<'_, serde_js
         );
     }
     Some(Cow::Owned(current))
+}
+
+/// Best-effort coercion of a Python `repr(dict)` string into valid JSON.
+///
+/// CodeAct action results can reach Rust as `str(dict)`, which means
+/// single-quoted strings plus Python literals (`True`, `False`, `None`).
+/// Rewriting that shape here lets image history reconstruction treat those
+/// results the same as regular JSON sentinels.
+fn coerce_python_repr_to_json(content: &str) -> Option<String> {
+    if content.is_empty() {
+        return None;
+    }
+
+    let mut out = String::with_capacity(content.len());
+    // 0 = outside string, 1 = inside single-quoted string, 2 = inside
+    // double-quoted string.
+    let mut state: u8 = 0;
+    let mut chars = content.char_indices().peekable();
+    while let Some((_, c)) = chars.next() {
+        match state {
+            0 => match c {
+                '\'' => {
+                    out.push('"');
+                    state = 1;
+                }
+                '"' => {
+                    out.push('"');
+                    state = 2;
+                }
+                'T' if consume_keyword_tail(&mut chars, "rue") => {
+                    out.push_str("true");
+                    continue;
+                }
+                'F' if consume_keyword_tail(&mut chars, "alse") => {
+                    out.push_str("false");
+                    continue;
+                }
+                'N' if consume_keyword_tail(&mut chars, "one") => {
+                    out.push_str("null");
+                    continue;
+                }
+                _ => out.push(c),
+            },
+            1 => match c {
+                '\\' => {
+                    if let Some((_, next)) = chars.next() {
+                        if next == '\'' {
+                            out.push('\'');
+                        } else {
+                            out.push('\\');
+                            out.push(next);
+                        }
+                        continue;
+                    }
+                    return None;
+                }
+                '"' => {
+                    out.push('\\');
+                    out.push('"');
+                }
+                '\'' => {
+                    out.push('"');
+                    state = 0;
+                }
+                _ => out.push(c),
+            },
+            2 => match c {
+                '\\' => {
+                    let Some((_, next)) = chars.next() else {
+                        return None;
+                    };
+                    out.push('\\');
+                    out.push(next);
+                    continue;
+                }
+                '"' => {
+                    out.push('"');
+                    state = 0;
+                }
+                _ => out.push(c),
+            },
+            _ => unreachable!(),
+        }
+    }
+
+    if state != 0 {
+        return None;
+    }
+    Some(out)
+}
+
+fn consume_keyword_tail(
+    chars: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    tail: &str,
+) -> bool {
+    let mut probe = chars.clone();
+    for expected in tail.chars() {
+        match probe.next() {
+            Some((_, actual)) if actual == expected => {}
+            _ => return false,
+        }
+    }
+    *chars = probe;
+    true
 }
 
 pub(crate) async fn persist_sentinel_image_artifact(
@@ -261,6 +373,29 @@ mod tests {
         let triple_wrapped = serde_json::to_string(&wrapped).unwrap();
 
         let parsed = GeneratedImageSentinel::from_output(&triple_wrapped).expect("sentinel");
+        assert_eq!(parsed.data_url(), Some("data:image/jpeg;base64,abc123"));
+        assert_eq!(parsed.media_type(), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn parses_python_repr_sentinel_string() {
+        let parsed = GeneratedImageSentinel::from_value(&serde_json::Value::String(
+            "{'type': 'image_generated', 'data': 'data:image/jpeg;base64,abc123', 'media_type': 'image/jpeg', 'path': 'workspace/out.jpg'}".to_string(),
+        ))
+        .expect("python repr sentinel");
+
+        assert_eq!(parsed.data_url(), Some("data:image/jpeg;base64,abc123"));
+        assert_eq!(parsed.media_type(), Some("image/jpeg"));
+        assert_eq!(parsed.path(), Some("workspace/out.jpg"));
+    }
+
+    #[test]
+    fn parses_python_repr_sentinel_with_non_ascii_prompt() {
+        let parsed = GeneratedImageSentinel::from_value(&serde_json::Value::String(
+            "{'data': 'data:image/jpeg;base64,abc123', 'media_type': 'image/jpeg', 'prompt': '生成小猫图片，狸花猫', 'type': 'image_generated'}".to_string(),
+        ))
+        .expect("python repr sentinel with non-ascii prompt");
+
         assert_eq!(parsed.data_url(), Some("data:image/jpeg;base64,abc123"));
         assert_eq!(parsed.media_type(), Some("image/jpeg"));
     }
