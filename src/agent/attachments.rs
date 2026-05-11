@@ -120,7 +120,7 @@ fn format_attachment(index: usize, att: &IncomingAttachment, local_path: Option<
                 .unwrap_or_default();
 
             let body = if !att.data.is_empty() && local_path.is_some() {
-                "[Image attached — you can already see this image directly in the conversation. If the user asks to edit it, use image_edit with the saved project file path above as image_path.]"
+                "[Image attached — you can already see this image directly in the conversation. If the user asks to edit it, use image_edit with the saved file path above as image_path.]"
             } else if !att.data.is_empty() {
                 "[Image attached — you can already see this image directly in the conversation. No editable file path is available in this turn; analyze it using your vision capabilities.]"
             } else if local_path.is_some() {
@@ -172,11 +172,7 @@ fn format_attachment(index: usize, att: &IncomingAttachment, local_path: Option<
 
 fn format_attachment_body(local_path: Option<&str>, content: String) -> String {
     match local_path {
-        Some(path) => format!(
-            "Saved to project file: {}\n{}",
-            escape_xml_text(path),
-            content
-        ),
+        Some(path) => format!("Saved file path: {}\n{}", escape_xml_text(path), content),
         None => content,
     }
 }
@@ -300,11 +296,7 @@ mod tests {
 
         let result = augment_with_attachments("edit this", &[att]).unwrap();
 
-        assert!(
-            result
-                .text
-                .contains("Saved to project file: /tmp/photo.png")
-        );
+        assert!(result.text.contains("Saved file path: /tmp/photo.png"));
         assert!(result.text.contains("use image_edit"));
         assert!(result.text.contains("image_path"));
         assert_eq!(result.image_parts.len(), 1);
@@ -328,7 +320,7 @@ mod tests {
         assert!(
             result
                 .text
-                .contains("Saved to project file: /tmp/persisted-photo.png")
+                .contains("Saved file path: /tmp/persisted-photo.png")
         );
         assert!(result.text.contains("use image_edit"));
         assert_eq!(result.image_parts.len(), 1);
@@ -348,9 +340,11 @@ mod tests {
                 "project_path=\".ironclaw/attachments/alice/project/2026-04-12/brief.txt\""
             )
         );
-        assert!(result.text.contains(
-            "Saved to project file: .ironclaw/attachments/alice/project/2026-04-12/brief.txt"
-        ));
+        assert!(
+            result.text.contains(
+                "Saved file path: .ironclaw/attachments/alice/project/2026-04-12/brief.txt"
+            )
+        );
         assert!(result.text.contains("Hello from disk"));
     }
 

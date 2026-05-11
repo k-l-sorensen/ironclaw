@@ -31,6 +31,49 @@ pub(crate) fn image_tool_event_id(turn_number: usize, tool_call_id: &str) -> Str
     format!("turn-{turn_number}-{tool_call_id}")
 }
 
+fn event_id_segment(raw: &str) -> String {
+    let segment = raw
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(96)
+        .collect::<String>();
+    let segment = segment.trim_matches('.');
+    if segment.is_empty() {
+        "image".to_string()
+    } else {
+        segment.to_string()
+    }
+}
+
+pub(crate) fn engine_v2_image_tool_event_id(
+    thread_id: Uuid,
+    step_id: Uuid,
+    tool_call_id: &str,
+) -> String {
+    format!(
+        "v2-{thread_id}-{step_id}-{}",
+        event_id_segment(tool_call_id)
+    )
+}
+
+pub(crate) fn engine_v2_image_result_event_id(
+    thread_id: Uuid,
+    result_index: usize,
+    tool_call_id: Option<&str>,
+) -> String {
+    match tool_call_id.filter(|id| !id.trim().is_empty()) {
+        Some(tool_call_id) => format!("v2-{thread_id}-{}", event_id_segment(tool_call_id)),
+        None => format!("v2-{thread_id}-image-{result_index}"),
+    }
+}
+
 impl GeneratedImageSentinel {
     pub(crate) fn from_output(output: &str) -> Option<Self> {
         let parsed = parse_embedded_json_string(output)?;
@@ -250,9 +293,7 @@ fn coerce_python_repr_to_json(content: &str) -> Option<String> {
             },
             2 => match c {
                 '\\' => {
-                    let Some((_, next)) = chars.next() else {
-                        return None;
-                    };
+                    let (_, next) = chars.next()?;
                     out.push('\\');
                     out.push(next);
                     continue;
@@ -460,6 +501,16 @@ mod tests {
         assert_eq!(with_path.path(), Some("/tmp/out.png"));
         assert_eq!(with_path.media_type(), Some("image/png"));
         assert_eq!(with_path.data_url(), Some("data:image/png;base64,abc123"));
+    }
+
+    #[test]
+    fn engine_v2_image_event_ids_include_thread_and_step_scope() {
+        let thread_id = Uuid::new_v4();
+        let step_id = Uuid::new_v4();
+
+        let event_id = super::engine_v2_image_tool_event_id(thread_id, step_id, "code call/1");
+
+        assert_eq!(event_id, format!("v2-{thread_id}-{step_id}-code_call_1"));
     }
 
     #[tokio::test]

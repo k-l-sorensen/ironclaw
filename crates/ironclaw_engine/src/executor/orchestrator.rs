@@ -1047,6 +1047,7 @@ async fn handle_execute_code_step(
                 .iter()
                 .map(|r| {
                     serde_json::json!({
+                        "call_id": r.call_id,
                         "action_name": r.action_name,
                         "output": r.output,
                         "is_error": r.is_error,

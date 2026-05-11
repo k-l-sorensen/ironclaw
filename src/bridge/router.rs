@@ -28,7 +28,7 @@ use crate::db::Database;
 use crate::error::Error;
 use crate::extensions::naming::legacy_extension_alias;
 use crate::gate::pending::{PendingGate, PendingGateKey};
-use crate::generated_images::GeneratedImageSentinel;
+use crate::generated_images::{GeneratedImageSentinel, engine_v2_image_result_event_id};
 
 /// Typed outcome from a v2 bridge handler.
 ///
@@ -176,6 +176,45 @@ fn attachment_project_relative_path(
     )
 }
 
+async fn persist_editable_image_attachment(
+    image_artifact_root: Option<&Path>,
+    message: &IncomingMessage,
+    attachment: &crate::channels::IncomingAttachment,
+    index: usize,
+) -> Option<String> {
+    if attachment.kind != crate::channels::AttachmentKind::Image || attachment.data.is_empty() {
+        return None;
+    }
+
+    let artifact_id = if attachment.id.trim().is_empty() {
+        format!("{}-attachment-{index}", message.id)
+    } else {
+        format!("{}-{}", message.id, attachment.id)
+    };
+
+    match crate::image_artifacts::persist_image_artifact(
+        image_artifact_root,
+        &attachment.data,
+        &attachment.mime_type,
+        &message.user_id,
+        message.id,
+        &artifact_id,
+    )
+    .await
+    {
+        Ok(path) => Some(path),
+        Err(err) => {
+            tracing::warn!(
+                message_id = %message.id,
+                attachment_id = %attachment.id,
+                error = %err,
+                "engine v2: failed to persist editable image attachment artifact"
+            );
+            None
+        }
+    }
+}
+
 /// Collapse anything that could break a markdown title/backtick span in a
 /// user-supplied filename before embedding it. User content in attachment
 /// filenames goes straight into `# Uploaded attachment: ...` and into the
@@ -279,6 +318,7 @@ fn attachment_index_note(
 
 async fn persist_project_attachments(
     project_root: &Path,
+    image_artifact_root: Option<&Path>,
     message: &IncomingMessage,
     project_id: ironclaw_engine::ProjectId,
     attachments: &mut [crate::channels::IncomingAttachment],
@@ -308,7 +348,10 @@ async fn persist_project_attachments(
             continue;
         }
 
-        attachment.local_path = Some(relative_path.clone());
+        let editable_image_path =
+            persist_editable_image_attachment(image_artifact_root, message, attachment, index)
+                .await;
+        attachment.local_path = Some(editable_image_path.unwrap_or_else(|| relative_path.clone()));
         // Build the index note while `data` is still populated so the
         // fallback to `data.len()` in `attachment_index_note` reports the
         // real payload size when `size_bytes` wasn't pre-filled.
@@ -1635,6 +1678,9 @@ pub async fn init_engine(agent: &Agent) -> Result<(), Error> {
         )
         .with_global_auto_approve(agent.config().auto_approve_tools),
     );
+    effect_adapter
+        .set_image_artifact_root(crate::image_artifacts::default_image_artifact_root())
+        .await;
     // Propagate the trace HTTP interceptor (live recording or replay) so
     // engine v2 tool dispatch records/replays HTTP exchanges. Without this,
     // recorded traces miss every outbound call made from the engine v2 path
@@ -4159,8 +4205,10 @@ async fn handle_with_engine_inner(
         resolve_user_project(&state.store, &message.user_id, state.default_project_id).await?;
 
     let mut persisted_attachments = message.attachments.clone();
+    let image_artifact_root = crate::image_artifacts::default_image_artifact_root();
     let attachment_notes = persist_project_attachments(
         &state.project_root,
+        Some(image_artifact_root.as_path()),
         message,
         project_id,
         &mut persisted_attachments,
@@ -5592,18 +5640,17 @@ fn tool_result_preview_for_v2_persistence(result: &serde_json::Value) -> String 
 }
 
 fn generated_image_info_from_result(
-    result: &serde_json::Value,
+    sentinel: &GeneratedImageSentinel,
     event_id: String,
-) -> Option<GeneratedImageInfo> {
-    let sentinel = GeneratedImageSentinel::from_value(result)?;
-    Some(GeneratedImageInfo {
+) -> GeneratedImageInfo {
+    GeneratedImageInfo {
         event_id,
         data_url: sentinel
             .data_url()
             .filter(|data_url| !data_url.is_empty())
             .map(str::to_string),
         path: sentinel.path().map(str::to_string),
-    })
+    }
 }
 
 fn append_persisted_v2_tool_call(
@@ -5623,14 +5670,18 @@ fn append_persisted_v2_tool_call(
         obj["tool_call_id"] = serde_json::Value::String(call_id.to_string());
     }
     if let Some(sentinel) = GeneratedImageSentinel::from_value(result) {
-        obj["result"] = serde_json::Value::String(sentinel.record_content_for_persistence());
-        let event_id = call_id
+        let event_id = sentinel
+            .event_id()
             .filter(|value| !value.is_empty())
             .map(str::to_string)
             .unwrap_or(fallback_event_id);
-        if let Some(image) = generated_image_info_from_result(result, event_id) {
-            generated_images.push(image);
-        }
+        let sentinel = if sentinel.event_id().is_some_and(|value| !value.is_empty()) {
+            sentinel
+        } else {
+            sentinel.with_event_id(event_id.clone())
+        };
+        obj["result"] = serde_json::Value::String(sentinel.record_content_for_persistence());
+        generated_images.push(generated_image_info_from_result(&sentinel, event_id));
     }
     calls.push(obj);
 }
@@ -5758,7 +5809,11 @@ async fn persist_v2_tool_calls(
             action_name,
             msg.action_call_id.as_deref(),
             &result,
-            format!("v2-image-{result_index}"),
+            engine_v2_image_result_event_id(
+                thread_id.0,
+                result_index,
+                msg.action_call_id.as_deref(),
+            ),
         );
     }
     if let Some(persisted_results) = thread
@@ -5779,7 +5834,11 @@ async fn persist_v2_tool_calls(
                 result_entry
                     .get("output")
                     .unwrap_or(&serde_json::Value::Null),
-                format!("v2-code-image-{result_index}"),
+                engine_v2_image_result_event_id(
+                    thread_id.0,
+                    result_index,
+                    result_entry.get("call_id").and_then(|value| value.as_str()),
+                ),
             );
         }
     }
@@ -10077,7 +10136,7 @@ mod tests {
             assert!(
                 user_msg
                     .content
-                    .contains("Saved to project file: .ironclaw/attachments/alice/"),
+                    .contains("Saved file path: .ironclaw/attachments/alice/"),
                 "expected saved path hint in user content, got: {}",
                 user_msg.content
             );
@@ -10122,6 +10181,58 @@ mod tests {
 
         *lock.write().await = None;
         outcome.expect("router attachment persistence test");
+    }
+
+    #[tokio::test]
+    async fn persist_project_attachments_uses_editable_artifact_path_for_images() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_root = temp_dir.path().join("projects");
+        let image_root = temp_dir.path().join("image-artifacts");
+        let message = IncomingMessage::new("gateway", "alice", "edit this image");
+        let project_id = ironclaw_engine::ProjectId::new();
+        let mut attachments = vec![crate::channels::IncomingAttachment {
+            id: "img-1".to_string(),
+            kind: crate::channels::AttachmentKind::Image,
+            mime_type: "image/png".to_string(),
+            filename: Some("cat.png".to_string()),
+            size_bytes: Some(3),
+            source_url: None,
+            storage_key: None,
+            local_path: None,
+            extracted_text: None,
+            data: b"png".to_vec(),
+            duration_secs: None,
+        }];
+
+        let notes = persist_project_attachments(
+            &project_root,
+            Some(image_root.as_path()),
+            &message,
+            project_id,
+            &mut attachments,
+        )
+        .await;
+
+        assert_eq!(notes.len(), 1);
+        let editable_path = attachments[0].local_path.as_deref().expect("local path");
+        let image_root = tokio::fs::canonicalize(&image_root)
+            .await
+            .expect("canonical image root");
+        assert!(
+            Path::new(editable_path).starts_with(&image_root),
+            "expected editable artifact path, got {editable_path}"
+        );
+        assert_eq!(
+            tokio::fs::read(editable_path).await.expect("read artifact"),
+            b"png"
+        );
+        let project_path = notes[0]
+            .metadata
+            .get("project_path")
+            .and_then(|value| value.as_str())
+            .expect("project path");
+        assert!(project_path.starts_with(PROJECT_ATTACHMENT_DIR));
+        assert!(project_root.join(project_path).exists());
     }
 
     #[tokio::test]
@@ -12091,7 +12202,10 @@ mod tests {
         let store_arc: Arc<dyn Store> = store;
         let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
         assert_eq!(generated_images.len(), 1);
-        assert_eq!(generated_images[0].event_id, "call-img");
+        assert_eq!(
+            generated_images[0].event_id,
+            format!("v2-{}-call-img", thread_id.0)
+        );
         assert_eq!(
             generated_images[0].data_url.as_deref(),
             Some("data:image/png;base64,abc123")
@@ -12113,6 +12227,7 @@ mod tests {
             .as_str()
             .expect("image result should be persisted");
         assert!(persisted_result.contains("\"type\":\"image_generated\""));
+        assert!(persisted_result.contains(&format!("v2-{}-call-img", thread_id.0)));
         assert!(persisted_result.contains("data:image/png;base64,abc123"));
     }
 
@@ -12153,7 +12268,10 @@ mod tests {
         let store_arc: Arc<dyn Store> = store;
         let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
         assert_eq!(generated_images.len(), 1);
-        assert_eq!(generated_images[0].event_id, "call-img");
+        assert_eq!(
+            generated_images[0].event_id,
+            format!("v2-{}-call-img", thread_id.0)
+        );
         assert_eq!(
             generated_images[0].data_url.as_deref(),
             Some("data:image/png;base64,abc123")
@@ -12215,7 +12333,10 @@ mod tests {
         let store_arc: Arc<dyn Store> = store;
         let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
         assert_eq!(generated_images.len(), 1);
-        assert_eq!(generated_images[0].event_id, "call-edit");
+        assert_eq!(
+            generated_images[0].event_id,
+            format!("v2-{}-call-edit", thread_id.0)
+        );
         assert_eq!(
             generated_images[0].data_url.as_deref(),
             Some("data:image/jpeg;base64,edited123")
@@ -12291,7 +12412,10 @@ mod tests {
         let store_arc: Arc<dyn Store> = store;
         let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
         assert_eq!(generated_images.len(), 1);
-        assert_eq!(generated_images[0].event_id, "code_call_1");
+        assert_eq!(
+            generated_images[0].event_id,
+            format!("v2-{}-code_call_1", thread_id.0)
+        );
         assert_eq!(
             generated_images[0].data_url.as_deref(),
             Some("data:image/png;base64,code123")
@@ -12360,7 +12484,10 @@ mod tests {
         let store_arc: Arc<dyn Store> = store;
         let generated_images = persist_v2_tool_calls(&store_arc, &db, thread_id, &message).await;
         assert_eq!(generated_images.len(), 1);
-        assert_eq!(generated_images[0].event_id, "code_call_py_1");
+        assert_eq!(
+            generated_images[0].event_id,
+            format!("v2-{}-code_call_py_1", thread_id.0)
+        );
         assert_eq!(
             generated_images[0].data_url.as_deref(),
             Some("data:image/png;base64,codepy123")

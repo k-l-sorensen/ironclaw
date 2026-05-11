@@ -231,6 +231,36 @@ def format_output(result, max_chars=8000):
     return text
 
 
+def _is_generated_image_output(output):
+    return isinstance(output, dict) and output.get("type") == "image_generated"
+
+
+def _persistable_action_result(r, max_output_chars=1000):
+    """Compact CodeAct action results for host-side history persistence."""
+    if not isinstance(r, dict):
+        return None
+
+    action_name = r.get("action_name", "unknown")
+    output = r.get("output")
+    if _is_generated_image_output(output):
+        persisted_output = output
+    else:
+        persisted_output = str(output) if output is not None else "[no output]"
+        if len(persisted_output) > max_output_chars:
+            persisted_output = persisted_output[:max_output_chars] + "..."
+
+    entry = {
+        "action_name": action_name,
+        "output": persisted_output,
+        "is_error": bool(r.get("is_error")),
+    }
+    if r.get("call_id"):
+        entry["call_id"] = r.get("call_id")
+    if r.get("duration_ms") is not None:
+        entry["duration_ms"] = r.get("duration_ms")
+    return entry
+
+
 def format_docs(docs):
     """Format memory docs for context injection."""
     parts = ["## Prior Knowledge (from completed threads)\n"]
@@ -923,11 +953,18 @@ def run_loop(context, goal, actions, state, config):
 
             # Execute code in nested Monty VM
             result = __execute_code_step__(code, state)
-            state["_persisted_action_results"] = result.get("action_results", [])
+            persisted_step_results = [
+                entry
+                for entry in (
+                    _persistable_action_result(r)
+                    for r in result.get("action_results", [])
+                )
+                if entry is not None
+            ]
             persisted_results_log = state.get("_persisted_action_results_log")
             if not isinstance(persisted_results_log, list):
                 persisted_results_log = []
-            persisted_results_log.extend(result.get("action_results", []))
+            persisted_results_log.extend(persisted_step_results)
             state["_persisted_action_results_log"] = persisted_results_log
 
             # Update persisted state with results
