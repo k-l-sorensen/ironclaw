@@ -100,7 +100,7 @@ The `ironclaw_server` fixture injects a minimal, deterministic environment:
 GATEWAY_ENABLED=true, GATEWAY_HOST=127.0.0.1, GATEWAY_PORT=<dynamic>
 GATEWAY_AUTH_TOKEN=e2e-test-token, GATEWAY_USER_ID=e2e-tester
 CLI_ENABLED=false
-LLM_BACKEND=openai_compatible, LLM_BASE_URL=<mock_llm_url>, LLM_MODEL=mock-model
+LLM_BACKEND=openai_compatible, LLM_BASE_URL=<mock_llm_url>, LLM_API_KEY=mock-api-key, LLM_MODEL=mock-model
 DATABASE_BACKEND=libsql, LIBSQL_PATH=<tmpdir>/e2e.db
 SANDBOX_ENABLED=false, ROUTINES_ENABLED=false, HEARTBEAT_ENABLED=false
 EMBEDDING_ENABLED=false, SKILLS_ENABLED=true
@@ -108,6 +108,12 @@ ONBOARD_COMPLETED=true   # prevents setup wizard
 ```
 
 The `hosted_oauth_refresh_server` fixture uses the same baseline, but with its own DB/home tempdirs and `GOOGLE_OAUTH_CLIENT_ID=hosted-google-client-id` so hosted OAuth flows exercise proxy credential injection instead of the baked-in desktop Google app.
+
+For isolated v2 auth/prompt fixtures, do not rely on env-vs-DB precedence to
+keep the mock LLM active. Pin the provider explicitly (typically by writing
+`llm_backend=openai_compatible`, `openai_compatible_base_url=<mock_llm_url>`,
+and `selected_model=mock-model` through `/api/settings/...`) so browser tests
+exercise auth/activation behavior instead of silently falling back to NearAI.
 
 The binary is also started with `--no-onboard`. Coverage env vars (`CARGO_LLVM_COV*`, `LLVM_*`, `CARGO_ENCODED_RUSTFLAGS`, `CARGO_INCREMENTAL`) are forwarded from the outer environment when present.
 

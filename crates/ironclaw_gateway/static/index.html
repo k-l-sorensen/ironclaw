@@ -149,6 +149,15 @@
       <p class="restart-modal-info" data-i18n="restart.checkLogs">
         Check the Logs tab for details after the restart completes.
       </p>
+      <div id="restart-loader-error" class="restart-loader-error" style="display: none;" role="alert">
+        <p class="restart-loader-error-text" id="restart-loader-error-text"></p>
+        <div class="restart-loader-error-actions">
+          <button type="button" class="restart-modal-btn confirm" id="restart-refresh-btn"
+            data-i18n="restart.refreshPage">Refresh page</button>
+          <button type="button" class="restart-modal-btn cancel" id="restart-dismiss-btn"
+            data-i18n="restart.dismiss">Dismiss</button>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -461,10 +470,6 @@
                 <div class="config-section-header">
                   <h3 data-i18n="config.modelProviders">Model Providers</h3>
                   <button id="add-provider-btn" class="btn-add-provider" data-i18n="config.addProvider">+ Add Provider</button>
-                </div>
-                <div class="config-notice" id="config-restart-notice" style="display:none">
-                  <span>⚠</span>
-                  <span data-i18n="config.restartNotice">Changes take effect after restart.</span>
                 </div>
                 <div id="providers-list" class="providers-list">
                   <div class="empty-state" data-i18n="common.loading">Loading...</div>

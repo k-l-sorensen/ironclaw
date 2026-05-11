@@ -111,7 +111,7 @@ The engine defines three traits that the host crate implements:
 `ExecutionLoop::run()` handles three `LlmResponse` variants:
 
 1. Check signals (Stop, InjectMessage) via `mpsc::Receiver`
-2. Build context (messages + available actions from active leases)
+2. Build context (messages + callable actions from active leases, plus capability background / `Activatable Integrations` prompt metadata)
 3. Call LLM via `LlmBackend::complete()`
 4. **If `Text`**: check tool intent nudge, return if final response
 5. **If `ActionCalls`** (Tier 0): for each call, find lease → check policy → consume use → execute via `EffectExecutor` → record result
@@ -122,6 +122,15 @@ The engine defines three traits that the host crate implements:
 ## CodeAct / Monty Integration (Tier 1)
 
 Python execution via Monty interpreter (`executor/scripting.rs`). Follows the RLM (Recursive Language Model) pattern.
+
+For engine v2 prompt surfacing, installed-but-unauthed provider tools (e.g.
+`gmail` without an OAuth token) are direct-callable: the engine's auth
+preflight raises an `Authentication` gate at execute time, the inline-await
+machinery parks the VM, and the OAuth callback delivers the resolved
+credential to retry the action. Integrations that need user-driven setup
+(`NeedsSetup`, `Inactive`, `AvailableNotInstalled`) are listed under
+`Activatable Integrations` and the model tells the user to install/activate
+them through the IronClaw UI — the model cannot enable them itself.
 
 **Context as variables** (not attention input):
 - Thread messages injected as `context` Python variable
