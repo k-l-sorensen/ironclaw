@@ -45,6 +45,47 @@ pub fn is_read_only_tool(tool_name: &str) -> bool {
     READ_ONLY_TOOLS.contains(&tool_name)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstalledSkillToolCeilingError {
+    MutatingTool { tool_name: String },
+}
+
+impl std::fmt::Display for InstalledSkillToolCeilingError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MutatingTool { tool_name } => write!(
+                formatter,
+                "installed skills may only dispatch read-only tools; `{tool_name}` is not allowed"
+            ),
+        }
+    }
+}
+
+/// Enforce Installed-skill action-time tool ceilings.
+///
+/// This is the dispatch-time companion to prompt-time tool attenuation. It
+/// fails closed for tools outside the read-only allowlist and normalizes
+/// `memory_search.reasoning` to `false` so the read-only ceiling cannot trigger
+/// an LLM/network synthesis call through a read-only-looking tool.
+pub fn enforce_installed_skill_tool_ceiling(
+    tool_name: &str,
+    params: &mut serde_json::Value,
+) -> Result<(), InstalledSkillToolCeilingError> {
+    if !is_read_only_tool(tool_name) {
+        return Err(InstalledSkillToolCeilingError::MutatingTool {
+            tool_name: tool_name.to_string(),
+        });
+    }
+
+    if tool_name == "memory_search"
+        && let Some(object) = params.as_object_mut()
+    {
+        object.insert("reasoning".to_string(), serde_json::Value::Bool(false));
+    }
+
+    Ok(())
+}
+
 /// Result of tool attenuation, including transparency information.
 #[derive(Debug, Clone)]
 pub struct AttenuationResult {
@@ -234,5 +275,37 @@ mod tests {
         assert!(!result.explanation.is_empty());
         assert!(result.removed_tools.contains(&"shell".to_string()));
         assert!(!result.removed_tools.contains(&"time".to_string()));
+    }
+
+    #[test]
+    fn installed_skill_ceiling_denies_mutating_tools() {
+        let mut params = serde_json::json!({});
+        let error = enforce_installed_skill_tool_ceiling("memory_write", &mut params).unwrap_err();
+        assert_eq!(
+            error,
+            InstalledSkillToolCeilingError::MutatingTool {
+                tool_name: "memory_write".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn installed_skill_ceiling_forces_memory_search_reasoning_off() {
+        let mut params = serde_json::json!({ "query": "project", "reasoning": true });
+        enforce_installed_skill_tool_ceiling("memory_search", &mut params).unwrap();
+        assert_eq!(
+            params.get("reasoning").and_then(|value| value.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn installed_skill_ceiling_adds_memory_search_reasoning_false_when_missing() {
+        let mut params = serde_json::json!({ "query": "project" });
+        enforce_installed_skill_tool_ceiling("memory_search", &mut params).unwrap();
+        assert_eq!(
+            params.get("reasoning").and_then(|value| value.as_bool()),
+            Some(false)
+        );
     }
 }

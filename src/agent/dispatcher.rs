@@ -24,6 +24,7 @@ use crate::generated_images::GeneratedImageSentinel;
 use crate::tools::permissions::{PermissionState, effective_permission};
 use crate::tools::redact_params;
 use ironclaw_llm::{ChatMessage, Reasoning, ReasoningContext, TokenUsage};
+use ironclaw_skills::SkillTrust;
 
 fn selected_model_override(value: &serde_json::Value) -> Option<String> {
     ironclaw_llm::normalized_model_override(value.as_str()).map(str::to_string)
@@ -433,6 +434,10 @@ impl ChatDelegate<'_> {
                 f(&mut turn_usage)
             }
         }
+    }
+
+    fn active_skill_trust_ceiling(&self) -> Option<SkillTrust> {
+        self.active_skills.iter().map(|skill| skill.trust).min()
     }
 }
 
@@ -905,6 +910,27 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
 
         for (idx, original_tc) in tool_calls.iter().enumerate() {
             let mut tc = original_tc.clone();
+
+            if self.active_skill_trust_ceiling() == Some(SkillTrust::Installed) {
+                let resolved_name = self
+                    .agent
+                    .tools()
+                    .resolve_name(&tc.name)
+                    .await
+                    .unwrap_or_else(|| tc.name.clone());
+                if let Err(error) = crate::skills::attenuation::enforce_installed_skill_tool_ceiling(
+                    &resolved_name,
+                    &mut tc.arguments,
+                ) {
+                    preflight.push((
+                        tc,
+                        PreflightOutcome::Rejected(format!(
+                            "Tool call blocked by installed skill trust ceiling: {error}"
+                        )),
+                    ));
+                    continue;
+                }
+            }
 
             let tool_opt = self.agent.tools().get(&tc.name).await;
             let sensitive = tool_opt

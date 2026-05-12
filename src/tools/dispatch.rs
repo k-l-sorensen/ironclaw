@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use crate::context::{ActionRecord, JobContext};
 use crate::db::Database;
-use crate::skills::attenuation::is_read_only_tool;
+use crate::skills::attenuation::enforce_installed_skill_tool_ceiling;
 use crate::tools::registry::ToolRegistry;
 use crate::tools::tool::{ToolError, ToolOutput};
 use crate::tools::{prepare_tool_params, redact_params};
@@ -124,7 +124,7 @@ impl ToolDispatcher {
     pub async fn dispatch(
         &self,
         tool_name: &str,
-        params: serde_json::Value,
+        mut params: serde_json::Value,
         user_id: &str,
         source: DispatchSource,
     ) -> Result<ToolOutput, ToolError> {
@@ -133,15 +133,24 @@ impl ToolDispatcher {
                 ToolError::ExecutionFailed(format!("tool not found: {tool_name}"))
             })?;
 
-        if let DispatchSource::Skill {
-            skill_name,
-            trust: SkillTrust::Installed,
-        } = &source
-            && !is_read_only_tool(&resolved_name)
-        {
-            return Err(ToolError::NotAuthorized(format!(
-                "installed skill `{skill_name}` may only dispatch read-only tools; `{resolved_name}` is not allowed"
-            )));
+        match &source {
+            DispatchSource::Skill {
+                skill_name,
+                trust: SkillTrust::Installed,
+            } => enforce_installed_skill_tool_ceiling(&resolved_name, &mut params).map_err(
+                |err| {
+                    ToolError::NotAuthorized(format!(
+                        "installed skill `{skill_name}` denied: {err}"
+                    ))
+                },
+            )?,
+            DispatchSource::Skill {
+                trust: SkillTrust::Trusted,
+                ..
+            }
+            | DispatchSource::Channel(_)
+            | DispatchSource::Routine { .. }
+            | DispatchSource::System => {}
         }
 
         // 1. Normalize parameters (coerce types, fill defaults).
@@ -357,6 +366,34 @@ mod integration_tests {
                 }),
                 Duration::from_millis(1),
             ))
+        }
+    }
+
+    struct ReadOnlyEchoTool {
+        captured: Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    }
+
+    #[async_trait]
+    impl Tool for ReadOnlyEchoTool {
+        fn name(&self) -> &str {
+            "echo"
+        }
+
+        fn description(&self) -> &str {
+            "Read-only echo test stub."
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+
+        async fn execute(
+            &self,
+            params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<ToolOutput, ToolError> {
+            *self.captured.lock().expect("captured lock") = Some(params.clone());
+            Ok(ToolOutput::success(params, Duration::from_millis(1)))
         }
     }
 
@@ -592,6 +629,89 @@ mod integration_tests {
             captured.lock().expect("captured lock").is_none(),
             "tool must not execute after installed-skill ceiling denies dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn dispatch_installed_skill_source_allows_read_only_tool() {
+        let (dispatcher, _backend, _db, registry, _dir) = test_dispatcher().await;
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        registry
+            .register(Arc::new(ReadOnlyEchoTool {
+                captured: Arc::clone(&captured),
+            }))
+            .await;
+
+        dispatcher
+            .dispatch(
+                "echo",
+                serde_json::json!({ "message": "allowed" }),
+                "tester",
+                DispatchSource::Skill {
+                    skill_name: "installed-skill".to_string(),
+                    trust: ironclaw_skills::SkillTrust::Installed,
+                },
+            )
+            .await
+            .expect("installed skills may dispatch read-only tools");
+
+        assert_eq!(
+            captured
+                .lock()
+                .expect("captured lock")
+                .as_ref()
+                .and_then(|params| params.get("message"))
+                .and_then(|value| value.as_str()),
+            Some("allowed")
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_trusted_skill_source_allows_mutating_tool() {
+        let (dispatcher, _backend, _db, registry, _dir) = test_dispatcher().await;
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        registry
+            .register(Arc::new(RecordingTool {
+                captured: Arc::clone(&captured),
+            }))
+            .await;
+
+        dispatcher
+            .dispatch(
+                "recording_stub",
+                serde_json::json!({ "message": "trusted" }),
+                "tester",
+                DispatchSource::Skill {
+                    skill_name: "trusted-skill".to_string(),
+                    trust: ironclaw_skills::SkillTrust::Trusted,
+                },
+            )
+            .await
+            .expect("trusted skills may dispatch mutating tools");
+
+        assert!(captured.lock().expect("captured lock").is_some());
+    }
+
+    #[tokio::test]
+    async fn dispatch_channel_source_ignores_skill_ceiling() {
+        let (dispatcher, _backend, _db, registry, _dir) = test_dispatcher().await;
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        registry
+            .register(Arc::new(RecordingTool {
+                captured: Arc::clone(&captured),
+            }))
+            .await;
+
+        dispatcher
+            .dispatch(
+                "recording_stub",
+                serde_json::json!({ "message": "channel" }),
+                "tester",
+                DispatchSource::Channel("gateway".to_string()),
+            )
+            .await
+            .expect("channel dispatch is not restricted by skill ceiling");
+
+        assert!(captured.lock().expect("captured lock").is_some());
     }
 
     #[tokio::test]
