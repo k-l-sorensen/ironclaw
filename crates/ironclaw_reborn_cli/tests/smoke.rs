@@ -23,7 +23,58 @@ fn help_mentions_reborn_commands() {
     );
     assert!(stdout.contains("completion"), "stdout: {stdout}");
     assert!(stdout.contains("doctor"), "stdout: {stdout}");
+    assert!(stdout.contains("profile"), "stdout: {stdout}");
     assert!(stdout.contains("run"), "stdout: {stdout}");
+}
+
+#[test]
+fn profile_list_shows_supported_profiles_without_reborn_home() {
+    let output = Command::new(reborn_bin())
+        .arg("profile")
+        .arg("list")
+        .env_clear()
+        .output()
+        .expect("ironclaw-reborn profile list should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("IronClaw Reborn profiles"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("local-dev (default)"), "stdout: {stdout}");
+    assert!(stdout.contains("production"), "stdout: {stdout}");
+    assert!(stdout.contains("migration-dry-run"), "stdout: {stdout}");
+    assert!(
+        stdout.contains("IRONCLAW_REBORN_PROFILE"),
+        "stdout: {stdout}"
+    );
+}
+
+#[test]
+fn profile_list_json_is_stable_and_does_not_resolve_reborn_home() {
+    let output = Command::new(reborn_bin())
+        .arg("profile")
+        .arg("list")
+        .arg("--json")
+        .env_clear()
+        .output()
+        .expect("ironclaw-reborn profile list --json should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        r#"{"profiles":[{"name":"local-dev","default":true},{"name":"production","default":false},{"name":"migration-dry-run","default":false}],"selector":"IRONCLAW_REBORN_PROFILE"}"#
+    );
 }
 
 #[test]

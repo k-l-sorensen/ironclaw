@@ -15,6 +15,8 @@ ironclaw-reborn --help
 ironclaw-reborn completion --shell bash
 ironclaw-reborn completion --shell zsh
 ironclaw-reborn doctor
+ironclaw-reborn profile list
+ironclaw-reborn profile list --json
 ironclaw-reborn run
 ```
 
@@ -55,6 +57,23 @@ Expected fields include:
 - `profile`
 - `v1_state: not-used`
 - `driver_registry: initialized`
+
+### `profile list`
+
+Lists the supported Reborn boot profiles without resolving Reborn home, reading v1 state, or creating directories.
+
+```bash
+cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- profile list
+cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- profile list --json
+```
+
+Supported profiles:
+
+- `local-dev` (default)
+- `production`
+- `migration-dry-run`
+
+Select a profile with `IRONCLAW_REBORN_PROFILE=<profile>`.
 
 ### `run`
 
@@ -116,6 +135,7 @@ cargo test -p ironclaw_architecture reborn
 cargo clippy -p ironclaw_reborn_cli --all-targets -- -D warnings
 cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- --help
 cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- completion --shell zsh >/tmp/ironclaw-reborn.zsh
+cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- profile list
 IRONCLAW_REBORN_HOME="$(mktemp -d)/reborn-home" \
   cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- run
 ```
