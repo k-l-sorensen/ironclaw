@@ -287,7 +287,10 @@ impl NearAiConfig {
     ///
     /// Reads `NEARAI_API_KEY` from the environment and selects the
     /// appropriate base URL (cloud-api when API key is present,
-    /// private.near.ai for session-token auth).
+    /// private.near.ai for session-token auth). `NEARAI_BASE_URL` is
+    /// trimmed before use — a trailing newline from a `.env` paste or CI
+    /// secret would otherwise reach `reqwest` and fail with "invalid uri
+    /// character". A whitespace-only override is treated as unset.
     pub(crate) fn for_model_discovery() -> Self {
         let api_key = crate::config::helpers::env_or_override("NEARAI_API_KEY")
             .filter(|k| !k.is_empty())
@@ -299,6 +302,8 @@ impl NearAiConfig {
             "https://private.near.ai"
         };
         let base_url = crate::config::helpers::env_or_override("NEARAI_BASE_URL")
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
             .unwrap_or_else(|| default_base.to_string());
 
         Self {

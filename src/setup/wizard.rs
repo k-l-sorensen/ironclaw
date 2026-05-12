@@ -4696,6 +4696,54 @@ mod tests {
         );
     }
 
+    /// Regression: a trailing newline on `NEARAI_BASE_URL` / `NEARAI_AUTH_URL`
+    /// (common when pasting from `.env` files or CI secret stores) must be
+    /// trimmed before the URL reaches `reqwest`. The main `LlmConfig::from_env`
+    /// path runs `validate_base_url` which trims, but the model-discovery
+    /// sibling reads the raw env value and previously let the newline through
+    /// to `NearAiChatProvider::api_url`, which only strips `/`. The result
+    /// was a startup-style "invalid uri character" failure at model-listing
+    /// time. Treat whitespace-only as unset.
+    #[test]
+    fn test_build_nearai_model_fetch_config_trims_whitespace_padded_urls() {
+        let _lock = lock_env();
+        let _guard1 = EnvGuard::set("NEARAI_BASE_URL", "  http://localhost:9090/v1\n");
+        let _guard2 = EnvGuard::set("NEARAI_AUTH_URL", "\thttp://localhost:9091 ");
+        let _guard3 = EnvGuard::clear("NEARAI_API_KEY");
+
+        let config = build_nearai_model_fetch_config();
+        assert_eq!(
+            config.nearai.base_url, "http://localhost:9090/v1",
+            "NEARAI_BASE_URL must be trimmed before reaching reqwest"
+        );
+        assert_eq!(
+            config.session.auth_base_url, "http://localhost:9091",
+            "NEARAI_AUTH_URL must be trimmed before reaching reqwest"
+        );
+    }
+
+    /// Regression: a whitespace-only `NEARAI_BASE_URL` / `NEARAI_AUTH_URL`
+    /// must be treated as unset, falling back to the default discovery
+    /// endpoint. Otherwise the validator (or `reqwest::Url::parse`) sees an
+    /// empty string and 422s the model-discovery call.
+    #[test]
+    fn test_build_nearai_model_fetch_config_treats_whitespace_only_as_unset() {
+        let _lock = lock_env();
+        let _guard1 = EnvGuard::set("NEARAI_BASE_URL", " \n");
+        let _guard2 = EnvGuard::set("NEARAI_AUTH_URL", "\t  ");
+        let _guard3 = EnvGuard::clear("NEARAI_API_KEY");
+
+        let config = build_nearai_model_fetch_config();
+        assert_eq!(
+            config.nearai.base_url, "https://private.near.ai",
+            "whitespace-only NEARAI_BASE_URL must fall back to the discovery default"
+        );
+        assert_eq!(
+            config.session.auth_base_url, "https://private.near.ai",
+            "whitespace-only NEARAI_AUTH_URL must fall back to the discovery default"
+        );
+    }
+
     /// Regression test for #846: auto_setup_database must establish a DB
     /// connection and run migrations so that persist_settings succeeds.
     #[cfg(feature = "libsql")]

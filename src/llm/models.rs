@@ -332,7 +332,13 @@ pub(crate) async fn fetch_openai_compatible_models(
 /// Uses [`NearAiConfig::for_model_discovery()`] to construct a minimal NEAR AI
 /// config, then wraps it in an `LlmConfig` with session config for auth.
 pub(crate) fn build_nearai_model_fetch_config() -> crate::config::LlmConfig {
+    // Trim NEARAI_AUTH_URL before use — a trailing newline from a `.env`
+    // paste or CI secret would otherwise reach `reqwest` and fail with
+    // "invalid uri character". A whitespace-only override is treated as
+    // unset.
     let auth_base_url = crate::config::helpers::env_or_override("NEARAI_AUTH_URL")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
         .unwrap_or_else(|| "https://private.near.ai".to_string());
 
     crate::config::LlmConfig {

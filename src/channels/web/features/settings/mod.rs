@@ -161,7 +161,7 @@ pub async fn settings_set_handler(
     AuthenticatedUser(user): AuthenticatedUser,
     Path(key): Path<String>,
     Query(query): Query<SettingScopeQuery>,
-    Json(body): Json<SettingWriteRequest>,
+    Json(mut body): Json<SettingWriteRequest>,
 ) -> Result<StatusCode, WriteErr> {
     let effective_user_id = resolve_settings_scope(&user, &query).map_err(no_body)?;
     ensure_setting_write_allowed(&user, &key).map_err(no_body)?;
@@ -173,7 +173,9 @@ pub async fn settings_set_handler(
         guard_active_provider_not_removed(store, &effective_user_id, &body.value)
             .await
             .map_err(no_body)?;
-        validate_custom_providers(&body.value).map_err(no_body)?;
+        // Normalizes `base_url` in-place so the persisted JSON carries the
+        // trimmed canonical value, not whitespace-padded user input.
+        validate_custom_providers(&mut body.value).map_err(no_body)?;
     }
 
     // Extract API keys from LLM settings and vault them in the secrets store.
@@ -422,39 +424,70 @@ fn is_valid_provider_id(id: &str) -> bool {
 }
 
 /// Returns `Err(422)` if any provider has an invalid ID, unrecognised adapter,
-/// or a base URL that fails SSRF validation.
-fn validate_custom_providers(value: &serde_json::Value) -> Result<(), StatusCode> {
+/// or a base URL that fails SSRF validation. `base_url` is normalized in-place
+/// to the trimmed canonical value returned by `validate_operator_base_url`, so
+/// the JSON persisted by the caller does not carry whitespace-padded user
+/// input. A whitespace-only `base_url` is treated as empty (staged-incomplete
+/// providers are allowed to omit it) and replaced with `""`.
+fn validate_custom_providers(value: &mut serde_json::Value) -> Result<(), StatusCode> {
     use crate::config::helpers::validate_operator_base_url;
 
-    let providers = match value.as_array() {
+    let providers = match value.as_array_mut() {
         Some(arr) => arr,
         None => return Ok(()),
     };
     for p in providers {
-        let id = p.get("id").and_then(|v| v.as_str()).unwrap_or("");
-        if !is_valid_provider_id(id) {
+        let id = p
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !is_valid_provider_id(&id) {
             tracing::warn!(
                 id = %id,
                 "Rejected custom provider with invalid ID (must be lowercase alphanumeric/hyphens/underscores, 1-64 chars)"
             );
             return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
-        let adapter = p.get("adapter").and_then(|v| v.as_str()).unwrap_or("");
+        let adapter = p
+            .get("adapter")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if adapter.is_empty() {
             tracing::warn!(id = %id, "Rejected custom provider with missing adapter field");
             return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
-        if !VALID_ADAPTERS.contains(&adapter) {
+        if !VALID_ADAPTERS.contains(&adapter.as_str()) {
             tracing::warn!(id = %id, adapter = %adapter, "Rejected unknown LLM adapter");
             return Err(StatusCode::UNPROCESSABLE_ENTITY);
         }
         // Validate base_url at save time to reject SSRF-unsafe URLs early.
-        if let Some(base_url) = p.get("base_url").and_then(|v| v.as_str())
-            && !base_url.is_empty()
-            && let Err(e) = validate_operator_base_url(base_url, "base_url")
-        {
-            tracing::warn!(id = %id, base_url = %base_url, error = %e, "Rejected custom provider with invalid base URL");
-            return Err(StatusCode::UNPROCESSABLE_ENTITY);
+        // Trim first so whitespace-only input is treated as empty (staged
+        // incomplete providers are allowed to omit base_url) and so the
+        // persisted JSON carries the canonical trimmed value rather than
+        // whitespace-padded user input — every runtime call site already
+        // trims again, but normalizing at the write boundary stops the
+        // drift at its source.
+        if let Some(raw) = p.get("base_url").and_then(|v| v.as_str()) {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                if raw != trimmed {
+                    p["base_url"] = serde_json::Value::String(String::new());
+                }
+            } else {
+                match validate_operator_base_url(trimmed, "base_url") {
+                    Ok(canonical) => {
+                        if canonical != raw {
+                            p["base_url"] = serde_json::Value::String(canonical);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(id = %id, base_url = %raw, error = %e, "Rejected custom provider with invalid base URL");
+                        return Err(StatusCode::UNPROCESSABLE_ENTITY);
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -1516,44 +1549,44 @@ mod tests {
 
     #[test]
     fn test_validate_custom_providers_rejects_bad_id() {
-        let input = serde_json::json!([
+        let mut input = serde_json::json!([
             { "id": "UPPER-CASE", "adapter": "open_ai_completions" }
         ]);
         assert_eq!(
-            validate_custom_providers(&input).unwrap_err(),
+            validate_custom_providers(&mut input).unwrap_err(),
             StatusCode::UNPROCESSABLE_ENTITY,
         );
     }
 
     #[test]
     fn test_validate_custom_providers_accepts_valid() {
-        let input = serde_json::json!([
+        let mut input = serde_json::json!([
             { "id": "my-llm", "adapter": "open_ai_completions" },
             { "id": "local-ollama", "adapter": "ollama" }
         ]);
-        assert!(validate_custom_providers(&input).is_ok());
+        assert!(validate_custom_providers(&mut input).is_ok());
     }
 
     // --- Adapter validation tests ---
 
     #[test]
     fn test_validate_custom_providers_rejects_unknown_adapter() {
-        let input = serde_json::json!([
+        let mut input = serde_json::json!([
             { "id": "test", "adapter": "not_a_real_adapter" }
         ]);
         assert_eq!(
-            validate_custom_providers(&input).unwrap_err(),
+            validate_custom_providers(&mut input).unwrap_err(),
             StatusCode::UNPROCESSABLE_ENTITY,
         );
     }
 
     #[test]
     fn test_validate_custom_providers_rejects_missing_adapter() {
-        let input = serde_json::json!([
+        let mut input = serde_json::json!([
             { "id": "test" }
         ]);
         assert_eq!(
-            validate_custom_providers(&input).unwrap_err(),
+            validate_custom_providers(&mut input).unwrap_err(),
             StatusCode::UNPROCESSABLE_ENTITY,
         );
     }
@@ -1561,11 +1594,11 @@ mod tests {
     #[test]
     fn test_validate_custom_providers_accepts_all_valid_adapters() {
         for adapter in VALID_ADAPTERS {
-            let input = serde_json::json!([
+            let mut input = serde_json::json!([
                 { "id": "test", "adapter": adapter }
             ]);
             assert!(
-                validate_custom_providers(&input).is_ok(),
+                validate_custom_providers(&mut input).is_ok(),
                 "adapter '{}' should be accepted",
                 adapter
             );
@@ -1574,20 +1607,20 @@ mod tests {
 
     #[test]
     fn test_validate_custom_providers_non_array_is_ok() {
-        let input = serde_json::json!("not-an-array");
-        assert!(validate_custom_providers(&input).is_ok());
+        let mut input = serde_json::json!("not-an-array");
+        assert!(validate_custom_providers(&mut input).is_ok());
     }
 
     #[test]
     fn test_validate_custom_providers_rejects_unsafe_base_url() {
         // Cloud metadata endpoint — must be rejected at save time.
-        let input = serde_json::json!([{
+        let mut input = serde_json::json!([{
             "id": "evil",
             "adapter": "open_ai_completions",
             "base_url": "https://169.254.169.254/latest/meta-data"
         }]);
         assert_eq!(
-            validate_custom_providers(&input).unwrap_err(),
+            validate_custom_providers(&mut input).unwrap_err(),
             StatusCode::UNPROCESSABLE_ENTITY,
         );
     }
@@ -1596,12 +1629,12 @@ mod tests {
     fn test_validate_custom_providers_accepts_valid_base_url() {
         // Use a URL that passes operator policy without DNS resolution
         // (localhost is always allowed, even in sandboxed CI environments).
-        let input = serde_json::json!([{
+        let mut input = serde_json::json!([{
             "id": "my-llm",
             "adapter": "open_ai_completions",
             "base_url": "http://localhost:8080/v1"
         }]);
-        assert!(validate_custom_providers(&input).is_ok());
+        assert!(validate_custom_providers(&mut input).is_ok());
     }
 
     #[test]
@@ -1616,12 +1649,53 @@ mod tests {
         //      (invoked from `Config::re_resolve_llm_with_secrets`) —
         //      demotes unusable custom providers to NearAI rather than
         //      crash-looping the instance (#2514).
-        let input = serde_json::json!([{
+        let mut input = serde_json::json!([{
             "id": "my-llm",
             "adapter": "open_ai_completions",
             "base_url": ""
         }]);
-        assert!(validate_custom_providers(&input).is_ok());
+        assert!(validate_custom_providers(&mut input).is_ok());
+    }
+
+    #[test]
+    fn test_validate_custom_providers_trims_whitespace_padded_base_url() {
+        // Regression: whitespace padding around an otherwise valid base
+        // URL must be stripped before persistence. The previous version
+        // discarded the trimmed return value from `validate_operator_base_url`
+        // and persisted the raw padded JSON, forcing every runtime caller
+        // to re-trim. Normalizing here stops the drift at its source.
+        let mut input = serde_json::json!([{
+            "id": "my-llm",
+            "adapter": "open_ai_completions",
+            "base_url": "  http://localhost:8080/v1\n"
+        }]);
+        assert!(validate_custom_providers(&mut input).is_ok());
+        assert_eq!(
+            input[0]["base_url"].as_str(),
+            Some("http://localhost:8080/v1"),
+            "base_url must be trimmed in-place"
+        );
+    }
+
+    #[test]
+    fn test_validate_custom_providers_treats_whitespace_only_base_url_as_empty() {
+        // Regression: a whitespace-only `base_url` used to fall through to
+        // `reqwest::Url::parse("")` (after trim) and 422 the request, even
+        // though an empty `base_url` is intentionally allowed so users can
+        // stage an incomplete provider. Treat whitespace-only as empty,
+        // mirroring the runtime trim, and normalize the stored value to
+        // `""` so the export/import round-trip is stable.
+        let mut input = serde_json::json!([{
+            "id": "my-llm",
+            "adapter": "open_ai_completions",
+            "base_url": " \n"
+        }]);
+        assert!(validate_custom_providers(&mut input).is_ok());
+        assert_eq!(
+            input[0]["base_url"].as_str(),
+            Some(""),
+            "whitespace-only base_url must normalize to empty string"
+        );
     }
 
     #[test]
