@@ -247,7 +247,10 @@
       attributes: true,
       attributeFilter: ['class', 'data-active-count', 'data-v1-only', 'data-v2-only', 'hidden', 'style'],
     });
-    threadObserver.observe(threadList, { childList: true, subtree: true });
+    // childList only — thread-list mutations always happen at the top level
+    // (loadThreads() does `list.innerHTML = ''` then re-appends direct
+    // children), so subtree observation would just be extra wake-ups.
+    threadObserver.observe(threadList, { childList: true });
     dotObserver.observe(sseDot, { attributes: true, attributeFilter: ['class'] });
     observing = true;
   }
