@@ -348,7 +348,7 @@ key first, then falls back to the standard env var.
 positions `0..=3` — `CLI/TUI`, `Web Gateway`, `HTTP webhook`, `Signal` — tracked
 by `CHANNEL_INDEX_GATEWAY`, `CHANNEL_INDEX_HTTP`, `CHANNEL_INDEX_SIGNAL`. If
 you reorder these options, update the constants and the regression test
-`test_channel_index_positions_match_option_order` together.
+`test_non_wasm_channel_labels_match_index_constants` together.
 
 **Channel sources** (priority order for installation):
 1. Already installed in `~/.ironclaw/channels/`
