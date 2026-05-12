@@ -12,6 +12,9 @@ It currently supports:
 
 ```bash
 ironclaw-reborn --help
+ironclaw-reborn channels list
+ironclaw-reborn channels list --json
+ironclaw-reborn channels list --verbose
 ironclaw-reborn completion --shell bash
 ironclaw-reborn completion --shell zsh
 ironclaw-reborn doctor
@@ -28,6 +31,24 @@ It intentionally does not yet support:
 - long-lived Reborn runtime services.
 
 ## Commands
+
+### `channels list`
+
+Reports configured Reborn channels without resolving Reborn home, reading v1 channel config, or creating directories.
+
+The Reborn channel registry is not wired yet, so the command currently reports an explicit empty surface:
+
+```bash
+cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- channels list
+cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- channels list --json
+cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- channels list --verbose
+```
+
+Expected fields include:
+
+- `configured: 0`
+- `status: not-wired`
+- `v1_state: not-used`
 
 ### `completion`
 
@@ -115,6 +136,7 @@ cargo test -p ironclaw_reborn_config
 cargo test -p ironclaw_architecture reborn
 cargo clippy -p ironclaw_reborn_cli --all-targets -- -D warnings
 cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- --help
+cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- channels list
 cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- completion --shell zsh >/tmp/ironclaw-reborn.zsh
 IRONCLAW_REBORN_HOME="$(mktemp -d)/reborn-home" \
   cargo run -q -p ironclaw_reborn_cli --bin ironclaw-reborn -- run

@@ -1,11 +1,14 @@
 use clap::Subcommand;
 
+pub(crate) mod channels;
 pub(crate) mod completion;
 pub(crate) mod doctor;
 pub(crate) mod run;
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Inspect configured Reborn channels.
+    Channels(channels::ChannelsCommand),
     /// Generate shell completion scripts.
     Completion(completion::CompletionCommand),
     /// Check Reborn binary configuration without creating state.
@@ -17,6 +20,7 @@ pub(crate) enum Command {
 impl Command {
     pub(crate) fn execute(self) -> anyhow::Result<()> {
         match self {
+            Self::Channels(command) => command.execute(),
             Self::Completion(command) => command.execute(),
             Self::Doctor(command) => {
                 command.execute(crate::context::RebornCliContext::resolve_from_env()?)

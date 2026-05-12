@@ -21,9 +21,78 @@ fn help_mentions_reborn_commands() {
         stdout.contains("Standalone IronClaw Reborn runtime"),
         "stdout: {stdout}"
     );
+    assert!(stdout.contains("channels"), "stdout: {stdout}");
     assert!(stdout.contains("completion"), "stdout: {stdout}");
     assert!(stdout.contains("doctor"), "stdout: {stdout}");
     assert!(stdout.contains("run"), "stdout: {stdout}");
+}
+
+#[test]
+fn channels_list_reports_unwired_empty_surface_without_reborn_home() {
+    let output = Command::new(reborn_bin())
+        .arg("channels")
+        .arg("list")
+        .env_clear()
+        .output()
+        .expect("ironclaw-reborn channels list should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("IronClaw Reborn channels"),
+        "stdout: {stdout}"
+    );
+    assert!(stdout.contains("configured: 0"), "stdout: {stdout}");
+    assert!(stdout.contains("status: not-wired"), "stdout: {stdout}");
+    assert!(stdout.contains("v1_state: not-used"), "stdout: {stdout}");
+}
+
+#[test]
+fn channels_list_json_reports_empty_surface_without_reborn_home() {
+    let output = Command::new(reborn_bin())
+        .arg("channels")
+        .arg("list")
+        .arg("--json")
+        .env_clear()
+        .output()
+        .expect("ironclaw-reborn channels list --json should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        r#"{"channels":[],"status":"not-wired","v1_state":"not-used"}"#
+    );
+}
+
+#[test]
+fn channels_list_verbose_explains_missing_reborn_registry() {
+    let output = Command::new(reborn_bin())
+        .arg("channels")
+        .arg("list")
+        .arg("--verbose")
+        .env_clear()
+        .output()
+        .expect("ironclaw-reborn channels list --verbose should run");
+
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Reborn channel registry is not wired yet"),
+        "stdout: {stdout}"
+    );
 }
 
 #[test]
