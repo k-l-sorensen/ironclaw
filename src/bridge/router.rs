@@ -292,27 +292,17 @@ async fn persist_editable_image_attachment(
     attachment: &crate::channels::IncomingAttachment,
     index: usize,
 ) -> Option<String> {
-    if attachment.kind != crate::channels::AttachmentKind::Image || attachment.data.is_empty() {
-        return None;
-    }
-
-    let artifact_id = if attachment.id.trim().is_empty() {
-        format!("{}-attachment-{index}", message.id)
-    } else {
-        format!("{}-{}", message.id, attachment.id)
-    };
-
-    match crate::image_artifacts::persist_image_artifact(
+    match crate::image_artifacts::persist_incoming_image_attachment_artifact(
         image_artifact_root,
-        &attachment.data,
-        &attachment.mime_type,
+        attachment,
         &message.user_id,
         message.id,
-        &artifact_id,
+        message.id,
+        index,
     )
     .await
     {
-        Ok(path) => Some(path),
+        Ok(path) => path,
         Err(err) => {
             tracing::warn!(
                 message_id = %message.id,
@@ -5789,6 +5779,35 @@ fn generated_image_info_from_result(
     }
 }
 
+fn compact_image_data_in_persisted_action_results(thread: &mut ironclaw_engine::Thread) -> bool {
+    let Some(results) = thread
+        .metadata
+        .get_mut(ironclaw_engine::PERSISTED_ACTION_RESULTS_METADATA_KEY)
+        .and_then(|value| value.as_array_mut())
+    else {
+        return false;
+    };
+
+    let mut changed = false;
+    for result in results {
+        let Some(output) = result.get_mut("output") else {
+            continue;
+        };
+        let Some(sentinel) = GeneratedImageSentinel::from_value(output) else {
+            continue;
+        };
+        let compact = sentinel.compact_value_without_data_url_with_reason(
+            "omitted from engine thread metadata after image artifact persistence",
+        );
+        if *output != compact {
+            *output = compact;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 fn v2_tool_call_dedupe_key(
     action_name: &str,
     call_id: Option<&str>,
@@ -5931,7 +5950,7 @@ async fn persist_v2_tool_calls(
     // a user-visible gap, so emit at `warn!` — this path is an HTTP
     // handler, not a TUI-corrupting background task, so CLAUDE.md's
     // "background tasks must not use info!/warn!" rule does not apply.
-    let thread = match store.load_thread(thread_id).await {
+    let mut thread = match store.load_thread(thread_id).await {
         Ok(Some(t)) => t,
         Ok(None) => {
             tracing::warn!(thread_id = %thread_id, "thread not found in store for tool_calls persist");
@@ -6004,6 +6023,16 @@ async fn persist_v2_tool_calls(
 
     if calls.is_empty() {
         return generated_images;
+    }
+
+    if compact_image_data_in_persisted_action_results(&mut thread)
+        && let Err(error) = store.save_thread(&thread).await
+    {
+        tracing::warn!(
+            thread_id = %thread_id,
+            error = %error,
+            "failed to compact image data in v2 thread metadata"
+        );
     }
 
     let wrapper = serde_json::json!({ "calls": calls });
@@ -12693,6 +12722,17 @@ mod tests {
             .expect("image result should be persisted");
         assert!(persisted_result.contains("\"type\":\"image_generated\""));
         assert!(persisted_result.contains("data:image/png;base64,code123"));
+
+        let compacted_thread = store_arc
+            .load_thread(thread_id)
+            .await
+            .expect("load compacted thread")
+            .expect("thread still exists");
+        let metadata_output = &compacted_thread.metadata
+            [ironclaw_engine::PERSISTED_ACTION_RESULTS_METADATA_KEY][0]["output"];
+        assert!(metadata_output.get("data").is_none());
+        assert_eq!(metadata_output["data_omitted"], true);
+        assert_eq!(metadata_output["path"], "workspace/code.png");
     }
 
     #[cfg(feature = "libsql")]

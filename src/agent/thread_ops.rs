@@ -23,9 +23,7 @@ use crate::agent::session::{
     MAX_PENDING_MESSAGES, PendingApproval, Session, ThreadState, TurnOutcome,
 };
 use crate::agent::submission::SubmissionResult;
-use crate::channels::{
-    AttachmentKind, ChatApprovalPrompt, HistoryMessage, IncomingMessage, StatusUpdate,
-};
+use crate::channels::{ChatApprovalPrompt, HistoryMessage, IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
 use crate::generated_images::GeneratedImageSentinel;
@@ -107,32 +105,25 @@ async fn persist_inline_image_attachments_at(
         .collect::<Vec<_>>();
     let mut created_paths = Vec::new();
     for (idx, attachment) in message.attachments.iter().enumerate() {
-        if attachment.kind != AttachmentKind::Image
-            || attachment.data.is_empty()
-            || local_paths[idx].is_some()
-        {
+        if local_paths[idx].is_some() {
             continue;
         }
 
-        let artifact_id = if attachment.id.trim().is_empty() {
-            format!("{}-attachment-{idx}", message.id)
-        } else {
-            format!("{}-{}", message.id, attachment.id)
-        };
-        match crate::image_artifacts::persist_image_artifact(
+        match crate::image_artifacts::persist_incoming_image_attachment_artifact(
             root,
-            &attachment.data,
-            &attachment.mime_type,
+            attachment,
             &message.user_id,
             thread_id,
-            &artifact_id,
+            message.id,
+            idx,
         )
         .await
         {
-            Ok(path) => {
+            Ok(Some(path)) => {
                 created_paths.push(path.clone());
                 local_paths[idx] = Some(path);
             }
+            Ok(None) => {}
             Err(err) => {
                 tracing::warn!(
                     message_id = %message.id,

@@ -4,6 +4,7 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+use ironclaw_common::attachment::{AttachmentKind, IncomingAttachment};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
@@ -70,6 +71,14 @@ fn image_artifact_filename(artifact_id: &str, attempt: usize, ext: &str) -> Stri
         format!("{stem}.{ext}")
     } else {
         format!("{stem}-{attempt}.{ext}")
+    }
+}
+
+fn image_attachment_artifact_id(message_id: Uuid, attachment_id: &str, index: usize) -> String {
+    if attachment_id.trim().is_empty() {
+        format!("{message_id}-attachment-{index}")
+    } else {
+        format!("{message_id}-{attachment_id}")
     }
 }
 
@@ -180,6 +189,30 @@ pub(crate) async fn persist_image_artifact(
     Err("failed to allocate unique image artifact path".to_string())
 }
 
+pub(crate) async fn persist_incoming_image_attachment_artifact(
+    root: Option<&Path>,
+    attachment: &IncomingAttachment,
+    user_id: &str,
+    thread_id: Uuid,
+    message_id: Uuid,
+    index: usize,
+) -> Result<Option<String>, String> {
+    if attachment.kind != AttachmentKind::Image || attachment.data.is_empty() {
+        return Ok(None);
+    }
+
+    persist_image_artifact(
+        root,
+        &attachment.data,
+        &attachment.mime_type,
+        user_id,
+        thread_id,
+        &image_attachment_artifact_id(message_id, &attachment.id, index),
+    )
+    .await
+    .map(Some)
+}
+
 pub(crate) fn decode_image_data_url(data_url: &str) -> Result<(String, Vec<u8>), String> {
     let Some(rest) = data_url.strip_prefix("data:") else {
         return Err("image data URL must start with data:".to_string());
@@ -211,6 +244,27 @@ pub(crate) fn decode_image_data_url(data_url: &str) -> Result<(String, Vec<u8>),
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn incoming_attachment(
+        kind: AttachmentKind,
+        id: &str,
+        mime_type: &str,
+        data: &[u8],
+    ) -> IncomingAttachment {
+        IncomingAttachment {
+            id: id.to_string(),
+            kind,
+            mime_type: mime_type.to_string(),
+            filename: None,
+            size_bytes: Some(data.len() as u64),
+            source_url: None,
+            storage_key: None,
+            local_path: None,
+            extracted_text: None,
+            data: data.to_vec(),
+            duration_secs: None,
+        }
+    }
 
     #[tokio::test]
     async fn persists_image_artifact_under_sanitized_path() {
@@ -268,6 +322,56 @@ mod tests {
             tokio::fs::read(second).await.expect("read second"),
             b"second"
         );
+    }
+
+    #[tokio::test]
+    async fn persists_incoming_image_attachment_artifact_with_shared_id_shape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let thread_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let attachment =
+            incoming_attachment(AttachmentKind::Image, "channel/file:1", "image/png", b"png");
+
+        let path = persist_incoming_image_attachment_artifact(
+            Some(dir.path()),
+            &attachment,
+            "alice",
+            thread_id,
+            message_id,
+            2,
+        )
+        .await
+        .expect("persisted")
+        .expect("image attachment should persist");
+
+        assert!(path.ends_with(".png"));
+        assert!(path.contains(&message_id.to_string()));
+        assert!(path.contains("channel_file_1"));
+        assert_eq!(tokio::fs::read(path).await.expect("read"), b"png");
+    }
+
+    #[tokio::test]
+    async fn skips_non_image_incoming_attachment_artifacts() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let attachment = incoming_attachment(
+            AttachmentKind::Document,
+            "doc",
+            "application/pdf",
+            b"not an image",
+        );
+
+        let path = persist_incoming_image_attachment_artifact(
+            Some(dir.path()),
+            &attachment,
+            "alice",
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            0,
+        )
+        .await
+        .expect("non-image attachments should be ignored");
+
+        assert!(path.is_none());
     }
 
     #[test]
