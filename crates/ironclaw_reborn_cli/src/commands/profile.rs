@@ -30,29 +30,26 @@ impl ProfileCommand {
 
 impl ProfileListCommand {
     fn execute(self) -> anyhow::Result<()> {
-        let profiles = [
-            RebornProfile::LocalDev,
-            RebornProfile::Production,
-            RebornProfile::MigrationDryRun,
-        ];
+        let profiles = RebornProfile::all();
 
         if self.json {
-            print!("{{\"profiles\":[");
-            for (index, profile) in profiles.iter().enumerate() {
-                if index > 0 {
-                    print!(",");
-                }
-                print!(
-                    "{{\"name\":\"{}\",\"default\":{}}}",
-                    profile,
-                    *profile == RebornProfile::default()
-                );
-            }
-            println!("],\"selector\":\"{}\"}}", REBORN_PROFILE_ENV);
+            let profiles = profiles.iter().map(|profile| {
+                serde_json::json!({
+                    "name": profile.as_str(),
+                    "default": *profile == RebornProfile::default(),
+                })
+            });
+            println!(
+                "{}",
+                serde_json::json!({
+                    "profiles": profiles.collect::<Vec<_>>(),
+                    "selector": REBORN_PROFILE_ENV,
+                })
+            );
         } else {
             println!("IronClaw Reborn profiles");
             for profile in profiles {
-                if profile == RebornProfile::default() {
+                if *profile == RebornProfile::default() {
                     println!("- {} (default)", profile);
                 } else {
                     println!("- {}", profile);

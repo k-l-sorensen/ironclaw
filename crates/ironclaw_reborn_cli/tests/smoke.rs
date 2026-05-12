@@ -73,7 +73,7 @@ fn profile_list_json_is_stable_and_does_not_resolve_reborn_home() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout.trim(),
-        r#"{"profiles":[{"name":"local-dev","default":true},{"name":"production","default":false},{"name":"migration-dry-run","default":false}],"selector":"IRONCLAW_REBORN_PROFILE"}"#
+        r#"{"profiles":[{"default":true,"name":"local-dev"},{"default":false,"name":"production"},{"default":false,"name":"migration-dry-run"}],"selector":"IRONCLAW_REBORN_PROFILE"}"#
     );
 }
 
