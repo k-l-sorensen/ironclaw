@@ -11,12 +11,14 @@
 
 pub mod capability_port;
 pub mod checkpoint_port;
+pub mod gate_ref;
 pub mod model_port;
 pub mod prompt_port;
 pub mod transcript_port;
 
 pub use capability_port::HookedLoopCapabilityPort;
 pub use checkpoint_port::HookedLoopCheckpointPort;
+pub use gate_ref::{HookGateRefFactory, UuidHookGateRefFactory};
 pub use model_port::HookedLoopModelPort;
 pub use prompt_port::HookedLoopPromptPort;
 pub use transcript_port::HookedLoopTranscriptPort;

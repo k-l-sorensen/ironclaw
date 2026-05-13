@@ -39,7 +39,10 @@ use ironclaw_hooks::ordering::HookPhase;
 use ironclaw_hooks::points::BeforeCapabilityHookContext;
 use ironclaw_hooks::predicate::{CapabilityPredicate, HookPredicateSpec};
 use ironclaw_hooks::registry::{HookBinding, HookPointSpec, HookRegistry};
-use ironclaw_hooks::sink::{PrivilegedBeforeCapabilityHook, PrivilegedGateSink};
+use ironclaw_hooks::sink::{
+    PrivilegedBeforeCapabilityHook, PrivilegedGateSink, RestrictedBeforeCapabilityHook,
+    RestrictedGateSink,
+};
 use ironclaw_hooks::trust::HookTrustClass;
 use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_loop_support::{
@@ -188,6 +191,50 @@ impl PrivilegedBeforeCapabilityHook for SelectiveDenyHook {
             sink.allow();
         }
     }
+}
+
+/// Installed-tier hook that always pause-approves. Used to prove the
+/// hook-middleware seam surfaces `PauseApproval` as
+/// `CapabilityOutcome::ApprovalRequired` with a real `LoopGateRef`, rather
+/// than the previous degraded `Denied` mapping.
+struct PauseApprovalHook;
+
+#[async_trait]
+impl RestrictedBeforeCapabilityHook for PauseApprovalHook {
+    async fn evaluate(
+        &self,
+        _ctx: &BeforeCapabilityHookContext,
+        sink: &mut dyn RestrictedGateSink,
+    ) {
+        sink.pause_approval("integration-test pause approval");
+    }
+}
+
+fn pause_approval_dispatcher() -> Arc<HookDispatcher> {
+    let hook_id = HookId::derive(
+        &ExtensionId("integration-tests".to_string()),
+        "0.0.1",
+        &HookLocalId("pause-approval".to_string()),
+        HookVersion::ONE,
+    );
+    let binding = HookBinding {
+        hook_id,
+        hook_version: HookVersion::ONE,
+        trust_class: HookTrustClass::Installed,
+        phase: HookPhase::Policy,
+        point: HookPointSpec::BeforeCapability,
+        poisoned: false,
+    };
+    let mut registry = HookRegistry::new();
+    registry
+        .insert(binding)
+        .expect("registry insert of fresh binding succeeds");
+    let mut dispatcher = HookDispatcher::new(registry);
+    dispatcher.install_before_capability(
+        hook_id,
+        BeforeCapabilityHookImpl::Restricted(Box::new(PauseApprovalHook)),
+    );
+    Arc::new(dispatcher)
 }
 
 fn predicate_deny_dispatcher() -> Arc<HookDispatcher> {
@@ -512,4 +559,47 @@ async fn factory_without_hook_dispatcher_reaches_inner_port_for_blocked_capabili
     let invocations = inner.invocations();
     assert_eq!(invocations.len(), 1, "inner port invoked exactly once");
     assert_eq!(invocations[0].as_str(), "cap.blocked");
+}
+
+#[tokio::test]
+async fn pause_approval_hook_surfaces_as_approval_required_with_real_gate_ref() {
+    // Proves that PauseApproval decisions no longer fall through to the
+    // degraded `Denied` mapping. The middleware uses the default
+    // `UuidHookGateRefFactory` to mint a real, validated `LoopGateRef` and
+    // surfaces the hook intent as `CapabilityOutcome::ApprovalRequired`.
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(pause_approval_dispatcher())
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with hook dispatcher installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke_capability returns a (suspended) outcome, not an error");
+
+    match outcome {
+        CapabilityOutcome::ApprovalRequired {
+            gate_ref,
+            safe_summary,
+        } => {
+            assert!(
+                gate_ref.as_str().starts_with("gate:hook-approval-"),
+                "gate ref does not match expected prefix: {}",
+                gate_ref.as_str()
+            );
+            assert_eq!(safe_summary, "integration-test pause approval");
+        }
+        other => panic!("expected ApprovalRequired, got {other:?}"),
+    }
+    assert!(
+        inner.invocations().is_empty(),
+        "inner port must NOT be invoked when a hook pauses; got {:?}",
+        inner.invocations()
+    );
 }

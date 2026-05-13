@@ -8,11 +8,17 @@
 //! - `GateDecisionInner::Deny` → return `CapabilityOutcome::Denied` with
 //!   `CapabilityDeniedReasonKind::Unknown("hook_denied")` and the sanitized
 //!   reason as `safe_summary`.
-//! - `GateDecisionInner::PauseApproval` / `PauseAuth` → return the
-//!   corresponding suspension outcome. The middleware itself does not
-//!   generate gate refs; Phase 2 (#3524 roadmap) wires those into the host's
-//!   approval/auth gate machinery. For now, suspension hook decisions surface
-//!   as `Denied` so the loop fails closed rather than silently allowing.
+//! - `GateDecisionInner::PauseApproval` → mint an approval gate ref via the
+//!   configured [`HookGateRefFactory`] and return
+//!   `CapabilityOutcome::ApprovalRequired { gate_ref, safe_summary }`.
+//! - `GateDecisionInner::PauseAuth` → mint an auth gate ref via the factory
+//!   and return `CapabilityOutcome::AuthRequired { gate_ref, safe_summary }`.
+//!
+//! If the factory itself fails (e.g. the host's gate-router rejected the
+//! mint), the middleware fails closed and surfaces the call as
+//! `CapabilityOutcome::Denied` with a sanitized `hook_gate_ref_unavailable`
+//! reason kind — better to refuse the call than route the loop through an
+//! unresolvable suspension.
 //!
 //! Failure cases from the dispatcher (panic, timeout, missing impl) also map
 //! to `Denied` per the [`crate::failure_policy`] rules.
@@ -29,6 +35,7 @@ use ironclaw_turns::run_profile::{
 
 use crate::dispatch::{BeforeCapabilityDispatchOutcome, HookDispatcher};
 use crate::kinds::gate::GateDecisionInner;
+use crate::middleware::gate_ref::{HookGateRefFactory, UuidHookGateRefFactory};
 use crate::points::BeforeCapabilityHookContext;
 
 /// Wraps an inner `LoopCapabilityPort`, fires `before_capability` hooks ahead
@@ -38,6 +45,7 @@ pub struct HookedLoopCapabilityPort {
     inner: Arc<dyn LoopCapabilityPort>,
     dispatcher: Arc<HookDispatcher>,
     tenant_id: TenantId,
+    gate_ref_factory: Arc<dyn HookGateRefFactory>,
 }
 
 impl HookedLoopCapabilityPort {
@@ -50,7 +58,18 @@ impl HookedLoopCapabilityPort {
             inner,
             dispatcher,
             tenant_id,
+            gate_ref_factory: Arc::new(UuidHookGateRefFactory),
         }
+    }
+
+    /// Override the gate-ref factory. Production code wires a factory that
+    /// is bound to the current `LoopRunContext` and the host's approval-
+    /// router so the resulting `ApprovalRequired` / `AuthRequired` outcomes
+    /// resolve correctly. Tests and the foundation slice can rely on the
+    /// default [`UuidHookGateRefFactory`].
+    pub fn with_gate_ref_factory(mut self, factory: Arc<dyn HookGateRefFactory>) -> Self {
+        self.gate_ref_factory = factory;
+        self
     }
 
     fn hook_context(&self, invocation: &CapabilityInvocation) -> BeforeCapabilityHookContext {
@@ -87,7 +106,7 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
         request: CapabilityInvocation,
     ) -> Result<CapabilityOutcome, AgentLoopHostError> {
         let outcome = self.run_dispatch(&request).await;
-        match decision_to_outcome(&outcome) {
+        match self.decision_to_outcome(&outcome).await {
             Some(translated) => Ok(translated),
             None => self.inner.invoke_capability(request).await,
         }
@@ -111,7 +130,7 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
                 break;
             }
             let dispatch = self.run_dispatch(&invocation).await;
-            let outcome = match decision_to_outcome(&dispatch) {
+            let outcome = match self.decision_to_outcome(&dispatch).await {
                 Some(translated) => translated,
                 None => self.inner.invoke_capability(invocation).await?,
             };
@@ -127,30 +146,65 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
     }
 }
 
-/// Returns `Some(outcome)` if the hook decision is restrictive (deny / pause
-/// / failure-closed), or `None` if the hooks said allow and the inner port
-/// should be consulted.
-fn decision_to_outcome(dispatched: &BeforeCapabilityDispatchOutcome) -> Option<CapabilityOutcome> {
-    match dispatched.decision.inner() {
-        GateDecisionInner::Allow => None,
-        GateDecisionInner::Deny { reason } => Some(CapabilityOutcome::Denied(CapabilityDenied {
-            reason_kind: CapabilityDeniedReasonKind::unknown("hook_denied")
-                .expect("hook_denied is a valid loop-safe identifier"),
-            safe_summary: reason.as_str().to_string(),
-        })),
-        GateDecisionInner::PauseApproval { reason } | GateDecisionInner::PauseAuth { reason } => {
-            // For the foundation slice, pause-class decisions fail closed at
-            // the middleware boundary: the gate-ref plumbing belongs in the
-            // approval-router wiring of the next slice. Returning Denied
-            // keeps the host's existing approval flow untouched while
-            // surfacing the hook's intent.
-            Some(CapabilityOutcome::Denied(CapabilityDenied {
-                reason_kind: CapabilityDeniedReasonKind::unknown("hook_paused")
-                    .expect("hook_paused is a valid loop-safe identifier"),
-                safe_summary: reason.as_str().to_string(),
-            }))
+impl HookedLoopCapabilityPort {
+    /// Translates a dispatcher outcome into a `CapabilityOutcome`. Returns
+    /// `Some(outcome)` when the hook decision is restrictive (deny / pause /
+    /// failure-closed), or `None` if the hooks allowed the call and the
+    /// inner port should be consulted.
+    ///
+    /// This is async because pause-class decisions await the
+    /// `HookGateRefFactory` to mint a real `LoopGateRef`. If the factory
+    /// fails, the middleware falls back to `Denied` with a sanitized
+    /// `hook_gate_ref_unavailable` reason.
+    async fn decision_to_outcome(
+        &self,
+        dispatched: &BeforeCapabilityDispatchOutcome,
+    ) -> Option<CapabilityOutcome> {
+        match dispatched.decision.inner() {
+            GateDecisionInner::Allow => None,
+            GateDecisionInner::Deny { reason } => {
+                Some(CapabilityOutcome::Denied(CapabilityDenied {
+                    reason_kind: CapabilityDeniedReasonKind::unknown("hook_denied")
+                        .expect("hook_denied is a valid loop-safe identifier"),
+                    safe_summary: reason.as_str().to_string(),
+                }))
+            }
+            GateDecisionInner::PauseApproval { reason } => {
+                match self
+                    .gate_ref_factory
+                    .mint_approval_ref(reason.as_str())
+                    .await
+                {
+                    Ok(gate_ref) => Some(CapabilityOutcome::ApprovalRequired {
+                        gate_ref,
+                        safe_summary: reason.as_str().to_string(),
+                    }),
+                    Err(_) => Some(fail_closed_gate_ref_unavailable(reason.as_str())),
+                }
+            }
+            GateDecisionInner::PauseAuth { reason } => {
+                match self.gate_ref_factory.mint_auth_ref(reason.as_str()).await {
+                    Ok(gate_ref) => Some(CapabilityOutcome::AuthRequired {
+                        gate_ref,
+                        safe_summary: reason.as_str().to_string(),
+                    }),
+                    Err(_) => Some(fail_closed_gate_ref_unavailable(reason.as_str())),
+                }
+            }
         }
     }
+}
+
+/// Fail-closed translation when the gate-ref factory cannot mint a ref for a
+/// pause-class decision. The safe summary intentionally carries only the
+/// hook's already-sanitized reason — the underlying host error is dropped to
+/// avoid leaking internal gate-router state into model-visible output.
+fn fail_closed_gate_ref_unavailable(sanitized_reason: &str) -> CapabilityOutcome {
+    CapabilityOutcome::Denied(CapabilityDenied {
+        reason_kind: CapabilityDeniedReasonKind::unknown("hook_gate_ref_unavailable")
+            .expect("hook_gate_ref_unavailable is a valid loop-safe identifier"),
+        safe_summary: sanitized_reason.to_string(),
+    })
 }
 
 /// Stable digest of capability arguments for hook context. The middleware
@@ -266,6 +320,80 @@ mod tests {
         }
     }
 
+    struct PauseApprovalHook;
+    #[async_trait]
+    impl RestrictedBeforeCapabilityHook for PauseApprovalHook {
+        async fn evaluate(
+            &self,
+            _ctx: &BeforeCapabilityHookContext,
+            sink: &mut dyn RestrictedGateSink,
+        ) {
+            sink.pause_approval("needs approval for this capability");
+        }
+    }
+
+    struct PauseAuthHook;
+    #[async_trait]
+    impl RestrictedBeforeCapabilityHook for PauseAuthHook {
+        async fn evaluate(
+            &self,
+            _ctx: &BeforeCapabilityHookContext,
+            sink: &mut dyn RestrictedGateSink,
+        ) {
+            sink.pause_auth("needs auth for this capability");
+        }
+    }
+
+    fn dispatcher_with_restricted_hook(
+        local: &str,
+        hook: Box<dyn RestrictedBeforeCapabilityHook>,
+    ) -> (Arc<HookDispatcher>, HookId) {
+        let hook_id = HookId::derive(
+            &ExtensionId("ext".to_string()),
+            "1.0",
+            &HookLocalId(local.to_string()),
+            HookVersion::ONE,
+        );
+        let binding = HookBinding {
+            hook_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Installed,
+            phase: HookPhase::Policy,
+            point: HookPointSpec::BeforeCapability,
+            poisoned: false,
+        };
+        let mut registry = HookRegistry::new();
+        registry.insert(binding).expect("ok");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_before_capability(hook_id, BeforeCapabilityHookImpl::Restricted(hook));
+        (Arc::new(dispatcher), hook_id)
+    }
+
+    /// Test-only gate-ref factory that always errors. Used to exercise the
+    /// fail-closed path when the host's gate-router refuses to mint a ref.
+    struct FailingGateRefFactory;
+    #[async_trait]
+    impl crate::middleware::gate_ref::HookGateRefFactory for FailingGateRefFactory {
+        async fn mint_approval_ref(
+            &self,
+            _reason: &str,
+        ) -> Result<ironclaw_turns::LoopGateRef, AgentLoopHostError> {
+            Err(AgentLoopHostError::new(
+                ironclaw_turns::run_profile::AgentLoopHostErrorKind::Internal,
+                "no router",
+            ))
+        }
+        async fn mint_auth_ref(
+            &self,
+            _reason: &str,
+        ) -> Result<ironclaw_turns::LoopGateRef, AgentLoopHostError> {
+            Err(AgentLoopHostError::new(
+                ironclaw_turns::run_profile::AgentLoopHostErrorKind::Internal,
+                "no router",
+            ))
+        }
+    }
+
     fn invocation(capability: &str) -> CapabilityInvocation {
         CapabilityInvocation {
             surface_version: CapabilitySurfaceVersion::new("v1").expect("ok"),
@@ -352,6 +480,84 @@ mod tests {
         for entry in &outcome.outcomes {
             assert!(matches!(entry, CapabilityOutcome::Denied(_)));
         }
+    }
+
+    #[tokio::test]
+    async fn pause_approval_decision_surfaces_as_approval_required() {
+        let inner = Arc::new(AlwaysCompletedPort::new());
+        let (dispatcher, _) =
+            dispatcher_with_restricted_hook("pause-approval", Box::new(PauseApprovalHook));
+        let wrapped = HookedLoopCapabilityPort::new(inner.clone(), dispatcher, tenant());
+
+        let outcome = wrapped
+            .invoke_capability(invocation("cap.x"))
+            .await
+            .expect("ok");
+
+        match outcome {
+            CapabilityOutcome::ApprovalRequired {
+                gate_ref,
+                safe_summary,
+            } => {
+                assert!(gate_ref.as_str().starts_with("gate:hook-approval-"));
+                assert_eq!(safe_summary, "needs approval for this capability");
+            }
+            other => panic!("expected ApprovalRequired, got {other:?}"),
+        }
+        assert!(inner.calls().is_empty(), "inner must not be invoked");
+    }
+
+    #[tokio::test]
+    async fn pause_auth_decision_surfaces_as_auth_required() {
+        let inner = Arc::new(AlwaysCompletedPort::new());
+        let (dispatcher, _) =
+            dispatcher_with_restricted_hook("pause-auth", Box::new(PauseAuthHook));
+        let wrapped = HookedLoopCapabilityPort::new(inner.clone(), dispatcher, tenant());
+
+        let outcome = wrapped
+            .invoke_capability(invocation("cap.x"))
+            .await
+            .expect("ok");
+
+        match outcome {
+            CapabilityOutcome::AuthRequired {
+                gate_ref,
+                safe_summary,
+            } => {
+                assert!(gate_ref.as_str().starts_with("gate:hook-auth-"));
+                assert_eq!(safe_summary, "needs auth for this capability");
+            }
+            other => panic!("expected AuthRequired, got {other:?}"),
+        }
+        assert!(inner.calls().is_empty(), "inner must not be invoked");
+    }
+
+    #[tokio::test]
+    async fn gate_ref_factory_failure_falls_back_to_denied() {
+        let inner = Arc::new(AlwaysCompletedPort::new());
+        let (dispatcher, _) =
+            dispatcher_with_restricted_hook("pause-approval-fail", Box::new(PauseApprovalHook));
+        let wrapped = HookedLoopCapabilityPort::new(inner.clone(), dispatcher, tenant())
+            .with_gate_ref_factory(Arc::new(FailingGateRefFactory));
+
+        let outcome = wrapped
+            .invoke_capability(invocation("cap.x"))
+            .await
+            .expect("ok");
+
+        match outcome {
+            CapabilityOutcome::Denied(denied) => {
+                assert_eq!(
+                    denied.reason_kind,
+                    CapabilityDeniedReasonKind::unknown("hook_gate_ref_unavailable").expect("ok"),
+                );
+                // Sanitized hook reason is preserved; underlying error text
+                // ("no router") must not leak.
+                assert_eq!(denied.safe_summary, "needs approval for this capability");
+            }
+            other => panic!("expected Denied fallback, got {other:?}"),
+        }
+        assert!(inner.calls().is_empty(), "inner must not be invoked");
     }
 
     #[tokio::test]
