@@ -7,7 +7,10 @@ use std::{
 
 use async_trait::async_trait;
 use ironclaw_hooks::dispatch::HookDispatcher;
-use ironclaw_hooks::middleware::{HookedLoopCapabilityPort, HookedLoopPromptPort};
+use ironclaw_hooks::middleware::{
+    HookedLoopCapabilityPort, HookedLoopCheckpointPort, HookedLoopModelPort, HookedLoopPromptPort,
+    HookedLoopTranscriptPort,
+};
 use ironclaw_host_api::{
     CapabilityId, CorrelationId, ExecutionContext, ExtensionId, InvocationId, ResourceEstimate,
     sha256_digest_token,
@@ -1073,20 +1076,38 @@ where
         if let Some(source) = self.skill_context_source.as_ref() {
             model_adapter = model_adapter.with_skill_context_source(source.clone());
         }
-        let model: Arc<dyn LoopModelPort> = Arc::new(model_adapter);
-        let checkpoint: Arc<dyn LoopCheckpointPort> = Arc::new(HostManagedLoopCheckpointPort::new(
-            run_context.clone(),
-            Arc::clone(&self.checkpoint_state_store),
-            Arc::clone(&self.loop_checkpoint_store),
-            Arc::clone(&self.milestone_sink),
-        ));
-        let transcript: Arc<dyn LoopTranscriptPort> =
+        let mut model: Arc<dyn LoopModelPort> = Arc::new(model_adapter);
+        let mut checkpoint: Arc<dyn LoopCheckpointPort> =
+            Arc::new(HostManagedLoopCheckpointPort::new(
+                run_context.clone(),
+                Arc::clone(&self.checkpoint_state_store),
+                Arc::clone(&self.loop_checkpoint_store),
+                Arc::clone(&self.milestone_sink),
+            ));
+        let mut transcript: Arc<dyn LoopTranscriptPort> =
             Arc::new(ThreadBackedLoopTranscriptPort::with_milestone_sink(
                 Arc::clone(&self.thread_service),
                 self.thread_scope.clone(),
                 run_context.clone(),
                 Arc::clone(&self.milestone_sink),
             ));
+        if let Some(dispatcher) = self.hook_dispatcher.as_ref() {
+            model = Arc::new(HookedLoopModelPort::new(
+                Arc::clone(&model),
+                Arc::clone(dispatcher),
+                run_context.scope.tenant_id.clone(),
+            ));
+            transcript = Arc::new(HookedLoopTranscriptPort::new(
+                Arc::clone(&transcript),
+                Arc::clone(dispatcher),
+                run_context.scope.tenant_id.clone(),
+            ));
+            checkpoint = Arc::new(HookedLoopCheckpointPort::new(
+                Arc::clone(&checkpoint),
+                Arc::clone(dispatcher),
+                run_context.scope.tenant_id.clone(),
+            ));
+        }
         let progress: Arc<dyn LoopProgressPort> = Arc::new(HostManagedLoopProgressPort::new(
             run_context.clone(),
             Arc::clone(&self.milestone_sink),
