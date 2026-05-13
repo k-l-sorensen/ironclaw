@@ -14,6 +14,9 @@ pub use planner::{AgentLoopPlanner, PlannerId, PlannerIdError};
 pub use strategies::{
     BatchPolicy, BatchPolicyStrategy, BudgetStrategy, CapabilityCallSummary, CapabilityErrorClass,
     CapabilityErrorSummary, CapabilityFilter, CapabilityStrategy, ConcurrencyHint, ContextStrategy,
+    DefaultBatchPolicyStrategy, DefaultBudgetStrategy, DefaultCapabilityStrategy,
+    DefaultContextStrategy, DefaultGateHandlingStrategy, DefaultInputDrainStrategy,
+    DefaultModelStrategy, DefaultRecoveryStrategy, DefaultStopConditionStrategy,
     GateHandlingStrategy, GateKind, GateOutcome, GateSummary, InputDrainStrategy, ModelErrorClass,
     ModelErrorSummary, ModelPreference, ModelStrategy, RecoveryOutcome, RecoveryStrategy,
     RetryAlteration, StopConditionStrategy, StopKind, StopOutcome, TurnEndKind, TurnSummary,
