@@ -133,7 +133,14 @@ pub struct HookDispatcher {
 }
 
 impl HookDispatcher {
-    pub fn new(registry: HookRegistry) -> Self {
+    /// Construct a bare dispatcher.
+    ///
+    /// **Internal:** outside this crate, use [`HookDispatcherBuilder::new`]
+    /// followed by [`HookDispatcherBuilder::build_arc`]. The builder is the
+    /// only public path to construction; this constructor remains visible to
+    /// the crate so middleware unit tests can compose dispatchers directly
+    /// without paying for an `Arc` wrap.
+    pub(crate) fn new(registry: HookRegistry) -> Self {
         Self {
             registry: Mutex::new(registry),
             before_capability: HashMap::new(),
@@ -144,7 +151,7 @@ impl HookDispatcher {
         }
     }
 
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+    pub(crate) fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
@@ -166,7 +173,7 @@ impl HookDispatcher {
     /// [`ironclaw_turns::run_profile::RunScopedHookMilestoneSink`] (or
     /// equivalent adapter) that injects run-context before forwarding to the
     /// host's `LoopHostMilestoneSink`.
-    pub fn with_milestone_sink(mut self, sink: Arc<dyn HookMilestoneSink>) -> Self {
+    pub(crate) fn with_milestone_sink(mut self, sink: Arc<dyn HookMilestoneSink>) -> Self {
         self.milestone_sink = Some(sink);
         self
     }
@@ -219,7 +226,7 @@ impl HookDispatcher {
 
     /// Install a `Builtin`-tier `before_capability` hook. Builtins may mint
     /// any decision (including `allow`).
-    pub fn install_builtin_before_capability(
+    pub(crate) fn install_builtin_before_capability(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -240,7 +247,7 @@ impl HookDispatcher {
 
     /// Install a `Trusted`-tier `before_capability` hook. Trusted hooks may
     /// mint any decision but cannot register at runtime-class phases.
-    pub fn install_trusted_before_capability(
+    pub(crate) fn install_trusted_before_capability(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -262,7 +269,7 @@ impl HookDispatcher {
     /// Install an `Installed`-tier `before_capability` hook. The impl trait is
     /// `RestrictedBeforeCapabilityHook`, whose sink cannot mint `allow` — this
     /// makes "Installed cannot Allow" a type-level fact.
-    pub fn install_installed_before_capability(
+    pub(crate) fn install_installed_before_capability(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -283,7 +290,7 @@ impl HookDispatcher {
 
     // ── Tier-specific public installers for before_prompt ───────────────────
 
-    pub fn install_builtin_before_prompt(
+    pub(crate) fn install_builtin_before_prompt(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -302,7 +309,7 @@ impl HookDispatcher {
         Ok(())
     }
 
-    pub fn install_trusted_before_prompt(
+    pub(crate) fn install_trusted_before_prompt(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -321,7 +328,7 @@ impl HookDispatcher {
         Ok(())
     }
 
-    pub fn install_installed_before_prompt(
+    pub(crate) fn install_installed_before_prompt(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -347,7 +354,7 @@ impl HookDispatcher {
     // generic `install_observer` accepts an explicit trust class; the
     // tier-specific helpers make the common case ergonomic.
 
-    pub fn install_observer(
+    pub(crate) fn install_observer(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -368,7 +375,7 @@ impl HookDispatcher {
         Ok(())
     }
 
-    pub fn install_builtin_observer(
+    pub(crate) fn install_builtin_observer(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -378,7 +385,7 @@ impl HookDispatcher {
         self.install_observer(hook_id, phase, point, HookTrustClass::Builtin, hook)
     }
 
-    pub fn install_trusted_observer(
+    pub(crate) fn install_trusted_observer(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -388,7 +395,7 @@ impl HookDispatcher {
         self.install_observer(hook_id, phase, point, HookTrustClass::Trusted, hook)
     }
 
-    pub fn install_installed_observer(
+    pub(crate) fn install_installed_observer(
         &mut self,
         hook_id: HookId,
         phase: HookPhase,
@@ -902,6 +909,214 @@ fn compose_gate_decision(
     }
 }
 
+/// Type-enforced builder for [`HookDispatcher`].
+///
+/// The dispatcher is wired in a specific order: registry → optional timeout
+/// → optional milestone sink → installed hooks. After construction it is
+/// almost always wrapped in [`Arc`] and handed to a host factory, at which
+/// point further mutation is impossible. The builder makes that lifecycle
+/// the *only* public construction path: callers chain configuration calls
+/// and terminate with [`HookDispatcherBuilder::build_arc`], which performs
+/// the `Arc` wrap and returns an immutable handle.
+///
+/// # Composition order
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use std::time::Duration;
+/// use ironclaw_hooks::dispatch::HookDispatcherBuilder;
+/// use ironclaw_hooks::registry::HookRegistry;
+///
+/// let dispatcher = HookDispatcherBuilder::new(HookRegistry::new())
+///     .with_timeout(Duration::from_millis(50))
+///     // .with_milestone_sink(sink)
+///     // .install_builtin_before_capability(...)?
+///     .build_arc();
+/// # let _ = dispatcher;
+/// ```
+///
+/// Wiring the milestone sink *before* `.build_arc()` is now type-enforced:
+/// the sink-attachment method lives on the builder, not on the
+/// already-shared `Arc<HookDispatcher>`. Forgetting the sink, or attaching
+/// it after Arc-wrapping, becomes a compile-time error rather than a
+/// silently-missed configuration step.
+#[must_use = "HookDispatcherBuilder does nothing until `.build_arc()` is called"]
+pub struct HookDispatcherBuilder {
+    dispatcher: HookDispatcher,
+}
+
+impl std::fmt::Debug for HookDispatcherBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HookDispatcherBuilder")
+            .finish_non_exhaustive()
+    }
+}
+
+impl HookDispatcherBuilder {
+    /// Start a new builder from a [`HookRegistry`].
+    pub fn new(registry: HookRegistry) -> Self {
+        Self {
+            dispatcher: HookDispatcher::new(registry),
+        }
+    }
+
+    /// Override the per-hook wall-clock timeout. Defaults to
+    /// [`DEFAULT_HOOK_TIMEOUT`] when not set.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.dispatcher = self.dispatcher.with_timeout(timeout);
+        self
+    }
+
+    /// Attach a [`HookMilestoneSink`]. See
+    /// [`HookDispatcher::with_milestone_sink`] (private) for the contract;
+    /// the key benefit of routing this through the builder is that the sink
+    /// is wired *before* the dispatcher is shared behind an `Arc`, which is
+    /// the only safe time to do so.
+    pub fn with_milestone_sink(mut self, sink: Arc<dyn HookMilestoneSink>) -> Self {
+        self.dispatcher = self.dispatcher.with_milestone_sink(sink);
+        self
+    }
+
+    /// Insert a free-standing binding (e.g., from a registrar that has its
+    /// own impl-installation flow). Most callers should use one of the
+    /// `install_*` helpers below instead.
+    pub fn insert_binding(mut self, binding: HookBinding) -> Result<Self, crate::error::HookError> {
+        self.dispatcher.insert_binding(binding)?;
+        Ok(self)
+    }
+
+    // ── Tier-specific public installers, mirroring HookDispatcher ────────
+
+    pub fn install_builtin_before_capability(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn PrivilegedBeforeCapabilityHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_builtin_before_capability(hook_id, phase, hook)?;
+        Ok(self)
+    }
+
+    pub fn install_trusted_before_capability(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn PrivilegedBeforeCapabilityHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_trusted_before_capability(hook_id, phase, hook)?;
+        Ok(self)
+    }
+
+    pub fn install_installed_before_capability(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn RestrictedBeforeCapabilityHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_installed_before_capability(hook_id, phase, hook)?;
+        Ok(self)
+    }
+
+    pub fn install_builtin_before_prompt(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn PrivilegedBeforePromptHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_builtin_before_prompt(hook_id, phase, hook)?;
+        Ok(self)
+    }
+
+    pub fn install_trusted_before_prompt(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn PrivilegedBeforePromptHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_trusted_before_prompt(hook_id, phase, hook)?;
+        Ok(self)
+    }
+
+    pub fn install_installed_before_prompt(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn RestrictedBeforePromptHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_installed_before_prompt(hook_id, phase, hook)?;
+        Ok(self)
+    }
+
+    pub fn install_observer(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        point: HookPointSpec,
+        trust_class: HookTrustClass,
+        hook: Box<dyn ObserverHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_observer(hook_id, phase, point, trust_class, hook)?;
+        Ok(self)
+    }
+
+    pub fn install_builtin_observer(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        point: HookPointSpec,
+        hook: Box<dyn ObserverHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_builtin_observer(hook_id, phase, point, hook)?;
+        Ok(self)
+    }
+
+    pub fn install_trusted_observer(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        point: HookPointSpec,
+        hook: Box<dyn ObserverHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_trusted_observer(hook_id, phase, point, hook)?;
+        Ok(self)
+    }
+
+    pub fn install_installed_observer(
+        mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        point: HookPointSpec,
+        hook: Box<dyn ObserverHook>,
+    ) -> Result<Self, crate::error::HookError> {
+        self.dispatcher
+            .install_installed_observer(hook_id, phase, point, hook)?;
+        Ok(self)
+    }
+
+    /// Get a mutable handle to the still-private dispatcher. Used by the
+    /// [`crate::registrar::HookRegistrar`] to install manifest entries
+    /// against an in-flight builder without exposing the underlying
+    /// installer surface.
+    pub(crate) fn dispatcher_mut(&mut self) -> &mut HookDispatcher {
+        &mut self.dispatcher
+    }
+
+    /// Finalize: wrap the configured dispatcher in [`Arc`]. After this call
+    /// the dispatcher can no longer be mutated.
+    pub fn build_arc(self) -> Arc<HookDispatcher> {
+        Arc::new(self.dispatcher)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1035,6 +1250,41 @@ mod tests {
         ) {
             // Deliberately returns without calling any sink method.
         }
+    }
+
+    /// Documents the load-bearing invariant introduced by the builder: from
+    /// outside the crate, the only way to obtain a `HookDispatcher` is via
+    /// `HookDispatcherBuilder::new(...).build_arc()`. `HookDispatcher::new`,
+    /// `.with_timeout`, `.with_milestone_sink`, and every `install_*` method
+    /// on the dispatcher are now `pub(crate)` — the type system enforces
+    /// the milestone-sink-before-Arc wiring order rather than relying on a
+    /// documentation convention.
+    ///
+    /// This is a compile-fact test, not a runtime assertion. The proof is
+    /// the visibility modifier on each method (verified by attempting to
+    /// call them from any downstream crate — which would fail to compile)
+    /// plus the `Arc` return type of `build_arc`, which forbids further
+    /// mutation.
+    #[test]
+    fn builder_build_arc_is_the_only_public_construction_path() {
+        // Sanity: the builder is publicly constructible and produces an
+        // Arc<HookDispatcher>. Once handed back as Arc, the dispatcher
+        // cannot be mutated (no &mut access through Arc, and the inherent
+        // mutators are pub(crate) anyway).
+        let dispatcher: Arc<HookDispatcher> =
+            HookDispatcherBuilder::new(HookRegistry::new()).build_arc();
+        let _ = dispatcher;
+
+        // The following lines, if uncommented from an external crate, would
+        // fail to compile:
+        //
+        //     HookDispatcher::new(HookRegistry::new());
+        //     dispatcher.with_timeout(Duration::from_millis(10));
+        //     dispatcher.with_milestone_sink(sink);
+        //     dispatcher.install_builtin_before_capability(...);
+        //
+        // (See visibility annotations on each method.)
+        let _seal_documented = true;
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@
 
 use std::sync::Arc;
 
-use crate::dispatch::HookDispatcher;
+use crate::dispatch::HookDispatcherBuilder;
 use crate::error::HookError;
 use crate::evaluator::PredicateEvaluator;
 use crate::identity::{ExtensionId, HookId, HookVersion};
@@ -39,24 +39,29 @@ impl HookRegistrar {
         Self { evaluator }
     }
 
-    /// Install all entries against `dispatcher`. Returns the
-    /// [`HookId`]s in the same order as `entries`. If any entry fails
-    /// validation or impl construction, the registrar returns the error
-    /// without rolling back earlier inserts — callers wanting all-or-nothing
-    /// semantics should build into a scratch dispatcher first.
+    /// Install all entries against `builder`, returning the updated
+    /// builder along with the [`HookId`]s in the same order as `entries`.
+    /// If any entry fails validation or impl construction, the registrar
+    /// returns the error without rolling back earlier inserts — callers
+    /// wanting all-or-nothing semantics should build into a scratch
+    /// builder first.
+    ///
+    /// Threading the builder through by value keeps the dispatcher
+    /// type-state intact: once the caller chains `.build_arc()` there is
+    /// no further opportunity to mutate the dispatcher.
     pub fn install(
         &self,
         extension: ExtensionId,
         extension_version: String,
         entries: Vec<HookManifestEntry>,
-        dispatcher: &mut HookDispatcher,
-    ) -> Result<Vec<HookId>, HookError> {
+        mut builder: HookDispatcherBuilder,
+    ) -> Result<(HookDispatcherBuilder, Vec<HookId>), HookError> {
         let mut installed = Vec::with_capacity(entries.len());
         for entry in entries {
-            let hook_id = self.install_one(&extension, &extension_version, entry, dispatcher)?;
+            let hook_id = self.install_one(&extension, &extension_version, entry, &mut builder)?;
             installed.push(hook_id);
         }
-        Ok(installed)
+        Ok((builder, installed))
     }
 
     fn install_one(
@@ -64,7 +69,7 @@ impl HookRegistrar {
         extension: &ExtensionId,
         extension_version: &str,
         entry: HookManifestEntry,
-        dispatcher: &mut HookDispatcher,
+        builder: &mut HookDispatcherBuilder,
     ) -> Result<HookId, HookError> {
         entry.validate().map_err(|e| {
             HookError::RegistryConstruction(format!(
@@ -84,11 +89,13 @@ impl HookRegistrar {
                         spec,
                         Arc::clone(&self.evaluator),
                     );
-                    dispatcher.install_installed_before_capability(
-                        hook_id,
-                        entry.phase,
-                        Box::new(hook),
-                    )?;
+                    builder
+                        .dispatcher_mut()
+                        .install_installed_before_capability(
+                            hook_id,
+                            entry.phase,
+                            Box::new(hook),
+                        )?;
                 }
                 other => {
                     return Err(HookError::RegistryConstruction(format!(
@@ -148,16 +155,17 @@ mod tests {
     #[tokio::test]
     async fn install_predicate_entry_builds_binding_and_installs_hook() {
         let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()));
-        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
-        let ids = registrar
+        let builder = HookDispatcherBuilder::new(HookRegistry::new());
+        let (builder, ids) = registrar
             .install(
                 extension(),
                 "0.4.2".to_string(),
                 vec![predicate_entry("deny-shell")],
-                &mut dispatcher,
+                builder,
             )
             .expect("install ok");
         assert_eq!(ids.len(), 1);
+        let dispatcher = builder.build_arc();
 
         // Dispatch and confirm the registered predicate fires.
         let tenant = ironclaw_host_api::TenantId::new("alpha").expect("tenant");
@@ -173,7 +181,7 @@ mod tests {
     #[test]
     fn install_rejects_wasm_body_for_now() {
         let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()));
-        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+        let builder = HookDispatcherBuilder::new(HookRegistry::new());
         let entry = HookManifestEntry {
             id: HookLocalId("wasm-hook".to_string()),
             kind: HookManifestKind::BeforeCapability,
@@ -188,12 +196,7 @@ mod tests {
             },
         };
         let err = registrar
-            .install(
-                extension(),
-                "0.1.0".to_string(),
-                vec![entry],
-                &mut dispatcher,
-            )
+            .install(extension(), "0.1.0".to_string(), vec![entry], builder)
             .expect_err("wasm body must be rejected");
         match err {
             HookError::RegistryConstruction(msg) => {
@@ -206,18 +209,13 @@ mod tests {
     #[test]
     fn install_rejects_invalid_phase_for_installed_tier() {
         let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()));
-        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+        let builder = HookDispatcherBuilder::new(HookRegistry::new());
         let mut entry = predicate_entry("bad-phase");
         // Validation phase is Builtin-only — manifest validation rejects it
         // before the registry would.
         entry.phase = HookPhase::Validation;
         let err = registrar
-            .install(
-                extension(),
-                "0.1.0".to_string(),
-                vec![entry],
-                &mut dispatcher,
-            )
+            .install(extension(), "0.1.0".to_string(), vec![entry], builder)
             .expect_err("validation phase must be rejected");
         assert!(matches!(err, HookError::RegistryConstruction(_)));
     }
@@ -225,7 +223,7 @@ mod tests {
     #[tokio::test]
     async fn install_returns_hook_ids_in_input_order() {
         let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()));
-        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+        let builder = HookDispatcherBuilder::new(HookRegistry::new());
         let entries = vec![
             predicate_entry("first"),
             predicate_entry("second"),
@@ -236,8 +234,8 @@ mod tests {
             .map(|e| HookId::derive(&extension(), "0.4.2", &e.id, HookVersion::ONE))
             .collect();
 
-        let actual = registrar
-            .install(extension(), "0.4.2".to_string(), entries, &mut dispatcher)
+        let (_builder, actual) = registrar
+            .install(extension(), "0.4.2".to_string(), entries, builder)
             .expect("install ok");
         assert_eq!(actual, expected);
     }

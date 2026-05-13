@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use ironclaw_hooks::dispatch::HookDispatcher;
+use ironclaw_hooks::dispatch::{HookDispatcher, HookDispatcherBuilder};
 use ironclaw_hooks::evaluator::PredicateEvaluator;
 use ironclaw_hooks::identity::{ExtensionId, HookId, HookLocalId, HookVersion};
 use ironclaw_hooks::installed_hook::PredicateBackedBeforeCapabilityHook;
@@ -227,15 +227,14 @@ fn pause_approval_dispatcher() -> Arc<HookDispatcher> {
         &HookLocalId("pause-approval".to_string()),
         HookVersion::ONE,
     );
-    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
-    dispatcher
+    HookDispatcherBuilder::new(HookRegistry::new())
         .install_installed_before_capability(
             hook_id,
             HookPhase::Policy,
             Box::new(PauseApprovalHook),
         )
-        .expect("install pause-approval hook");
-    Arc::new(dispatcher)
+        .expect("install pause-approval hook")
+        .build_arc()
 }
 
 fn predicate_deny_dispatcher() -> Arc<HookDispatcher> {
@@ -259,11 +258,10 @@ fn predicate_deny_dispatcher() -> Arc<HookDispatcher> {
     let evaluator = Arc::new(PredicateEvaluator::new());
     let hook = PredicateBackedBeforeCapabilityHook::new(hook_id, spec, evaluator);
 
-    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
-    dispatcher
+    HookDispatcherBuilder::new(HookRegistry::new())
         .install_installed_before_capability(hook_id, HookPhase::Policy, Box::new(hook))
-        .expect("Installed-tier predicate hook installs at policy phase");
-    Arc::new(dispatcher)
+        .expect("Installed-tier predicate hook installs at policy phase")
+        .build_arc()
 }
 
 fn selective_deny_dispatcher(target: &str) -> Arc<HookDispatcher> {
@@ -273,11 +271,10 @@ fn selective_deny_dispatcher(target: &str) -> Arc<HookDispatcher> {
     let hook = SelectiveDenyHook {
         target: target.to_string(),
     };
-    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
-    dispatcher
+    HookDispatcherBuilder::new(HookRegistry::new())
         .install_builtin_before_capability(hook_id, HookPhase::Policy, Box::new(hook))
-        .expect("Builtin-tier hook installs at policy phase");
-    Arc::new(dispatcher)
+        .expect("Builtin-tier hook installs at policy phase")
+        .build_arc()
 }
 
 // ─── Fixture for building hosts with the factory ───────────────────────────
@@ -521,8 +518,13 @@ async fn hook_dispatch_emits_milestones_into_host_sink() {
         "tests::hooks_integration::milestone_selective_deny",
         HookVersion::ONE,
     );
-    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
-    dispatcher
+    let hook_milestone_sink: Arc<RunScopedHookMilestoneSink> =
+        Arc::new(RunScopedHookMilestoneSink::new(
+            fixture.context.clone(),
+            Arc::clone(&fixture.milestone_sink) as _,
+        ));
+    let dispatcher = HookDispatcherBuilder::new(HookRegistry::new())
+        .with_milestone_sink(hook_milestone_sink)
         .install_builtin_before_capability(
             hook_id,
             HookPhase::Policy,
@@ -530,14 +532,8 @@ async fn hook_dispatch_emits_milestones_into_host_sink() {
                 target: "cap.blocked".to_string(),
             }),
         )
-        .expect("install builtin gate hook");
-    let hook_milestone_sink: Arc<RunScopedHookMilestoneSink> =
-        Arc::new(RunScopedHookMilestoneSink::new(
-            fixture.context.clone(),
-            Arc::clone(&fixture.milestone_sink) as _,
-        ));
-    dispatcher = dispatcher.with_milestone_sink(hook_milestone_sink);
-    let dispatcher = Arc::new(dispatcher);
+        .expect("install builtin gate hook")
+        .build_arc();
 
     let host = fixture
         .factory()
@@ -692,16 +688,15 @@ fn observer_dispatcher_at(point: HookPointSpec, seen: Arc<Mutex<u32>>) -> Arc<Ho
         },
         HookVersion::ONE,
     );
-    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
-    dispatcher
+    HookDispatcherBuilder::new(HookRegistry::new())
         .install_builtin_observer(
             hook_id,
             HookPhase::Telemetry,
             point,
             Box::new(CountingObserver { seen }),
         )
-        .expect("install builtin observer");
-    Arc::new(dispatcher)
+        .expect("install builtin observer")
+        .build_arc()
 }
 
 /// Build a `LoopModelRequest` referencing the inbound message added by the
@@ -839,22 +834,21 @@ async fn observer_panic_does_not_fail_model_call() {
         "tests::hooks_integration::panicking_observer",
         HookVersion::ONE,
     );
-    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
-    dispatcher
+    let hook_milestone_sink: Arc<RunScopedHookMilestoneSink> =
+        Arc::new(RunScopedHookMilestoneSink::new(
+            fixture.context.clone(),
+            Arc::clone(&fixture.milestone_sink) as _,
+        ));
+    let dispatcher = HookDispatcherBuilder::new(HookRegistry::new())
+        .with_milestone_sink(hook_milestone_sink)
         .install_builtin_observer(
             hook_id,
             HookPhase::Telemetry,
             HookPointSpec::AfterModel,
             Box::new(PanickingObserver),
         )
-        .expect("install panicking observer");
-    let hook_milestone_sink: Arc<RunScopedHookMilestoneSink> =
-        Arc::new(RunScopedHookMilestoneSink::new(
-            fixture.context.clone(),
-            Arc::clone(&fixture.milestone_sink) as _,
-        ));
-    dispatcher = dispatcher.with_milestone_sink(hook_milestone_sink);
-    let dispatcher = Arc::new(dispatcher);
+        .expect("install panicking observer")
+        .build_arc();
 
     let host = fixture
         .factory()
@@ -934,11 +928,10 @@ fn numeric_sum_dispatcher() -> Arc<HookDispatcher> {
     let evaluator = Arc::new(PredicateEvaluator::new());
     let hook = PredicateBackedBeforeCapabilityHook::new(hook_id, spec, evaluator);
 
-    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
-    dispatcher
+    HookDispatcherBuilder::new(HookRegistry::new())
         .install_installed_before_capability(hook_id, HookPhase::Policy, Box::new(hook))
-        .expect("Installed-tier predicate hook installs at policy phase");
-    Arc::new(dispatcher)
+        .expect("Installed-tier predicate hook installs at policy phase")
+        .build_arc()
 }
 
 #[tokio::test]

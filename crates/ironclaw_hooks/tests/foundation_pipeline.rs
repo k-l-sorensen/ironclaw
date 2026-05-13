@@ -9,7 +9,7 @@
 
 use async_trait::async_trait;
 use ironclaw_hooks::{
-    dispatch::HookDispatcher,
+    dispatch::HookDispatcherBuilder,
     identity::{ExtensionId, HookId, HookLocalId, HookVersion},
     manifest::{HookManifestBody, HookManifestEntry, HookManifestKind, HookManifestScope},
     ordering::{HookPhase, HookPriority},
@@ -81,14 +81,14 @@ async fn manifest_to_dispatch_pipeline() {
     // 3. The dispatcher consumes the binding and an installed impl. The
     //    Installed-tier installer constructs the binding internally and
     //    enforces the trust × phase × impl-tier pairing.
-    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
-    dispatcher
+    let dispatcher = HookDispatcherBuilder::new(HookRegistry::new())
         .install_installed_before_capability(
             hook_id,
             manifest_entry.phase,
             Box::new(DenyEverythingFromManifest),
         )
-        .expect("installed-tier hook installs at policy phase");
+        .expect("installed-tier hook installs at policy phase")
+        .build_arc();
 
     // 4. Dispatch sees the deny decision; the composed outcome reflects it.
     let ctx = BeforeCapabilityHookContext::new_unresolved(
