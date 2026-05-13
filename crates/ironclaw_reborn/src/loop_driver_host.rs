@@ -15,8 +15,9 @@ use ironclaw_host_runtime::{
     RuntimeCapabilityRequest, RuntimeFailureKind,
 };
 use ironclaw_loop_support::{
-    EmptyLoopCapabilityPort, HostManagedModelGateway, HostSkillContextSource,
-    ThreadBackedLoopContextPort, ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort,
+    EmptyLoopCapabilityPort, HostIdentityContextSource, HostManagedModelGateway,
+    HostSkillContextSource, ThreadBackedLoopContextPort, ThreadBackedLoopModelPort,
+    ThreadBackedLoopTranscriptPort,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
 
@@ -38,11 +39,11 @@ use ironclaw_turns::{
         LoopHostMilestoneSink, LoopInputBatch, LoopInputCursor, LoopInputPort,
         LoopModelBudgetAccountant, LoopModelGateway, LoopModelGatewayError,
         LoopModelGatewayRequest, LoopModelPolicyGuard, LoopModelPort, LoopModelRequest,
-        LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort,
-        LoopPromptBundle, LoopPromptBundleAuthority, LoopPromptBundleRequest, LoopPromptPort,
-        LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
-        NoOpBudgetAccountant, NoOpPolicyGuard, ProcessHandleSummary, StageCheckpointPayloadRequest,
-        UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
+        LoopPromptBundleAuthority, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
+        LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, NoOpBudgetAccountant,
+        NoOpPolicyGuard, ProcessHandleSummary, StageCheckpointPayloadRequest, UpdateAssistantDraft,
+        VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -942,6 +943,7 @@ where
     config: TextOnlyLoopHostConfig,
     skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
     safety_context: Option<InstructionSafetyContext>,
+    identity_context_source: Option<Arc<dyn HostIdentityContextSource>>,
 }
 
 impl<S, G> RebornLoopDriverHostFactory<S, G>
@@ -971,6 +973,7 @@ where
             config,
             skill_context_source: None,
             safety_context: None,
+            identity_context_source: None,
         }
     }
 
@@ -981,6 +984,14 @@ where
 
     pub fn with_safety_context(mut self, safety_context: InstructionSafetyContext) -> Self {
         self.safety_context = Some(safety_context);
+        self
+    }
+
+    pub fn with_identity_context_source(
+        mut self,
+        source: Arc<dyn HostIdentityContextSource>,
+    ) -> Self {
+        self.identity_context_source = Some(source);
         self
     }
 
@@ -1033,6 +1044,9 @@ where
         if let Some(source) = self.skill_context_source.as_ref() {
             context_adapter = context_adapter.with_skill_context_source(source.clone());
         }
+        if let Some(source) = self.identity_context_source.as_ref() {
+            context_adapter = context_adapter.with_identity_context_source(source.clone());
+        }
         let context: Arc<dyn LoopContextPort> = Arc::new(context_adapter);
         let instruction_materialization_store: Arc<dyn InstructionMaterializationStore> =
             Arc::new(InMemoryInstructionMaterializationStore::default());
@@ -1069,6 +1083,7 @@ where
             Arc::clone(&self.model_gateway),
             max_messages,
             self.skill_context_source.clone(),
+            self.identity_context_source.clone(),
             Some(Arc::clone(&instruction_materialization_store)),
             prompt_authority,
         ));
@@ -1160,6 +1175,7 @@ where
     host_gateway: Arc<G>,
     max_messages: usize,
     skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
+    identity_context_source: Option<Arc<dyn HostIdentityContextSource>>,
     instruction_materialization_store: Option<Arc<dyn InstructionMaterializationStore>>,
     prompt_authority: LoopPromptBundleAuthority,
 }
@@ -1175,6 +1191,7 @@ where
         host_gateway: Arc<G>,
         max_messages: usize,
         skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
+        identity_context_source: Option<Arc<dyn HostIdentityContextSource>>,
         instruction_materialization_store: Option<Arc<dyn InstructionMaterializationStore>>,
         prompt_authority: LoopPromptBundleAuthority,
     ) -> Self {
@@ -1184,6 +1201,7 @@ where
             host_gateway,
             max_messages,
             skill_context_source,
+            identity_context_source,
             instruction_materialization_store,
             prompt_authority,
         }
@@ -1210,6 +1228,9 @@ where
         .with_prompt_bundle_authority(self.prompt_authority.clone());
         if let Some(source) = self.skill_context_source.as_ref() {
             model_port = model_port.with_skill_context_source(source.clone());
+        }
+        if let Some(source) = self.identity_context_source.as_ref() {
+            model_port = model_port.with_identity_context_source(source.clone());
         }
         if let Some(store) = self.instruction_materialization_store.as_ref() {
             model_port = model_port.with_instruction_materialization_store(Arc::clone(store));
