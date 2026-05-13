@@ -20,8 +20,12 @@
 //! process counters and durable persistence are a separate slice.
 
 use std::collections::{HashMap, VecDeque};
+use std::str::FromStr;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use ironclaw_host_api::TenantId;
+use rust_decimal::Decimal;
 
 use crate::identity::HookId;
 use crate::points::BeforeCapabilityHookContext;
@@ -48,12 +52,18 @@ pub enum EvaluatorDecision {
 pub struct PredicateEvaluator {
     /// `(hook_id, capability_name)` → recent invocation timestamps.
     invocation_history: Mutex<HashMap<HistoryKey, VecDeque<Instant>>>,
+    /// `(tenant_id, hook_id, capability_name, field_path)` → recent
+    /// (timestamp, numeric value) entries for `NumericSum` accumulation.
+    /// Tenant-keyed so that one tenant's spend cannot affect another's
+    /// rolling cap.
+    value_history: Mutex<HashMap<ValueHistoryKey, VecDeque<(Instant, Decimal)>>>,
 }
 
 impl PredicateEvaluator {
     pub fn new() -> Self {
         Self {
             invocation_history: Mutex::new(HashMap::new()),
+            value_history: Mutex::new(HashMap::new()),
         }
     }
 
@@ -140,17 +150,69 @@ impl PredicateEvaluator {
                             EvaluatorDecision::Allow
                         }
                     }
-                    ValueOrRateBound::NumericSum { .. } => {
-                        // NumericSum requires inspection of capability
-                        // arguments, which the current hook context does not
-                        // expose. Surfaced as a known gap; evaluator allows
-                        // and emits a warn so misconfigurations are visible.
-                        tracing::warn!(
-                            "predicate evaluator received NumericSum bound; \
-                             argument-extraction support is not yet implemented \
-                             (allowing). Track via #3524 follow-up slices."
-                        );
-                        EvaluatorDecision::Allow
+                    ValueOrRateBound::NumericSum { max, field, window } => {
+                        let max_value = match Decimal::from_str(max.trim()) {
+                            Ok(v) => v,
+                            Err(_) => {
+                                tracing::debug!(
+                                    max,
+                                    "predicate evaluator could not parse NumericSum max; \
+                                     failing closed"
+                                );
+                                return restrictive_action(on_exceeded);
+                            }
+                        };
+                        let Some(window_dur) = parse_window(window) else {
+                            tracing::debug!(
+                                window,
+                                "predicate evaluator could not parse window; failing closed"
+                            );
+                            return restrictive_action(on_exceeded);
+                        };
+                        if !ctx.arguments.is_resolved() {
+                            tracing::debug!(
+                                capability = %ctx.capability_name,
+                                field = %field,
+                                "NumericSum predicate fired but capability arguments are \
+                                 unresolved; failing closed"
+                            );
+                            return restrictive_action(on_exceeded);
+                        }
+                        let Some(value) = ctx.arguments.extract_numeric(field) else {
+                            tracing::debug!(
+                                capability = %ctx.capability_name,
+                                field = %field,
+                                "NumericSum predicate fired but field is missing or non-numeric; \
+                                 failing closed"
+                            );
+                            return restrictive_action(on_exceeded);
+                        };
+                        let key = ValueHistoryKey {
+                            tenant_id: ctx.tenant_id.clone(),
+                            hook_id,
+                            capability: ctx.capability_name.clone(),
+                            field: field.clone(),
+                        };
+                        let mut history = self
+                            .value_history
+                            .lock()
+                            .expect("predicate value history mutex poisoned");
+                        let entries = history.entry(key).or_default();
+                        let cutoff = now.checked_sub(window_dur).unwrap_or(now);
+                        while let Some((ts, _)) = entries.front() {
+                            if *ts < cutoff {
+                                entries.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        entries.push_back((now, value));
+                        let sum: Decimal = entries.iter().map(|(_, v)| *v).sum();
+                        if sum > max_value {
+                            restrictive_action(on_exceeded)
+                        } else {
+                            EvaluatorDecision::Allow
+                        }
                     }
                 }
             }
@@ -169,6 +231,14 @@ struct HistoryKey {
     hook_id: HookId,
     tenant_id: ironclaw_host_api::TenantId,
     capability: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ValueHistoryKey {
+    tenant_id: TenantId,
+    hook_id: HookId,
+    capability: String,
+    field: String,
 }
 
 fn predicate_matches(predicate: &CapabilityPredicate, ctx: &BeforeCapabilityHookContext) -> bool {
@@ -255,7 +325,29 @@ mod tests {
     }
 
     fn ctx(capability: &str) -> BeforeCapabilityHookContext {
-        BeforeCapabilityHookContext::new(tenant(), capability.to_string(), [0u8; 32])
+        BeforeCapabilityHookContext::new_unresolved(tenant(), capability.to_string(), [0u8; 32])
+    }
+
+    fn ctx_with_args(capability: &str, args: serde_json::Value) -> BeforeCapabilityHookContext {
+        BeforeCapabilityHookContext::new(
+            tenant(),
+            capability.to_string(),
+            [0u8; 32],
+            crate::points::SanitizedArguments::from_json(args),
+        )
+    }
+
+    fn ctx_with_args_for_tenant(
+        tenant_id: TenantId,
+        capability: &str,
+        args: serde_json::Value,
+    ) -> BeforeCapabilityHookContext {
+        BeforeCapabilityHookContext::new(
+            tenant_id,
+            capability.to_string(),
+            [0u8; 32],
+            crate::points::SanitizedArguments::from_json(args),
+        )
     }
 
     fn hook_id() -> HookId {
@@ -434,6 +526,180 @@ mod tests {
         assert_eq!(parse_window("notvalid"), None);
         assert_eq!(parse_window(""), None);
         assert_eq!(parse_window("100"), None);
+    }
+
+    fn numeric_sum_spec(max: &str, field: &str, window: &str) -> HookPredicateSpec {
+        HookPredicateSpec::RateOrValueCap {
+            when: CapabilityPredicate::NameEquals {
+                name: "wallet.spend".to_string(),
+            },
+            bound: ValueOrRateBound::NumericSum {
+                max: max.to_string(),
+                field: field.to_string(),
+                window: window.to_string(),
+            },
+            on_exceeded: OnExceededAction::Deny {
+                reason: "cap exceeded".to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn numeric_sum_denies_after_total_exceeds_max() {
+        let evaluator = PredicateEvaluator::new();
+        let spec = numeric_sum_spec("100", "amount", "1h");
+        let now = Instant::now();
+        // 40 + 40 = 80, under cap
+        assert_eq!(
+            evaluator.evaluate_at(
+                hook_id(),
+                &spec,
+                &ctx_with_args("wallet.spend", serde_json::json!({"amount": "40"})),
+                now,
+            ),
+            EvaluatorDecision::Allow,
+        );
+        assert_eq!(
+            evaluator.evaluate_at(
+                hook_id(),
+                &spec,
+                &ctx_with_args("wallet.spend", serde_json::json!({"amount": "40"})),
+                now,
+            ),
+            EvaluatorDecision::Allow,
+        );
+        // Third spend pushes 120 > 100.
+        assert!(matches!(
+            evaluator.evaluate_at(
+                hook_id(),
+                &spec,
+                &ctx_with_args("wallet.spend", serde_json::json!({"amount": "40"})),
+                now,
+            ),
+            EvaluatorDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn numeric_sum_fails_closed_with_unresolved_args() {
+        let evaluator = PredicateEvaluator::new();
+        let spec = numeric_sum_spec("100", "amount", "1h");
+        // Unresolved args -> Deny, even though the cap is enormous relative to nothing.
+        assert!(matches!(
+            evaluator.evaluate(hook_id(), &spec, &ctx("wallet.spend")),
+            EvaluatorDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn numeric_sum_fails_closed_with_missing_field() {
+        let evaluator = PredicateEvaluator::new();
+        let spec = numeric_sum_spec("100", "amount", "1h");
+        assert!(matches!(
+            evaluator.evaluate(
+                hook_id(),
+                &spec,
+                &ctx_with_args("wallet.spend", serde_json::json!({"other": "5"})),
+            ),
+            EvaluatorDecision::Deny { .. }
+        ));
+    }
+
+    #[test]
+    fn numeric_sum_resets_after_window() {
+        let evaluator = PredicateEvaluator::new();
+        let spec = numeric_sum_spec("50", "amount", "10s");
+        let start = Instant::now();
+        // First call: 40 <= 50, allow.
+        assert_eq!(
+            evaluator.evaluate_at(
+                hook_id(),
+                &spec,
+                &ctx_with_args("wallet.spend", serde_json::json!({"amount": 40})),
+                start,
+            ),
+            EvaluatorDecision::Allow,
+        );
+        // Second call within window: 40 + 40 = 80 > 50, deny.
+        assert!(matches!(
+            evaluator.evaluate_at(
+                hook_id(),
+                &spec,
+                &ctx_with_args("wallet.spend", serde_json::json!({"amount": 40})),
+                start + Duration::from_secs(1),
+            ),
+            EvaluatorDecision::Deny { .. }
+        ));
+        // After window: prior entries trimmed; only the new 40 counts.
+        assert_eq!(
+            evaluator.evaluate_at(
+                hook_id(),
+                &spec,
+                &ctx_with_args("wallet.spend", serde_json::json!({"amount": 40})),
+                start + Duration::from_secs(20),
+            ),
+            EvaluatorDecision::Allow,
+        );
+    }
+
+    #[test]
+    fn numeric_sum_partitions_by_tenant() {
+        let evaluator = PredicateEvaluator::new();
+        let spec = numeric_sum_spec("50", "amount", "1h");
+        let now = Instant::now();
+        let alpha = TenantId::new("alpha").expect("ok");
+        let beta = TenantId::new("beta").expect("ok");
+        // alpha: 30 + 30 = 60 > 50 -> second spend denied.
+        assert_eq!(
+            evaluator.evaluate_at(
+                hook_id(),
+                &spec,
+                &ctx_with_args_for_tenant(
+                    alpha.clone(),
+                    "wallet.spend",
+                    serde_json::json!({"amount": 30}),
+                ),
+                now,
+            ),
+            EvaluatorDecision::Allow,
+        );
+        assert!(matches!(
+            evaluator.evaluate_at(
+                hook_id(),
+                &spec,
+                &ctx_with_args_for_tenant(
+                    alpha,
+                    "wallet.spend",
+                    serde_json::json!({"amount": 30}),
+                ),
+                now,
+            ),
+            EvaluatorDecision::Deny { .. }
+        ));
+        // beta has its own bucket and is unaffected by alpha's spend.
+        assert_eq!(
+            evaluator.evaluate_at(
+                hook_id(),
+                &spec,
+                &ctx_with_args_for_tenant(beta, "wallet.spend", serde_json::json!({"amount": 30}),),
+                now,
+            ),
+            EvaluatorDecision::Allow,
+        );
+    }
+
+    #[test]
+    fn numeric_sum_fails_closed_with_unparseable_max() {
+        let evaluator = PredicateEvaluator::new();
+        let spec = numeric_sum_spec("not-a-number", "amount", "1h");
+        assert!(matches!(
+            evaluator.evaluate(
+                hook_id(),
+                &spec,
+                &ctx_with_args("wallet.spend", serde_json::json!({"amount": 1})),
+            ),
+            EvaluatorDecision::Deny { .. }
+        ));
     }
 
     #[test]

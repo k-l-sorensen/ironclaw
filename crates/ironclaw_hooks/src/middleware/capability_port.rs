@@ -29,7 +29,8 @@ use ironclaw_turns::run_profile::{
 
 use crate::dispatch::{BeforeCapabilityDispatchOutcome, HookDispatcher};
 use crate::kinds::gate::GateDecisionInner;
-use crate::points::BeforeCapabilityHookContext;
+use crate::middleware::resolver::{CapabilityInputResolver, NullCapabilityInputResolver};
+use crate::points::{BeforeCapabilityHookContext, SanitizedArguments};
 
 /// Wraps an inner `LoopCapabilityPort`, fires `before_capability` hooks ahead
 /// of each invocation, and translates the dispatcher's composed decision into
@@ -38,9 +39,14 @@ pub struct HookedLoopCapabilityPort {
     inner: Arc<dyn LoopCapabilityPort>,
     dispatcher: Arc<HookDispatcher>,
     tenant_id: TenantId,
+    resolver: Arc<dyn CapabilityInputResolver>,
 }
 
 impl HookedLoopCapabilityPort {
+    /// Construct a middleware with the bundled
+    /// [`NullCapabilityInputResolver`]. Predicate evaluators that depend on
+    /// argument contents (e.g., `ValueOrRateBound::NumericSum`) will fail
+    /// closed; use [`Self::with_resolver`] to wire in a production resolver.
     pub fn new(
         inner: Arc<dyn LoopCapabilityPort>,
         dispatcher: Arc<HookDispatcher>,
@@ -50,14 +56,28 @@ impl HookedLoopCapabilityPort {
             inner,
             dispatcher,
             tenant_id,
+            resolver: Arc::new(NullCapabilityInputResolver),
         }
     }
 
-    fn hook_context(&self, invocation: &CapabilityInvocation) -> BeforeCapabilityHookContext {
+    /// Override the resolver used to surface sanitized arguments to hook
+    /// predicates. Returns `self` so callers can chain after `new`.
+    #[must_use]
+    pub fn with_resolver(mut self, resolver: Arc<dyn CapabilityInputResolver>) -> Self {
+        self.resolver = resolver;
+        self
+    }
+
+    async fn hook_context(&self, invocation: &CapabilityInvocation) -> BeforeCapabilityHookContext {
+        let arguments = match self.resolver.resolve(invocation).await {
+            Some(value) => SanitizedArguments::from_json(value),
+            None => SanitizedArguments::unresolved(),
+        };
         BeforeCapabilityHookContext::new(
             self.tenant_id.clone(),
             invocation.capability_id.to_string(),
             invocation_arguments_digest(invocation),
+            arguments,
         )
     }
 
@@ -65,7 +85,7 @@ impl HookedLoopCapabilityPort {
         &self,
         invocation: &CapabilityInvocation,
     ) -> BeforeCapabilityDispatchOutcome {
-        let ctx = self.hook_context(invocation);
+        let ctx = self.hook_context(invocation).await;
         self.dispatcher.dispatch_before_capability(&ctx).await
     }
 }

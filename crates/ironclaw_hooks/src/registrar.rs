@@ -161,7 +161,11 @@ mod tests {
 
         // Dispatch and confirm the registered predicate fires.
         let tenant = ironclaw_host_api::TenantId::new("alpha").expect("tenant");
-        let ctx = BeforeCapabilityHookContext::new(tenant, "shell.exec".to_string(), [0u8; 32]);
+        let ctx = BeforeCapabilityHookContext::new_unresolved(
+            tenant,
+            "shell.exec".to_string(),
+            [0u8; 32],
+        );
         let outcome = dispatcher.dispatch_before_capability(&ctx).await;
         assert!(!outcome.decision.permits());
     }

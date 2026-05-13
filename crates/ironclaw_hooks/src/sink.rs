@@ -351,7 +351,7 @@ mod tests {
         }
 
         let mut recording = RecordingGateSink::new();
-        let ctx = BeforeCapabilityHookContext::new(
+        let ctx = BeforeCapabilityHookContext::new_unresolved(
             ironclaw_host_api::TenantId::new("t".to_string()).expect("valid tenant"),
             "cap.x".to_string(),
             [0u8; 32],
@@ -377,7 +377,7 @@ mod tests {
         }
 
         let mut recording = RecordingGateSink::new();
-        let ctx = BeforeCapabilityHookContext::new(
+        let ctx = BeforeCapabilityHookContext::new_unresolved(
             ironclaw_host_api::TenantId::new("t".to_string()).expect("valid tenant"),
             "cap.x".to_string(),
             [0u8; 32],
@@ -403,7 +403,7 @@ mod tests {
         }
 
         let mut recording = RecordingGateSink::new();
-        let ctx = BeforeCapabilityHookContext::new(
+        let ctx = BeforeCapabilityHookContext::new_unresolved(
             ironclaw_host_api::TenantId::new("t".to_string()).expect("valid tenant"),
             "cap.x".to_string(),
             [0u8; 32],

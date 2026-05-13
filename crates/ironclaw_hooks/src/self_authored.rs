@@ -373,7 +373,11 @@ mod tests {
         let prov = provenance(&spec);
         let hook = SelfAuthoredBeforeCapabilityHook::new(hook_id(), spec, prov);
 
-        let ctx = BeforeCapabilityHookContext::new(tenant(), "shell.exec".to_string(), [0u8; 32]);
+        let ctx = BeforeCapabilityHookContext::new_unresolved(
+            tenant(),
+            "shell.exec".to_string(),
+            [0u8; 32],
+        );
         let mut sink = RecordingSelfAuthoredSink::new();
         hook.evaluate(&ctx, &mut sink);
         match &sink.state {
@@ -382,8 +386,11 @@ mod tests {
         }
 
         // A non-matching capability passes.
-        let ctx_other =
-            BeforeCapabilityHookContext::new(tenant(), "memory.read".to_string(), [0u8; 32]);
+        let ctx_other = BeforeCapabilityHookContext::new_unresolved(
+            tenant(),
+            "memory.read".to_string(),
+            [0u8; 32],
+        );
         let mut sink_other = RecordingSelfAuthoredSink::new();
         hook.evaluate(&ctx_other, &mut sink_other);
         assert_eq!(sink_other.state, GateSinkState::Passed);
