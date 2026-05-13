@@ -761,12 +761,9 @@ fn invocation_idempotency_key(
 
 /// Derive a `CapabilityConcurrency` from a registry `CapabilityDescriptor`.
 ///
-/// Iter-8 finding 1 fix: the loop framework's batch policy needs to know which
-/// calls inside a batch must run alone (filesystem writes, shell, approval-
-/// gated work). Mirror the conservative-default rule from the executor here:
-/// any side-effecting effect or `default_permission = Ask` forces `Exclusive`.
-/// Read-only descriptors keep `SafeForParallel` so simple read fan-outs still
-/// parallelize.
+/// Any side-effecting effect or `default_permission = Ask` forces `Exclusive`
+/// so the framework's batch policy stops on first suspension. Read-only
+/// descriptors keep `SafeForParallel` so simple read fan-outs still parallelize.
 fn capability_concurrency_for(descriptor: &CapabilityDescriptor) -> CapabilityConcurrency {
     if matches!(descriptor.default_permission, PermissionMode::Ask) {
         return CapabilityConcurrency::Exclusive;
@@ -1626,12 +1623,11 @@ impl LoopCheckpointPort for HostManagedLoopCheckpointPort {
         &self,
         request: StoreLoopCheckpointPayload,
     ) -> Result<LoopCheckpointStateRef, AgentLoopHostError> {
-        // Iter-5 finding 3: thread the active run profile's
-        // `max_checkpoint_bytes` cap into the store so profiles that opt
-        // into larger checkpoints (durable mission = 256 KiB) aren't
-        // silently rejected by the legacy 64 KiB default in
-        // `CheckpointStateStore`. The store still enforces an absolute
-        // system ceiling on top of this.
+        // Thread the active run profile's `max_checkpoint_bytes` cap into
+        // the store so profiles that opt into larger checkpoints (durable
+        // mission = 256 KiB) aren't silently rejected by the store's legacy
+        // default. The store still enforces an absolute system ceiling on
+        // top of this.
         let profile_cap = self
             .run_context
             .resolved_run_profile

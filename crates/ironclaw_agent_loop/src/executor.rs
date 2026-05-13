@@ -3918,7 +3918,6 @@ mod tests {
     async fn drain_followup_returns_control_pending_not_empty_at_poll_limit() {
         let gate_ref = LoopGateRef::new("gate:lots-of-control").unwrap();
         let mut batches: Vec<Vec<LoopInput>> = Vec::new();
-        // iter 1 prologue.
         batches.push(Vec::new());
         batches.push(Vec::new());
         // `INPUT_POLL_LIMIT` consecutive control-only pages for
@@ -3928,7 +3927,6 @@ mod tests {
                 gate_ref: gate_ref.clone(),
             }]);
         }
-        // iter 2 prologue + drain — clean tick.
         batches.push(Vec::new());
         batches.push(Vec::new());
         batches.push(Vec::new());
