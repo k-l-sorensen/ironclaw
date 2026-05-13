@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::HookError;
 use crate::identity::{HookId, HookVersion};
-use crate::ordering::HookPhase;
+use crate::ordering::{HookPhase, HookPriority};
 use crate::trust::HookTrustClass;
 
 /// A single hook registration for an active run.
@@ -24,6 +24,13 @@ pub struct HookBinding {
     pub hook_version: HookVersion,
     pub trust_class: HookTrustClass,
     pub phase: HookPhase,
+    /// Author-chosen ordering tiebreaker within a phase. The dispatcher
+    /// composes `(phase, priority, hook_id)` into [`HookOrderKey`] so two
+    /// hooks at the same phase order deterministically by priority then
+    /// content-addressed id. Defaults to [`HookPriority::DEFAULT`] for
+    /// checkpoint payloads serialized before this field existed.
+    #[serde(default = "default_priority")]
+    pub priority: HookPriority,
     /// Coarse description of where the hook fires. The actual hook
     /// implementation (the trait object) is stored separately so this type
     /// remains serializable for checkpoint payloads.
@@ -106,6 +113,10 @@ impl HookBindingScope {
     }
 }
 
+fn default_priority() -> HookPriority {
+    HookPriority::DEFAULT
+}
+
 /// Identifies which dispatcher point a binding registers against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -176,6 +187,22 @@ impl HookRegistry {
         Ok(())
     }
 
+    /// Apply a manifest-declared priority to an already-inserted binding.
+    /// No-op if the hook id is not registered. Used by the registrar
+    /// post-install (the tier-specific installers default priority to
+    /// `HookPriority::DEFAULT` and the registrar then sets the
+    /// manifest value).
+    pub fn set_priority(&mut self, hook_id: HookId, priority: HookPriority) {
+        for bindings in self.by_point.values_mut() {
+            for binding in bindings.iter_mut() {
+                if binding.hook_id == hook_id {
+                    binding.priority = priority;
+                    return;
+                }
+            }
+        }
+    }
+
     /// Active (non-poisoned) bindings at a point.
     pub fn active_at(&self, point: HookPointSpec) -> impl Iterator<Item = &HookBinding> {
         self.by_point
@@ -230,6 +257,7 @@ mod tests {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Installed,
             phase,
+            priority: HookPriority::DEFAULT,
             point,
             owning_extension: None,
             scope: HookBindingScope::Global,
@@ -281,6 +309,7 @@ mod tests {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Installed,
             phase: HookPhase::Policy,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,
@@ -306,6 +335,7 @@ mod tests {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Installed,
             phase: HookPhase::Telemetry,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::AfterCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,

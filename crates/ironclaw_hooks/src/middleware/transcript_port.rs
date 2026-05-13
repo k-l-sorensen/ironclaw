@@ -94,6 +94,7 @@ impl LoopTranscriptPort for HookedLoopTranscriptPort {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ordering::HookPriority;
     use crate::dispatch::ObserverHookImpl;
     use crate::identity::{HookId, HookVersion};
     use crate::kinds::observer::NoteCategory;
@@ -186,6 +187,7 @@ mod tests {
                 hook_version: HookVersion::ONE,
                 trust_class: HookTrustClass::Builtin,
                 phase: HookPhase::Telemetry,
+                priority: HookPriority::DEFAULT,
                 point: HookPointSpec::AfterModel,
                 owning_extension: None,
                 scope: crate::registry::HookBindingScope::Global,

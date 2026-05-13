@@ -21,7 +21,7 @@ use crate::identity::HookVersion;
 use crate::kinds::gate::{BeforeCapabilityHookDecision, GateDecisionInner};
 use crate::kinds::mutator::HookPatch;
 use crate::kinds::observer::ObserverFact;
-use crate::ordering::{HookOrderKey, HookPhase};
+use crate::ordering::{HookOrderKey, HookPhase, HookPriority};
 use crate::points::{BeforeCapabilityHookContext, BeforePromptHookContext, ObserverHookContext};
 use crate::registry::{HookBinding, HookBindingScope, HookPointSpec, HookRegistry};
 use crate::sink::{
@@ -206,6 +206,22 @@ impl HookDispatcher {
         registry.insert(binding)
     }
 
+    /// Update an already-inserted binding's `priority` field. The registrar
+    /// uses this to apply the manifest-declared priority after the
+    /// tier-specific installer creates the binding with the default. No-op
+    /// when the hook is not registered.
+    ///
+    /// Why this is split from the installer: the tier-specific installers
+    /// take `(hook_id, phase, ...)` but not priority — adding priority to
+    /// every installer signature would churn ~40 call sites for a value
+    /// that's only ever non-default on the manifest path. The registrar is
+    /// the only caller that knows the manifest priority, so it sets it
+    /// post-insert.
+    pub(crate) fn set_binding_priority(&mut self, hook_id: HookId, priority: HookPriority) {
+        let mut registry = self.registry.lock().expect("hook registry mutex poisoned");
+        registry.set_priority(hook_id, priority);
+    }
+
     /// Internal: register a hook implementation against an existing binding.
     /// All public installers route through this; the public surface enforces
     /// trust-tier × impl-tier pairing at the type level.
@@ -246,6 +262,7 @@ impl HookDispatcher {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Builtin,
             phase,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,
@@ -269,6 +286,7 @@ impl HookDispatcher {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Trusted,
             phase,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,
@@ -301,6 +319,7 @@ impl HookDispatcher {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Installed,
             phase,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
             owning_extension: Some(owning_extension),
             scope,
@@ -324,6 +343,7 @@ impl HookDispatcher {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Builtin,
             phase,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforePrompt,
             owning_extension: None,
             scope: HookBindingScope::Global,
@@ -345,6 +365,7 @@ impl HookDispatcher {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Trusted,
             phase,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforePrompt,
             owning_extension: None,
             scope: HookBindingScope::Global,
@@ -368,6 +389,7 @@ impl HookDispatcher {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Installed,
             phase,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforePrompt,
             owning_extension: Some(owning_extension),
             scope,
@@ -401,6 +423,7 @@ impl HookDispatcher {
             hook_version: HookVersion::ONE,
             trust_class,
             phase,
+            priority: HookPriority::DEFAULT,
             point,
             owning_extension,
             scope,
@@ -476,7 +499,7 @@ impl HookDispatcher {
     ) -> BeforeCapabilityDispatchOutcome {
         let ordered = self.ordered_bindings(HookPointSpec::BeforeCapability);
         let mut composed = BeforeCapabilityHookDecision::allow();
-        let mut observer_facts = Vec::new();
+        let observer_facts = Vec::new();
         let mut failures = Vec::new();
         let mut short_circuited = false;
 
@@ -561,15 +584,14 @@ impl HookDispatcher {
             }
         }
 
-        // Drain observer-only telemetry hooks at this point (separate from
-        // before_capability dispatch — observer impls are stored in
-        // `observers` and resolved by their bindings in another map).
-        let telemetry_outcome = self
-            .dispatch_observer_at(HookPointSpec::AfterCapability, ctx.tenant_id.clone())
-            .await;
-        observer_facts.extend(telemetry_outcome.facts);
-        failures.extend(telemetry_outcome.failures);
-
+        // NOTE: `AfterCapability` observers are NOT drained here. They fire
+        // *after* the capability actually executes, which is a different
+        // moment than the end of `before_capability` dispatch. The middleware
+        // (`HookedLoopCapabilityPort`) is responsible for invoking
+        // `dispatch_observer_at(AfterCapability, ...)` once the inner port
+        // returns. Observers that need to run *before* the capability
+        // invocation should register at `BeforeCapability` phase
+        // `Telemetry`.
         BeforeCapabilityDispatchOutcome {
             decision: composed,
             observer_facts,
@@ -652,9 +674,16 @@ impl HookDispatcher {
                     crate::points::observer::ObservedKind::AfterCheckpoint
                 }
                 _ => {
-                    // Non-observer point passed in; return empty outcome and
-                    // record a protocol violation against the dispatcher's own
-                    // configuration (this is a bug in the caller).
+                    // Non-observer point passed in: a bug in the dispatcher's
+                    // own caller (we should never reach this arm from
+                    // production paths). Log so the bug is visible without
+                    // crashing the loop.
+                    tracing::error!(
+                        ?point,
+                        "dispatch_observer_at called with non-observer point; \
+                         returning empty outcome (this indicates a dispatcher \
+                         wiring bug)"
+                    );
                     return ObserverDispatchOutcome { facts, failures };
                 }
             },
@@ -1261,6 +1290,7 @@ mod tests {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Installed,
             phase,
+            priority: HookPriority::DEFAULT,
             point,
             owning_extension: None,
             scope: HookBindingScope::Global,
@@ -1497,6 +1527,7 @@ mod tests {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Builtin,
             phase: HookPhase::Validation,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,
@@ -1608,6 +1639,7 @@ mod tests {
                 hook_version: HookVersion::ONE,
                 trust_class: HookTrustClass::Installed,
                 phase: HookPhase::Policy,
+                priority: HookPriority::DEFAULT,
                 point: HookPointSpec::BeforePrompt,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
@@ -1636,6 +1668,7 @@ mod tests {
                 hook_version: HookVersion::ONE,
                 trust_class: HookTrustClass::Builtin,
                 phase: HookPhase::Telemetry,
+                priority: HookPriority::DEFAULT,
                 point: HookPointSpec::AfterModel,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
@@ -2032,6 +2065,7 @@ mod tests {
                 hook_version: HookVersion::ONE,
                 trust_class: HookTrustClass::Installed,
                 phase: HookPhase::Policy,
+                priority: HookPriority::DEFAULT,
                 point: HookPointSpec::BeforePrompt,
                 owning_extension: None,
                 scope: HookBindingScope::Global,

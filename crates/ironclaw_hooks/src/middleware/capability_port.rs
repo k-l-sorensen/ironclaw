@@ -152,10 +152,22 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
         request: CapabilityInvocation,
     ) -> Result<CapabilityOutcome, AgentLoopHostError> {
         let outcome = self.run_dispatch(&request).await;
-        match self.decision_to_outcome(&outcome).await {
+        let result = match self.decision_to_outcome(&outcome).await {
             Some(translated) => Ok(translated),
             None => self.inner.invoke_capability(request).await,
-        }
+        };
+        // Fire AfterCapability observers regardless of whether the hook
+        // short-circuited or the inner port ran. Observer-only point — no
+        // gate decisions composed here. Telemetry must reflect both denied
+        // and allowed invocations.
+        let _ = self
+            .dispatcher
+            .dispatch_observer_at(
+                crate::registry::HookPointSpec::AfterCapability,
+                self.tenant_id.clone(),
+            )
+            .await;
+        result
     }
 
     async fn invoke_capability_batch(
@@ -271,6 +283,7 @@ fn invocation_arguments_digest(invocation: &CapabilityInvocation) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ordering::HookPriority;
     use crate::dispatch::BeforeCapabilityHookImpl;
     use crate::identity::{ExtensionId, HookId, HookLocalId, HookVersion};
     use crate::ordering::HookPhase;
@@ -405,6 +418,7 @@ mod tests {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Installed,
             phase: HookPhase::Policy,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,
@@ -462,6 +476,7 @@ mod tests {
             hook_version: HookVersion::ONE,
             trust_class: HookTrustClass::Installed,
             phase: HookPhase::Policy,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,

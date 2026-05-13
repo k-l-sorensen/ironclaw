@@ -177,6 +177,7 @@ fn synthesize_hook_message_ref(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ordering::HookPriority;
     use crate::dispatch::BeforePromptHookImpl;
     use crate::identity::{ExtensionId, HookId, HookLocalId, HookVersion};
     use crate::kinds::mutator::PatchOrdinalHint;
@@ -226,6 +227,7 @@ mod tests {
                 .expect("ok"),
                 messages: Vec::new(),
                 surface_version: None,
+                instruction_fingerprint: None,
             })
         }
     }
@@ -242,6 +244,7 @@ mod tests {
             hook_version: HookVersion::ONE,
             trust_class,
             phase: HookPhase::Policy,
+            priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforePrompt,
             owning_extension: None,
             scope: crate::registry::HookBindingScope::Global,

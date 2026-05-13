@@ -34,8 +34,9 @@ use ironclaw_turns::{
         AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, BeginAssistantDraft,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
         CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityFailure,
-        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceVersion,
-        FinalizeAssistantMessage, HostManagedLoopPromptPort, LoopCapabilityPort,
+        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, FinalizeAssistantMessage,
+        HostManagedLoopPromptPort, InMemoryInstructionMaterializationStore,
+        InstructionMaterializationStore, InstructionSafetyContext, LoopCapabilityPort,
         LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle, LoopContextPort,
         LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputBatch,
         LoopInputCursor, LoopInputPort, LoopModelPort, LoopModelRequest, LoopModelResponse,
@@ -92,22 +93,22 @@ pub struct RebornLoopDriverHostRequest {
 
 #[derive(Default)]
 struct CapabilitySurfaceState {
-    current: Mutex<Option<CapabilitySurfaceVersion>>,
+    current: Mutex<Option<VisibleCapabilitySurface>>,
 }
 
 impl CapabilitySurfaceState {
-    fn set_current(&self, version: CapabilitySurfaceVersion) -> Result<(), AgentLoopHostError> {
+    fn set_current(&self, surface: VisibleCapabilitySurface) -> Result<(), AgentLoopHostError> {
         let mut current = self.current.lock().map_err(|_| {
             AgentLoopHostError::new(
                 AgentLoopHostErrorKind::Unavailable,
                 "capability surface state is unavailable",
             )
         })?;
-        *current = Some(version);
+        *current = Some(surface);
         Ok(())
     }
 
-    fn current(&self) -> Result<Option<CapabilitySurfaceVersion>, AgentLoopHostError> {
+    fn current(&self) -> Result<Option<VisibleCapabilitySurface>, AgentLoopHostError> {
         self.current
             .lock()
             .map(|current| current.clone())
@@ -141,7 +142,7 @@ impl LoopCapabilityPort for SurfaceTrackingLoopCapabilityPort {
         request: VisibleCapabilityRequest,
     ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
         let surface = self.inner.visible_capabilities(request).await?;
-        self.surface_state.set_current(surface.version.clone())?;
+        self.surface_state.set_current(surface.clone())?;
         Ok(surface)
     }
 
@@ -1072,6 +1073,7 @@ where
     /// argument-dependent predicates (e.g., `NumericSum`) evaluate against
     /// real capability arguments instead of failing closed.
     capability_input_resolver: Option<Arc<dyn LoopCapabilityInputResolver>>,
+    safety_context: Option<InstructionSafetyContext>,
 }
 
 impl<S, G> RebornLoopDriverHostFactory<S, G>
@@ -1100,6 +1102,7 @@ where
             skill_context_source: None,
             hook_dispatcher_factory: None,
             capability_input_resolver: None,
+            safety_context: None,
         }
     }
 
@@ -1183,6 +1186,11 @@ where
         self.with_hook_dispatcher(builder.build_arc())
     }
 
+    pub fn with_safety_context(mut self, safety_context: InstructionSafetyContext) -> Self {
+        self.safety_context = Some(safety_context);
+        self
+    }
+
     pub fn with_model_route_resolver<R>(mut self, resolver: Arc<R>) -> Self
     where
         R: ModelRouteResolver + 'static,
@@ -1228,7 +1236,8 @@ where
             .hook_dispatcher_factory
             .as_ref()
             .map(|factory| factory());
-
+        let instruction_materialization_store: Arc<dyn InstructionMaterializationStore> =
+            Arc::new(InMemoryInstructionMaterializationStore::default());
         let surface_state = Arc::new(CapabilitySurfaceState::default());
         let mut capabilities: Arc<dyn LoopCapabilityPort> = Arc::new(
             SurfaceTrackingLoopCapabilityPort::new(capabilities, Arc::clone(&surface_state)),
@@ -1256,15 +1265,18 @@ where
                 reason: error.safe_summary,
             })?;
         let surface_state_for_prompt = Arc::clone(&surface_state);
-        let mut prompt: Arc<dyn LoopPromptPort> = Arc::new(
-            HostManagedLoopPromptPort::new(
-                run_context.clone(),
-                Arc::clone(&context),
-                Arc::clone(&self.milestone_sink),
-            )
-            .with_default_message_limit(max_messages)
-            .with_current_surface_version_lookup(move || surface_state_for_prompt.current()),
-        );
+        let mut prompt_port = HostManagedLoopPromptPort::new(
+            run_context.clone(),
+            Arc::clone(&context),
+            Arc::clone(&self.milestone_sink),
+        )
+        .with_default_message_limit(max_messages)
+        .with_current_surface_lookup(move || surface_state_for_prompt.current())
+        .with_instruction_materialization_store(Arc::clone(&instruction_materialization_store));
+        if let Some(safety_context) = self.safety_context.clone() {
+            prompt_port = prompt_port.with_safety_context(safety_context);
+        }
+        let mut prompt: Arc<dyn LoopPromptPort> = Arc::new(prompt_port);
         if let Some(dispatcher) = per_build_dispatcher.as_ref() {
             prompt = Arc::new(HookedLoopPromptPort::new(
                 Arc::clone(&prompt),
@@ -1285,6 +1297,8 @@ where
         if let Some(source) = self.skill_context_source.as_ref() {
             model_adapter = model_adapter.with_skill_context_source(source.clone());
         }
+        model_adapter =
+            model_adapter.with_instruction_materialization_store(instruction_materialization_store);
         let mut model: Arc<dyn LoopModelPort> = Arc::new(model_adapter);
         let mut checkpoint: Arc<dyn LoopCheckpointPort> =
             Arc::new(HostManagedLoopCheckpointPort::new(

@@ -59,9 +59,10 @@ impl HookId {
     }
 
     pub fn to_hex(&self) -> String {
+        use std::fmt::Write;
         let mut s = String::with_capacity(64);
         for byte in self.0 {
-            s.push_str(&format!("{byte:02x}"));
+            write!(s, "{byte:02x}").expect("writing to String never fails");
         }
         s
     }
@@ -69,13 +70,13 @@ impl HookId {
 
 impl fmt::Debug for HookId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Display only the first 8 bytes for log readability; full hex via
+        // Display only the first 4 bytes for log readability; full hex via
         // to_hex(). Avoids dumping 64-char strings into trace logs.
-        let mut head = String::with_capacity(16);
+        write!(f, "HookId(")?;
         for byte in self.0.iter().take(4) {
-            head.push_str(&format!("{byte:02x}"));
+            write!(f, "{byte:02x}")?;
         }
-        write!(f, "HookId({head}…)")
+        write!(f, "…)")
     }
 }
 

@@ -161,15 +161,19 @@ impl HookRegistrar {
                         spec,
                         Arc::clone(&self.evaluator),
                     );
-                    builder
-                        .dispatcher_mut()
-                        .install_installed_before_capability(
-                            hook_id,
-                            entry.phase,
-                            owning_extension.clone(),
-                            binding_scope,
-                            Box::new(hook),
-                        )?;
+                    let dispatcher = builder.dispatcher_mut();
+                    dispatcher.install_installed_before_capability(
+                        hook_id,
+                        entry.phase,
+                        owning_extension.clone(),
+                        binding_scope,
+                        Box::new(hook),
+                    )?;
+                    // Apply the manifest-declared priority. The installer
+                    // defaults to `HookPriority::DEFAULT`; the registrar is
+                    // the only path that knows the manifest's `priority`
+                    // field, so we set it post-insert.
+                    dispatcher.set_binding_priority(hook_id, entry.priority);
                 }
                 other => {
                     return Err(HookError::RegistryConstruction(format!(
