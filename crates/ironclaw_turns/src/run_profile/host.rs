@@ -223,10 +223,10 @@ bounded_loop_ref!(LoopProcessRef, "loop process ref", "process:", 256);
 impl LoopCheckpointStateRef {
     /// Sentinel ref used by the canonical executor when a host's
     /// `LoopCheckpointPort::store_checkpoint_payload` returns `Unavailable`
-    /// (the default trait impl for legacy hosts that have not yet migrated
-    /// to the store-then-checkpoint contract). The legacy host's
-    /// `checkpoint()` impl is expected to ignore the ref entirely. Master
-    /// spec §10 / WS-6 iter-7 finding 3.
+    /// (the default trait impl for legacy hosts that have not yet
+    /// migrated to the store-then-checkpoint contract). The legacy
+    /// host's `checkpoint()` impl is expected to ignore the ref entirely
+    /// (master spec §10).
     pub fn legacy_unknown() -> Self {
         Self("checkpoint:unknown".to_string())
     }
@@ -907,10 +907,9 @@ pub struct CapabilityDescriptorView {
     /// / `ModifyBudget`, or whose `default_permission` is `Ask`, must report
     /// `Exclusive`. If the host can't tell, `Exclusive` is the safe default.
     ///
-    /// Iter-9 finding 2: `#[serde(default)]` so older
-    /// `VisibleCapabilitySurface` payloads, recorded events, and pre-WS-6
-    /// hosts that don't populate this field still deserialize. The default
-    /// of `CapabilityConcurrency::Exclusive` is the conservative choice —
+    /// `#[serde(default)]` so older `VisibleCapabilitySurface` payloads
+    /// and hosts that don't populate this field still deserialize. The
+    /// default of `CapabilityConcurrency::Exclusive` is conservative —
     /// missing data is treated as "must run alone".
     #[serde(default)]
     pub concurrency: CapabilityConcurrency,
@@ -1302,11 +1301,9 @@ fn unsupported_host_method(method: &'static str) -> AgentLoopHostError {
 mod tests {
     use super::*;
 
-    /// Iter-9 finding 2: `CapabilityDescriptorView::concurrency` must
-    /// `#[serde(default)]` so older payloads (pre-WS-6 hosts, recorded
-    /// events, persisted surface snapshots) deserialize. Missing field
-    /// → `CapabilityConcurrency::Exclusive`, the conservative default
-    /// per the field doc.
+    /// `CapabilityDescriptorView::concurrency` is `#[serde(default)]` so
+    /// older payloads without the field deserialize as
+    /// `CapabilityConcurrency::Exclusive` (the conservative default).
     #[test]
     fn capability_descriptor_view_missing_concurrency_defaults_to_exclusive() {
         let legacy_json = serde_json::json!({
@@ -1315,9 +1312,7 @@ mod tests {
             "runtime": "wasm",
             "safe_name": "test",
             "safe_description": "test capability"
-            // NOTE: `concurrency` field intentionally absent — this is
-            // exactly the shape a pre-WS-6 host or replayed older event
-            // would produce.
+            // `concurrency` field intentionally absent.
         });
         let view: CapabilityDescriptorView = serde_json::from_value(legacy_json)
             .expect("legacy payload without concurrency must deserialize");

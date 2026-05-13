@@ -128,23 +128,12 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
         state: &mut LoopExecutionState,
     ) -> Result<LoopExit, AgentLoopExecutorError> {
         let mut next = state.clone();
-        // In-process anchor for `BudgetStrategy::wall_clock_limit`
-        // enforcement. The executor consults this at the top of every tick
-        // (alongside `iteration_limit`) so a profile that opts into a time
-        // cap can fail out even when the model+capability pipeline would
-        // otherwise keep producing forward progress. Master spec §6 /
-        // WS-6 iter-5 finding 2.
-        //
-        // Iter-6 finding 1: the persisted `started_at_unix_ms` anchor
-        // (carried in `LoopExecutionState`) survives `Blocked` / process
-        // restart / checkpoint reload, while this `tokio::time::Instant`
-        // does not. We set the persisted anchor on first entry only, and
-        // consult it AS WELL AS the in-process `Instant` so that:
-        //   - a fresh run anchors both at the same wall-clock moment;
-        //   - a resumed run with an already-old `started_at_unix_ms`
-        //     trips the cap as soon as the first tick observes
-        //     `SystemTime::now() - started_at >= limit`, even though the
-        //     fresh `Instant` would otherwise reset the budget.
+        // The persisted `started_at_unix_ms` anchor survives `Blocked` /
+        // process restart / checkpoint reload, while this in-process
+        // `tokio::time::Instant` does not. Both are consulted at the top
+        // of every tick so a fresh run anchors at the same moment and a
+        // resumed run with an already-old `started_at_unix_ms` trips
+        // the cap immediately rather than getting a brand-new budget.
         let start_time = tokio::time::Instant::now();
         if next.started_at_unix_ms.is_none() {
             next.started_at_unix_ms = Some(system_time_now_unix_ms());
@@ -152,10 +141,9 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
 
         loop {
             if next.iteration >= planner.budget().iteration_limit(&next) {
-                // Iter-5 finding 4: take a `Final` checkpoint before failing
-                // so profiles with `require_final_checkpoint = true` (durable
-                // mission) don't reject the failure as
-                // `MissingFinalCheckpoint`.
+                // Take `Final` before failing so profiles with
+                // `require_final_checkpoint = true` don't reject the
+                // failure as `MissingFinalCheckpoint`.
                 let checked = self.checkpoint(host, next, CheckpointKind::Final).await?;
                 *state = checked;
                 return Ok(LoopExit::Failed {
@@ -231,13 +219,11 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                     continue;
                 }
                 ModelStep::SkipIteration(skip_state) => {
-                    // Iter-5 finding 1: a recovery `SkipResult` on a model
-                    // error must advance the iteration counter so the
-                    // outer cap eventually trips. Drop the cached surface
-                    // version (the next iteration will re-fetch) and tick
-                    // the counter. Without this, a persistent transient
-                    // model failure under a SkipResult-returning recovery
-                    // strategy spins forever.
+                    // A recovery `SkipResult` on a persistent model error
+                    // must advance the iteration counter so the outer cap
+                    // eventually trips. Drop the cached surface version
+                    // and tick the counter; otherwise a SkipResult-returning
+                    // recovery against a persistent failure spins forever.
                     next = skip_state;
                     next.surface_version = None;
                     next.iteration = next.iteration.saturating_add(1);
@@ -245,12 +231,9 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                     continue;
                 }
                 ModelStep::Exit(exit_state, exit) => {
-                    // Iter-5 finding 4: a `Failed` terminal exit MUST carry a
-                    // `Final` checkpoint. `Cancelled` already took one inside
-                    // `invoke_model_with_recovery`'s Cancelled branch, so we
-                    // only need to handle the `Failed` shape here. Same logic
-                    // applies symmetrically to capability `Step::Exit` paths
-                    // below.
+                    // A `Failed` terminal exit must carry a `Final`
+                    // checkpoint. `Cancelled` already took one inside
+                    // `invoke_model_with_recovery`'s Cancelled branch.
                     let (checked, exit) = self
                         .final_checkpoint_for_failure(host, exit_state, exit)
                         .await?;
@@ -293,25 +276,14 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                                     continue;
                                 }
                                 FollowupDrainOutcome::TerminalCancel { next_cursor } => {
-                                    // Cancel/Interrupt arrived in the drain
-                                    // page (potentially mixed with a
-                                    // FollowUp). Iter-6 finding 2: take the
-                                    // `Final` checkpoint FIRST, then ack
-                                    // the page. If the checkpoint fails we
-                                    // surface the error without acking so
-                                    // the next `execute()` re-polls the
-                                    // cancel.
-                                    //
-                                    // Iter-9 finding 1: advance the cursor
-                                    // BEFORE the checkpoint so the
-                                    // durable Final state names the
-                                    // post-cancel position. The
-                                    // pre-iter-9 code set
-                                    // `acked.input_cursor` after the
-                                    // checkpoint, so the persisted state
-                                    // still pointed at the cancel — on
-                                    // resume the loop would re-poll a
-                                    // page the host had already dropped.
+                                    // Take `Final` BEFORE acking the page
+                                    // so a checkpoint failure leaves the
+                                    // cancel re-pollable on next
+                                    // `execute()`. Advance the cursor
+                                    // BEFORE the checkpoint so the durable
+                                    // Final state names the post-cancel
+                                    // position; otherwise resume re-polls
+                                    // a page the host already dropped.
                                     let mut advanced = drained_state;
                                     advanced.input_cursor = next_cursor.clone();
                                     let checked = self
@@ -329,16 +301,14 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                                     return Ok(exit);
                                 }
                                 FollowupDrainOutcome::ControlPending => {
-                                    // Iter-7 finding 2: drain hit
-                                    // `INPUT_POLL_LIMIT` consecutive
-                                    // control-only pages. Side effects
-                                    // were applied + acked but the
-                                    // queue might still be holding a
-                                    // FollowUp on a later page. Do
-                                    // NOT take the Final checkpoint
-                                    // and do NOT exit `Completed` —
-                                    // advance the iteration so the
-                                    // next tick can keep draining.
+                                    // Drain hit `INPUT_POLL_LIMIT`
+                                    // consecutive control-only pages.
+                                    // Side effects were applied + acked
+                                    // but a FollowUp may sit on a later
+                                    // page, so do NOT Final-checkpoint
+                                    // or exit `Completed` — advance the
+                                    // iteration so the next tick keeps
+                                    // draining.
                                     next = drained_state;
                                     next.iteration = next.iteration.saturating_add(1);
                                     *state = next.clone();
@@ -362,13 +332,12 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                         .await?
                     {
                         Step::Exit(exit_state, exit) => {
-                            // Iter-5 finding 4: Final-checkpoint on the
-                            // `Failed` shape before returning. `Blocked`
-                            // already took `BeforeBlock` inside `handle_gate`
-                            // (and the spec says blocked exits checkpoint
-                            // BeforeBlock, not Final). `Cancelled` already
-                            // took `Final` inside the capability retry's
-                            // Cancelled branch.
+                            // `Failed` shape Final-checkpoints here.
+                            // `Blocked` already took `BeforeBlock` in
+                            // `handle_gate` (per spec, blocked exits
+                            // checkpoint BeforeBlock, not Final).
+                            // `Cancelled` already took `Final` in the
+                            // capability retry's Cancelled branch.
                             let (checked, exit) = self
                                 .final_checkpoint_for_failure(host, exit_state, exit)
                                 .await?;
@@ -399,11 +368,10 @@ impl AgentLoopExecutor for CanonicalAgentLoopExecutor {
                     }
 
                     if let Some(exit_kind) = self.no_progress_exit(&next) {
-                        // Iter-5 finding 4: take a `Final` checkpoint on the
-                        // no-progress path too. The pre-iter-5 code returned
-                        // `LoopExit::Failed` without checkpointing, so a
-                        // profile with `require_final_checkpoint = true`
-                        // would reject the exit as `MissingFinalCheckpoint`.
+                        // Take `Final` on the no-progress path so profiles
+                        // with `require_final_checkpoint = true` accept the
+                        // exit instead of rejecting it as
+                        // `MissingFinalCheckpoint`.
                         let checked = self.checkpoint(host, next, CheckpointKind::Final).await?;
                         *state = checked;
                         return Ok(LoopExit::Failed { kind: exit_kind });
@@ -450,11 +418,11 @@ enum ModelStep {
     /// Recovery returned `SkipResult` for a model error. The model call is
     /// dropped, the iteration counter MUST advance on the next loop tick, and
     /// the outer loop's iteration cap / wall-clock cap eventually trips even
-    /// if the underlying model port keeps failing. Iter-5 finding 1: this is
-    /// distinct from `ReloadSurface`, which restarts the SAME iteration
-    /// without bumping the counter (and so spins forever when recovery
-    /// always returns `SkipResult` against a persistent
-    /// `Unavailable`/`Internal` model error).
+    /// if the underlying model port keeps failing. Distinct from
+    /// `ReloadSurface`, which restarts the SAME iteration without bumping the
+    /// counter (and so would spin forever when recovery always returns
+    /// `SkipResult` against a persistent `Unavailable`/`Internal` model
+    /// error).
     SkipIteration(LoopExecutionState),
     /// Recovery decided to abort; bubble up the loop exit.
     Exit(LoopExecutionState, LoopExit),
@@ -471,10 +439,8 @@ enum FollowupDrainOutcome {
     /// has NOT been acked — `drain_followup` carries the `next_cursor` back
     /// to the caller, which must take the `Final` checkpoint and only then
     /// ack the page. Sibling control side effects in the same page were
-    /// applied in place. Iter-6 finding 2: the pre-iter-6 code acked the
-    /// terminal page inside `drain_followup` and let the caller checkpoint
-    /// afterward, so a checkpoint failure left the cancel consumed but the
-    /// run un-persisted.
+    /// applied in place. Acking before the checkpoint would leave the
+    /// cancel consumed but the run un-persisted on a checkpoint failure.
     TerminalCancel {
         next_cursor: ironclaw_turns::run_profile::LoopInputCursor,
     },
@@ -484,9 +450,8 @@ enum FollowupDrainOutcome {
     /// empty — a genuine FollowUp may be sitting on a later page. The
     /// caller MUST NOT take the `Final` checkpoint and MUST NOT exit
     /// `Completed`; it should advance the iteration and let the next tick
-    /// continue draining. Iter-7 finding 2: pre-iter-7 the same shape
-    /// returned `Empty`, which the caller treated as "queue drained" and
-    /// stranded any FollowUp sitting past page 16.
+    /// continue draining. Returning `Empty` here would strand a FollowUp
+    /// sitting past page `INPUT_POLL_LIMIT`.
     ControlPending,
     /// Queue was empty (or contained only GateResolved / SurfaceChanged that
     /// were applied + acked); the loop completes naturally.
@@ -495,7 +460,7 @@ enum FollowupDrainOutcome {
 
 impl CanonicalAgentLoopExecutor {
     /// Issue the model call, classifying any host-port error against the
-    /// runtime recovery strategy (master spec §10, WS-6 finding 7).
+    /// runtime recovery strategy (master spec §10).
     ///
     /// - `Cancelled` from the model port: surfaced as `HostUnavailable` so
     ///   the outer cancellation-observation path runs on the next tick.
@@ -511,27 +476,23 @@ impl CanonicalAgentLoopExecutor {
         mut state: LoopExecutionState,
         request: LoopModelRequest,
     ) -> Result<ModelStep, AgentLoopExecutorError> {
-        // WS-6 iter-4 finding 3: a logical model call records its failure
-        // kind in `recent_failure_kinds` AT MOST ONCE — not once per retry
-        // attempt. The pre-iter-4 code pushed on every attempt, so an
-        // eventually-successful model turn could trip
-        // `DefaultStopConditionStrategy::failure_run_threshold` (3) as soon
-        // as a custom recovery allowed three retries. Mirrors the capability
-        // retry path, which pushes once at the start of
-        // `handle_capability_error` and never inside the inner loop.
+        // A logical model call records its failure kind in
+        // `recent_failure_kinds` at most once — not once per retry attempt
+        // — so an eventually-successful model turn doesn't trip
+        // `DefaultStopConditionStrategy::failure_run_threshold` after a few
+        // retries. Mirrors the capability retry path, which pushes once at
+        // the start of `handle_capability_error` and never inside the
+        // inner loop.
         let mut recorded_failure = false;
         for _ in 0..MAX_RETRIES_PER_CALL {
             match host.stream_model(request.clone()).await {
                 Ok(response) => return Ok(ModelStep::Response(state, response)),
                 Err(error) => match self.classify_model_host_error(&error) {
                     ModelErrorRouting::Cancelled => {
-                        // WS-6 iter-3 finding 5: surface model-port
-                        // cancellation as `LoopExit::Cancelled` rather
-                        // than `HostUnavailable`. The host aborted the
-                        // in-flight stream; the loop must take the
-                        // `Final` checkpoint and exit cleanly so callers
-                        // see the cancellation as a normal terminal
-                        // state, not as infrastructure failure.
+                        // Surface model-port cancellation as
+                        // `LoopExit::Cancelled` (Final-checkpointed) so
+                        // callers see a normal terminal state, not
+                        // infrastructure failure.
                         let checked = self.checkpoint(host, state, CheckpointKind::Final).await?;
                         let exit = LoopExit::Cancelled(CancelledKind {
                             interrupted_message_refs: checked.assistant_refs.clone(),
@@ -562,9 +523,7 @@ impl CanonicalAgentLoopExecutor {
                                         },
                                     ));
                                 }
-                                // WS-6 iter-3 finding 4: honor `Backoff`
-                                // delays as a tokio sleep before the next
-                                // model attempt.
+                                // Honor `Backoff` delay before retry.
                                 if let Some(crate::strategies::RetryAlteration::Backoff { delay }) =
                                     alter
                                 {
@@ -573,21 +532,16 @@ impl CanonicalAgentLoopExecutor {
                                 continue;
                             }
                             RecoveryOutcome::SkipResult { recovery } => {
-                                // SkipResult on a model error means "drop this
-                                // turn AND advance to the next iteration".
-                                // Iter-5 finding 1: the pre-iter-5 code routed
-                                // this through `ReloadSurface`, which restarts
-                                // the SAME tick without bumping
-                                // `state.iteration`. With `DefaultPlanner`'s
-                                // placeholder recovery (which returns
-                                // `SkipResult` on every model error), a
-                                // persistent `Unavailable`/`Internal` model
-                                // failure would spin forever — never hitting
-                                // the iteration cap or the wall-clock cap.
-                                // `SkipIteration` is the explicit
-                                // monotonic-progress variant: the outer
-                                // execute() advances the iteration counter so
-                                // the budget eventually trips.
+                                // SkipResult on a model error means "drop
+                                // this turn AND advance the iteration".
+                                // Routing through `ReloadSurface` instead
+                                // would restart the same tick without
+                                // bumping `state.iteration`, so a
+                                // persistent model failure under a
+                                // SkipResult-returning recovery would
+                                // spin forever past the iteration and
+                                // wall-clock caps. `SkipIteration` is the
+                                // explicit monotonic-progress variant.
                                 state.recovery_state = recovery;
                                 return Ok(ModelStep::SkipIteration(state));
                             }
@@ -710,23 +664,21 @@ impl CanonicalAgentLoopExecutor {
         state.control_state.last_batch_total = summaries.len() as u32;
         state.control_state.terminate_hints_in_last_batch = 0;
 
-        // Enforce executor-side filter (master spec §6 / WS-6 finding 3 +
-        // iter-3 finding 2): the narrowed surface is built locally, but
-        // `VisibleCapabilityRequest` doesn't accept a filter — so the model
-        // could cite the unfiltered host surface_version to invoke a hidden
-        // capability. The fix preserves the planner's original call order:
+        // Enforce executor-side filter (master spec §6): the narrowed
+        // surface is built locally, but `VisibleCapabilityRequest` doesn't
+        // accept a filter — so the model could cite the unfiltered host
+        // surface_version to invoke a hidden capability. The check must
+        // preserve the planner's original call order:
         //
-        //   - Compute an `(allowed, hidden)` mask in the original sequence.
+        //   - Compute an `(allowed, hidden)` mask in original sequence.
         //   - If ALL calls are allowed, batch-invoke as before (preserves
         //     parallelism for the common case).
         //   - If ANY call is hidden, fall back to ordered per-call
         //     execution: invoke allowed calls one at a time via the
         //     single-call host API, and synthesize a `Denied` outcome at
-        //     the hidden call's position. Crucially, a hidden call that
-        //     routes through recovery to `Abort` short-circuits before any
-        //     subsequent allowed call's side effect runs — fixing the
-        //     iter-2 ordering bug where `[hidden, allowed]` would execute
-        //     `allowed` before processing the denial.
+        //     the hidden call's position. A hidden call that routes
+        //     through recovery to `Abort` short-circuits before any
+        //     subsequent allowed call's side effect runs.
         let allowed_ids: HashSet<_> = surface
             .descriptors
             .iter()
@@ -743,15 +695,14 @@ impl CanonicalAgentLoopExecutor {
                 .cloned()
                 .map(capability_invocation_from_candidate)
                 .collect();
-            // Iter-9 finding 3: `stop_on_first_suspension` MUST be true if
-            // EITHER the policy is `Sequential`, OR any summary in the
-            // batch has `ConcurrencyHint::Exclusive`. A custom
-            // `BatchPolicyStrategy` that returns `Parallel` for a batch
-            // containing an Exclusive call would otherwise let the host
-            // run later invocations after an
-            // `ApprovalRequired`/`AuthRequired`/`SpawnedProcess` outcome.
-            // The concurrency hint is the descriptor's own disclosure
-            // and overrides a permissive planner.
+            // `stop_on_first_suspension` must be true if EITHER the
+            // policy is `Sequential`, OR any summary in the batch has
+            // `ConcurrencyHint::Exclusive`. A custom `BatchPolicyStrategy`
+            // that returns `Parallel` for a batch containing an Exclusive
+            // call would otherwise let the host run later invocations
+            // after an `ApprovalRequired`/`AuthRequired`/`SpawnedProcess`
+            // outcome — the concurrency hint is the descriptor's own
+            // disclosure and overrides a permissive planner.
             let any_exclusive = summaries
                 .iter()
                 .any(|summary| matches!(summary.concurrency_hint, ConcurrencyHint::Exclusive));
@@ -804,11 +755,11 @@ impl CanonicalAgentLoopExecutor {
         Ok(Step::Continue(state))
     }
 
-    /// Consume the outcomes from a full-batch invocation. Per WS-6 iter-3
-    /// finding 3, a `Sequential` batch may return a short outcome vec when
-    /// the host stops at the first suspension; in that case the last
-    /// outcome MUST be a suspension kind, and only the executed prefix is
-    /// processed. A `Parallel` batch keeps the strict 1:1 count contract.
+    /// Consume the outcomes from a full-batch invocation. A `Sequential`
+    /// batch may return a short outcome vec when the host stops at the
+    /// first suspension; in that case the last outcome must be a suspension
+    /// kind and only the executed prefix is processed. A `Parallel` batch
+    /// keeps the strict 1:1 count contract.
     async fn consume_batch_outcomes(
         &self,
         planner: &dyn AgentLoopPlanner,
@@ -935,15 +886,13 @@ impl CanonicalAgentLoopExecutor {
                 .await;
             match recovery {
                 RecoveryOutcome::Retry { recovery, alter } => {
-                    // WS-6 iter-4 finding 2: a `Denied` outcome must NEVER
-                    // be replayed through the host. `Denied` is either an
-                    // executor-side synthetic denial (the capability was
-                    // filtered out — replaying would let the model bypass
-                    // the filter) or a host-side policy denial (already
-                    // authoritative — replaying is just retry-against-the-
-                    // same-policy noise). In both cases, treat the recovery
-                    // `Retry` as `SkipResult`: consume the budget bump but
-                    // do not invoke the host.
+                    // A `Denied` outcome must NEVER be replayed through the
+                    // host. `Denied` is either an executor-side synthetic
+                    // denial (the capability was filtered out — replaying
+                    // would let the model bypass the filter) or a host-side
+                    // policy denial (already authoritative). Treat the
+                    // recovery `Retry` as `SkipResult`: consume the budget
+                    // bump but do not invoke the host.
                     if matches!(current_summary.class, CapabilityErrorClass::PolicyDenied) {
                         state.recovery_state = recovery;
                         return Ok(Step::Continue(state));
@@ -960,8 +909,7 @@ impl CanonicalAgentLoopExecutor {
                             },
                         ));
                     }
-                    // WS-6 iter-3 finding 4: honor `Backoff` delays as a
-                    // tokio sleep before re-invoking the capability.
+                    // Honor `Backoff` delay before retry.
                     if let Some(crate::strategies::RetryAlteration::Backoff { delay }) = alter {
                         tokio::time::sleep(delay).await;
                     }
@@ -971,8 +919,8 @@ impl CanonicalAgentLoopExecutor {
                     {
                         Ok(outcome) => outcome,
                         Err(error) if matches!(error.kind, AgentLoopHostErrorKind::Cancelled) => {
-                            // WS-6 iter-3 finding 5: capability-port
-                            // cancellation surfaces as `LoopExit::Cancelled`.
+                            // Capability-port cancellation surfaces as
+                            // `LoopExit::Cancelled`.
                             let checked =
                                 self.checkpoint(host, state, CheckpointKind::Final).await?;
                             let exit = LoopExit::Cancelled(CancelledKind {
@@ -1110,19 +1058,17 @@ impl CanonicalAgentLoopExecutor {
         mut state: LoopExecutionState,
         kind: CheckpointKind,
     ) -> Result<LoopExecutionState, AgentLoopExecutorError> {
-        // Master spec §10: the checkpoint payload MUST be persisted before the
-        // checkpoint marker is recorded. `HostManagedLoopCheckpointPort`
+        // Master spec §10: the checkpoint payload MUST be persisted before
+        // the checkpoint marker is recorded. `HostManagedLoopCheckpointPort`
         // rejects unknown state refs by design — store first, then checkpoint
         // with the returned ref.
         //
-        // Iter-7 finding 3: legacy hosts that have not yet migrated to the
+        // Legacy hosts that have not migrated to the
         // `store_checkpoint_payload`-then-`checkpoint` contract return
-        // `Unavailable` from the default trait impl. We treat that variant as
-        // "this host doesn't store payloads; fall back to the legacy
-        // checkpoint()-only path" and pass the `legacy_unknown` sentinel ref
-        // so the legacy host can recognize it. Any other error (Internal,
-        // CheckpointRejected, transient outage) bubbles up as
-        // `CheckpointFailed` so retries can re-poll.
+        // `Unavailable` from the default trait impl; we fall back to the
+        // legacy `checkpoint()`-only path using the `legacy_unknown`
+        // sentinel ref. Any other error bubbles up as `CheckpointFailed`
+        // so retries can re-poll.
         let payload = serde_json::to_vec(&serde_json::json!({
             "schema_id": CHECKPOINT_SCHEMA_ID,
             "state": &state,
@@ -1160,13 +1106,10 @@ impl CanonicalAgentLoopExecutor {
         host: &(dyn AgentLoopDriverHost + Send + Sync),
         mut state: LoopExecutionState,
     ) -> Result<(LoopExecutionState, Option<LoopExit>), AgentLoopExecutorError> {
-        // Iter-7 finding 1: page past control-only pages just like
-        // `drain_followup` does. Pre-iter-7 this function polled exactly
-        // once: if the first page held only `GateResolved` /
-        // `CapabilitySurfaceChanged`, it acked them and returned `None`,
-        // so a queued `Cancel`/`Interrupt` on the next page stayed
-        // invisible until after another model/capability cycle and the
-        // loop produced one more reply / ran extra tools.
+        // Page past control-only pages just like `drain_followup`. Polling
+        // exactly once would let a queued `Cancel`/`Interrupt` on a later
+        // page stay invisible until the loop produced one more reply or
+        // ran extra tools.
         //
         // Loop up to `INPUT_POLL_LIMIT` rounds — same defense-in-depth
         // bound as `drain_followup`. The loop terminates on:
@@ -1181,44 +1124,35 @@ impl CanonicalAgentLoopExecutor {
                 .map_err(|_| AgentLoopExecutorError::HostUnavailable {
                     stage: HostStage::Input,
                 })?;
-            // Per WS-6 finding 1: apply control side effects
-            // (GateResolved, CapabilitySurfaceChanged) in-page as
-            // idempotent state mutations. Pages are atomic — the cursor
-            // is page-granular — so we can't partial-ack between a
-            // control event and a user-facing event in the same page.
+            // Apply control side effects (GateResolved,
+            // CapabilitySurfaceChanged) in-page as idempotent state
+            // mutations. Pages are atomic — the cursor is page-granular
+            // — so we can't partial-ack between a control event and a
+            // user-facing event in the same page.
             apply_control_side_effects(&mut state, &batch.inputs);
 
-            // Cancel / Interrupt are terminal: take the `Final`
-            // checkpoint FIRST, then ack the page only once the
-            // checkpoint is durable.
-            //
-            // Iter-6 finding 2: the pre-iter-6 code acked the page before
-            // checkpointing. If `store_checkpoint_payload()` or
-            // `checkpoint()` failed (transient DB outage), the cancel
-            // had already been consumed but the run state was not
-            // persisted — a retried run would observe
+            // Cancel / Interrupt are terminal: take `Final` first, then
+            // ack the page only once the checkpoint is durable. Acking
+            // before the checkpoint would consume the cancel without
+            // persisting state, so a retried run would observe
             // `state.input_cursor` past the cancel and never re-poll
-            // it. Reordering to checkpoint-then-ack means a checkpoint
-            // failure bubbles up before the cursor advance, so the next
-            // `execute()` call re-polls the same cancel page.
+            // it.
             if batch.inputs.iter().any(|input| {
                 matches!(
                     input,
                     LoopInput::Cancel { .. } | LoopInput::Interrupt { .. }
                 )
             }) {
-                // Iter-9 finding 1: advance the cursor on `state` BEFORE
-                // taking the Final checkpoint, so the durable record
-                // names the next-unprocessed position. If we ack first
-                // and then the checkpoint write fails, the host has
-                // dropped the page but the only durable cursor still
-                // points at the cancel — on retry the loop would
-                // re-poll a page the host has already discarded.
+                // Advance the cursor on `state` BEFORE checkpointing so
+                // the durable record names the next-unprocessed position.
+                // Ack-then-checkpoint would let a checkpoint write
+                // failure leave the host with the page dropped but the
+                // only durable cursor still pointing at the cancel.
                 // Checkpoint-with-advanced-cursor-then-ack means a
                 // checkpoint failure bubbles up before the host drops
                 // the page; ack failure after a successful checkpoint
-                // is benign (cursor is ahead of host; next iteration's
-                // poll skips already-processed positions).
+                // is benign (next iteration's poll skips
+                // already-processed positions).
                 state.input_cursor = batch.next_cursor.clone();
                 let checked = self.checkpoint(host, state, CheckpointKind::Final).await?;
                 host.ack_inputs(batch.next_cursor).await.map_err(|_| {
@@ -1255,18 +1189,13 @@ impl CanonicalAgentLoopExecutor {
                 return Ok((state, None));
             }
 
-            // Control-only page: side effects were applied above. Ack
-            // and loop back to poll for the next page. The pre-iter-7
-            // code returned `None` here unconditionally, so a queued
-            // terminal on page 2 was deferred.
-            //
-            // Iter-9 finding 1: checkpoint with the advanced cursor and
-            // applied control side effects BEFORE the host ack so the
-            // durable record reflects "this page is consumed". If the
-            // worker crashes between ack and the next durable
-            // checkpoint, an older checkpoint would point at the
-            // already-dropped page and the GateResolved /
-            // CapabilitySurfaceChanged side effects would be lost.
+            // Control-only page: side effects were applied above.
+            // Checkpoint with the advanced cursor and applied side
+            // effects BEFORE the host ack — otherwise a crash between
+            // ack and the next durable checkpoint would resume from an
+            // older checkpoint pointing at the already-dropped page,
+            // losing the GateResolved / CapabilitySurfaceChanged side
+            // effects.
             state.input_cursor = batch.next_cursor.clone();
             state = self
                 .checkpoint(host, state, CheckpointKind::BeforeModel)
@@ -1295,15 +1224,14 @@ impl CanonicalAgentLoopExecutor {
             .map_err(|_| AgentLoopExecutorError::HostUnavailable {
                 stage: HostStage::Input,
             })?;
-        // Per WS-6 finding 1: pages are atomic. Apply control side effects
-        // in-page (gate-resolved → clear last_gate; surface-changed → drop
-        // cached surface_version). If a user-facing steering message is
-        // present in the same page, ack so the loop makes progress. If
-        // Cancel/Interrupt is also present, don't ack — the next iteration's
-        // `observe_cancellation` polls the same cursor, sees the terminal
-        // input, and exits Cancelled. The FollowUp case stays
-        // un-acked here so the dedicated post-reply drain handler can
-        // consume it.
+        // Pages are atomic. Apply control side effects in-page
+        // (gate-resolved → clear last_gate; surface-changed → drop cached
+        // surface_version). If a user-facing steering message is present
+        // in the same page, ack so the loop makes progress. If
+        // Cancel/Interrupt is also present, don't ack — the next
+        // iteration's `observe_cancellation` polls the same cursor and
+        // exits Cancelled. The FollowUp case stays un-acked here so the
+        // dedicated post-reply drain handler can consume it.
         apply_control_side_effects(&mut state, &batch.inputs);
         let has_terminal = batch.inputs.iter().any(|input| {
             matches!(
@@ -1327,14 +1255,12 @@ impl CanonicalAgentLoopExecutor {
             return Ok(state);
         }
         if has_steering {
-            // Iter-9 finding 1: durably checkpoint with the advanced
-            // cursor (and any applied control side effects from
-            // `apply_control_side_effects` above) BEFORE acking. If we
-            // acked first and the worker crashed before the next
-            // checkpoint, an older checkpoint would re-poll a page
-            // the host has already discarded — losing the steering
-            // message and any sibling GateResolved /
-            // CapabilitySurfaceChanged side effects.
+            // Checkpoint with the advanced cursor (and any applied
+            // control side effects) BEFORE acking. Ack-then-checkpoint
+            // would let a worker crash resume from an older checkpoint
+            // re-polling a page the host has already discarded, losing
+            // the steering message and any sibling control side
+            // effects.
             state.input_cursor = batch.next_cursor.clone();
             state = self
                 .checkpoint(host, state, CheckpointKind::BeforeModel)
@@ -1353,19 +1279,15 @@ impl CanonicalAgentLoopExecutor {
         host: &(dyn AgentLoopDriverHost + Send + Sync),
         mut state: LoopExecutionState,
     ) -> Result<(LoopExecutionState, FollowupDrainOutcome), AgentLoopExecutorError> {
-        // WS-6 iter-4 finding 1: keep draining follow-up pages until either
-        // a FollowUp / terminal input is found, or the queue is genuinely
-        // empty. The pre-iter-4 code returned `Empty` after acking a
-        // control-only page (GateResolved / SurfaceChanged), so a FollowUp
-        // on a *later* page was silently dropped: the caller took the
-        // `Final` checkpoint and exited `Completed`, leaving queued user
-        // input unanswered. Pages stay atomic (we still ack one at a time);
-        // we just keep polling until we hit something terminal or empty.
+        // Keep draining follow-up pages until either a FollowUp /
+        // terminal input is found, or the queue is genuinely empty.
+        // Returning `Empty` after acking a control-only page would
+        // silently drop a FollowUp on a *later* page. Pages stay atomic
+        // (we still ack one at a time); we just keep polling.
         //
         // Defense-in-depth bound: at most `INPUT_POLL_LIMIT` poll rounds
-        // per call — same cap as the per-page input batch size — so a
-        // misbehaving host that returns an infinite stream of control-only
-        // pages can't spin forever inside one drain.
+        // per call so a misbehaving host that returns an infinite stream
+        // of control-only pages can't spin forever inside one drain.
         for _ in 0..INPUT_POLL_LIMIT {
             let batch = host
                 .poll_inputs(state.input_cursor.clone(), INPUT_POLL_LIMIT)
@@ -1373,13 +1295,12 @@ impl CanonicalAgentLoopExecutor {
                 .map_err(|_| AgentLoopExecutorError::HostUnavailable {
                     stage: HostStage::Input,
                 })?;
-            // Iter-8 finding 2: a fresh `UserMessage` or `Steering` arriving
-            // just as the loop would otherwise complete must be treated as
+            // A fresh `UserMessage` or `Steering` arriving just as the
+            // loop would otherwise complete must be treated as
             // follow-up-equivalent — it's user-facing input the next
-            // iteration owes a reply to. Pre-iter-8 we matched only
-            // `FollowUp`, so a `UserMessage` queued post-reply fell through
-            // to the control-only branch, got `ack_inputs`'d, and the run
-            // exited `Completed` dropping the input entirely.
+            // iteration owes a reply to. Matching only `FollowUp` would
+            // let a post-reply `UserMessage` fall through to the
+            // control-only branch and get acked away.
             let has_followup = batch.inputs.iter().any(|input| {
                 matches!(
                     input,
@@ -1394,26 +1315,22 @@ impl CanonicalAgentLoopExecutor {
                     LoopInput::Cancel { .. } | LoopInput::Interrupt { .. }
                 )
             });
-            // Master spec §8 step 2 / WS-6 brief §3.3a + finding 1: pages
-            // are atomic — the `LoopInputPort` cursor is page-granular, so
-            // a mixed page (FollowUp + GateResolved + SurfaceChanged) must
-            // be acked as a whole. We apply control side effects in-page
-            // as idempotent state mutations, then ack. The pre-iter-3
-            // "ControlPending" refusal-to-ack livelocked on any mixed page
-            // where a control event was in the same poll as the
-            // user-facing input.
+            // Master spec §8 step 2: pages are atomic — the
+            // `LoopInputPort` cursor is page-granular, so a mixed page
+            // (FollowUp + GateResolved + SurfaceChanged) must be acked
+            // as a whole. Apply control side effects in-page as
+            // idempotent state mutations, then ack. A
+            // refuse-to-ack-on-mixed-page approach would livelock on
+            // any page where a control event sits with a user-facing
+            // input.
             apply_control_side_effects(&mut state, &batch.inputs);
             if has_terminal {
-                // Cancel/Interrupt is terminal. Iter-6 finding 2: do NOT
-                // ack the page here. Carry the un-applied cursor back to
-                // the caller, which takes the `Final` checkpoint and then
-                // acks. The pre-iter-6 code acked first (including any
-                // FollowUp in the same page — superseded by the user's
-                // cancel) and relied on the caller to checkpoint
-                // afterward; a checkpoint failure left the cancel
-                // consumed but the run state un-persisted. Sibling
-                // control side effects were already applied above via
-                // `apply_control_side_effects`.
+                // Cancel/Interrupt is terminal. Do NOT ack here. Carry
+                // the un-applied cursor back to the caller, which takes
+                // `Final` and then acks. Ack-first would leave the
+                // cancel consumed but the run state un-persisted on a
+                // checkpoint failure. Sibling control side effects
+                // were already applied via `apply_control_side_effects`.
                 return Ok((
                     state,
                     FollowupDrainOutcome::TerminalCancel {
@@ -1422,16 +1339,13 @@ impl CanonicalAgentLoopExecutor {
                 ));
             }
             if has_followup {
-                // Iter-9 finding 1: durably checkpoint with the advanced
-                // cursor BEFORE the host ack. The caller's outer loop
-                // will not take a checkpoint until after another
-                // observe_cancellation/drain_steering cycle plus a
-                // model invocation; if the worker crashes between this
-                // ack and the next `BeforeModel` checkpoint, the only
-                // durable record points at the already-dropped
-                // mixed-page (FollowUp + GateResolved /
-                // CapabilitySurfaceChanged) and the control side
-                // effects vanish.
+                // Durably checkpoint with the advanced cursor BEFORE
+                // the host ack. The caller's outer loop won't checkpoint
+                // until after another observe_cancellation /
+                // drain_steering cycle plus a model invocation, so
+                // ack-then-crash would lose the GateResolved /
+                // CapabilitySurfaceChanged side effects sharing the
+                // mixed page.
                 state.input_cursor = batch.next_cursor.clone();
                 state = self
                     .checkpoint(host, state, CheckpointKind::BeforeModel)
@@ -1449,18 +1363,12 @@ impl CanonicalAgentLoopExecutor {
                 // the `Final` checkpoint.
                 return Ok((state, FollowupDrainOutcome::Empty));
             }
-            // Control-only page (GateResolved / SurfaceChanged): side
-            // effects were just applied. Ack the page and loop back to
-            // poll for the next one — a FollowUp may be sitting on a
-            // later page.
-            //
-            // Iter-9 finding 1: durably checkpoint with the advanced
-            // cursor and applied side effects BEFORE the ack. Without
-            // this, the loop could ack a control-only page, crash, and
-            // resume from an older checkpoint that re-polls the same
-            // page — but the host has already dropped it, so the
-            // GateResolved / CapabilitySurfaceChanged effects are
-            // permanently lost.
+            // Control-only page: side effects were just applied.
+            // Durably checkpoint with the advanced cursor and applied
+            // side effects BEFORE the ack — otherwise ack-then-crash
+            // would resume from an older checkpoint re-polling a page
+            // the host has dropped, permanently losing the GateResolved
+            // / CapabilitySurfaceChanged effects.
             state.input_cursor = batch.next_cursor.clone();
             state = self
                 .checkpoint(host, state, CheckpointKind::BeforeModel)
@@ -1471,13 +1379,12 @@ impl CanonicalAgentLoopExecutor {
                 }
             })?;
         }
-        // Iter-7 finding 2: `INPUT_POLL_LIMIT` consecutive control-only
-        // pages were acked and their side effects applied, but we never
-        // saw a definitive "empty" page or a user-facing input. Pre-iter-7
-        // we collapsed this into `Empty`, which the caller treated as
-        // "queue drained" — Final-checkpointing and exiting `Completed`
-        // even if a real FollowUp was sitting on page 17. Return
-        // `ControlPending` so the caller continues the loop instead.
+        // `INPUT_POLL_LIMIT` consecutive control-only pages were acked
+        // but we never saw a definitive "empty" page or a user-facing
+        // input. Collapsing this into `Empty` would let the caller
+        // Final-checkpoint and exit `Completed` even with a real
+        // FollowUp sitting on a later page. Return `ControlPending` so
+        // the caller continues the loop.
         Ok((state, FollowupDrainOutcome::ControlPending))
     }
 
@@ -1487,13 +1394,11 @@ impl CanonicalAgentLoopExecutor {
         state: LoopExecutionState,
         kind: StopKind,
     ) -> Result<(LoopExecutionState, LoopExit), AgentLoopExecutorError> {
-        // Iter-5 finding 4: every terminal exit path takes a `Final`
-        // checkpoint just before returning so profiles with
-        // `require_final_checkpoint = true` don't reject the exit as
-        // `MissingFinalCheckpoint`. The pre-iter-5 `StopKind::Aborted` branch
-        // skipped the checkpoint; the helper now uniformly checkpoints and
-        // returns the checked state alongside the exit so the caller can
-        // commit it to `*state`.
+        // Every terminal exit path takes `Final` just before returning
+        // so profiles with `require_final_checkpoint = true` don't
+        // reject the exit as `MissingFinalCheckpoint`. The helper
+        // uniformly checkpoints and returns the checked state alongside
+        // the exit so the caller can commit it to `*state`.
         match kind {
             StopKind::GracefulStop => {
                 let checked = self.checkpoint(host, state, CheckpointKind::Final).await?;
@@ -1520,11 +1425,11 @@ impl CanonicalAgentLoopExecutor {
         }
     }
 
-    /// Iter-5 finding 4 helper: when a sub-routine returns a `LoopExit::Failed`,
-    /// take a `Final` checkpoint before propagating it. `Completed` /
-    /// `Blocked` / `Cancelled` exits already carry their own checkpoint
-    /// discipline (Final / BeforeBlock / Final respectively) inside the
-    /// sub-routine, so this helper is a no-op for them.
+    /// When a sub-routine returns `LoopExit::Failed`, take a `Final`
+    /// checkpoint before propagating it. `Completed` / `Blocked` /
+    /// `Cancelled` exits already carry their own checkpoint discipline
+    /// (Final / BeforeBlock / Final respectively) inside the sub-routine,
+    /// so this helper is a no-op for them.
     async fn final_checkpoint_for_failure(
         &self,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
@@ -1585,15 +1490,7 @@ fn model_preference_id(
 /// Project the model's chosen capability batch into the shape
 /// `BatchPolicyStrategy` consumes.
 ///
-/// Iter-8 finding 1 fix: previously every call was hardcoded
-/// `ConcurrencyHint::SafeForParallel`, so `DefaultBatchPolicyStrategy` picked
-/// `Parallel` for every batch — including ones that contained an
-/// approval-gated write or shell. The downstream
-/// `RebornLoopDriverHost::invoke_capability_batch` then set
-/// `stop_on_first_suspension = false` and ran later calls after an
-/// `ApprovalRequired` / `AuthRequired` / `SpawnedProcess` outcome.
-///
-/// We now resolve each call against the visible-surface descriptor it claims
+/// Each call resolves against the visible-surface descriptor it claims
 /// to use, mapping `CapabilityConcurrency::Exclusive` -> `Exclusive` and
 /// `CapabilityConcurrency::SafeForParallel` -> `SafeForParallel`. When a
 /// descriptor is missing from the visible surface (defensive — the
@@ -1689,12 +1586,12 @@ fn elapsed_since(start: tokio::time::Instant) -> Duration {
 
 /// Current wall clock as milliseconds since the Unix epoch.
 ///
-/// Iter-6 finding 1: used to capture and compare the persisted
+/// Captures and compares the persisted
 /// `LoopExecutionState::started_at_unix_ms` anchor so a resumed run
-/// retains its time budget across process restart. A clock reading prior
-/// to UNIX_EPOCH (effectively impossible on a sane host) saturates to
-/// `0`; the wall-clock comparator then treats elapsed time as `0`, which
-/// is conservative — it never spuriously trips the cap.
+/// retains its time budget across process restart. A clock reading
+/// before `UNIX_EPOCH` saturates to `0`; the wall-clock comparator then
+/// treats elapsed time as `0`, which is conservative — it never
+/// spuriously trips the cap.
 fn system_time_now_unix_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1704,17 +1601,16 @@ fn system_time_now_unix_ms() -> u64 {
 
 /// Whether the wall-clock budget has been exceeded.
 ///
-/// Iter-6 finding 1: combines the in-process `tokio::time::Instant` cap
-/// (so test code with `start_paused = true` still works) with the
-/// persisted `SystemTime` anchor (so a run that resumes after process
-/// restart immediately observes its already-elapsed budget). The cap
-/// fires if EITHER source agrees that the limit has been reached.
+/// Combines the in-process `tokio::time::Instant` cap (so test code with
+/// `start_paused = true` still works) with the persisted `SystemTime`
+/// anchor (so a run that resumes after process restart immediately
+/// observes its already-elapsed budget). The cap fires if EITHER source
+/// agrees the limit has been reached.
 ///
 /// Clock-skew note: if the OS clock jumps backward, `SystemTime` elapsed
 /// underflows to `Duration::ZERO`, and the in-process `Instant` cap takes
-/// over for the remainder of this `execute()` call. We do NOT panic or
-/// fail the run — wall-clock budgets are a defense-in-depth limiter, not
-/// a correctness invariant.
+/// over for the remainder of this `execute()` call. Wall-clock budgets
+/// are a defense-in-depth limiter, not a correctness invariant.
 fn wall_clock_limit_exceeded(
     in_process_start: tokio::time::Instant,
     persisted_start_unix_ms: Option<u64>,
@@ -1890,23 +1786,21 @@ mod tests {
         ack_count: Mutex<usize>,
         stored_state_refs: Mutex<Vec<ironclaw_turns::run_profile::LoopCheckpointStateRef>>,
         stored_payloads: Mutex<Vec<(LoopCheckpointKind, usize)>>,
-        /// Iter-6 finding 2: when set, `store_checkpoint_payload` fails for
-        /// requests carrying `LoopCheckpointKind::Final`. Exercises the
+        /// When set, `store_checkpoint_payload` fails for requests
+        /// carrying `LoopCheckpointKind::Final`. Exercises the
         /// terminal-cancel ordering: the page must NOT be acked if the
         /// Final checkpoint write fails.
         fail_final_store: Mutex<bool>,
-        /// Iter-7 finding 3: when set, `store_checkpoint_payload` returns
-        /// `Unavailable` (the default trait impl shape) and the host's
-        /// `checkpoint()` accepts the legacy sentinel state ref. Models a
-        /// pre-migration host that has not yet wired the
-        /// store-then-checkpoint contract.
+        /// When set, `store_checkpoint_payload` returns `Unavailable`
+        /// (the default trait impl shape) and the host's `checkpoint()`
+        /// accepts the legacy sentinel state ref. Models a pre-migration
+        /// host that has not yet wired the store-then-checkpoint contract.
         legacy_checkpoint_only: Mutex<bool>,
-        /// Iter-9 finding 3: capture every `CapabilityBatchInvocation`
-        /// the executor builds so tests can assert that
-        /// `stop_on_first_suspension` is forced to `true` when any
-        /// summary in the batch has `ConcurrencyHint::Exclusive`, even
-        /// under a custom planner whose `BatchPolicyStrategy` would
-        /// otherwise return `Parallel`.
+        /// Captures every `CapabilityBatchInvocation` so tests can assert
+        /// that `stop_on_first_suspension` is forced to `true` when any
+        /// summary has `ConcurrencyHint::Exclusive`, even under a custom
+        /// planner whose `BatchPolicyStrategy` would otherwise return
+        /// `Parallel`.
         batch_requests: Mutex<Vec<CapabilityBatchInvocation>>,
     }
 
@@ -2151,11 +2045,11 @@ mod tests {
             &self,
             request: LoopCheckpointRequest,
         ) -> Result<TurnCheckpointId, AgentLoopHostError> {
-            // Iter-7 finding 3: legacy hosts that returned `Unavailable`
-            // from `store_checkpoint_payload` get called back with the
-            // `legacy_unknown` sentinel ref. Their `checkpoint()` impl
-            // is expected to accept it (they had their own out-of-band
-            // ref allocation in the pre-migration contract).
+            // Legacy hosts that returned `Unavailable` from
+            // `store_checkpoint_payload` are called back with the
+            // `legacy_unknown` sentinel ref; their `checkpoint()`
+            // accepts it because they had their own out-of-band ref
+            // allocation pre-migration.
             if *self.legacy_checkpoint_only.lock().unwrap() {
                 self.checkpoints.lock().unwrap().push(request.kind);
                 return Ok(TurnCheckpointId::new());
@@ -2182,20 +2076,18 @@ mod tests {
             request: ironclaw_turns::run_profile::StoreLoopCheckpointPayload,
         ) -> Result<ironclaw_turns::run_profile::LoopCheckpointStateRef, AgentLoopHostError>
         {
-            // Iter-7 finding 3: a legacy host that has not yet migrated
-            // returns `Unavailable` (this is the shape of the default
-            // trait impl). The executor must tolerate this and fall back
-            // to the legacy checkpoint()-only path.
+            // A legacy host returns `Unavailable` (the default trait
+            // impl shape); the executor must tolerate it and fall back
+            // to the legacy `checkpoint()`-only path.
             if *self.legacy_checkpoint_only.lock().unwrap() {
                 return Err(AgentLoopHostError::new(
                     AgentLoopHostErrorKind::Unavailable,
                     "legacy host: store_checkpoint_payload not implemented",
                 ));
             }
-            // Iter-6 finding 2: simulate a transient DB outage when the
-            // executor tries to persist the Final checkpoint payload so
-            // tests can verify the cancel-page ack does NOT happen before
-            // the checkpoint is durable.
+            // Simulate a transient DB outage when persisting Final, to
+            // verify the cancel-page ack does NOT happen before the
+            // checkpoint is durable.
             if matches!(request.kind, LoopCheckpointKind::Final)
                 && *self.fail_final_store.lock().unwrap()
             {
@@ -2515,10 +2407,6 @@ mod tests {
         assert_eq!(host.checkpoint_kinds(), vec![LoopCheckpointKind::Final]);
     }
 
-    // ============================================================
-    // Codex /review follow-ups: tests for the five P1/P2 fixes.
-    // ============================================================
-
     /// Custom recovery strategy that always returns `Retry { Backoff }`.
     /// Used to drive the inner retry loop on repeated capability failures.
     struct AlwaysRetryRecovery;
@@ -2590,18 +2478,18 @@ mod tests {
         }
     }
 
-    /// Finding 1: a `FollowUp` arriving in the drain queue must continue the
-    /// run, not silently drop the message and complete.
+    /// A `FollowUp` arriving in the drain queue must continue the run,
+    /// not silently drop the message and complete.
     #[tokio::test]
     async fn followup_drain_continues_run_when_followup_arrives() {
         let host = MockHost::new(vec![reply_output("first"), reply_output("second")])
             .with_poll_inputs(vec![
-                Vec::new(),                             // observe_cancellation iter 1
-                Vec::new(),                             // drain_steering iter 1
+                Vec::new(),
+                Vec::new(),
                 vec![followup_input("more-from-user")], // drain_followup after reply 1
-                Vec::new(),                             // observe_cancellation iter 2
-                Vec::new(),                             // drain_steering iter 2
-                Vec::new(),                             // drain_followup after reply 2
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
 
@@ -2612,8 +2500,7 @@ mod tests {
         assert_eq!(exit, LoopExit::Completed(CompletionKind::NaturalEnd));
         assert_eq!(host.model_call_count(), 2);
         assert_eq!(state.assistant_refs.len(), 2);
-        // Exactly one Final checkpoint at the very end (no Final after iter 1
-        // because we continued).
+        // Exactly one Final checkpoint at the very end.
         let finals = host
             .checkpoint_kinds()
             .iter()
@@ -2627,22 +2514,18 @@ mod tests {
         );
     }
 
-    /// Iter-8 finding 2: a `UserMessage` (not `FollowUp`) arriving in the
-    /// drain queue must continue the run, not silently drop the message and
-    /// complete. Pre-iter-8 `drain_followup` matched only `LoopInput::FollowUp`
-    /// — a fresh `UserMessage` enqueued just as the loop would otherwise
-    /// complete fell through to the control-only branch and got `ack_inputs`'d,
-    /// exiting `Completed` while dropping the input.
+    /// A `UserMessage` (not `FollowUp`) arriving in the drain queue must
+    /// continue the run, not silently drop the message and complete.
     #[tokio::test]
     async fn followup_drain_continues_run_when_user_message_arrives() {
         let host = MockHost::new(vec![reply_output("first"), reply_output("second")])
             .with_poll_inputs(vec![
-                Vec::new(),                                  // observe_cancellation iter 1
-                Vec::new(),                                  // drain_steering iter 1
+                Vec::new(),
+                Vec::new(),
                 vec![user_message_input("late-user-typed")], // drain_followup after reply 1
-                Vec::new(),                                  // observe_cancellation iter 2
-                Vec::new(),                                  // drain_steering iter 2
-                Vec::new(),                                  // drain_followup after reply 2
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
 
@@ -2655,19 +2538,18 @@ mod tests {
         assert_eq!(state.assistant_refs.len(), 2);
     }
 
-    /// Iter-8 finding 2: same shape as the `UserMessage` case but for
-    /// `LoopInput::Steering` — also user-facing input the next iteration
-    /// owes processing to, also dropped pre-iter-8.
+    /// Same shape as the `UserMessage` case but for `LoopInput::Steering`
+    /// — also user-facing input the next iteration owes processing to.
     #[tokio::test]
     async fn followup_drain_continues_run_when_steering_arrives() {
         let host = MockHost::new(vec![reply_output("first"), reply_output("second")])
             .with_poll_inputs(vec![
-                Vec::new(),                               // observe_cancellation iter 1
-                Vec::new(),                               // drain_steering iter 1
+                Vec::new(),
+                Vec::new(),
                 vec![steering_input("steering-message")], // drain_followup after reply 1
-                Vec::new(),                               // observe_cancellation iter 2
-                Vec::new(),                               // drain_steering iter 2
-                Vec::new(),                               // drain_followup after reply 2
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
 
@@ -2678,17 +2560,15 @@ mod tests {
         assert_eq!(state.assistant_refs.len(), 2);
     }
 
-    /// Iter-2 finding 2 / iter-3 finding 1: a `Cancel` arriving in the
-    /// drain queue must terminate the run with `LoopExit::Cancelled`. With
-    /// the iter-3 atomic-page semantics, `drain_followup` itself observes
-    /// the terminal input, applies any sibling control side effects, acks
-    /// the page, and returns `TerminalCancel` so the caller finalizes —
-    /// the next iteration's `observe_cancellation` is no longer required.
+    /// A `Cancel` arriving in the drain queue must terminate the run with
+    /// `LoopExit::Cancelled`. `drain_followup` itself observes the terminal
+    /// input, applies any sibling control side effects, acks the page,
+    /// and returns `TerminalCancel` so the caller finalizes.
     #[tokio::test]
     async fn followup_drain_terminates_on_cancel_in_drain_page() {
         let host = MockHost::new(vec![reply_output("hello")]).with_poll_inputs(vec![
-            Vec::new(),           // observe_cancellation iter 1
-            Vec::new(),           // drain_steering iter 1
+            Vec::new(),
+            Vec::new(),
             vec![cancel_input()], // drain_followup after reply — cancel-only batch
         ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
@@ -2709,8 +2589,8 @@ mod tests {
         );
     }
 
-    /// Finding 3: a recovery `Retry` followed by a still-`Failed` outcome
-    /// must re-consult recovery and (with `DefaultRecoveryStrategy`) abort
+    /// A recovery `Retry` followed by a still-`Failed` outcome must
+    /// re-consult recovery and (with `DefaultRecoveryStrategy`) abort
     /// once the per-class budget is exhausted, surfacing
     /// `LoopExit::Failed { CapabilityProtocolError }`.
     #[tokio::test]
@@ -2744,9 +2624,8 @@ mod tests {
         assert_eq!(host.single_call_count(), 2);
     }
 
-    /// Finding 3 (defense-in-depth): a custom recovery strategy that never
-    /// returns `Abort` must be capped by `MAX_RETRIES_PER_CALL` and exit
-    /// with `DriverBug`.
+    /// A custom recovery strategy that never returns `Abort` must be
+    /// capped by `MAX_RETRIES_PER_CALL` and exit with `DriverBug`.
     #[tokio::test]
     async fn always_retry_recovery_is_capped_by_max_retries_per_call() {
         let host =
@@ -2781,8 +2660,8 @@ mod tests {
         }
     }
 
-    /// Finding 4: an `AllowOnly([cap_a])` capability filter narrows the
-    /// visible surface to only `cap_a` even when the host returns more.
+    /// An `AllowOnly([cap_a])` capability filter narrows the visible
+    /// surface to only `cap_a` even when the host returns more.
     #[tokio::test]
     async fn capability_filter_allow_only_narrows_visible_surface() {
         // Host returns two descriptors; planner filter allows only one.
@@ -2830,8 +2709,8 @@ mod tests {
         assert_eq!(untouched.descriptors.len(), 2);
     }
 
-    /// Finding 5: `SpawnedProcess` must be treated as `Blocked` (with a
-    /// gate-shaped ref derived from the process handle), not as a failure.
+    /// `SpawnedProcess` must be treated as `Blocked` (with a gate-shaped
+    /// ref derived from the process handle), not as a failure.
     #[tokio::test]
     async fn spawned_process_outcome_blocks_with_synthetic_gate_ref() {
         let process_ref =
@@ -2866,15 +2745,9 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // Codex /review (second pass) follow-ups: tests for findings 1,
-    // 3, 4, 7. The pre-existing tests already lock in findings 2, 5,
-    // 6, 8 — see the section above.
-    // ============================================================
-
-    /// Finding 1: checkpoint payload must be stored before the host's
-    /// `checkpoint()` call, so the real `HostManagedLoopCheckpointPort`
-    /// (which verifies the state ref exists) accepts every checkpoint.
+    /// Checkpoint payload must be stored before the host's `checkpoint()`
+    /// call, so the real `HostManagedLoopCheckpointPort` (which verifies
+    /// the state ref exists) accepts every checkpoint.
     #[tokio::test]
     async fn checkpoint_payload_is_stored_before_each_checkpoint_marker() {
         let host = MockHost::new(vec![reply_output("hi")]);
@@ -2890,9 +2763,9 @@ mod tests {
         assert_eq!(host.stored_payload_count(), 2);
     }
 
-    /// Finding 3: a model-emitted capability call against a capability the
-    /// executor filter narrowed away must be denied executor-side without
-    /// ever reaching the host's `invoke_capability_batch`.
+    /// A model-emitted capability call against a capability the executor
+    /// filter narrowed away must be denied executor-side without ever
+    /// reaching the host's `invoke_capability_batch`.
     #[tokio::test]
     async fn hidden_capability_candidate_is_denied_without_host_invocation() {
         use crate::strategies::{
@@ -2944,18 +2817,18 @@ mod tests {
         let _ = BatchPolicy::Parallel;
     }
 
-    /// Finding 4: a `GateResolved` input must clear `last_gate` and be
-    /// acked so it doesn't get re-polled forever.
+    /// A `GateResolved` input must clear `last_gate` and be acked so
+    /// it doesn't get re-polled forever.
     #[tokio::test]
     async fn gate_resolved_input_clears_last_gate_and_is_acked() {
         let gate_ref = LoopGateRef::new("gate:approval-1").unwrap();
         let host = MockHost::new(vec![reply_output("done")]).with_poll_inputs(vec![
-            // observe_cancellation iter 1: GateResolved alone — must consume.
+            // GateResolved alone — must consume.
             vec![LoopInput::GateResolved {
                 gate_ref: gate_ref.clone(),
             }],
-            Vec::new(), // drain_steering iter 1
-            Vec::new(), // drain_followup after reply (empty → Final)
+            Vec::new(),
+            Vec::new(),
         ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
         state.last_gate = Some(gate_ref.clone());
@@ -2968,17 +2841,17 @@ mod tests {
         assert!(host.ack_count() >= 1, "GateResolved batch must be acked");
     }
 
-    /// Finding 4: a `CapabilitySurfaceChanged` input must drop the cached
+    /// A `CapabilitySurfaceChanged` input must drop the cached
     /// `surface_version` so the next iteration re-fetches.
     #[tokio::test]
     async fn surface_changed_input_drops_cached_surface_version() {
         let host = MockHost::new(vec![reply_output("done")]).with_poll_inputs(vec![
-            // observe_cancellation iter 1: SurfaceChanged alone.
+            // SurfaceChanged alone.
             vec![LoopInput::CapabilitySurfaceChanged {
                 version: surface_version(),
             }],
-            Vec::new(), // drain_steering iter 1
-            Vec::new(), // drain_followup after reply
+            Vec::new(),
+            Vec::new(),
         ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
 
@@ -2988,9 +2861,9 @@ mod tests {
         assert!(host.ack_count() >= 1, "SurfaceChanged batch must be acked");
     }
 
-    /// Finding 7: a host model-port error with kind `StaleSurface` must
-    /// trigger a capability surface reload and re-issue the iteration
-    /// without consuming the iteration budget.
+    /// A host model-port error with kind `StaleSurface` must trigger a
+    /// capability surface reload and re-issue the iteration without
+    /// consuming the iteration budget.
     #[tokio::test]
     async fn stale_surface_model_error_reloads_capabilities_and_retries() {
         let host = MockHost::new(vec![reply_output("done")]).with_model_errors(vec![
@@ -3006,9 +2879,9 @@ mod tests {
         assert_eq!(host.model_call_count(), 2);
     }
 
-    /// Finding 7: a host model-port error classified as transient
-    /// (`Unavailable`) must be routed through `RecoveryStrategy::on_model_error`
-    /// and ultimately abort with `ModelError` when the per-class budget is
+    /// A host model-port error classified as transient (`Unavailable`)
+    /// must be routed through `RecoveryStrategy::on_model_error` and
+    /// ultimately abort with `ModelError` when the per-class budget is
     /// exhausted.
     #[tokio::test]
     async fn transient_model_error_routes_through_recovery_then_aborts() {
@@ -3044,34 +2917,27 @@ mod tests {
         assert_eq!(host.model_call_count(), 3);
     }
 
-    // ============================================================
-    // Codex /review (iter-3) follow-ups: tests for findings 1–5.
-    // ============================================================
-
-    /// Iter-3 finding 1: a page containing BOTH `FollowUp` and a control
-    /// event (`GateResolved`) is no longer left permanently un-acked
-    /// (which the iter-2 implementation did → livelock). The executor
-    /// applies the control side effect in-place, acks the mixed page,
-    /// continues with the follow-up, and exits naturally.
+    /// A page containing BOTH `FollowUp` and a control event
+    /// (`GateResolved`) must not livelock. The executor applies the
+    /// control side effect in-place, acks the mixed page, continues
+    /// with the follow-up, and exits naturally.
     #[tokio::test]
     async fn mixed_followup_and_gate_resolved_drain_page_is_acked_no_livelock() {
         let gate_ref = LoopGateRef::new("gate:approval-mix").unwrap();
         let host = MockHost::new(vec![reply_output("first"), reply_output("second")])
             .with_poll_inputs(vec![
-                Vec::new(), // observe_cancellation iter 1
-                Vec::new(), // drain_steering iter 1
-                // drain_followup after reply 1: FollowUp + GateResolved
-                // in the same atomic page — pre-iter-3 code livelocked
-                // here.
+                Vec::new(),
+                Vec::new(),
+                // FollowUp + GateResolved in the same atomic page.
                 vec![
                     followup_input("user-says-more"),
                     LoopInput::GateResolved {
                         gate_ref: gate_ref.clone(),
                     },
                 ],
-                Vec::new(), // observe_cancellation iter 2
-                Vec::new(), // drain_steering iter 2
-                Vec::new(), // drain_followup after reply 2 → Empty → Final
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
         state.last_gate = Some(gate_ref.clone());
@@ -3090,13 +2956,12 @@ mod tests {
         assert!(host.ack_count() >= 1);
     }
 
-    /// Iter-3 finding 2: when the planner's filter narrows a capability
-    /// away that appears BEFORE an allowed call in the model's batch,
-    /// the executor must short-circuit on the policy denial WITHOUT
-    /// having executed the subsequent allowed call. The pre-iter-3 code
-    /// invoked the entire allowed sub-batch up-front, so `[hidden, allowed]`
-    /// would already have executed `allowed` by the time the synthetic
-    /// `Denied` outcome was processed.
+    /// When the planner's filter narrows a capability away that appears
+    /// BEFORE an allowed call in the model's batch, the executor must
+    /// short-circuit on the policy denial without having executed the
+    /// subsequent allowed call. Naively invoking the entire allowed
+    /// sub-batch up-front would let `[hidden, allowed]` run `allowed`
+    /// before the synthetic `Denied` outcome is processed.
     #[tokio::test]
     async fn hidden_capability_before_allowed_aborts_without_executing_allowed() {
         use crate::strategies::{
@@ -3190,11 +3055,10 @@ mod tests {
         );
     }
 
-    /// Iter-3 finding 3: a `Sequential` batch returning a truncated
-    /// outcome prefix (host stopped at first suspension) is accepted
-    /// when the tail is a suspension. The executor routes the
-    /// suspension through the existing gate path → `Blocked`. The
-    /// pre-iter-3 code raised "outcome count did not match" instead.
+    /// A `Sequential` batch returning a truncated outcome prefix (host
+    /// stopped at first suspension) is accepted when the tail is a
+    /// suspension. The executor routes the suspension through the
+    /// existing gate path → `Blocked`.
     #[tokio::test]
     async fn sequential_batch_truncated_at_suspension_routes_through_gate() {
         use crate::strategies::{
@@ -3253,11 +3117,11 @@ mod tests {
         );
     }
 
-    /// Iter-3 finding 4: a `Retry { Backoff { delay } }` from recovery
-    /// must trigger a tokio sleep before the next attempt. We use
-    /// `tokio::time` paused-clock + a custom recovery that requests a
-    /// 60s backoff, then assert the elapsed *virtual* time is at least
-    /// 60s — proving the executor consulted the clock.
+    /// A `Retry { Backoff { delay } }` from recovery must trigger a
+    /// tokio sleep before the next attempt. Using `tokio::time`
+    /// paused-clock + a custom recovery that requests a 60s backoff,
+    /// the elapsed virtual time is at least 60s — proving the executor
+    /// consulted the clock.
     #[tokio::test(start_paused = true)]
     async fn backoff_alteration_is_honored_via_tokio_sleep() {
         struct BackoffThenAbort {
@@ -3325,9 +3189,9 @@ mod tests {
         );
     }
 
-    /// Iter-3 finding 5: a `LoopModelPort` error with kind `Cancelled`
-    /// must surface as `LoopExit::Cancelled` (not `HostUnavailable`),
-    /// taking the `Final` checkpoint along the way.
+    /// A `LoopModelPort` error with kind `Cancelled` must surface as
+    /// `LoopExit::Cancelled` (not `HostUnavailable`), taking the
+    /// `Final` checkpoint along the way.
     #[tokio::test]
     async fn model_port_cancelled_error_surfaces_as_cancelled_exit() {
         let host = MockHost::new(vec![]).with_model_errors(vec![AgentLoopHostError::new(
@@ -3361,35 +3225,25 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // Codex /review (iter-4) follow-ups: tests for findings 1–3.
-    // ============================================================
-
-    /// Iter-4 finding 1: `drain_followup` must keep polling past
-    /// control-only pages. A control-only page followed by a follow-up
-    /// page used to drop the follow-up silently (caller took `Final` and
-    /// exited `Completed`). With the fix, the executor acks the
-    /// control-only page, polls again, finds the follow-up, and continues
-    /// the run.
+    /// `drain_followup` must keep polling past control-only pages. The
+    /// executor acks the control-only page, polls again, finds the
+    /// follow-up on a later page, and continues the run.
     #[tokio::test]
     async fn followup_drain_keeps_polling_past_control_only_pages() {
         let gate_ref = LoopGateRef::new("gate:later-followup").unwrap();
         let host = MockHost::new(vec![reply_output("first"), reply_output("second")])
             .with_poll_inputs(vec![
-                Vec::new(), // observe_cancellation iter 1
-                Vec::new(), // drain_steering iter 1
-                // drain_followup after reply 1, page 1: control-only
-                // GateResolved (pre-iter-4 returned Empty here and dropped
-                // the follow-up on page 2).
+                Vec::new(),
+                Vec::new(),
+                // control-only GateResolved on page 1.
                 vec![LoopInput::GateResolved {
                     gate_ref: gate_ref.clone(),
                 }],
-                // drain_followup after reply 1, page 2: the actual
-                // follow-up sitting on a later page.
+                // follow-up sitting on page 2.
                 vec![followup_input("user-followup-on-page-2")],
-                Vec::new(), // observe_cancellation iter 2
-                Vec::new(), // drain_steering iter 2
-                Vec::new(), // drain_followup after reply 2 — Empty → Final
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
         state.last_gate = Some(gate_ref.clone());
@@ -3419,10 +3273,10 @@ mod tests {
         );
     }
 
-    /// Iter-4 finding 2: a `Denied` outcome must NEVER be replayed
-    /// through `host.invoke_capability`. Even with a recovery strategy
-    /// that always returns `Retry`, the host's single-call port must not
-    /// be invoked — the denial is authoritative. The executor treats
+    /// A `Denied` outcome must NEVER be replayed through
+    /// `host.invoke_capability`. Even with a recovery strategy that
+    /// always returns `Retry`, the host's single-call port must not be
+    /// invoked — the denial is authoritative. The executor treats
     /// `Retry` on `PolicyDenied` as `SkipResult`.
     #[tokio::test]
     async fn denied_outcome_is_not_replayed_through_host_under_retry_recovery() {
@@ -3453,10 +3307,9 @@ mod tests {
             .with_model(Arc::new(DefaultModelStrategy))
             .with_batch(Arc::new(DefaultBatchPolicyStrategy))
             .with_gate(Arc::new(DefaultGateHandlingStrategy))
-            // The AlwaysRetryRecovery strategy returns Retry on every
-            // capability error. Without the iter-4 fix, the executor
-            // would re-invoke the host with the denied call — and since
-            // no single_outcomes are queued, MockHost would panic.
+            // AlwaysRetryRecovery returns Retry on every capability
+            // error. Re-invoking the host with the denied call would
+            // panic since no single_outcomes are queued.
             .with_recovery(Arc::new(AlwaysRetryRecovery))
             .with_stop(Arc::new(DefaultStopConditionStrategy::default()))
             .with_drain(Arc::new(DefaultInputDrainStrategy))
@@ -3480,14 +3333,11 @@ mod tests {
         );
     }
 
-    /// Iter-4 finding 3: `recent_failure_kinds` must be pushed AT MOST
-    /// ONCE per logical model call, not once per retry attempt. An
-    /// eventually-successful model turn must not trip
+    /// `recent_failure_kinds` must be pushed at most once per logical
+    /// model call, not once per retry attempt. An eventually-successful
+    /// model turn must not trip
     /// `DefaultStopConditionStrategy::failure_run_threshold` (3) as a
-    /// false `NoProgressDetected` exit. We use `AlwaysRetryRecovery` so
-    /// the model is retried for two transient errors before succeeding;
-    /// the run must complete naturally and `recent_failure_kinds` must
-    /// hold exactly one `ModelError` entry, not three.
+    /// false `NoProgressDetected` exit.
     #[tokio::test]
     async fn model_retry_records_failure_kind_once_per_logical_call() {
         // 2 transient errors, then the model port returns the queued
@@ -3526,16 +3376,12 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // Codex /review (iter-5) follow-ups: tests for findings 1-4.
-    // ============================================================
-
-    /// Iter-5 finding 1: a recovery `SkipResult` on a persistent model error
-    /// must advance the iteration counter so the iteration cap eventually
-    /// trips. The pre-iter-5 code routed `SkipResult` through
-    /// `ReloadSurface`, which restarts the SAME iteration — and with a
-    /// `SkipResult`-returning recovery, the loop would spin forever on a
-    /// persistent `Unavailable` model failure.
+    /// A recovery `SkipResult` on a persistent model error must advance
+    /// the iteration counter so the iteration cap eventually trips.
+    /// Routing `SkipResult` through `ReloadSurface` would restart the
+    /// SAME iteration; with a `SkipResult`-returning recovery against a
+    /// persistent `Unavailable` model failure, the loop would spin
+    /// forever.
     #[tokio::test]
     async fn skip_result_on_model_error_advances_iteration_until_cap_trips() {
         // A recovery strategy that always returns `SkipResult` on model
@@ -3566,10 +3412,10 @@ mod tests {
         }
 
         // Pre-script enough Unavailable errors that any non-progressing
-        // loop would spin past the iteration cap. With the iter-5 fix,
-        // each SkipResult advances the iteration counter; with a 3-tick
-        // cap, exactly 3 model attempts are observed before
-        // IterationLimitReached fails out.
+        // loop would spin past the iteration cap. Each SkipResult
+        // advances the iteration counter; with a 3-tick cap, exactly
+        // 3 model attempts are observed before IterationLimitReached
+        // fails out.
         let host = MockHost::new(vec![]).with_model_errors(vec![
             AgentLoopHostError::new(AgentLoopHostErrorKind::Unavailable, "down 1"),
             AgentLoopHostError::new(AgentLoopHostErrorKind::Unavailable, "down 2"),
@@ -3589,8 +3435,7 @@ mod tests {
             .unwrap();
 
         // Iteration cap trips because each SkipResult advances
-        // state.iteration. Without the fix, the executor would spin
-        // forever on the same iteration.
+        // state.iteration.
         match exit {
             LoopExit::Failed {
                 kind: FailureKind::IterationLimitReached,
@@ -3600,7 +3445,7 @@ mod tests {
         // Three model attempts (one per advancing iteration), then the
         // cap trips at the top of iteration 3.
         assert_eq!(host.model_call_count(), 3);
-        // Iter-5 finding 4: the IterationLimit exit Final-checkpoints.
+        // The IterationLimit exit Final-checkpoints.
         assert!(
             host.checkpoint_kinds()
                 .iter()
@@ -3610,15 +3455,15 @@ mod tests {
         );
     }
 
-    /// Iter-5 finding 2: `BudgetStrategy::wall_clock_limit` is consulted at
-    /// the top of every tick alongside `iteration_limit`. When exceeded,
-    /// the executor fails out with `WallClockLimitReached` after taking a
+    /// `BudgetStrategy::wall_clock_limit` is consulted at the top of
+    /// every tick alongside `iteration_limit`. When exceeded, the
+    /// executor fails out with `WallClockLimitReached` after taking a
     /// `Final` checkpoint.
     ///
-    /// To exercise the wall-clock branch deterministically we use a
-    /// recovery strategy that always retries model errors with a long
+    /// To exercise the wall-clock branch deterministically the test
+    /// uses a recovery strategy that retries model errors with a long
     /// `Backoff`, paired with a stream of model errors. The backoff
-    /// sleep advances tokio's paused clock past the cap; the very next
+    /// sleep advances tokio's paused clock past the cap; the next
     /// wall-clock check at the top of the loop fires.
     #[tokio::test(start_paused = true)]
     async fn wall_clock_limit_failed_exit_with_final_checkpoint() {
@@ -3664,13 +3509,12 @@ mod tests {
             }
         }
 
-        // Two model errors so the recovery loop sleeps once (90s virtual
-        // time elapses), then the second attempt is still in the same
-        // iteration. We need to LEAVE the inner retry loop so the
-        // top-of-tick wall-clock check fires. The retry loop exits
-        // either on Ok or on the `MAX_RETRIES_PER_CALL` cap. To trigger
-        // a clean exit, we route through `SkipResult` after the
-        // backoff sleep so the executor advances to the next tick.
+        // Two model errors so the recovery loop sleeps once (90s
+        // virtual time elapses), then the second attempt is still in
+        // the same iteration. The inner retry loop must exit so the
+        // top-of-tick wall-clock check fires; route through
+        // `SkipResult` after the backoff sleep to advance to the next
+        // tick.
         struct OnceBackoffThenSkip {
             backed_off: Mutex<bool>,
         }
@@ -3703,8 +3547,8 @@ mod tests {
                     }
                 } else {
                     // After the 90s sleep, SkipResult ends the inner
-                    // retry loop and advances the iteration counter.
-                    // The next tick's wall-clock check fires (90s > 60s).
+                    // retry loop and advances the iteration counter so
+                    // the next tick's wall-clock check fires.
                     RecoveryOutcome::SkipResult {
                         recovery: state.recovery_state.with_incremented_attempts(),
                     }
@@ -3746,7 +3590,7 @@ mod tests {
             } => {}
             other => panic!("expected Failed WallClockLimitReached, got {other:?}"),
         }
-        // Iter-5 finding 4: wall-clock failure Final-checkpoints.
+        // Wall-clock failure Final-checkpoints.
         assert!(
             host.checkpoint_kinds()
                 .iter()
@@ -3756,16 +3600,9 @@ mod tests {
         );
     }
 
-    /// Iter-5 finding 3 (in-crate part): a `PutCheckpointStateRequest`
-    /// carrying `with_max_payload_bytes` larger than the legacy 64 KiB
-    /// default is accepted by the store, AND the per-profile cap is
-    /// enforced when the payload exceeds it.
-    ///
-    /// The host-side wiring (loop_driver_host.rs threading the active
-    /// profile's `checkpoint_policy.max_checkpoint_bytes`) is exercised
-    /// through this in-crate contract; the cap is now respected end-to-
-    /// end because (a) the absolute system ceiling is 256 KiB and (b)
-    /// the request carries the profile cap.
+    /// A `PutCheckpointStateRequest` carrying `with_max_payload_bytes`
+    /// larger than the legacy 64 KiB default is accepted by the store,
+    /// and the per-profile cap is enforced when the payload exceeds it.
     #[tokio::test]
     async fn checkpoint_state_store_honors_profile_cap_over_legacy_default() {
         use ironclaw_turns::{
@@ -3811,10 +3648,9 @@ mod tests {
         }
     }
 
-    /// Iter-5 finding 4: every terminal failure-shaped exit takes a
-    /// `Final` checkpoint. Covers `Stop::Aborted` (returned from the stop
-    /// strategy after a capability batch). Pre-iter-5 code skipped the
-    /// checkpoint on this path, so a profile with
+    /// Every terminal failure-shaped exit takes a `Final` checkpoint.
+    /// Covers `Stop::Aborted` (returned from the stop strategy after a
+    /// capability batch); without the checkpoint, a profile with
     /// `require_final_checkpoint = true` would reject the exit as
     /// `MissingFinalCheckpoint`.
     #[tokio::test]
@@ -3885,18 +3721,11 @@ mod tests {
         _check(&CanonicalAgentLoopExecutor);
     }
 
-    /// Iter-6 finding 1: the wall-clock budget anchor MUST survive
-    /// checkpoint reload. A run that resumes with a `started_at_unix_ms`
-    /// already older than `wall_clock_limit` trips
-    /// `WallClockLimitReached` on the first tick, even though the
-    /// in-process `tokio::time::Instant` (which always starts fresh) has
-    /// only just been captured.
-    ///
-    /// Pre-iter-6 the anchor was a local `let start_time =
-    /// Instant::now();`. A `Blocked` run that re-entered `execute()` got a
-    /// brand-new wall-clock budget while keeping its old iteration count;
-    /// this test would have failed (the executor would have run the model
-    /// instead of failing fast).
+    /// The wall-clock budget anchor must survive checkpoint reload. A
+    /// run that resumes with a `started_at_unix_ms` already older than
+    /// `wall_clock_limit` trips `WallClockLimitReached` on the first
+    /// tick, even though the in-process `tokio::time::Instant` (which
+    /// always starts fresh) has only just been captured.
     #[tokio::test]
     async fn resumed_run_with_stale_started_at_trips_wall_clock_limit_on_first_tick() {
         // Budget with a 60s wall-clock cap.
@@ -3948,7 +3777,7 @@ mod tests {
             0,
             "wall-clock cap must fire before the model is invoked on a resumed run"
         );
-        // Final checkpoint was taken (iter-5 finding 4 contract).
+        // Final checkpoint was taken.
         assert!(
             host.checkpoint_kinds()
                 .iter()
@@ -3958,11 +3787,9 @@ mod tests {
         );
     }
 
-    /// Iter-6 finding 1: a fresh run anchors `started_at_unix_ms` on the
-    /// first `execute()` entry and the value survives a JSON round trip,
-    /// so the next `execute()` can read it as the run's effective start.
-    /// Companion to the resume test above; this one only verifies the
-    /// write + persistence shape.
+    /// A fresh run anchors `started_at_unix_ms` on the first
+    /// `execute()` entry and the value survives a JSON round trip, so
+    /// the next `execute()` can read it as the run's effective start.
     #[tokio::test]
     async fn first_execute_entry_anchors_started_at_unix_ms_and_persists_via_checkpoint_payload() {
         let host = MockHost::new(vec![reply_output("done")]);
@@ -3990,20 +3817,15 @@ mod tests {
         assert_eq!(restored.started_at_unix_ms, Some(anchor));
     }
 
-    /// Iter-6 finding 2: when the `Final` checkpoint fails during
-    /// terminal-cancel handling in `observe_cancellation`, the cancel
-    /// page MUST NOT be acked. The executor surfaces a
-    /// `CheckpointFailed` error and `state.input_cursor` retains the
-    /// pre-cancel value, so the next `execute()` re-polls the same
-    /// cancel page and tries again.
-    ///
-    /// Pre-iter-6 the ack happened FIRST; a transient DB outage during
-    /// checkpoint left the cancel consumed but the run un-persisted —
-    /// the retry would skip past the cancel and run forever.
+    /// When the `Final` checkpoint fails during terminal-cancel
+    /// handling in `observe_cancellation`, the cancel page must NOT be
+    /// acked. The executor surfaces a `CheckpointFailed` error and
+    /// `state.input_cursor` retains the pre-cancel value, so the next
+    /// `execute()` re-polls the same cancel page.
     #[tokio::test]
     async fn cancel_page_is_not_acked_when_final_checkpoint_store_fails() {
         let host = MockHost::new(vec![]).with_poll_inputs(vec![
-            // observe_cancellation iter 1: a cancel-only page.
+            // a cancel-only page.
             vec![cancel_input()],
         ]);
         host.fail_final_checkpoint_store();
@@ -4033,29 +3855,20 @@ mod tests {
         );
     }
 
-    // ============================================================
-    // Codex /review (iter-7) follow-ups: tests for findings 1-3.
-    // ============================================================
-
-    /// Iter-7 finding 1: `observe_cancellation` must page past
-    /// control-only pages. A `GateResolved` on page 1 followed by a
-    /// `Cancel` on page 2 must terminate the run before any further
-    /// model call, not after one more reply.
+    /// `observe_cancellation` must page past control-only pages. A
+    /// `GateResolved` on page 1 followed by a `Cancel` on page 2 must
+    /// terminate the run before any further model call, not after one
+    /// more reply.
     #[tokio::test]
     async fn observe_cancellation_pages_past_control_only_to_find_terminal() {
         let gate_ref = LoopGateRef::new("gate:before-cancel").unwrap();
-        // No model output scripted: if `observe_cancellation` failed to
-        // see the cancel on page 2, the next iteration would call the
-        // model and the test's `unwrap_or_else` default would fire — but
-        // we still assert `model_call_count == 0` to be explicit.
+        // No model output is scripted; we assert `model_call_count == 0`.
         let host = MockHost::new(vec![]).with_poll_inputs(vec![
-            // observe_cancellation iter 1, page 1: control-only.
-            // Pre-iter-7 this acked and returned None, hiding the
-            // cancel on page 2 until the next outer iteration.
+            // control-only on page 1.
             vec![LoopInput::GateResolved {
                 gate_ref: gate_ref.clone(),
             }],
-            // observe_cancellation iter 1, page 2: the terminal cancel.
+            // terminal cancel on page 2.
             vec![cancel_input()],
         ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
@@ -4096,43 +3909,29 @@ mod tests {
         );
     }
 
-    /// Iter-7 finding 2: when `drain_followup` exhausts `INPUT_POLL_LIMIT`
-    /// consecutive control-only pages it MUST return `ControlPending`,
-    /// NOT `Empty` — otherwise the caller Final-checkpoints and exits
-    /// `Completed` even though the queue might still hold a FollowUp on
-    /// a later page.
-    ///
-    /// This test scripts 16 consecutive control-only pages for the
-    /// drain after reply 1 (the drain exhausts its poll budget without
-    /// seeing a definitive empty page). With the iter-7 fix the
-    /// executor returns `ControlPending`, advances the iteration, and
-    /// the next tick's drain (after reply 2) sees a clean empty page
-    /// and Final-checkpoints normally — so we observe exactly 2 model
-    /// calls and exactly one Final checkpoint.
-    ///
-    /// Pre-iter-7 the same script returned `Empty` after page 16, the
-    /// caller Final-checkpointed after reply 1 and exited `Completed` —
-    /// model_call_count would be 1, not 2.
+    /// When `drain_followup` exhausts `INPUT_POLL_LIMIT` consecutive
+    /// control-only pages it must return `ControlPending`, not `Empty`
+    /// — otherwise the caller Final-checkpoints and exits `Completed`
+    /// even though the queue might still hold a FollowUp on a later
+    /// page.
     #[tokio::test]
     async fn drain_followup_returns_control_pending_not_empty_at_poll_limit() {
         let gate_ref = LoopGateRef::new("gate:lots-of-control").unwrap();
         let mut batches: Vec<Vec<LoopInput>> = Vec::new();
-        // Prologue: observe_cancellation + drain_steering for iter 1.
+        // iter 1 prologue.
         batches.push(Vec::new());
         batches.push(Vec::new());
-        // 16 consecutive control-only pages for `drain_followup` after
-        // reply 1 (the INPUT_POLL_LIMIT cap). Pre-iter-7 the drain
-        // would have collapsed this into Empty and the caller would
-        // have Final-checkpointed + exited Completed after reply 1.
+        // `INPUT_POLL_LIMIT` consecutive control-only pages for
+        // drain_followup after reply 1.
         for _ in 0..16 {
             batches.push(vec![LoopInput::GateResolved {
                 gate_ref: gate_ref.clone(),
             }]);
         }
-        // Iter 2 prologue + drain — clean tick that completes naturally.
-        batches.push(Vec::new()); // observe_cancellation iter 2
-        batches.push(Vec::new()); // drain_steering iter 2
-        batches.push(Vec::new()); // drain_followup iter 2 — Empty → Final.
+        // iter 2 prologue + drain — clean tick.
+        batches.push(Vec::new());
+        batches.push(Vec::new());
+        batches.push(Vec::new());
 
         let host = MockHost::new(vec![reply_output("first"), reply_output("second")])
             .with_poll_inputs(batches);
@@ -4141,11 +3940,9 @@ mod tests {
 
         let exit = run(&host, &mut state, 8).await;
 
-        // The run did NOT exit Completed after reply 1 — the executor
+        // The run did not exit Completed after reply 1 — the executor
         // advanced the iteration past 16 control-only drain pages and
-        // ran the second reply. Pre-iter-7 (Empty at the limit)
-        // model_call_count would have been 1 because the caller would
-        // have Final-checkpointed straight away.
+        // ran the second reply.
         assert_eq!(exit, LoopExit::Completed(CompletionKind::NaturalEnd));
         assert_eq!(
             host.model_call_count(),
@@ -4153,9 +3950,7 @@ mod tests {
             "the iteration must advance past 16 control-only drain pages, not exit Completed"
         );
         assert_eq!(state.assistant_refs.len(), 2);
-        // Exactly one Final checkpoint at the very end — NOT one after
-        // reply 1 (which is what the pre-iter-7 Empty-at-limit bug
-        // would have produced).
+        // Exactly one Final checkpoint at the very end.
         let finals = host
             .checkpoint_kinds()
             .iter()
@@ -4169,15 +3964,12 @@ mod tests {
         );
     }
 
-    /// Iter-7 finding 3: a legacy host whose `store_checkpoint_payload`
-    /// returns `Unavailable` (the default trait impl) must still be able
-    /// to checkpoint via the legacy `checkpoint()`-only contract. The
-    /// executor falls back to passing `LoopCheckpointStateRef::legacy_unknown()`
-    /// to the host's `checkpoint()` impl.
-    ///
-    /// Pre-iter-7 this path returned `CheckpointFailed` at every
-    /// checkpoint, breaking the compatibility path the trait change
-    /// advertised.
+    /// A legacy host whose `store_checkpoint_payload` returns
+    /// `Unavailable` (the default trait impl) must still be able to
+    /// checkpoint via the legacy `checkpoint()`-only contract; the
+    /// executor falls back to passing
+    /// `LoopCheckpointStateRef::legacy_unknown()` to the host's
+    /// `checkpoint()` impl.
     #[tokio::test]
     async fn legacy_host_without_store_payload_still_checkpoints_via_checkpoint_only_path() {
         let host = MockHost::new(vec![reply_output("done")]);
@@ -4211,10 +4003,6 @@ mod tests {
             host.checkpoint_kinds()
         );
     }
-
-    // ---- Iter-8 finding 1: `capability_summaries` projects per-descriptor
-    // concurrency hints from the visible surface, not a hardcoded
-    // `SafeForParallel`. ----
 
     fn descriptor(id: &str, concurrency: CapabilityConcurrency) -> CapabilityDescriptorView {
         CapabilityDescriptorView {
@@ -4328,43 +4116,29 @@ mod tests {
         assert_eq!(policy, BatchPolicy::Sequential);
     }
 
-    // ============================================================
-    // Codex /review (iter-9) follow-ups: tests for findings 1-3.
-    // ============================================================
-
-    /// Iter-9 finding 1: a control-only page consumed by `drain_followup`
-    /// must take a durable checkpoint with the advanced cursor BEFORE
-    /// the host's `ack_inputs`. Pre-iter-9 the cursor advance was
-    /// in-memory only and the next `BeforeModel` checkpoint did not
-    /// happen until after the model was invoked — so a crash between
-    /// ack and the next model call would leave the only durable
-    /// record pointing at a page the host had already dropped, and
-    /// the `GateResolved` / `CapabilitySurfaceChanged` side effects
-    /// would be lost.
-    ///
-    /// We exercise the contract by scripting `drain_followup` to walk
-    /// a control-only page followed by a real `FollowUp`, and assert
-    /// that the executor calls `store_checkpoint_payload` at least
-    /// once between the first poll and the eventual ack (i.e. the
-    /// drain itself produces a stored checkpoint payload).
+    /// A control-only page consumed by `drain_followup` must take a
+    /// durable checkpoint with the advanced cursor BEFORE the host's
+    /// `ack_inputs` — otherwise a crash between ack and the next
+    /// `BeforeModel` checkpoint would leave the only durable record
+    /// pointing at a page the host had already dropped, and the
+    /// `GateResolved` / `CapabilitySurfaceChanged` side effects would
+    /// be lost.
     #[tokio::test]
     async fn drain_followup_control_only_page_checkpoints_before_ack() {
         let gate_ref = LoopGateRef::new("gate:durability").unwrap();
         let host = MockHost::new(vec![reply_output("first"), reply_output("second")])
             .with_poll_inputs(vec![
-                Vec::new(), // observe_cancellation iter 1
-                Vec::new(), // drain_steering iter 1
-                // drain_followup after reply 1: control-only page (must
-                // be checkpoint-before-ack).
+                Vec::new(),
+                Vec::new(),
+                // control-only page after reply 1.
                 vec![LoopInput::GateResolved {
                     gate_ref: gate_ref.clone(),
                 }],
-                // drain_followup after reply 1: a real FollowUp on the
-                // next page (also must be checkpoint-before-ack).
+                // FollowUp on the next page.
                 vec![followup_input("kept-alive")],
-                Vec::new(), // observe_cancellation iter 2
-                Vec::new(), // drain_steering iter 2
-                Vec::new(), // drain_followup after reply 2 → Empty → Final
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
             ]);
         let mut state = LoopExecutionState::initial_for_run(host.run_context());
         state.last_gate = Some(gate_ref.clone());
@@ -4380,14 +4154,12 @@ mod tests {
         // The gate side effect was applied (proving the control page
         // was processed).
         assert_eq!(state.last_gate, None);
-        // Iter-9 finding 1 contract: each ack site MUST be preceded by
-        // a stored checkpoint payload. We had a control-only page ack
-        // plus a followup-consumed ack inside drain_followup; together
-        // with the normal `BeforeModel` / `BeforeSideEffect` / `Final`
-        // checkpoints the executor takes anyway, we expect strictly
-        // more stored payloads than a no-drain baseline. Concretely:
-        // BeforeModel(it1) + BeforeModel(control-ack) + BeforeModel(followup-ack)
-        // + BeforeModel(it2) + Final ≥ 5.
+        // Each ack site must be preceded by a stored checkpoint
+        // payload. With a control-only ack plus a followup-consumed ack
+        // inside drain_followup, together with the normal `BeforeModel`
+        // / `BeforeSideEffect` / `Final` checkpoints, we expect:
+        // BeforeModel(it1) + BeforeModel(control-ack)
+        // + BeforeModel(followup-ack) + BeforeModel(it2) + Final ≥ 5.
         let payload_count_after = host.stored_payload_count();
         assert!(
             payload_count_after - payload_count_before >= 5,
@@ -4397,13 +4169,9 @@ mod tests {
         );
     }
 
-    /// Iter-9 finding 2: `CapabilityDescriptorView::concurrency` must
-    /// `#[serde(default)]` so older payloads (pre-WS-6 hosts, recorded
-    /// events, persisted surface snapshots without the field)
-    /// deserialize as `CapabilityConcurrency::Exclusive`. Locking this
-    /// in at the framework boundary as well — `host.rs` carries the
-    /// unit-level test, this one verifies the field is visible at the
-    /// loop-framework re-export point and behaves the same way.
+    /// `CapabilityDescriptorView::concurrency` is `#[serde(default)]`
+    /// so older payloads without the field deserialize as
+    /// `CapabilityConcurrency::Exclusive`.
     #[test]
     fn legacy_descriptor_view_without_concurrency_defaults_to_exclusive() {
         let legacy_json = serde_json::json!({
@@ -4419,15 +4187,12 @@ mod tests {
         assert_eq!(view.concurrency, CapabilityConcurrency::Exclusive);
     }
 
-    /// Iter-9 finding 3: a custom `BatchPolicyStrategy` that returns
-    /// `Parallel` for a batch containing at least one `Exclusive`
-    /// summary MUST be overridden by the executor: the
-    /// `CapabilityBatchInvocation` sent to the host has
-    /// `stop_on_first_suspension = true`. Pre-iter-9 the flag was
-    /// derived only from the policy, so a permissive planner could
-    /// let the host run later invocations after an
-    /// `ApprovalRequired` / `AuthRequired` / `SpawnedProcess`
-    /// outcome.
+    /// A custom `BatchPolicyStrategy` that returns `Parallel` for a
+    /// batch containing at least one `Exclusive` summary must be
+    /// overridden by the executor: the `CapabilityBatchInvocation`
+    /// sent to the host has `stop_on_first_suspension = true`,
+    /// because the descriptor's `Exclusive` disclosure wins over a
+    /// permissive planner.
     #[tokio::test]
     async fn parallel_policy_with_any_exclusive_summary_forces_stop_on_suspension() {
         use crate::strategies::{
@@ -4449,9 +4214,8 @@ mod tests {
 
         let read_cap = CapabilityId::new("demo.read").unwrap();
         let write_cap = CapabilityId::new("demo.write").unwrap();
-        // Host surface: one safe, one exclusive. With `AlwaysParallel`
-        // the planner-policy is `Parallel`, but iter-9 finding 3 says
-        // the descriptor's own `Exclusive` disclosure must win.
+        // Host surface: one safe, one exclusive. The descriptor's
+        // `Exclusive` disclosure must win over `AlwaysParallel`.
         let surface = VisibleCapabilitySurface {
             version: surface_version(),
             descriptors: vec![
