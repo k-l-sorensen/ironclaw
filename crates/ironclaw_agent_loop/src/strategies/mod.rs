@@ -11,25 +11,33 @@
 //! `Default*` impls land in WS-5; the executor body that consumes these
 //! outcomes lands in WS-6.
 
-mod capability;
-mod context;
-mod model;
 pub mod batch;
 pub mod budget;
+mod capability;
+mod context;
 pub mod drain;
 pub mod gate;
+mod model;
 pub mod recovery;
 pub mod stop;
 
-pub use capability::{CapabilityFilter, CapabilityStrategy};
-pub use context::ContextStrategy;
-pub use model::{ModelPreference, ModelStrategy};
-pub use batch::{BatchPolicy, BatchPolicyStrategy, CapabilityCallSummary, ConcurrencyHint};
-pub use budget::{BudgetStrategy, UnlimitedBudget};
-pub use drain::InputDrainStrategy;
-pub use gate::{GateHandlingStrategy, GateKind, GateOutcome, GateSummary};
-pub use recovery::{
-    CapabilityErrorClass, CapabilityErrorSummary, ModelErrorClass, ModelErrorSummary,
-    RecoveryOutcome, RecoveryStrategy, RetryAlteration,
+pub use batch::{
+    BatchPolicy, BatchPolicyStrategy, CapabilityCallSummary, ConcurrencyHint,
+    DefaultBatchPolicyStrategy,
 };
-pub use stop::{StopConditionStrategy, StopKind, StopOutcome, TurnEndKind, TurnSummary};
+pub use budget::{BudgetStrategy, DefaultBudgetStrategy, UnlimitedBudget};
+pub use capability::{CapabilityFilter, CapabilityStrategy, DefaultCapabilityStrategy};
+pub use context::{ContextStrategy, DefaultContextStrategy};
+pub use drain::{DefaultInputDrainStrategy, InputDrainStrategy};
+pub use gate::{
+    DefaultGateHandlingStrategy, GateHandlingStrategy, GateKind, GateOutcome, GateSummary,
+};
+pub use model::{DefaultModelStrategy, ModelPreference, ModelStrategy};
+pub use recovery::{
+    CapabilityErrorClass, CapabilityErrorSummary, DefaultRecoveryStrategy, ModelErrorClass,
+    ModelErrorSummary, RecoveryOutcome, RecoveryStrategy, RetryAlteration,
+};
+pub use stop::{
+    DefaultStopConditionStrategy, StopConditionStrategy, StopKind, StopOutcome, TurnEndKind,
+    TurnSummary,
+};
