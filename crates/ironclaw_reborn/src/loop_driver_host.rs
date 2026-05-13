@@ -915,6 +915,20 @@ fn host_runtime_error(error: HostRuntimeError) -> AgentLoopHostError {
     }
 }
 
+/// Factory closure that produces an `Arc<HookDispatcher>` for each host
+/// build. The closure is invoked once per `build_text_only_host*` call.
+///
+/// To get full per-run isolation of dispatcher-owned mutable state (poisoned
+/// slots, in-process registry edits, timeout overrides), the closure should
+/// construct a **fresh** `HookDispatcher` on every call (e.g.
+/// `Arc::new(build_my_dispatcher())`). To opt into the legacy shared-state
+/// behavior, return clones of the same `Arc<HookDispatcher>`.
+///
+/// `Fn` (not `FnOnce`) — invoked once per build, potentially many times over
+/// the factory's lifetime. `Send + Sync + 'static` so the factory can be held
+/// across `.await` points and shared across tokio tasks.
+pub type HookDispatcherFactory = Arc<dyn Fn() -> Arc<HookDispatcher> + Send + Sync + 'static>;
+
 pub struct RebornLoopDriverHostFactory<S, G>
 where
     S: SessionThreadService + ?Sized,
@@ -929,11 +943,15 @@ where
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
     config: TextOnlyLoopHostConfig,
     skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
-    /// Optional hook dispatcher. When set, the factory wraps the capability
-    /// and prompt ports with the hooked middleware from `ironclaw_hooks` so
-    /// every invocation runs hook dispatch ahead of the inner port. Default
-    /// behavior (no dispatcher) is unchanged from the pre-hooks shape.
-    hook_dispatcher: Option<Arc<HookDispatcher>>,
+    /// Optional hook dispatcher factory. When set, the factory invokes the
+    /// closure on every `build_text_only_host*` call to obtain a fresh
+    /// `HookDispatcher`, wraps it in `Arc`, and then plumbs it through
+    /// `HookedLoopCapabilityPort` / `HookedLoopPromptPort`. Building a fresh
+    /// dispatcher per host build means slot-poisoning state, the per-tenant
+    /// predicate counter, and any registry mutations done while a run is
+    /// active do not leak into the next run. Default behavior (no factory) is
+    /// unchanged from the pre-hooks shape.
+    hook_dispatcher_factory: Option<HookDispatcherFactory>,
 }
 
 impl<S, G> RebornLoopDriverHostFactory<S, G>
@@ -960,7 +978,7 @@ where
             milestone_sink,
             config,
             skill_context_source: None,
-            hook_dispatcher: None,
+            hook_dispatcher_factory: None,
         }
     }
 
@@ -969,24 +987,51 @@ where
         self
     }
 
-    /// Install a [`HookDispatcher`] that wraps the capability and prompt
-    /// ports. When set, every capability invocation runs through
-    /// `before_capability` dispatch before reaching the inner port, and every
-    /// prompt-bundle build runs through `before_prompt` dispatch.
+    /// Install a hook dispatcher factory closure. The closure is invoked once
+    /// on every `build_text_only_host*` call to mint a fresh
+    /// [`HookDispatcher`], which the factory then wraps in `Arc` and threads
+    /// through `HookedLoopCapabilityPort` / `HookedLoopPromptPort`.
+    ///
+    /// This is the recommended hook installation path: per-build construction
+    /// gives each host its own dispatcher, so slot poisoning, registry
+    /// mutations, and any other dispatcher-owned state are scoped to a single
+    /// run rather than shared across every host the factory ever produces.
     ///
     /// **Hook telemetry**: to surface hook dispatch in the host's milestone
-    /// stream, the caller must attach a
-    /// [`ironclaw_turns::run_profile::HookMilestoneSink`] to the dispatcher
-    /// *before* wrapping it in `Arc`, via
-    /// [`HookDispatcher::with_milestone_sink`]. Wrap the factory's
-    /// `LoopHostMilestoneSink` in a
-    /// [`ironclaw_turns::run_profile::RunScopedHookMilestoneSink`] for the
-    /// active run to inject run-context before forwarding to the host's
-    /// milestone backend. Hook activity is invisible to observers when no
-    /// sink is attached.
-    pub fn with_hook_dispatcher(mut self, dispatcher: Arc<HookDispatcher>) -> Self {
-        self.hook_dispatcher = Some(dispatcher);
+    /// stream, the closure itself should attach a
+    /// [`ironclaw_turns::run_profile::HookMilestoneSink`] (typically a
+    /// [`ironclaw_turns::run_profile::RunScopedHookMilestoneSink`] wrapping
+    /// the factory's `LoopHostMilestoneSink`) before returning the
+    /// dispatcher. The wrapping happens inside the closure so each run gets a
+    /// dispatcher already configured for telemetry. Hook activity is
+    /// invisible to observers when no sink is attached.
+    pub fn with_hook_dispatcher_factory<F>(mut self, factory: F) -> Self
+    where
+        F: Fn() -> Arc<HookDispatcher> + Send + Sync + 'static,
+    {
+        self.hook_dispatcher_factory = Some(Arc::new(factory));
         self
+    }
+
+    /// Install a shared [`HookDispatcher`] that wraps the capability and
+    /// prompt ports for every host built by this factory.
+    ///
+    /// **Deprecated for production use.** This is preserved as a thin
+    /// backward-compat wrapper that adapts a single `Arc<HookDispatcher>`
+    /// into a factory closure cloning the same instance on every build. As a
+    /// result, dispatcher-owned mutable state (poisoned slots, predicate
+    /// counters, registry mutations) is **shared across every run** the
+    /// factory produces — a hook poisoned in run N stays poisoned for runs
+    /// N+1, N+2, …
+    ///
+    /// New callers should prefer [`Self::with_hook_dispatcher_factory`],
+    /// which mints a fresh dispatcher per host build and provides full
+    /// per-run isolation of hook state.
+    pub fn with_hook_dispatcher(self, dispatcher: Arc<HookDispatcher>) -> Self {
+        // Single-instance Arc cloning preserves the legacy shared-state shape
+        // so existing call sites and tests behave identically. New code paths
+        // should reach for `with_hook_dispatcher_factory` instead.
+        self.with_hook_dispatcher_factory(move || Arc::clone(&dispatcher))
     }
 
     pub fn with_model_route_resolver<R>(mut self, resolver: Arc<R>) -> Self
@@ -1026,11 +1071,20 @@ where
             context_adapter = context_adapter.with_skill_context_source(source.clone());
         }
         let context: Arc<dyn LoopContextPort> = Arc::new(context_adapter);
+        // Mint a fresh dispatcher per build when a factory is installed. This
+        // localizes dispatcher-owned state (slot poisoning, registry edits,
+        // predicate counters) to this one host so it cannot leak into the
+        // next run that shares this factory.
+        let per_build_dispatcher = self
+            .hook_dispatcher_factory
+            .as_ref()
+            .map(|factory| factory());
+
         let surface_state = Arc::new(CapabilitySurfaceState::default());
         let mut capabilities: Arc<dyn LoopCapabilityPort> = Arc::new(
             SurfaceTrackingLoopCapabilityPort::new(capabilities, Arc::clone(&surface_state)),
         );
-        if let Some(dispatcher) = self.hook_dispatcher.as_ref() {
+        if let Some(dispatcher) = per_build_dispatcher.as_ref() {
             capabilities = Arc::new(HookedLoopCapabilityPort::new(
                 Arc::clone(&capabilities),
                 Arc::clone(dispatcher),
@@ -1053,7 +1107,7 @@ where
             .with_default_message_limit(max_messages)
             .with_current_surface_version_lookup(move || surface_state_for_prompt.current()),
         );
-        if let Some(dispatcher) = self.hook_dispatcher.as_ref() {
+        if let Some(dispatcher) = per_build_dispatcher.as_ref() {
             prompt = Arc::new(HookedLoopPromptPort::new(
                 Arc::clone(&prompt),
                 Arc::clone(dispatcher),

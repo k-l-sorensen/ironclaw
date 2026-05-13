@@ -83,16 +83,59 @@ classification, and it does so based on where the hook came from.
 - `predicate` — declarative predicate language for `Installed` hooks (types
   only; evaluation lives in the dispatcher)
 
-## Known deferred work
+## Dispatcher-per-build (per-run isolation)
 
-- **Dispatcher-per-build (tenant + run isolation).** Poison state and the
-  registry today live inside the dispatcher and persist for the lifetime of
-  the dispatcher instance. This is intentional in the current slice: a hook
-  that demonstrates protocol violation stays disabled until the process
-  restarts, which is the conservative default. The
-  `PredicateEvaluator`'s sliding-window counter is keyed by
-  `(hook_id, tenant_id, capability)` so rate-cap state is correctly
-  partitioned across tenants. What remains is the broader pattern of
-  building a fresh dispatcher per run (or per tenant) so that resume
-  semantics, replay, and full cross-tenant isolation of mutable hook state
-  are first-class. Tracked as a follow-up.
+The `HookDispatcher` owns mutable state — most importantly the registry's
+slot-poisoning bits — that should not survive across host builds. Earlier
+slices held one `Arc<HookDispatcher>` on the Reborn factory and reused it
+for every `build_text_only_host*` call, which meant a hook poisoned during
+run N stayed disabled for runs N+1, N+2, …  The
+`PredicateEvaluator`'s sliding-window counter is keyed by
+`(hook_id, tenant_id, capability)` so rate-cap state was already correctly
+partitioned across tenants, but the dispatcher itself was not.
+
+The Reborn factory now accepts a **closure** that mints a fresh dispatcher
+per host build:
+
+```rust
+RebornLoopDriverHostFactory::new(/* … */)
+    .with_hook_dispatcher_factory(move || {
+        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+        dispatcher
+            .install_builtin_before_capability(
+                hook_id,
+                HookPhase::Policy,
+                Box::new(my_hook),
+            )
+            .expect("install hook");
+        // Optional: per-build telemetry wiring.
+        let sink = Arc::new(RunScopedHookMilestoneSink::new(
+            run_context.clone(),
+            Arc::clone(&host_milestone_sink) as _,
+        ));
+        Arc::new(dispatcher.with_milestone_sink(sink))
+    });
+```
+
+The closure must be `Fn + Send + Sync + 'static` and return
+`Arc<HookDispatcher>`. It is invoked exactly once per
+`build_text_only_host*` call, so any state captured inside (e.g. the
+template registry, the milestone-sink template, or feature flags) lives in
+the closure while the dispatcher itself — and its poison state — is scoped
+to one run.
+
+The legacy `with_hook_dispatcher(Arc<HookDispatcher>)` adapter still exists
+and intentionally preserves the old shared-state semantic for backward
+compat: it wraps the supplied `Arc` in a closure that returns clones of the
+same `Arc`, so a hook poisoned in run N stays poisoned for run N+1. New
+call sites should reach for `with_hook_dispatcher_factory` for real per-run
+isolation.
+
+Cross-run isolation is regression-tested in
+`crates/ironclaw_reborn/tests/hooks_integration.rs`:
+`per_build_dispatcher_state_does_not_leak_across_runs` installs a panicking
+hook and proves that the inner port still never receives the call on build
+2 (because the fresh dispatcher's slot is un-poisoned and re-applies the
+fail-closed deny). `legacy_with_hook_dispatcher_shares_state_across_builds`
+pins the shared-state semantic of the legacy adapter as the explicit
+opt-in baseline.
