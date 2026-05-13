@@ -76,6 +76,25 @@ impl HookRegistry {
                 binding.trust_class, binding.phase
             )));
         }
+        // Hook IDs must be globally unique across the registry. A duplicate
+        // ID at the same point would allow the same physical hook to appear
+        // twice in a single dispatch snapshot; a duplicate at a different
+        // point would let an attacker side-load a second binding for the
+        // same hook id and observe its slot from outside the original point.
+        // Either case violates the "one hook id, one slot" property the
+        // poison machinery relies on.
+        let duplicate = self
+            .by_point
+            .values()
+            .flat_map(|bindings| bindings.iter())
+            .any(|existing| existing.hook_id == binding.hook_id);
+        if duplicate {
+            return Err(HookError::RegistryConstruction(format!(
+                "duplicate hook id `{}` rejected: each hook id may register \
+                 against the registry at most once",
+                binding.hook_id
+            )));
+        }
         self.by_point
             .entry(binding.point)
             .or_default()
@@ -170,6 +189,52 @@ mod tests {
             ))
             .expect("policy phase is open to Installed");
         assert_eq!(registry.len(), 1);
+    }
+
+    #[test]
+    fn rejects_duplicate_hook_id_at_same_point() {
+        let mut registry = HookRegistry::new();
+        let first = installed_binding("alpha", HookPhase::Policy, HookPointSpec::BeforeCapability);
+        let id = first.hook_id;
+        registry.insert(first).expect("first insert ok");
+
+        // Same id, same point. Must be rejected to keep "one hook id, one
+        // slot" intact for the poison re-check in dispatch.
+        let dup = HookBinding {
+            hook_id: id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Installed,
+            phase: HookPhase::Policy,
+            point: HookPointSpec::BeforeCapability,
+            poisoned: false,
+        };
+        match registry.insert(dup) {
+            Err(HookError::RegistryConstruction(msg)) => {
+                assert!(msg.contains("duplicate"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected duplicate rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_duplicate_hook_id_at_different_point() {
+        let mut registry = HookRegistry::new();
+        let first = installed_binding("alpha", HookPhase::Policy, HookPointSpec::BeforeCapability);
+        let id = first.hook_id;
+        registry.insert(first).expect("first insert ok");
+
+        let dup_at_other_point = HookBinding {
+            hook_id: id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Installed,
+            phase: HookPhase::Telemetry,
+            point: HookPointSpec::AfterCapability,
+            poisoned: false,
+        };
+        assert!(matches!(
+            registry.insert(dup_at_other_point),
+            Err(HookError::RegistryConstruction(_))
+        ));
     }
 
     #[test]

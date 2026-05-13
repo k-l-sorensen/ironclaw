@@ -19,14 +19,12 @@
 
 use std::sync::Arc;
 
-use crate::dispatch::{BeforeCapabilityHookImpl, HookDispatcher};
+use crate::dispatch::HookDispatcher;
 use crate::error::HookError;
 use crate::evaluator::PredicateEvaluator;
 use crate::identity::{ExtensionId, HookId, HookVersion};
 use crate::installed_hook::PredicateBackedBeforeCapabilityHook;
 use crate::manifest::{HookManifestBody, HookManifestEntry, HookManifestKind};
-use crate::registry::{HookBinding, HookPointSpec};
-use crate::trust::HookTrustClass;
 
 /// Converts validated [`HookManifestEntry`] values into installed bindings +
 /// dispatcher impls. One registrar per run; the shared
@@ -77,16 +75,6 @@ impl HookRegistrar {
 
         let hook_version = HookVersion::ONE;
         let hook_id = HookId::derive(extension, extension_version, &entry.id, hook_version);
-        let point = point_for_kind(entry.kind);
-        let binding = HookBinding {
-            hook_id,
-            hook_version,
-            trust_class: HookTrustClass::Installed,
-            phase: entry.phase,
-            point,
-            poisoned: false,
-        };
-        dispatcher.insert_binding(binding)?;
 
         match entry.body {
             HookManifestBody::Predicate { spec } => match entry.kind {
@@ -96,10 +84,11 @@ impl HookRegistrar {
                         spec,
                         Arc::clone(&self.evaluator),
                     );
-                    dispatcher.install_before_capability(
+                    dispatcher.install_installed_before_capability(
                         hook_id,
-                        BeforeCapabilityHookImpl::Restricted(Box::new(hook)),
-                    );
+                        entry.phase,
+                        Box::new(hook),
+                    )?;
                 }
                 other => {
                     return Err(HookError::RegistryConstruction(format!(
@@ -119,16 +108,6 @@ impl HookRegistrar {
         }
 
         Ok(hook_id)
-    }
-}
-
-fn point_for_kind(kind: HookManifestKind) -> HookPointSpec {
-    match kind {
-        HookManifestKind::BeforeCapability => HookPointSpec::BeforeCapability,
-        HookManifestKind::BeforePrompt => HookPointSpec::BeforePrompt,
-        HookManifestKind::AfterModel => HookPointSpec::AfterModel,
-        HookManifestKind::AfterCapability => HookPointSpec::AfterCapability,
-        HookManifestKind::AfterCheckpoint => HookPointSpec::AfterCheckpoint,
     }
 }
 

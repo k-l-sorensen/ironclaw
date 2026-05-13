@@ -115,6 +115,7 @@ impl PredicateEvaluator {
                         };
                         let key = HistoryKey {
                             hook_id,
+                            tenant_id: ctx.tenant_id.clone(),
                             capability: ctx.capability_name.clone(),
                         };
                         let mut history = self
@@ -166,6 +167,7 @@ impl Default for PredicateEvaluator {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HistoryKey {
     hook_id: HookId,
+    tenant_id: ironclaw_host_api::TenantId,
     capability: String,
 }
 
@@ -195,22 +197,52 @@ fn restrictive_action(action: &OnExceededAction) -> EvaluatorDecision {
 }
 
 /// Parse a window string like `"24h"`, `"10m"`, `"30s"` into a [`Duration`].
-/// Unknown units or malformed inputs return `None`.
+/// Unknown units, non-ASCII tail bytes, empty input, or malformed numeric
+/// portions all return `None`. Crucially, the implementation must not panic
+/// on non-ASCII or sub-byte-boundary input — manifest authors are untrusted
+/// and the parser runs at install time.
 fn parse_window(input: &str) -> Option<Duration> {
     let input = input.trim();
     if input.is_empty() {
         return None;
     }
-    let (num, unit) = input.split_at(input.len() - 1);
-    let num: u64 = num.parse().ok()?;
-    let secs = match unit {
-        "s" => num,
-        "m" => num.checked_mul(60)?,
-        "h" => num.checked_mul(3600)?,
-        "d" => num.checked_mul(86_400)?,
+    // Split on the last char as a unit. `input.split_at(input.len() - 1)`
+    // would panic on multi-byte tail chars; iterate the chars instead and
+    // use the unit char's own UTF-8 byte length to slice.
+    let unit_char = input.chars().last()?;
+    let unit_len = unit_char.len_utf8();
+    if unit_len > input.len() {
+        return None;
+    }
+    let (num_str, _unit_str) = input.split_at(input.len() - unit_len);
+    if num_str.is_empty() {
+        return None;
+    }
+    let num: u64 = num_str.parse().ok()?;
+    let secs = match unit_char {
+        's' => num,
+        'm' => num.checked_mul(60)?,
+        'h' => num.checked_mul(3600)?,
+        'd' => num.checked_mul(86_400)?,
         _ => return None,
     };
     Some(Duration::from_secs(secs))
+}
+
+/// Public window-validation helper used by manifest validation. Returns `Ok`
+/// if the window parses to a non-zero duration, `Err` with a human-readable
+/// reason otherwise. Used to surface bad windows at manifest install time
+/// rather than at evaluation time.
+pub fn validate_window(window: &str) -> Result<(), String> {
+    match parse_window(window) {
+        Some(d) if !d.is_zero() => Ok(()),
+        Some(_) => Err(format!(
+            "window `{window}` parses to zero duration; use a positive value"
+        )),
+        None => Err(format!(
+            "window `{window}` is not a valid duration; expected `<u64><s|m|h|d>` (e.g. `24h`)"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +434,66 @@ mod tests {
         assert_eq!(parse_window("notvalid"), None);
         assert_eq!(parse_window(""), None);
         assert_eq!(parse_window("100"), None);
+    }
+
+    #[test]
+    fn parse_window_handles_non_ascii_safely() {
+        // `™` is multi-byte; the old `split_at(len - 1)` would panic here.
+        assert_eq!(parse_window("24™"), None);
+        // Cyrillic + leading digits: also must not panic.
+        assert_eq!(parse_window("24ч"), None);
+    }
+
+    #[test]
+    fn parse_window_handles_empty_safely() {
+        assert_eq!(parse_window(""), None);
+        assert_eq!(parse_window("   "), None);
+    }
+
+    #[test]
+    fn parse_window_handles_single_char() {
+        // Single ASCII char with no numeric prefix: not a window.
+        assert_eq!(parse_window("h"), None);
+        // Single multi-byte char: not a window, must not panic.
+        assert_eq!(parse_window("™"), None);
+    }
+
+    #[test]
+    fn invocation_counter_partitions_by_tenant() {
+        let evaluator = PredicateEvaluator::new();
+        let spec = HookPredicateSpec::RateOrValueCap {
+            when: CapabilityPredicate::Always,
+            bound: ValueOrRateBound::InvocationCount {
+                max: 1,
+                window: "1h".to_string(),
+            },
+            on_exceeded: OnExceededAction::Deny {
+                reason: "rate cap".to_string(),
+            },
+        };
+
+        let now = Instant::now();
+        let alpha = ironclaw_host_api::TenantId::new("alpha").expect("ok");
+        let beta = ironclaw_host_api::TenantId::new("beta").expect("ok");
+
+        let ctx_alpha = BeforeCapabilityHookContext::new(alpha, "cap.x".to_string(), [0u8; 32]);
+        let ctx_beta = BeforeCapabilityHookContext::new(beta, "cap.x".to_string(), [0u8; 32]);
+
+        // Alpha hits the cap with one allowed call and a second deny.
+        assert_eq!(
+            evaluator.evaluate_at(hook_id(), &spec, &ctx_alpha, now),
+            EvaluatorDecision::Allow
+        );
+        assert!(matches!(
+            evaluator.evaluate_at(hook_id(), &spec, &ctx_alpha, now),
+            EvaluatorDecision::Deny { .. }
+        ));
+        // Beta is a separate tenant and must NOT inherit alpha's counter.
+        assert_eq!(
+            evaluator.evaluate_at(hook_id(), &spec, &ctx_beta, now),
+            EvaluatorDecision::Allow,
+            "tenants must not share rate-cap counters"
+        );
     }
 
     #[test]

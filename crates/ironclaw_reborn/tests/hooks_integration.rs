@@ -31,16 +31,15 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use ironclaw_hooks::dispatch::{BeforeCapabilityHookImpl, HookDispatcher};
+use ironclaw_hooks::dispatch::HookDispatcher;
 use ironclaw_hooks::evaluator::PredicateEvaluator;
 use ironclaw_hooks::identity::{ExtensionId, HookId, HookLocalId, HookVersion};
 use ironclaw_hooks::installed_hook::PredicateBackedBeforeCapabilityHook;
 use ironclaw_hooks::ordering::HookPhase;
 use ironclaw_hooks::points::BeforeCapabilityHookContext;
 use ironclaw_hooks::predicate::{CapabilityPredicate, HookPredicateSpec};
-use ironclaw_hooks::registry::{HookBinding, HookPointSpec, HookRegistry};
+use ironclaw_hooks::registry::HookRegistry;
 use ironclaw_hooks::sink::{PrivilegedBeforeCapabilityHook, PrivilegedGateSink};
-use ironclaw_hooks::trust::HookTrustClass;
 use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
@@ -192,26 +191,16 @@ impl PrivilegedBeforeCapabilityHook for SelectiveDenyHook {
 
 fn predicate_deny_dispatcher() -> Arc<HookDispatcher> {
     // PredicateBackedBeforeCapabilityHook is the Installed-tier predicate
-    // wrapper, so use a registry binding with Installed trust class.
+    // wrapper. Use the public Installed-tier installer, which constructs the
+    // binding with HookTrustClass::Installed and routes the impl into the
+    // Restricted variant — there is no public path that pairs Installed with
+    // a Privileged impl.
     let hook_id = HookId::derive(
         &ExtensionId("integration-tests".to_string()),
         "0.0.1",
         &HookLocalId("deny-cap-blocked".to_string()),
         HookVersion::ONE,
     );
-    let binding = HookBinding {
-        hook_id,
-        hook_version: HookVersion::ONE,
-        trust_class: HookTrustClass::Installed,
-        phase: HookPhase::Policy,
-        point: HookPointSpec::BeforeCapability,
-        poisoned: false,
-    };
-    let mut registry = HookRegistry::new();
-    registry
-        .insert(binding)
-        .expect("registry insert of fresh binding succeeds");
-
     let spec = HookPredicateSpec::DenyCapability {
         when: CapabilityPredicate::NameEquals {
             name: "cap.blocked".to_string(),
@@ -221,11 +210,10 @@ fn predicate_deny_dispatcher() -> Arc<HookDispatcher> {
     let evaluator = Arc::new(PredicateEvaluator::new());
     let hook = PredicateBackedBeforeCapabilityHook::new(hook_id, spec, evaluator);
 
-    let mut dispatcher = HookDispatcher::new(registry);
-    dispatcher.install_before_capability(
-        hook_id,
-        BeforeCapabilityHookImpl::Restricted(Box::new(hook)),
-    );
+    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+    dispatcher
+        .install_installed_before_capability(hook_id, HookPhase::Policy, Box::new(hook))
+        .expect("Installed-tier predicate hook installs at policy phase");
     Arc::new(dispatcher)
 }
 
@@ -233,27 +221,13 @@ fn selective_deny_dispatcher(target: &str) -> Arc<HookDispatcher> {
     // SelectiveDenyHook is a Privileged (Builtin-tier) hook so it may mint
     // .allow() — which is exactly what we need to prove pass-through.
     let hook_id = HookId::for_builtin("tests::hooks_integration::selective_deny", HookVersion::ONE);
-    let binding = HookBinding {
-        hook_id,
-        hook_version: HookVersion::ONE,
-        trust_class: HookTrustClass::Builtin,
-        phase: HookPhase::Policy,
-        point: HookPointSpec::BeforeCapability,
-        poisoned: false,
-    };
-    let mut registry = HookRegistry::new();
-    registry
-        .insert(binding)
-        .expect("registry insert of fresh binding succeeds");
-
     let hook = SelectiveDenyHook {
         target: target.to_string(),
     };
-    let mut dispatcher = HookDispatcher::new(registry);
-    dispatcher.install_before_capability(
-        hook_id,
-        BeforeCapabilityHookImpl::Privileged(Box::new(hook)),
-    );
+    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+    dispatcher
+        .install_builtin_before_capability(hook_id, HookPhase::Policy, Box::new(hook))
+        .expect("Builtin-tier hook installs at policy phase");
     Arc::new(dispatcher)
 }
 

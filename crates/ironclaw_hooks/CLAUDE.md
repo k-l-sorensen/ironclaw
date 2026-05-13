@@ -82,3 +82,17 @@ classification, and it does so based on where the hook came from.
 - `manifest` — extension manifest `[[hooks]]` schema (serde types)
 - `predicate` — declarative predicate language for `Installed` hooks (types
   only; evaluation lives in the dispatcher)
+
+## Known deferred work
+
+- **Dispatcher-per-build (tenant + run isolation).** Poison state and the
+  registry today live inside the dispatcher and persist for the lifetime of
+  the dispatcher instance. This is intentional in the current slice: a hook
+  that demonstrates protocol violation stays disabled until the process
+  restarts, which is the conservative default. The
+  `PredicateEvaluator`'s sliding-window counter is keyed by
+  `(hook_id, tenant_id, capability)` so rate-cap state is correctly
+  partitioned across tenants. What remains is the broader pattern of
+  building a fresh dispatcher per run (or per tenant) so that resume
+  semantics, replay, and full cross-tenant isolation of mutable hook state
+  are first-class. Tracked as a follow-up.

@@ -9,14 +9,13 @@
 
 use async_trait::async_trait;
 use ironclaw_hooks::{
-    HookTrustClass,
-    dispatch::{BeforeCapabilityHookImpl, HookDispatcher},
+    dispatch::HookDispatcher,
     identity::{ExtensionId, HookId, HookLocalId, HookVersion},
     manifest::{HookManifestBody, HookManifestEntry, HookManifestKind, HookManifestScope},
     ordering::{HookPhase, HookPriority},
     points::BeforeCapabilityHookContext,
     predicate::{CapabilityPredicate, HookPredicateSpec, OnExceededAction, ValueOrRateBound},
-    registry::{HookBinding, HookPointSpec, HookRegistry},
+    registry::HookRegistry,
     sink::{RestrictedBeforeCapabilityHook, RestrictedGateSink},
 };
 
@@ -69,33 +68,27 @@ async fn manifest_to_dispatch_pipeline() {
     };
     manifest_entry.validate().expect("manifest validates");
 
-    // 2. Registry installer pins a content-addressed hook id and produces a
-    //    binding. (In production this happens inside the installer; here we
-    //    drive the same pieces directly.)
+    // 2. Registry installer pins a content-addressed hook id. (In production
+    //    this happens inside the installer; here we drive the same pieces
+    //    directly through the tier-specific public installer.)
     let hook_id = HookId::derive(
         &ExtensionId("polymarket-trader".to_string()),
         "0.4.2",
         &manifest_entry.id,
         HookVersion::ONE,
     );
-    let binding = HookBinding {
-        hook_id,
-        hook_version: HookVersion::ONE,
-        trust_class: HookTrustClass::Installed,
-        phase: manifest_entry.phase,
-        point: HookPointSpec::BeforeCapability,
-        poisoned: false,
-    };
 
-    // 3. The dispatcher consumes the binding and an installed impl (the
-    //    eventual evaluator).
-    let mut registry = HookRegistry::new();
-    registry.insert(binding).expect("binding installs");
-    let mut dispatcher = HookDispatcher::new(registry);
-    dispatcher.install_before_capability(
-        hook_id,
-        BeforeCapabilityHookImpl::Restricted(Box::new(DenyEverythingFromManifest)),
-    );
+    // 3. The dispatcher consumes the binding and an installed impl. The
+    //    Installed-tier installer constructs the binding internally and
+    //    enforces the trust × phase × impl-tier pairing.
+    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+    dispatcher
+        .install_installed_before_capability(
+            hook_id,
+            manifest_entry.phase,
+            Box::new(DenyEverythingFromManifest),
+        )
+        .expect("installed-tier hook installs at policy phase");
 
     // 4. Dispatch sees the deny decision; the composed outcome reflects it.
     let ctx = BeforeCapabilityHookContext::new(

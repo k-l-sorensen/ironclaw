@@ -16,10 +16,11 @@ use futures::FutureExt;
 use crate::error::SanitizedReason;
 use crate::failure_policy::{FailureCategory, FailureDisposition};
 use crate::identity::HookId;
+use crate::identity::HookVersion;
 use crate::kinds::gate::{BeforeCapabilityHookDecision, GateDecisionInner};
 use crate::kinds::mutator::HookPatch;
 use crate::kinds::observer::ObserverFact;
-use crate::ordering::HookOrderKey;
+use crate::ordering::{HookOrderKey, HookPhase};
 use crate::points::{BeforeCapabilityHookContext, BeforePromptHookContext, ObserverHookContext};
 use crate::registry::{HookBinding, HookPointSpec, HookRegistry};
 use crate::sink::{
@@ -35,19 +36,32 @@ pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_millis(50);
 /// Tier-tagged trait object holding a `before_capability` hook implementation.
 /// The variants make the trust tier explicit at the registration boundary so
 /// the dispatcher routes through the correct sink trait.
-pub enum BeforeCapabilityHookImpl {
+///
+/// This type is deliberately `pub(crate)`. The only way to introduce a
+/// `Privileged` impl into the dispatcher is through one of the
+/// `install_builtin_*` / `install_trusted_*` constructors on
+/// [`HookDispatcher`], which always construct the matching binding with a
+/// `Builtin` or `Trusted` trust class. This is what makes the
+/// "Installed cannot Allow" property a *type-level* invariant: no external
+/// caller can pair `HookTrustClass::Installed` with
+/// `BeforeCapabilityHookImpl::Privileged` because they cannot construct
+/// `Privileged` at all.
+pub(crate) enum BeforeCapabilityHookImpl {
     Privileged(Box<dyn PrivilegedBeforeCapabilityHook>),
     Restricted(Box<dyn RestrictedBeforeCapabilityHook>),
 }
 
-/// Tier-tagged trait object for a `before_prompt` mutator hook.
-pub enum BeforePromptHookImpl {
+/// Tier-tagged trait object for a `before_prompt` mutator hook. Same trust
+/// rationale as [`BeforeCapabilityHookImpl`] — sealed to this crate.
+pub(crate) enum BeforePromptHookImpl {
     Privileged(Box<dyn PrivilegedBeforePromptHook>),
     Restricted(Box<dyn RestrictedBeforePromptHook>),
 }
 
-/// Tier-tagged trait object for an observer hook.
-pub enum ObserverHookImpl {
+/// Tier-tagged trait object for an observer hook. Sealed to this crate for
+/// API symmetry; observers have the same trait surface for every tier but the
+/// registry still tracks trust_class for audit attribution.
+pub(crate) enum ObserverHookImpl {
     Any(Box<dyn ObserverHook>),
 }
 
@@ -144,17 +158,212 @@ impl HookDispatcher {
         registry.insert(binding)
     }
 
-    /// Register a hook implementation against an existing binding.
-    pub fn install_before_capability(&mut self, hook_id: HookId, hook: BeforeCapabilityHookImpl) {
+    /// Internal: register a hook implementation against an existing binding.
+    /// All public installers route through this; the public surface enforces
+    /// trust-tier × impl-tier pairing at the type level.
+    pub(crate) fn install_before_capability(
+        &mut self,
+        hook_id: HookId,
+        hook: BeforeCapabilityHookImpl,
+    ) {
         self.before_capability.insert(hook_id, hook);
     }
 
-    pub fn install_before_prompt(&mut self, hook_id: HookId, hook: BeforePromptHookImpl) {
+    pub(crate) fn install_before_prompt(&mut self, hook_id: HookId, hook: BeforePromptHookImpl) {
         self.before_prompt.insert(hook_id, hook);
     }
 
-    pub fn install_observer(&mut self, hook_id: HookId, hook: ObserverHookImpl) {
+    pub(crate) fn install_observer_impl(&mut self, hook_id: HookId, hook: ObserverHookImpl) {
         self.observers.insert(hook_id, hook);
+    }
+
+    // ── Tier-specific public installers for before_capability ───────────────
+    //
+    // Each installer builds the `HookBinding` with the correct trust class and
+    // routes the impl into the matching enum variant. There is no public path
+    // that pairs an `Installed` binding with a `Privileged` impl: the
+    // `Privileged` variant is `pub(crate)` and cannot be constructed outside
+    // this crate.
+
+    /// Install a `Builtin`-tier `before_capability` hook. Builtins may mint
+    /// any decision (including `allow`).
+    pub fn install_builtin_before_capability(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn PrivilegedBeforeCapabilityHook>,
+    ) -> Result<(), crate::error::HookError> {
+        let binding = HookBinding {
+            hook_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Builtin,
+            phase,
+            point: HookPointSpec::BeforeCapability,
+            poisoned: false,
+        };
+        self.insert_binding(binding)?;
+        self.install_before_capability(hook_id, BeforeCapabilityHookImpl::Privileged(hook));
+        Ok(())
+    }
+
+    /// Install a `Trusted`-tier `before_capability` hook. Trusted hooks may
+    /// mint any decision but cannot register at runtime-class phases.
+    pub fn install_trusted_before_capability(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn PrivilegedBeforeCapabilityHook>,
+    ) -> Result<(), crate::error::HookError> {
+        let binding = HookBinding {
+            hook_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Trusted,
+            phase,
+            point: HookPointSpec::BeforeCapability,
+            poisoned: false,
+        };
+        self.insert_binding(binding)?;
+        self.install_before_capability(hook_id, BeforeCapabilityHookImpl::Privileged(hook));
+        Ok(())
+    }
+
+    /// Install an `Installed`-tier `before_capability` hook. The impl trait is
+    /// `RestrictedBeforeCapabilityHook`, whose sink cannot mint `allow` — this
+    /// makes "Installed cannot Allow" a type-level fact.
+    pub fn install_installed_before_capability(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn RestrictedBeforeCapabilityHook>,
+    ) -> Result<(), crate::error::HookError> {
+        let binding = HookBinding {
+            hook_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Installed,
+            phase,
+            point: HookPointSpec::BeforeCapability,
+            poisoned: false,
+        };
+        self.insert_binding(binding)?;
+        self.install_before_capability(hook_id, BeforeCapabilityHookImpl::Restricted(hook));
+        Ok(())
+    }
+
+    // ── Tier-specific public installers for before_prompt ───────────────────
+
+    pub fn install_builtin_before_prompt(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn PrivilegedBeforePromptHook>,
+    ) -> Result<(), crate::error::HookError> {
+        let binding = HookBinding {
+            hook_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Builtin,
+            phase,
+            point: HookPointSpec::BeforePrompt,
+            poisoned: false,
+        };
+        self.insert_binding(binding)?;
+        self.install_before_prompt(hook_id, BeforePromptHookImpl::Privileged(hook));
+        Ok(())
+    }
+
+    pub fn install_trusted_before_prompt(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn PrivilegedBeforePromptHook>,
+    ) -> Result<(), crate::error::HookError> {
+        let binding = HookBinding {
+            hook_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Trusted,
+            phase,
+            point: HookPointSpec::BeforePrompt,
+            poisoned: false,
+        };
+        self.insert_binding(binding)?;
+        self.install_before_prompt(hook_id, BeforePromptHookImpl::Privileged(hook));
+        Ok(())
+    }
+
+    pub fn install_installed_before_prompt(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        hook: Box<dyn RestrictedBeforePromptHook>,
+    ) -> Result<(), crate::error::HookError> {
+        let binding = HookBinding {
+            hook_id,
+            hook_version: HookVersion::ONE,
+            trust_class: HookTrustClass::Installed,
+            phase,
+            point: HookPointSpec::BeforePrompt,
+            poisoned: false,
+        };
+        self.insert_binding(binding)?;
+        self.install_before_prompt(hook_id, BeforePromptHookImpl::Restricted(hook));
+        Ok(())
+    }
+
+    // ── Observer installers ────────────────────────────────────────────────
+    //
+    // Observers share a single trait surface across all tiers, but the
+    // registry still records the trust class for audit attribution. The
+    // generic `install_observer` accepts an explicit trust class; the
+    // tier-specific helpers make the common case ergonomic.
+
+    pub fn install_observer(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        point: HookPointSpec,
+        trust_class: HookTrustClass,
+        hook: Box<dyn ObserverHook>,
+    ) -> Result<(), crate::error::HookError> {
+        let binding = HookBinding {
+            hook_id,
+            hook_version: HookVersion::ONE,
+            trust_class,
+            phase,
+            point,
+            poisoned: false,
+        };
+        self.insert_binding(binding)?;
+        self.install_observer_impl(hook_id, ObserverHookImpl::Any(hook));
+        Ok(())
+    }
+
+    pub fn install_builtin_observer(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        point: HookPointSpec,
+        hook: Box<dyn ObserverHook>,
+    ) -> Result<(), crate::error::HookError> {
+        self.install_observer(hook_id, phase, point, HookTrustClass::Builtin, hook)
+    }
+
+    pub fn install_trusted_observer(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        point: HookPointSpec,
+        hook: Box<dyn ObserverHook>,
+    ) -> Result<(), crate::error::HookError> {
+        self.install_observer(hook_id, phase, point, HookTrustClass::Trusted, hook)
+    }
+
+    pub fn install_installed_observer(
+        &mut self,
+        hook_id: HookId,
+        phase: HookPhase,
+        point: HookPointSpec,
+        hook: Box<dyn ObserverHook>,
+    ) -> Result<(), crate::error::HookError> {
+        self.install_observer(hook_id, phase, point, HookTrustClass::Installed, hook)
     }
 
     /// Dispatch `before_capability`. Hooks run in `(phase, priority, hook_id)`
@@ -172,6 +381,13 @@ impl HookDispatcher {
 
         for (key, binding) in ordered {
             if short_circuited && !matches!(key.phase, crate::ordering::HookPhase::Telemetry) {
+                continue;
+            }
+            // Re-check poison status: an earlier hook in this same dispatch
+            // may have poisoned this slot. The snapshot is taken once at the
+            // top of the loop, so without this check a binding poisoned mid-
+            // dispatch would still be invoked.
+            if self.is_poisoned(binding.hook_id) {
                 continue;
             }
             let Some(hook) = self.before_capability.get(&binding.hook_id) else {
@@ -253,6 +469,9 @@ impl HookDispatcher {
         let mut failures = Vec::new();
 
         for (_key, binding) in ordered {
+            if self.is_poisoned(binding.hook_id) {
+                continue;
+            }
             let Some(hook) = self.before_prompt.get(&binding.hook_id) else {
                 self.poison_with_failure(
                     binding.hook_id,
@@ -308,6 +527,9 @@ impl HookDispatcher {
         };
 
         for (_key, binding) in ordered {
+            if self.is_poisoned(binding.hook_id) {
+                continue;
+            }
             let Some(hook) = self.observers.get(&binding.hook_id) else {
                 self.poison_with_failure(
                     binding.hook_id,
@@ -326,6 +548,24 @@ impl HookDispatcher {
         }
 
         ObserverDispatchOutcome { facts, failures }
+    }
+
+    /// Returns true if the registry currently has `hook_id` poisoned. Used by
+    /// the dispatch loops to skip bindings poisoned earlier in the same
+    /// dispatch (the snapshot taken at the top of the loop wouldn't otherwise
+    /// reflect mid-dispatch poisoning).
+    fn is_poisoned(&self, hook_id: HookId) -> bool {
+        match self.registry.lock() {
+            Ok(registry) => registry.is_poisoned(hook_id),
+            Err(poisoned) => {
+                // Registry mutex was poisoned by an external panic; we can't
+                // safely use stale state, so treat every hook as poisoned.
+                // The dispatch loop will skip it and downstream telemetry
+                // surfaces the registry-mutex breakage separately.
+                let _ = poisoned;
+                true
+            }
+        }
     }
 
     fn ordered_bindings(&self, point: HookPointSpec) -> Vec<(HookOrderKey, HookBinding)> {
@@ -939,12 +1179,166 @@ mod tests {
             })
             .expect("ok");
         let mut dispatcher = HookDispatcher::new(registry);
-        dispatcher.install_observer(id, ObserverHookImpl::Any(Box::new(NotingObserver)));
+        dispatcher.install_observer_impl(id, ObserverHookImpl::Any(Box::new(NotingObserver)));
 
         let outcome = dispatcher
             .dispatch_observer_at(HookPointSpec::AfterModel, tenant())
             .await;
         assert_eq!(outcome.facts.len(), 1);
         assert!(outcome.failures.is_empty());
+    }
+
+    // ── C1 regression: trust-class × impl-tier pairing is sealed ────────────
+
+    /// Compile-time seal. `BeforeCapabilityHookImpl::Privileged(...)` is
+    /// `pub(crate)`. There is no public path to pair an `Installed` binding
+    /// with a `Privileged` impl because the variant cannot be constructed
+    /// from outside the crate. This test documents the load-bearing fact
+    /// rather than asserting on a value — the proof is the visibility
+    /// modifier on the enum at the top of this file.
+    #[test]
+    fn compile_time_seal_test() {
+        // The following line, if uncommented from an external crate, would
+        // fail to compile:
+        //
+        //     BeforeCapabilityHookImpl::Privileged(Box::new(my_hook))
+        //
+        // Reachable only from inside `ironclaw_hooks`. External callers must
+        // route through `install_builtin_*` / `install_trusted_*` /
+        // `install_installed_*`, each of which constructs the binding with
+        // the matching trust class.
+        let _seal_documented = true;
+    }
+
+    /// Even though we can *internally* construct an Installed binding paired
+    /// with a Privileged impl in this test, the C1 fix is that there is no
+    /// *public* API that lets a caller do so. The public installers each fix
+    /// the trust class to match the impl trait. This test exercises every
+    /// public installer to prove the trust class is set correctly.
+    #[tokio::test]
+    async fn public_installers_set_matching_trust_class() {
+        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+
+        let builtin_id = HookId::for_builtin("c1::builtin", HookVersion::ONE);
+        dispatcher
+            .install_builtin_before_capability(
+                builtin_id,
+                HookPhase::Policy,
+                Box::new(AllowingBuiltinHook),
+            )
+            .expect("builtin installs at policy");
+
+        let trusted_id = HookId::for_builtin("c1::trusted", HookVersion::ONE);
+        dispatcher
+            .install_trusted_before_capability(
+                trusted_id,
+                HookPhase::Policy,
+                Box::new(AllowingBuiltinHook),
+            )
+            .expect("trusted installs at policy");
+
+        let installed_id = ext_hook_id("c1-installed");
+        dispatcher
+            .install_installed_before_capability(
+                installed_id,
+                HookPhase::Policy,
+                Box::new(PassingInstalledHook),
+            )
+            .expect("installed installs at policy");
+
+        let registry = dispatcher.registry.lock().expect("registry");
+        let bindings: Vec<_> = registry
+            .active_at(HookPointSpec::BeforeCapability)
+            .cloned()
+            .collect();
+        let by_id: std::collections::HashMap<HookId, HookTrustClass> = bindings
+            .iter()
+            .map(|b| (b.hook_id, b.trust_class))
+            .collect();
+        assert_eq!(by_id.get(&builtin_id), Some(&HookTrustClass::Builtin));
+        assert_eq!(by_id.get(&trusted_id), Some(&HookTrustClass::Trusted));
+        assert_eq!(by_id.get(&installed_id), Some(&HookTrustClass::Installed));
+    }
+
+    /// The `install_installed_before_capability` installer takes
+    /// `Box<dyn RestrictedBeforeCapabilityHook>` and constructs the binding
+    /// with `HookTrustClass::Installed`. Its impl trait does not expose
+    /// `allow()` on its sink (`RestrictedGateSink` has no `.allow()`). So
+    /// even a malicious Installed hook cannot mint `Allow` through this
+    /// path — the sink trait is the trust seal.
+    #[tokio::test]
+    async fn installed_binding_cannot_be_paired_with_privileged_impl() {
+        // We cannot construct an "Installed binding + Privileged impl" pair
+        // through the public API at all; trying to install a privileged hook
+        // via `install_installed_before_capability` is a type error. The
+        // best we can do at runtime is prove that the installer accepts only
+        // Restricted impls and that the resulting sink cannot allow.
+        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+        let id = ext_hook_id("c1-restricted-only");
+        dispatcher
+            .install_installed_before_capability(
+                id,
+                HookPhase::Policy,
+                Box::new(DenyingInstalledHook),
+            )
+            .expect("installed installs at policy");
+
+        let outcome = dispatcher.dispatch_before_capability(&ctx()).await;
+        assert!(
+            !outcome.decision.permits(),
+            "Installed-tier deny must not be overridable through this path"
+        );
+    }
+
+    // ── C5 regression: dedupe + mid-dispatch poison re-check ────────────────
+
+    /// A hook that always panics; used to drive the dispatcher into poisoning
+    /// a slot before the snapshot is fully consumed.
+    struct AlwaysPanicHook;
+    #[async_trait]
+    impl RestrictedBeforeCapabilityHook for AlwaysPanicHook {
+        async fn evaluate(
+            &self,
+            _ctx: &BeforeCapabilityHookContext,
+            _sink: &mut dyn RestrictedGateSink,
+        ) {
+            panic!("c5 intentional panic");
+        }
+    }
+
+    #[tokio::test]
+    async fn poisoned_during_dispatch_skips_subsequent_invocations() {
+        // First dispatch poisons the slot via a panic.
+        let id = ext_hook_id("c5-poisoner");
+        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+        dispatcher
+            .install_installed_before_capability(id, HookPhase::Policy, Box::new(AlwaysPanicHook))
+            .expect("installs ok");
+
+        let first = dispatcher.dispatch_before_capability(&ctx()).await;
+        assert_eq!(first.failures.len(), 1, "first call records the panic");
+        assert!(
+            dispatcher
+                .registry
+                .lock()
+                .expect("registry")
+                .is_poisoned(id),
+            "slot must be poisoned after panic"
+        );
+
+        // Second dispatch must NOT invoke the panicking hook again — the
+        // poison re-check inside the loop has to skip it. If the re-check is
+        // missing, the panic would happen a second time and a fresh failure
+        // record would appear here.
+        let second = dispatcher.dispatch_before_capability(&ctx()).await;
+        assert!(
+            second.failures.is_empty(),
+            "poisoned hook must not be re-invoked, got failures: {:?}",
+            second.failures
+        );
+        assert!(
+            second.decision.permits(),
+            "with no live hooks, composed decision is allow"
+        );
     }
 }

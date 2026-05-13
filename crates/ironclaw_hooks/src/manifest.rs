@@ -21,9 +21,10 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::evaluator::validate_window;
 use crate::identity::HookLocalId;
 use crate::ordering::{HookPhase, HookPriority};
-use crate::predicate::HookPredicateSpec;
+use crate::predicate::{HookPredicateSpec, ValueOrRateBound};
 
 /// A single hook declaration in an extension manifest. Use [`Self::validate`]
 /// at install time to surface format violations as structured errors.
@@ -175,6 +176,26 @@ impl HookManifestEntry {
                 self.id.0
             )));
         }
+        // Validate predicate bodies that carry a sliding-window string. We
+        // surface unparseable windows at install time rather than letting
+        // them fail closed at every evaluation.
+        if let HookManifestBody::Predicate { spec } = &self.body {
+            let window = match spec {
+                HookPredicateSpec::RateOrValueCap { bound, .. } => match bound {
+                    ValueOrRateBound::InvocationCount { window, .. } => Some(window.as_str()),
+                    ValueOrRateBound::NumericSum { window, .. } => Some(window.as_str()),
+                },
+                _ => None,
+            };
+            if let Some(window) = window {
+                validate_window(window).map_err(|msg| {
+                    HookManifestValidationError(format!(
+                        "hook `{}` has invalid window: {}",
+                        self.id.0, msg
+                    ))
+                })?;
+            }
+        }
         Ok(())
     }
 }
@@ -273,6 +294,59 @@ mod tests {
             description: None,
             requires_grant: Some("g".to_string()),
             body: predicate_body(),
+        };
+        assert!(entry.validate().is_err());
+    }
+
+    #[test]
+    fn validate_rejects_unparseable_window() {
+        let entry = HookManifestEntry {
+            id: HookLocalId("bad-window".to_string()),
+            kind: HookManifestKind::BeforeCapability,
+            scope: HookManifestScope::OwnCapabilities,
+            phase: HookPhase::Policy,
+            priority: HookPriority::DEFAULT,
+            description: None,
+            requires_grant: None,
+            body: HookManifestBody::Predicate {
+                spec: HookPredicateSpec::RateOrValueCap {
+                    when: CapabilityPredicate::Always,
+                    bound: ValueOrRateBound::InvocationCount {
+                        max: 1,
+                        window: "24™".to_string(),
+                    },
+                    on_exceeded: OnExceededAction::Deny {
+                        reason: "x".to_string(),
+                    },
+                },
+            },
+        };
+        let err = entry.validate().expect_err("bad window must reject");
+        assert!(err.0.contains("window"), "unexpected msg: {}", err.0);
+    }
+
+    #[test]
+    fn validate_rejects_zero_duration_window() {
+        let entry = HookManifestEntry {
+            id: HookLocalId("zero".to_string()),
+            kind: HookManifestKind::BeforeCapability,
+            scope: HookManifestScope::OwnCapabilities,
+            phase: HookPhase::Policy,
+            priority: HookPriority::DEFAULT,
+            description: None,
+            requires_grant: None,
+            body: HookManifestBody::Predicate {
+                spec: HookPredicateSpec::RateOrValueCap {
+                    when: CapabilityPredicate::Always,
+                    bound: ValueOrRateBound::InvocationCount {
+                        max: 1,
+                        window: "0s".to_string(),
+                    },
+                    on_exceeded: OnExceededAction::Deny {
+                        reason: "x".to_string(),
+                    },
+                },
+            },
         };
         assert!(entry.validate().is_err());
     }

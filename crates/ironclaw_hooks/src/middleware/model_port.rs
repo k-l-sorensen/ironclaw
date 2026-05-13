@@ -179,7 +179,7 @@ mod tests {
             })
             .expect("ok");
         let mut dispatcher = HookDispatcher::new(registry);
-        dispatcher.install_observer(id, observer);
+        dispatcher.install_observer_impl(id, observer);
         Arc::new(dispatcher)
     }
 
