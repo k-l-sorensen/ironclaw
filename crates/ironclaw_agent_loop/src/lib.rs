@@ -8,5 +8,8 @@ pub mod state;
 pub mod strategies;
 
 pub use strategies::{
-    CapabilityFilter, CapabilityStrategy, ContextStrategy, ModelPreference, ModelStrategy,
+    BatchPolicy, BatchPolicyStrategy, CapabilityCallSummary, CapabilityErrorClass,
+    CapabilityErrorSummary, CapabilityFilter, CapabilityStrategy, ConcurrencyHint, ContextStrategy,
+    GateHandlingStrategy, GateKind, GateOutcome, GateSummary, ModelErrorClass, ModelErrorSummary,
+    ModelPreference, ModelStrategy, RecoveryOutcome, RecoveryStrategy, RetryAlteration,
 };
