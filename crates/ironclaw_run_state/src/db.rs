@@ -263,17 +263,21 @@ impl LibSqlRunStateStore {
 /// Combined libSQL run-state and approval-request store.
 #[cfg(feature = "libsql")]
 pub struct LibSqlRunStateApprovalStore {
-    db: Arc<libsql::Database>,
+    run_state: LibSqlRunStateStore,
+    approvals: LibSqlApprovalRequestStore,
 }
 
 #[cfg(feature = "libsql")]
 impl LibSqlRunStateApprovalStore {
     pub fn new(db: Arc<libsql::Database>) -> Self {
-        Self { db }
+        Self {
+            run_state: LibSqlRunStateStore::new(Arc::clone(&db)),
+            approvals: LibSqlApprovalRequestStore::new(db),
+        }
     }
 
     pub async fn run_migrations(&self) -> Result<(), RunStateError> {
-        run_libsql_migrations(&self.db).await
+        self.run_state.run_migrations().await
     }
 }
 
@@ -281,9 +285,7 @@ impl LibSqlRunStateApprovalStore {
 #[async_trait::async_trait]
 impl RunStateStore for LibSqlRunStateApprovalStore {
     async fn start(&self, start: RunStart) -> Result<RunRecord, RunStateError> {
-        LibSqlRunStateStore::new(Arc::clone(&self.db))
-            .start(start)
-            .await
+        self.run_state.start(start).await
     }
 
     async fn block_approval(
@@ -292,7 +294,7 @@ impl RunStateStore for LibSqlRunStateApprovalStore {
         invocation_id: InvocationId,
         approval: ApprovalRequest,
     ) -> Result<RunRecord, RunStateError> {
-        LibSqlRunStateStore::new(Arc::clone(&self.db))
+        self.run_state
             .block_approval(scope, invocation_id, approval)
             .await
     }
@@ -303,7 +305,7 @@ impl RunStateStore for LibSqlRunStateApprovalStore {
         invocation_id: InvocationId,
         error_kind: String,
     ) -> Result<RunRecord, RunStateError> {
-        LibSqlRunStateStore::new(Arc::clone(&self.db))
+        self.run_state
             .block_auth(scope, invocation_id, error_kind)
             .await
     }
@@ -313,9 +315,7 @@ impl RunStateStore for LibSqlRunStateApprovalStore {
         scope: &ResourceScope,
         invocation_id: InvocationId,
     ) -> Result<RunRecord, RunStateError> {
-        LibSqlRunStateStore::new(Arc::clone(&self.db))
-            .complete(scope, invocation_id)
-            .await
+        self.run_state.complete(scope, invocation_id).await
     }
 
     async fn fail(
@@ -324,9 +324,7 @@ impl RunStateStore for LibSqlRunStateApprovalStore {
         invocation_id: InvocationId,
         error_kind: String,
     ) -> Result<RunRecord, RunStateError> {
-        LibSqlRunStateStore::new(Arc::clone(&self.db))
-            .fail(scope, invocation_id, error_kind)
-            .await
+        self.run_state.fail(scope, invocation_id, error_kind).await
     }
 
     async fn get(
@@ -334,18 +332,14 @@ impl RunStateStore for LibSqlRunStateApprovalStore {
         scope: &ResourceScope,
         invocation_id: InvocationId,
     ) -> Result<Option<RunRecord>, RunStateError> {
-        LibSqlRunStateStore::new(Arc::clone(&self.db))
-            .get(scope, invocation_id)
-            .await
+        self.run_state.get(scope, invocation_id).await
     }
 
     async fn records_for_scope(
         &self,
         scope: &ResourceScope,
     ) -> Result<Vec<RunRecord>, RunStateError> {
-        LibSqlRunStateStore::new(Arc::clone(&self.db))
-            .records_for_scope(scope)
-            .await
+        self.run_state.records_for_scope(scope).await
     }
 }
 
@@ -357,9 +351,7 @@ impl ApprovalRequestStore for LibSqlRunStateApprovalStore {
         scope: ResourceScope,
         request: ApprovalRequest,
     ) -> Result<ApprovalRecord, RunStateError> {
-        LibSqlApprovalRequestStore::new(Arc::clone(&self.db))
-            .save_pending(scope, request)
-            .await
+        self.approvals.save_pending(scope, request).await
     }
 
     async fn get(
@@ -367,9 +359,7 @@ impl ApprovalRequestStore for LibSqlRunStateApprovalStore {
         scope: &ResourceScope,
         request_id: ApprovalRequestId,
     ) -> Result<Option<ApprovalRecord>, RunStateError> {
-        LibSqlApprovalRequestStore::new(Arc::clone(&self.db))
-            .get(scope, request_id)
-            .await
+        self.approvals.get(scope, request_id).await
     }
 
     async fn approve(
@@ -377,9 +367,7 @@ impl ApprovalRequestStore for LibSqlRunStateApprovalStore {
         scope: &ResourceScope,
         request_id: ApprovalRequestId,
     ) -> Result<ApprovalRecord, RunStateError> {
-        LibSqlApprovalRequestStore::new(Arc::clone(&self.db))
-            .approve(scope, request_id)
-            .await
+        self.approvals.approve(scope, request_id).await
     }
 
     async fn deny(
@@ -387,9 +375,7 @@ impl ApprovalRequestStore for LibSqlRunStateApprovalStore {
         scope: &ResourceScope,
         request_id: ApprovalRequestId,
     ) -> Result<ApprovalRecord, RunStateError> {
-        LibSqlApprovalRequestStore::new(Arc::clone(&self.db))
-            .deny(scope, request_id)
-            .await
+        self.approvals.deny(scope, request_id).await
     }
 
     async fn discard_pending(
@@ -397,18 +383,14 @@ impl ApprovalRequestStore for LibSqlRunStateApprovalStore {
         scope: &ResourceScope,
         request_id: ApprovalRequestId,
     ) -> Result<ApprovalRecord, RunStateError> {
-        LibSqlApprovalRequestStore::new(Arc::clone(&self.db))
-            .discard_pending(scope, request_id)
-            .await
+        self.approvals.discard_pending(scope, request_id).await
     }
 
     async fn records_for_scope(
         &self,
         scope: &ResourceScope,
     ) -> Result<Vec<ApprovalRecord>, RunStateError> {
-        LibSqlApprovalRequestStore::new(Arc::clone(&self.db))
-            .records_for_scope(scope)
-            .await
+        self.approvals.records_for_scope(scope).await
     }
 }
 
@@ -421,7 +403,7 @@ impl RunStateApprovalStore for LibSqlRunStateApprovalStore {
         invocation_id: InvocationId,
         approval: ApprovalRequest,
     ) -> Result<RunRecord, RunStateError> {
-        let conn = libsql_begin_immediate(&self.db).await?;
+        let conn = libsql_begin_immediate(&self.run_state.db).await?;
         let result = async {
             if libsql_get_approval(&conn, &scope, approval.id)
                 .await?
@@ -812,17 +794,21 @@ impl PostgresRunStateStore {
 /// Combined PostgreSQL run-state and approval-request store.
 #[cfg(feature = "postgres")]
 pub struct PostgresRunStateApprovalStore {
-    pool: deadpool_postgres::Pool,
+    run_state: PostgresRunStateStore,
+    approvals: PostgresApprovalRequestStore,
 }
 
 #[cfg(feature = "postgres")]
 impl PostgresRunStateApprovalStore {
     pub fn new(pool: deadpool_postgres::Pool) -> Self {
-        Self { pool }
+        Self {
+            run_state: PostgresRunStateStore::new(pool.clone()),
+            approvals: PostgresApprovalRequestStore::new(pool),
+        }
     }
 
     pub async fn run_migrations(&self) -> Result<(), RunStateError> {
-        run_postgres_migrations(&self.pool).await
+        self.run_state.run_migrations().await
     }
 }
 
@@ -830,9 +816,7 @@ impl PostgresRunStateApprovalStore {
 #[async_trait::async_trait]
 impl RunStateStore for PostgresRunStateApprovalStore {
     async fn start(&self, start: RunStart) -> Result<RunRecord, RunStateError> {
-        PostgresRunStateStore::new(self.pool.clone())
-            .start(start)
-            .await
+        self.run_state.start(start).await
     }
 
     async fn block_approval(
@@ -841,7 +825,7 @@ impl RunStateStore for PostgresRunStateApprovalStore {
         invocation_id: InvocationId,
         approval: ApprovalRequest,
     ) -> Result<RunRecord, RunStateError> {
-        PostgresRunStateStore::new(self.pool.clone())
+        self.run_state
             .block_approval(scope, invocation_id, approval)
             .await
     }
@@ -852,7 +836,7 @@ impl RunStateStore for PostgresRunStateApprovalStore {
         invocation_id: InvocationId,
         error_kind: String,
     ) -> Result<RunRecord, RunStateError> {
-        PostgresRunStateStore::new(self.pool.clone())
+        self.run_state
             .block_auth(scope, invocation_id, error_kind)
             .await
     }
@@ -862,9 +846,7 @@ impl RunStateStore for PostgresRunStateApprovalStore {
         scope: &ResourceScope,
         invocation_id: InvocationId,
     ) -> Result<RunRecord, RunStateError> {
-        PostgresRunStateStore::new(self.pool.clone())
-            .complete(scope, invocation_id)
-            .await
+        self.run_state.complete(scope, invocation_id).await
     }
 
     async fn fail(
@@ -873,9 +855,7 @@ impl RunStateStore for PostgresRunStateApprovalStore {
         invocation_id: InvocationId,
         error_kind: String,
     ) -> Result<RunRecord, RunStateError> {
-        PostgresRunStateStore::new(self.pool.clone())
-            .fail(scope, invocation_id, error_kind)
-            .await
+        self.run_state.fail(scope, invocation_id, error_kind).await
     }
 
     async fn get(
@@ -883,18 +863,14 @@ impl RunStateStore for PostgresRunStateApprovalStore {
         scope: &ResourceScope,
         invocation_id: InvocationId,
     ) -> Result<Option<RunRecord>, RunStateError> {
-        PostgresRunStateStore::new(self.pool.clone())
-            .get(scope, invocation_id)
-            .await
+        self.run_state.get(scope, invocation_id).await
     }
 
     async fn records_for_scope(
         &self,
         scope: &ResourceScope,
     ) -> Result<Vec<RunRecord>, RunStateError> {
-        PostgresRunStateStore::new(self.pool.clone())
-            .records_for_scope(scope)
-            .await
+        self.run_state.records_for_scope(scope).await
     }
 }
 
@@ -906,9 +882,7 @@ impl ApprovalRequestStore for PostgresRunStateApprovalStore {
         scope: ResourceScope,
         request: ApprovalRequest,
     ) -> Result<ApprovalRecord, RunStateError> {
-        PostgresApprovalRequestStore::new(self.pool.clone())
-            .save_pending(scope, request)
-            .await
+        self.approvals.save_pending(scope, request).await
     }
 
     async fn get(
@@ -916,9 +890,7 @@ impl ApprovalRequestStore for PostgresRunStateApprovalStore {
         scope: &ResourceScope,
         request_id: ApprovalRequestId,
     ) -> Result<Option<ApprovalRecord>, RunStateError> {
-        PostgresApprovalRequestStore::new(self.pool.clone())
-            .get(scope, request_id)
-            .await
+        self.approvals.get(scope, request_id).await
     }
 
     async fn approve(
@@ -926,9 +898,7 @@ impl ApprovalRequestStore for PostgresRunStateApprovalStore {
         scope: &ResourceScope,
         request_id: ApprovalRequestId,
     ) -> Result<ApprovalRecord, RunStateError> {
-        PostgresApprovalRequestStore::new(self.pool.clone())
-            .approve(scope, request_id)
-            .await
+        self.approvals.approve(scope, request_id).await
     }
 
     async fn deny(
@@ -936,9 +906,7 @@ impl ApprovalRequestStore for PostgresRunStateApprovalStore {
         scope: &ResourceScope,
         request_id: ApprovalRequestId,
     ) -> Result<ApprovalRecord, RunStateError> {
-        PostgresApprovalRequestStore::new(self.pool.clone())
-            .deny(scope, request_id)
-            .await
+        self.approvals.deny(scope, request_id).await
     }
 
     async fn discard_pending(
@@ -946,18 +914,14 @@ impl ApprovalRequestStore for PostgresRunStateApprovalStore {
         scope: &ResourceScope,
         request_id: ApprovalRequestId,
     ) -> Result<ApprovalRecord, RunStateError> {
-        PostgresApprovalRequestStore::new(self.pool.clone())
-            .discard_pending(scope, request_id)
-            .await
+        self.approvals.discard_pending(scope, request_id).await
     }
 
     async fn records_for_scope(
         &self,
         scope: &ResourceScope,
     ) -> Result<Vec<ApprovalRecord>, RunStateError> {
-        PostgresApprovalRequestStore::new(self.pool.clone())
-            .records_for_scope(scope)
-            .await
+        self.approvals.records_for_scope(scope).await
     }
 }
 
@@ -970,7 +934,7 @@ impl RunStateApprovalStore for PostgresRunStateApprovalStore {
         invocation_id: InvocationId,
         approval: ApprovalRequest,
     ) -> Result<RunRecord, RunStateError> {
-        let mut client = self.pool.get().await.map_err(db_error)?;
+        let mut client = self.run_state.pool.get().await.map_err(db_error)?;
         let txn = client.transaction().await.map_err(db_error)?;
         let mut run = match postgres_get_run_for_update(&txn, &scope, invocation_id).await? {
             Some(run) => run,
