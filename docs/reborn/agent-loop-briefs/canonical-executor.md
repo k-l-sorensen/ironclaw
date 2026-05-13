@@ -307,8 +307,11 @@ impl CanonicalAgentLoopExecutor {
 
         // Invoke batch through host. Loop crate does not directly call individual
         // capabilities — host owns the dispatch and applies the policy hint.
+        // Always request stop-on-first-suspension: approval/auth/resource/process
+        // waits are dynamic outcomes that SafeForParallel descriptors cannot
+        // predict.
         let outcomes = host
-            .invoke_capability_batch(/* calls, policy */)
+            .invoke_capability_batch(/* calls, policy, stop_on_first_suspension = true */)
             .await
             .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Capability })?;
 
@@ -489,10 +492,10 @@ impl CanonicalAgentLoopExecutor {
         let (steering_msgs, last_consumed_cursor) =
             partition_steering_kinds(&batch);  // filters to UserMessage; tracks furthest cursor consumed
         if !steering_msgs.is_empty() {
+            state.input_cursor = last_consumed_cursor.clone();
             host.ack_inputs(last_consumed_cursor.clone())
                 .await
                 .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Input })?;
-            state.input_cursor = last_consumed_cursor;
             // Append steering_msgs into transcript-bound state — concrete shape
             // depends on how messages flow into the next prompt bundle (host-owned
             // projection per master doc §6).
@@ -520,10 +523,10 @@ impl CanonicalAgentLoopExecutor {
         if followup_msgs.is_empty() {
             return Ok((state, false));
         }
+        state.input_cursor = last_consumed_cursor.clone();
         host.ack_inputs(last_consumed_cursor.clone())
             .await
             .map_err(|_| AgentLoopExecutorError::HostUnavailable { stage: HostStage::Input })?;
-        state.input_cursor = last_consumed_cursor;
         Ok((state, true))
     }
 

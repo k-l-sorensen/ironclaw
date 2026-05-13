@@ -13,13 +13,14 @@ use ironclaw_turns::{
         CapabilitySurfaceVersion, CheckpointPolicy, CheckpointSchemaId, ConcurrencyClass,
         ContextProfileId, FinalizeAssistantMessage, LoopCancelReasonKind, LoopCheckpointKind,
         LoopCheckpointRequest, LoopContextBundle, LoopContextPort, LoopContextRequest,
-        LoopDriverId, LoopInput, LoopInputBatch, LoopInputCursor, LoopInputPort, LoopModelMessage,
-        LoopModelPort, LoopModelRequest, LoopModelResponse, LoopPromptBundle, LoopPromptBundleRef,
-        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort, ModelProfileId,
-        ModelStreamChunk, ParentLoopOutput, ProcessHandleSummary, RedactedRunProfileProvenance,
-        ResolvedRunProfile, ResourceBudgetPolicy, ResourceBudgetTier, RunClassId,
-        RunProfileFingerprint, RuntimeProfileConstraints, SchedulingClass, SteeringPolicy,
-        VisibleCapabilityRequest, VisibleCapabilitySurface,
+        LoopDriverId, LoopInput, LoopInputBatch, LoopInputCursor, LoopInputCursorToken,
+        LoopInputPort, LoopModelMessage, LoopModelPort, LoopModelRequest, LoopModelResponse,
+        LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort,
+        LoopRunContext, LoopRunInfoPort, ModelProfileId, ModelStreamChunk, ParentLoopOutput,
+        ProcessHandleSummary, RedactedRunProfileProvenance, ResolvedRunProfile,
+        ResourceBudgetPolicy, ResourceBudgetTier, RunClassId, RunProfileFingerprint,
+        RuntimeProfileConstraints, SchedulingClass, SteeringPolicy, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
 };
 
@@ -27,7 +28,7 @@ use super::capability::{apply_capability_filter, capability_summaries};
 use super::util::{MAX_RETRIES_PER_CALL, system_time_now_unix_ms};
 use super::{
     AgentLoopExecutor, AgentLoopExecutorError, CancelledKind, CanonicalAgentLoopExecutor,
-    CompletionKind, FailureKind, LoopExit,
+    CompletionKind, FailureKind, HostStage, LoopExit,
 };
 use crate::{
     DefaultPlanner,
@@ -79,8 +80,10 @@ struct MockHost {
     single_calls: Mutex<usize>,
     cancelled: Mutex<bool>,
     poll_inputs: Mutex<VecDeque<Vec<LoopInput>>>,
+    poll_input_cursors: Mutex<VecDeque<LoopInputCursor>>,
     capability_surface: Mutex<Option<VisibleCapabilitySurface>>,
     ack_count: Mutex<usize>,
+    ack_errors: Mutex<VecDeque<AgentLoopHostError>>,
     stored_state_refs: Mutex<Vec<ironclaw_turns::run_profile::LoopCheckpointStateRef>>,
     stored_payloads: Mutex<Vec<(LoopCheckpointKind, usize)>>,
     /// When set, `store_checkpoint_payload` fails for requests
@@ -94,11 +97,11 @@ struct MockHost {
     /// host that has not yet wired the store-then-checkpoint contract.
     legacy_checkpoint_only: Mutex<bool>,
     /// Captures every `CapabilityBatchInvocation` so tests can assert
-    /// that `stop_on_first_suspension` is forced to `true` when any
-    /// summary has `ConcurrencyHint::Exclusive`, even under a custom
-    /// planner whose `BatchPolicyStrategy` would otherwise return
-    /// `Parallel`.
+    /// that `stop_on_first_suspension` is always forced to `true`,
+    /// including under a custom planner whose `BatchPolicyStrategy`
+    /// would otherwise return `Parallel`.
     batch_requests: Mutex<Vec<CapabilityBatchInvocation>>,
+    batch_executed_capability_ids: Mutex<Vec<CapabilityId>>,
 }
 
 impl MockHost {
@@ -114,13 +117,16 @@ impl MockHost {
             single_calls: Mutex::new(0),
             cancelled: Mutex::new(false),
             poll_inputs: Mutex::new(VecDeque::new()),
+            poll_input_cursors: Mutex::new(VecDeque::new()),
             capability_surface: Mutex::new(None),
             ack_count: Mutex::new(0),
+            ack_errors: Mutex::new(VecDeque::new()),
             stored_state_refs: Mutex::new(Vec::new()),
             stored_payloads: Mutex::new(Vec::new()),
             fail_final_store: Mutex::new(false),
             legacy_checkpoint_only: Mutex::new(false),
             batch_requests: Mutex::new(Vec::new()),
+            batch_executed_capability_ids: Mutex::new(Vec::new()),
         }
     }
 
@@ -143,6 +149,23 @@ impl MockHost {
 
     fn with_poll_inputs(self, batches: Vec<Vec<LoopInput>>) -> Self {
         self.poll_inputs.lock().unwrap().extend(batches);
+        self
+    }
+
+    fn with_poll_input_pages(self, pages: Vec<(Vec<LoopInput>, LoopInputCursor)>) -> Self {
+        let mut inputs = self.poll_inputs.lock().unwrap();
+        let mut cursors = self.poll_input_cursors.lock().unwrap();
+        for (page_inputs, next_cursor) in pages {
+            inputs.push_back(page_inputs);
+            cursors.push_back(next_cursor);
+        }
+        drop(cursors);
+        drop(inputs);
+        self
+    }
+
+    fn with_ack_error(self, error: AgentLoopHostError) -> Self {
+        self.ack_errors.lock().unwrap().push_back(error);
         self
     }
 
@@ -189,6 +212,10 @@ impl MockHost {
 
     fn recorded_batch_requests(&self) -> Vec<CapabilityBatchInvocation> {
         self.batch_requests.lock().unwrap().clone()
+    }
+
+    fn batch_executed_capability_ids(&self) -> Vec<CapabilityId> {
+        self.batch_executed_capability_ids.lock().unwrap().clone()
     }
 }
 
@@ -249,14 +276,23 @@ impl LoopInputPort for MockHost {
         } else {
             Vec::new()
         };
+        let next_cursor = self
+            .poll_input_cursors
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(after);
         Ok(LoopInputBatch {
             inputs,
-            next_cursor: after,
+            next_cursor,
         })
     }
 
     async fn ack_inputs(&self, _cursor: LoopInputCursor) -> Result<(), AgentLoopHostError> {
         *self.ack_count.lock().unwrap() += 1;
+        if let Some(error) = self.ack_errors.lock().unwrap().pop_front() {
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -321,8 +357,16 @@ impl ironclaw_turns::run_profile::LoopCapabilityPort for MockHost {
         &self,
         request: CapabilityBatchInvocation,
     ) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
+        let outcome = self.batch_outcomes.lock().unwrap().pop_front().unwrap();
+        self.batch_executed_capability_ids.lock().unwrap().extend(
+            request
+                .invocations
+                .iter()
+                .take(outcome.outcomes.len())
+                .map(|invocation| invocation.capability_id.clone()),
+        );
         self.batch_requests.lock().unwrap().push(request);
-        Ok(self.batch_outcomes.lock().unwrap().pop_front().unwrap())
+        Ok(outcome)
     }
 }
 
@@ -488,6 +532,13 @@ fn surface_version() -> CapabilitySurfaceVersion {
     CapabilitySurfaceVersion::new("surface.v1").unwrap()
 }
 
+fn input_cursor(context: &LoopRunContext, token: &str) -> LoopInputCursor {
+    LoopInputCursor::from_host_token(
+        context,
+        LoopInputCursorToken::new(format!("input-cursor:{token}")).unwrap(),
+    )
+}
+
 fn call(input: &str) -> CapabilityCallCandidate {
     CapabilityCallCandidate {
         surface_version: surface_version(),
@@ -535,6 +586,16 @@ fn approval_batch() -> CapabilityBatchOutcome {
         outcomes: vec![CapabilityOutcome::ApprovalRequired {
             gate_ref: LoopGateRef::new("gate:approval").unwrap(),
             safe_summary: "approval required".to_string(),
+        }],
+        stopped_on_suspension: true,
+    }
+}
+
+fn auth_required_batch() -> CapabilityBatchOutcome {
+    CapabilityBatchOutcome {
+        outcomes: vec![CapabilityOutcome::AuthRequired {
+            gate_ref: LoopGateRef::new("gate:auth").unwrap(),
+            safe_summary: "auth required".to_string(),
         }],
         stopped_on_suspension: true,
     }
@@ -2148,6 +2209,54 @@ async fn cancel_page_is_not_acked_when_final_checkpoint_store_fails() {
     );
 }
 
+/// When a drain page checkpoints successfully but `ack_inputs` fails,
+/// the caller-visible in-memory state must already carry the advanced
+/// cursor so retrying with the same `LoopExecutionState` does not
+/// re-poll a consumed page.
+#[tokio::test]
+async fn ack_failure_after_checkpoint_preserves_advanced_input_cursor() {
+    let gate_ref = LoopGateRef::new("gate:ack-failure").unwrap();
+    let host = MockHost::new(vec![reply_output("unused")]);
+    let advanced_cursor = input_cursor(host.run_context(), "after-control");
+    let host = host
+        .with_poll_input_pages(vec![(
+            vec![LoopInput::GateResolved {
+                gate_ref: gate_ref.clone(),
+            }],
+            advanced_cursor.clone(),
+        )])
+        .with_ack_error(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "ack store unavailable",
+        ));
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+    state.last_gate = Some(gate_ref);
+
+    let result = CanonicalAgentLoopExecutor
+        .execute(&planner(8), &host, &mut state)
+        .await;
+
+    match result {
+        Err(AgentLoopExecutorError::HostUnavailable {
+            stage: HostStage::Input,
+        }) => {}
+        other => panic!("expected HostUnavailable(Input), got {other:?}"),
+    }
+    assert_eq!(
+        state.input_cursor, advanced_cursor,
+        "input_cursor must advance before ack_inputs so retries skip the consumed page"
+    );
+    assert_eq!(
+        state.last_gate, None,
+        "control side effect must be retained"
+    );
+    assert_eq!(host.ack_count(), 1);
+    assert!(
+        host.stored_payload_count() > 0,
+        "ack failure test must exercise the after-checkpoint path"
+    );
+}
+
 /// `observe_cancellation` must page past control-only pages. A
 /// `GateResolved` on page 1 followed by a `Cancel` on page 2 must
 /// terminate the run before any further model call, not after one
@@ -2565,12 +2674,11 @@ async fn parallel_policy_with_any_exclusive_summary_forces_stop_on_suspension() 
     );
 }
 
-/// Companion to the previous test: when ALL summaries are
+/// Companion to the previous test: even when ALL summaries are
 /// `SafeForParallel` AND the planner picks `Parallel`, the executor
-/// leaves `stop_on_first_suspension = false` so the read-fanout
-/// fast path is preserved.
+/// still asks the host to stop on the first dynamic suspension.
 #[tokio::test]
-async fn parallel_policy_with_all_safe_summaries_keeps_stop_on_suspension_false() {
+async fn parallel_policy_with_all_safe_summaries_stops_on_suspension() {
     let surface = VisibleCapabilitySurface {
         version: surface_version(),
         descriptors: vec![
@@ -2603,8 +2711,61 @@ async fn parallel_policy_with_all_safe_summaries_keeps_stop_on_suspension_false(
     let requests = host.recorded_batch_requests();
     assert_eq!(requests.len(), 1);
     assert!(
-        !requests[0].stop_on_first_suspension,
-        "stop_on_first_suspension must stay false when policy is \
+        requests[0].stop_on_first_suspension,
+        "stop_on_first_suspension must stay true even when policy is \
          Parallel AND all summaries are SafeForParallel"
+    );
+}
+
+/// A SafeForParallel descriptor cannot predict dynamic auth state.
+/// When the first call in an otherwise parallel-safe batch returns
+/// `AuthRequired`, the executor must have requested stop-on-suspension,
+/// surface `Blocked`, and leave the second invocation unexecuted.
+#[tokio::test]
+async fn all_safe_parallel_batch_stops_before_second_invocation_on_auth_required() {
+    let read_a = CapabilityId::new("demo.read_a").unwrap();
+    let read_b = CapabilityId::new("demo.read_b").unwrap();
+    let surface = VisibleCapabilitySurface {
+        version: surface_version(),
+        descriptors: vec![
+            descriptor("demo.read_a", CapabilityConcurrency::SafeForParallel),
+            descriptor("demo.read_b", CapabilityConcurrency::SafeForParallel),
+        ],
+    };
+    let calls = vec![
+        CapabilityCallCandidate {
+            surface_version: surface_version(),
+            capability_id: read_a.clone(),
+            input_ref: CapabilityInputRef::new("input:a").unwrap(),
+        },
+        CapabilityCallCandidate {
+            surface_version: surface_version(),
+            capability_id: read_b,
+            input_ref: CapabilityInputRef::new("input:b").unwrap(),
+        },
+    ];
+    let host = MockHost::new(vec![ParentLoopOutput::CapabilityCalls(calls)])
+        .with_capability_surface(surface)
+        .with_batch(auth_required_batch());
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = run(&host, &mut state, 8).await;
+
+    assert_eq!(
+        exit,
+        LoopExit::Blocked {
+            gate_ref: LoopGateRef::new("gate:auth").unwrap()
+        }
+    );
+    let requests = host.recorded_batch_requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0].stop_on_first_suspension,
+        "auth suspension must be requested as a stop point even for all-safe parallel batches"
+    );
+    assert_eq!(
+        host.batch_executed_capability_ids(),
+        vec![read_a],
+        "host should only execute the prefix ending at the AuthRequired suspension"
     );
 }

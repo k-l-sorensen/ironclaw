@@ -55,10 +55,11 @@ impl CanonicalAgentLoopExecutor {
         &self,
         planner: &dyn AgentLoopPlanner,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
+        persisted_state: &mut LoopExecutionState,
         state: LoopExecutionState,
     ) -> Result<(LoopExecutionState, FollowupDrainOutcome), AgentLoopExecutorError> {
         if planner.drain().drain_followup(&state).await {
-            self.drain_followup(host, state).await
+            self.drain_followup(host, persisted_state, state).await
         } else {
             Ok((state, FollowupDrainOutcome::Empty))
         }
@@ -67,6 +68,7 @@ impl CanonicalAgentLoopExecutor {
     pub(super) async fn observe_cancellation(
         &self,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
+        persisted_state: &mut LoopExecutionState,
         mut state: LoopExecutionState,
     ) -> Result<(LoopExecutionState, Option<LoopExit>), AgentLoopExecutorError> {
         // Page past control-only pages just like `drain_followup`. Polling
@@ -118,11 +120,8 @@ impl CanonicalAgentLoopExecutor {
                 // already-processed positions).
                 state.input_cursor = batch.next_cursor.clone();
                 let checked = self.checkpoint(host, state, CheckpointKind::Final).await?;
-                host.ack_inputs(batch.next_cursor).await.map_err(|_| {
-                    AgentLoopExecutorError::HostUnavailable {
-                        stage: HostStage::Input,
-                    }
-                })?;
+                ack_inputs_after_state_advance(host, persisted_state, &checked, batch.next_cursor)
+                    .await?;
                 let exit = LoopExit::Cancelled(CancelledKind {
                     interrupted_message_refs: checked.assistant_refs.clone(),
                 });
@@ -163,11 +162,8 @@ impl CanonicalAgentLoopExecutor {
             state = self
                 .checkpoint(host, state, CheckpointKind::BeforeModel)
                 .await?;
-            host.ack_inputs(batch.next_cursor).await.map_err(|_| {
-                AgentLoopExecutorError::HostUnavailable {
-                    stage: HostStage::Input,
-                }
-            })?;
+            ack_inputs_after_state_advance(host, persisted_state, &state, batch.next_cursor)
+                .await?;
         }
         // Defense-in-depth: `INPUT_POLL_LIMIT` consecutive control-only
         // pages without a terminal, empty, or user-facing page. Return
@@ -179,6 +175,7 @@ impl CanonicalAgentLoopExecutor {
     pub(super) async fn drain_steering(
         &self,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
+        persisted_state: &mut LoopExecutionState,
         mut state: LoopExecutionState,
     ) -> Result<LoopExecutionState, AgentLoopExecutorError> {
         let batch = host
@@ -228,11 +225,8 @@ impl CanonicalAgentLoopExecutor {
             state = self
                 .checkpoint(host, state, CheckpointKind::BeforeModel)
                 .await?;
-            host.ack_inputs(batch.next_cursor).await.map_err(|_| {
-                AgentLoopExecutorError::HostUnavailable {
-                    stage: HostStage::Input,
-                }
-            })?;
+            ack_inputs_after_state_advance(host, persisted_state, &state, batch.next_cursor)
+                .await?;
         }
         Ok(state)
     }
@@ -240,6 +234,7 @@ impl CanonicalAgentLoopExecutor {
     pub(super) async fn drain_followup(
         &self,
         host: &(dyn AgentLoopDriverHost + Send + Sync),
+        persisted_state: &mut LoopExecutionState,
         mut state: LoopExecutionState,
     ) -> Result<(LoopExecutionState, FollowupDrainOutcome), AgentLoopExecutorError> {
         // Keep draining follow-up pages until either a FollowUp /
@@ -313,11 +308,8 @@ impl CanonicalAgentLoopExecutor {
                 state = self
                     .checkpoint(host, state, CheckpointKind::BeforeModel)
                     .await?;
-                host.ack_inputs(batch.next_cursor).await.map_err(|_| {
-                    AgentLoopExecutorError::HostUnavailable {
-                        stage: HostStage::Input,
-                    }
-                })?;
+                ack_inputs_after_state_advance(host, persisted_state, &state, batch.next_cursor)
+                    .await?;
                 return Ok((state, FollowupDrainOutcome::FollowUpConsumed));
             }
             // No user-facing or terminal inputs in this page.
@@ -336,11 +328,8 @@ impl CanonicalAgentLoopExecutor {
             state = self
                 .checkpoint(host, state, CheckpointKind::BeforeModel)
                 .await?;
-            host.ack_inputs(batch.next_cursor).await.map_err(|_| {
-                AgentLoopExecutorError::HostUnavailable {
-                    stage: HostStage::Input,
-                }
-            })?;
+            ack_inputs_after_state_advance(host, persisted_state, &state, batch.next_cursor)
+                .await?;
         }
         // `INPUT_POLL_LIMIT` consecutive control-only pages were acked
         // but we never saw a definitive "empty" page or a user-facing
@@ -350,6 +339,20 @@ impl CanonicalAgentLoopExecutor {
         // the caller continues the loop.
         Ok((state, FollowupDrainOutcome::ControlPending))
     }
+}
+
+pub(super) async fn ack_inputs_after_state_advance(
+    host: &(dyn AgentLoopDriverHost + Send + Sync),
+    persisted_state: &mut LoopExecutionState,
+    advanced_state: &LoopExecutionState,
+    cursor: ironclaw_turns::run_profile::LoopInputCursor,
+) -> Result<(), AgentLoopExecutorError> {
+    *persisted_state = advanced_state.clone();
+    host.ack_inputs(cursor)
+        .await
+        .map_err(|_| AgentLoopExecutorError::HostUnavailable {
+            stage: HostStage::Input,
+        })
 }
 
 /// Apply idempotent control-input side effects to `state`. Cancel and

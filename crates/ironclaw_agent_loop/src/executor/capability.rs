@@ -75,19 +75,12 @@ impl CanonicalAgentLoopExecutor {
                 .cloned()
                 .map(capability_invocation_from_candidate)
                 .collect();
-            // `stop_on_first_suspension` must be true if EITHER the
-            // policy is `Sequential`, OR any summary in the batch has
-            // `ConcurrencyHint::Exclusive`. A custom `BatchPolicyStrategy`
-            // that returns `Parallel` for a batch containing an Exclusive
-            // call would otherwise let the host run later invocations
-            // after an `ApprovalRequired`/`AuthRequired`/`SpawnedProcess`
-            // outcome — the concurrency hint is the descriptor's own
-            // disclosure and overrides a permissive planner.
-            let any_exclusive = summaries
-                .iter()
-                .any(|summary| matches!(summary.concurrency_hint, ConcurrencyHint::Exclusive));
-            let stop_on_first_suspension =
-                matches!(policy, BatchPolicy::Sequential) || any_exclusive;
+            // Suspension outcomes are dynamic host state
+            // (ApprovalRequired/AuthRequired/ResourceBlocked/
+            // SpawnedProcess), not something a SafeForParallel descriptor
+            // can predict. Always ask the host to stop before executing a
+            // later invocation once any call suspends.
+            let stop_on_first_suspension = true;
             let batch = host
                 .invoke_capability_batch(CapabilityBatchInvocation {
                     invocations: host_invocations,
@@ -147,7 +140,7 @@ impl CanonicalAgentLoopExecutor {
         mut state: LoopExecutionState,
         calls: Vec<CapabilityCallCandidate>,
         batch: ironclaw_turns::run_profile::CapabilityBatchOutcome,
-        policy: BatchPolicy,
+        _policy: BatchPolicy,
     ) -> Result<Step, AgentLoopExecutorError> {
         let outcomes_len = batch.outcomes.len();
         let calls_len = calls.len();
@@ -157,21 +150,25 @@ impl CanonicalAgentLoopExecutor {
             });
         }
         if outcomes_len < calls_len {
-            // Short prefix only valid for `Sequential` AND the tail must
-            // be a suspension (per `CapabilityOutcome::is_suspension`).
-            if !matches!(policy, BatchPolicy::Sequential) {
+            // Short prefix only valid when the host reports it stopped on
+            // suspension, and the tail must be a suspension (per
+            // `CapabilityOutcome::is_suspension`). The executor requests
+            // stop-on-suspension for every batch, including `Parallel`
+            // batches, because dynamic auth/approval/resource/process
+            // states can arise even for SafeForParallel descriptors.
+            if !batch.stopped_on_suspension {
                 return Err(AgentLoopExecutorError::PlannerContract {
-                    detail: "parallel capability batch returned a short outcome prefix",
+                    detail: "capability batch returned a short outcome prefix without stopping on suspension",
                 });
             }
             let Some(last) = batch.outcomes.last() else {
                 return Err(AgentLoopExecutorError::PlannerContract {
-                    detail: "sequential capability batch returned no outcomes",
+                    detail: "capability batch returned no outcomes after stopping on suspension",
                 });
             };
             if !last.is_suspension() {
                 return Err(AgentLoopExecutorError::PlannerContract {
-                    detail: "sequential capability batch truncated without a suspension tail",
+                    detail: "capability batch truncated without a suspension tail",
                 });
             }
         }

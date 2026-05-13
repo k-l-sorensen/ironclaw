@@ -13,7 +13,7 @@ use crate::{
 };
 
 use super::capability::apply_capability_filter;
-use super::drain::FollowupDrainOutcome;
+use super::drain::{FollowupDrainOutcome, ack_inputs_after_state_advance};
 use super::model::{ModelStep, model_preference_id};
 use super::util::{system_time_now_unix_ms, wall_clock_limit_exceeded};
 use super::{
@@ -66,7 +66,7 @@ impl CanonicalAgentLoopExecutor {
                 });
             }
 
-            let observed = self.observe_cancellation(host, next).await?;
+            let observed = self.observe_cancellation(host, state, next).await?;
             next = observed.0;
             if let Some(exit) = observed.1 {
                 *state = next;
@@ -74,7 +74,7 @@ impl CanonicalAgentLoopExecutor {
             }
 
             if planner.drain().drain_steering(&next).await {
-                next = self.drain_steering(host, next).await?;
+                next = self.drain_steering(host, state, next).await?;
             }
 
             let context_request = planner.context().plan_context_request(&next).await;
@@ -172,7 +172,7 @@ impl CanonicalAgentLoopExecutor {
                             // catches them. Only checkpoint Final when the
                             // followup queue is truly empty.
                             let (drained_state, outcome) = self
-                                .drain_followup_if_planner_asks(planner, host, reply_state)
+                                .drain_followup_if_planner_asks(planner, host, state, reply_state)
                                 .await?;
                             match outcome {
                                 FollowupDrainOutcome::FollowUpConsumed => {
@@ -195,11 +195,13 @@ impl CanonicalAgentLoopExecutor {
                                     let checked = self
                                         .checkpoint(host, advanced, CheckpointKind::Final)
                                         .await?;
-                                    host.ack_inputs(next_cursor).await.map_err(|_| {
-                                        AgentLoopExecutorError::HostUnavailable {
-                                            stage: HostStage::Input,
-                                        }
-                                    })?;
+                                    ack_inputs_after_state_advance(
+                                        host,
+                                        state,
+                                        &checked,
+                                        next_cursor,
+                                    )
+                                    .await?;
                                     let exit = LoopExit::Cancelled(CancelledKind {
                                         interrupted_message_refs: checked.assistant_refs.clone(),
                                     });
@@ -283,7 +285,7 @@ impl CanonicalAgentLoopExecutor {
                         return Ok(LoopExit::Failed { kind: exit_kind });
                     }
 
-                    let observed = self.observe_cancellation(host, next).await?;
+                    let observed = self.observe_cancellation(host, state, next).await?;
                     next = observed.0;
                     if let Some(exit) = observed.1 {
                         *state = next;
