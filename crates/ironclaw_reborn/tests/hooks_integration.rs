@@ -35,13 +35,14 @@ use ironclaw_hooks::dispatch::HookDispatcher;
 use ironclaw_hooks::evaluator::PredicateEvaluator;
 use ironclaw_hooks::identity::{ExtensionId, HookId, HookLocalId, HookVersion};
 use ironclaw_hooks::installed_hook::PredicateBackedBeforeCapabilityHook;
+use ironclaw_hooks::kinds::observer::NoteCategory;
 use ironclaw_hooks::ordering::HookPhase;
-use ironclaw_hooks::points::BeforeCapabilityHookContext;
+use ironclaw_hooks::points::{BeforeCapabilityHookContext, ObserverHookContext};
 use ironclaw_hooks::predicate::{CapabilityPredicate, HookPredicateSpec};
-use ironclaw_hooks::registry::HookRegistry;
+use ironclaw_hooks::registry::{HookPointSpec, HookRegistry};
 use ironclaw_hooks::sink::{
-    PrivilegedBeforeCapabilityHook, PrivilegedGateSink, RestrictedBeforeCapabilityHook,
-    RestrictedGateSink,
+    ObserverHook, ObserverSink, PrivilegedBeforeCapabilityHook, PrivilegedGateSink,
+    RestrictedBeforeCapabilityHook, RestrictedGateSink,
 };
 use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_loop_support::{
@@ -55,18 +56,20 @@ use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
     SessionThreadService, ThreadScope,
 };
-use ironclaw_turns::LoopResultRef;
 use ironclaw_turns::{
-    AcceptedMessageRef, EventCursor, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
-    InMemoryRunProfileResolver, ReplyTargetBindingRef, RunProfileId, RunProfileResolutionRequest,
+    AcceptedMessageRef, CheckpointStateStore, EventCursor, InMemoryCheckpointStateStore,
+    InMemoryLoopCheckpointStore, InMemoryRunProfileResolver, LoopResultRef,
+    PutCheckpointStateRequest, ReplyTargetBindingRef, RunProfileId, RunProfileResolutionRequest,
     RunProfileResolver, RunProfileVersion, SourceBindingRef, TurnLeaseToken, TurnRunId,
     TurnRunnerId, TurnScope, TurnStatus,
     run_profile::{
         AgentLoopHostError, CapabilityBatchInvocation, CapabilityBatchOutcome,
         CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityInputRef,
         CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceVersion,
-        InMemoryLoopHostMilestoneSink, LoopCapabilityPort, LoopHostMilestoneKind, LoopRunContext,
-        RunScopedHookMilestoneSink, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        InMemoryLoopHostMilestoneSink, LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort,
+        LoopCheckpointRequest, LoopHostMilestoneKind, LoopModelPort, LoopModelRequest,
+        LoopRunContext, RunScopedHookMilestoneSink, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -156,9 +159,13 @@ fn descriptor(capability_id: &str) -> CapabilityDescriptorView {
 
 // ─── Model-gateway stub ────────────────────────────────────────────────────
 
-/// Minimal `HostManagedModelGateway` stub. The integration tests don't drive
-/// the model port; the gateway is only required because the factory's type
-/// signature demands one. Its `stream_model` is therefore never invoked.
+/// Minimal `HostManagedModelGateway` stub. Most integration tests don't drive
+/// the model port — the gateway is only required because the factory's type
+/// signature demands one. The observer-middleware tests (`observer_hook_*`)
+/// do drive `stream_model`, so the gateway returns a successful assistant
+/// reply rather than panicking. Capability-port tests still pass `cap.allowed`
+/// / `cap.blocked` through the capability seam without ever invoking the
+/// model gateway.
 struct UnusedGateway;
 
 #[async_trait]
@@ -167,8 +174,9 @@ impl HostManagedModelGateway for UnusedGateway {
         &self,
         _request: HostManagedModelRequest,
     ) -> Result<HostManagedModelResponse, HostManagedModelError> {
-        // If this ever runs, the test is exercising the wrong seam.
-        panic!("model gateway must not be invoked by capability-port integration tests");
+        Ok(HostManagedModelResponse::assistant_reply(
+            "integration-test stub reply",
+        ))
     }
 }
 
@@ -636,5 +644,239 @@ async fn pause_approval_hook_surfaces_as_approval_required_with_real_gate_ref() 
         inner.invocations().is_empty(),
         "inner port must NOT be invoked when a hook pauses; got {:?}",
         inner.invocations()
+    );
+}
+
+// ─── Observer middleware integration tests ─────────────────────────────────
+//
+// These prove that `RebornLoopDriverHostFactory` wraps the model, transcript,
+// and checkpoint ports with the observer middleware from
+// `ironclaw_hooks::middleware::{model_port, transcript_port, checkpoint_port}`
+// when a `HookDispatcher` is configured. Unit tests on the observer wrappers
+// alone do not catch a factory regression — these do.
+
+/// Builtin observer hook that counts invocations into a shared `Mutex`.
+struct CountingObserver {
+    seen: Arc<Mutex<u32>>,
+}
+
+#[async_trait]
+impl ObserverHook for CountingObserver {
+    async fn observe(&self, _ctx: &ObserverHookContext, sink: &mut dyn ObserverSink) {
+        *self.seen.lock().expect("observer counter not poisoned") += 1;
+        sink.note(NoteCategory::HookFired, "observer fired");
+    }
+}
+
+/// Builtin observer that always panics — used to prove the outer call still
+/// returns `Ok` and that the dispatcher records the failure via milestone.
+struct PanickingObserver;
+
+#[async_trait]
+impl ObserverHook for PanickingObserver {
+    async fn observe(&self, _ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {
+        panic!("intentional observer panic");
+    }
+}
+
+fn observer_dispatcher_at(point: HookPointSpec, seen: Arc<Mutex<u32>>) -> Arc<HookDispatcher> {
+    let hook_id = HookId::for_builtin(
+        match point {
+            HookPointSpec::AfterModel => "tests::hooks_integration::after_model_observer",
+            HookPointSpec::AfterCapability => "tests::hooks_integration::after_capability_observer",
+            HookPointSpec::AfterCheckpoint => "tests::hooks_integration::after_checkpoint_observer",
+            other => panic!("unsupported observer point in test: {other:?}"),
+        },
+        HookVersion::ONE,
+    );
+    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+    dispatcher
+        .install_builtin_observer(
+            hook_id,
+            HookPhase::Telemetry,
+            point,
+            Box::new(CountingObserver { seen }),
+        )
+        .expect("install builtin observer");
+    Arc::new(dispatcher)
+}
+
+/// Build a `LoopModelRequest` referencing the inbound message added by the
+/// fixture so `ThreadBackedLoopModelPort` resolves real context messages.
+fn model_request() -> LoopModelRequest {
+    LoopModelRequest {
+        messages: Vec::new(),
+        surface_version: None,
+        model_preference: None,
+    }
+}
+
+#[tokio::test]
+async fn observer_hook_fires_after_model_through_factory() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let seen = Arc::new(Mutex::new(0u32));
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(observer_dispatcher_at(
+            HookPointSpec::AfterModel,
+            Arc::clone(&seen),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with AfterModel observer installed");
+
+    host.stream_model(model_request())
+        .await
+        .expect("stream_model returns Ok via the wrapped model port");
+
+    assert_eq!(
+        *seen.lock().expect("observer counter not poisoned"),
+        1,
+        "AfterModel observer must fire exactly once after a successful \
+         model stream — proves the factory wraps the model port"
+    );
+}
+
+#[tokio::test]
+async fn observer_hook_fires_after_capability_through_factory() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+    let seen = Arc::new(Mutex::new(0u32));
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(observer_dispatcher_at(
+            HookPointSpec::AfterCapability,
+            Arc::clone(&seen),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with AfterCapability observer installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.allowed"))
+        .await
+        .expect("invoke_capability returns a (completed) outcome");
+
+    assert!(
+        matches!(outcome, CapabilityOutcome::Completed(_)),
+        "capability must complete normally, got {outcome:?}"
+    );
+    assert_eq!(
+        *seen.lock().expect("observer counter not poisoned"),
+        1,
+        "AfterCapability observer must fire exactly once after a successful \
+         capability invocation"
+    );
+}
+
+#[tokio::test]
+async fn observer_hook_fires_after_checkpoint_through_factory() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let seen = Arc::new(Mutex::new(0u32));
+
+    // The HostManagedLoopCheckpointPort requires a pre-existing checkpoint
+    // state record under the run's scope before it will write a loop
+    // checkpoint, so seed one up front.
+    let state_record = fixture
+        .checkpoint_state_store
+        .put_checkpoint_state(PutCheckpointStateRequest::new(
+            fixture.context.scope.clone(),
+            fixture.context.turn_id,
+            fixture.context.run_id,
+            fixture.context.checkpoint_schema_id.clone(),
+            fixture.context.checkpoint_schema_version,
+            LoopCheckpointKind::BeforeModel,
+            b"observer-test-checkpoint-payload".to_vec(),
+        ))
+        .await
+        .expect("seed checkpoint state record");
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(observer_dispatcher_at(
+            HookPointSpec::AfterCheckpoint,
+            Arc::clone(&seen),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with AfterCheckpoint observer installed");
+
+    host.checkpoint(LoopCheckpointRequest {
+        kind: LoopCheckpointKind::BeforeModel,
+        state_ref: state_record.state_ref,
+    })
+    .await
+    .expect("checkpoint write succeeds through the wrapped checkpoint port");
+
+    assert_eq!(
+        *seen.lock().expect("observer counter not poisoned"),
+        1,
+        "AfterCheckpoint observer must fire exactly once after a successful \
+         checkpoint write — proves the factory wraps the checkpoint port"
+    );
+}
+
+#[tokio::test]
+async fn observer_panic_does_not_fail_model_call() {
+    // A panicking observer hook must fail isolated: the model call returns
+    // Ok, and the dispatcher records a HookFailed milestone with the
+    // observer's hook id. The poison side effect is also visible through
+    // the milestone stream.
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+
+    // Wrap the panicking-observer dispatcher in a run-scoped milestone sink
+    // so HookFailed lands in the host milestone backend.
+    let hook_id = HookId::for_builtin(
+        "tests::hooks_integration::panicking_observer",
+        HookVersion::ONE,
+    );
+    let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+    dispatcher
+        .install_builtin_observer(
+            hook_id,
+            HookPhase::Telemetry,
+            HookPointSpec::AfterModel,
+            Box::new(PanickingObserver),
+        )
+        .expect("install panicking observer");
+    let hook_milestone_sink: Arc<RunScopedHookMilestoneSink> =
+        Arc::new(RunScopedHookMilestoneSink::new(
+            fixture.context.clone(),
+            Arc::clone(&fixture.milestone_sink) as _,
+        ));
+    dispatcher = dispatcher.with_milestone_sink(hook_milestone_sink);
+    let dispatcher = Arc::new(dispatcher);
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with panicking observer installed");
+
+    let response = host.stream_model(model_request()).await;
+    assert!(
+        response.is_ok(),
+        "observer panic must NOT propagate into the outer model call; got {response:?}"
+    );
+
+    // The dispatcher emits a HookFailed milestone for the panicking observer;
+    // proves the observer poisoning is recorded without affecting the outer
+    // port outcome.
+    let saw_failed = fixture
+        .milestone_sink
+        .milestones()
+        .iter()
+        .any(|m| matches!(m.kind, LoopHostMilestoneKind::HookFailed { .. }));
+    assert!(
+        saw_failed,
+        "expected a HookFailed milestone after observer panic; milestones = {:?}",
+        fixture.milestone_sink.milestones()
     );
 }
