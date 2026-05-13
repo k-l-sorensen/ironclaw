@@ -40,6 +40,12 @@ pub trait PrivilegedGateSink: Send {
     fn deny(&mut self, reason: &'static str);
     fn pause_approval(&mut self, reason: &'static str);
     fn pause_auth(&mut self, reason: &'static str);
+    /// Record that the hook evaluated the context and has no opinion. The
+    /// dispatcher treats this as "this hook contributes nothing to the
+    /// composed decision" — distinct from "the hook returned without calling
+    /// any sink method," which is treated as a protocol violation and
+    /// fails closed.
+    fn pass(&mut self);
 }
 
 /// Gate sink surface for Installed hooks. Deliberately omits `allow`; an
@@ -48,63 +54,99 @@ pub trait RestrictedGateSink: Send {
     fn deny(&mut self, reason: &'static str);
     fn pause_approval(&mut self, reason: &'static str);
     fn pause_auth(&mut self, reason: &'static str);
+    /// Record that the hook evaluated the context and has no opinion. See
+    /// [`PrivilegedGateSink::pass`] for the full semantics.
+    fn pass(&mut self);
 }
 
-/// Dispatcher-internal sink implementation that records the decision a hook
+/// State recorded by [`RecordingGateSink`] as the hook calls sink methods.
+/// The dispatcher consumes this to distinguish "hook called nothing"
+/// (`Unset` → Malformed → fail-closed) from "hook explicitly passed"
+/// (`Passed` → no-opinion → composed decision unchanged) from "hook minted
+/// a decision" (`Decided` → compose normally).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GateSinkState {
+    Unset,
+    Passed,
+    Decided(BeforeCapabilityHookDecision),
+}
+
+/// Dispatcher-internal sink implementation that records the outcome a hook
 /// minted. Implements both privileged and restricted traits because the
 /// dispatcher uses one concrete type behind whichever trait pointer it hands
 /// the hook.
 pub(crate) struct RecordingGateSink {
-    pub(crate) decision: Option<BeforeCapabilityHookDecision>,
+    pub(crate) state: GateSinkState,
 }
 
 impl RecordingGateSink {
     pub(crate) fn new() -> Self {
-        Self { decision: None }
+        Self {
+            state: GateSinkState::Unset,
+        }
+    }
+
+    /// Test/dispatcher accessor: the decision the hook minted, if any.
+    /// Returns `None` for both `Unset` and `Passed` — callers that need to
+    /// distinguish should inspect [`Self::state`] directly.
+    #[cfg(test)]
+    pub(crate) fn decision(&self) -> Option<&BeforeCapabilityHookDecision> {
+        match &self.state {
+            GateSinkState::Decided(d) => Some(d),
+            _ => None,
+        }
     }
 }
 
 impl PrivilegedGateSink for RecordingGateSink {
     fn allow(&mut self) {
-        self.decision = Some(BeforeCapabilityHookDecision::allow());
+        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::allow());
     }
 
     fn deny(&mut self, reason: &'static str) {
-        self.decision = Some(BeforeCapabilityHookDecision::deny(
+        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::deny(
             SanitizedReason::from_static(reason),
         ));
     }
 
     fn pause_approval(&mut self, reason: &'static str) {
-        self.decision = Some(BeforeCapabilityHookDecision::pause_approval(
+        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::pause_approval(
             SanitizedReason::from_static(reason),
         ));
     }
 
     fn pause_auth(&mut self, reason: &'static str) {
-        self.decision = Some(BeforeCapabilityHookDecision::pause_auth(
+        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::pause_auth(
             SanitizedReason::from_static(reason),
         ));
+    }
+
+    fn pass(&mut self) {
+        self.state = GateSinkState::Passed;
     }
 }
 
 impl RestrictedGateSink for RecordingGateSink {
     fn deny(&mut self, reason: &'static str) {
-        self.decision = Some(BeforeCapabilityHookDecision::deny(
+        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::deny(
             SanitizedReason::from_static(reason),
         ));
     }
 
     fn pause_approval(&mut self, reason: &'static str) {
-        self.decision = Some(BeforeCapabilityHookDecision::pause_approval(
+        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::pause_approval(
             SanitizedReason::from_static(reason),
         ));
     }
 
     fn pause_auth(&mut self, reason: &'static str) {
-        self.decision = Some(BeforeCapabilityHookDecision::pause_auth(
+        self.state = GateSinkState::Decided(BeforeCapabilityHookDecision::pause_auth(
             SanitizedReason::from_static(reason),
         ));
+    }
+
+    fn pass(&mut self) {
+        self.state = GateSinkState::Passed;
     }
 }
 
@@ -317,7 +359,7 @@ mod tests {
         DenyOnly
             .evaluate(&ctx, &mut recording as &mut dyn RestrictedGateSink)
             .await;
-        assert!(!recording.decision.as_ref().unwrap().permits());
+        assert!(!recording.decision().expect("decision recorded").permits());
     }
 
     #[tokio::test]
@@ -343,7 +385,34 @@ mod tests {
         AllowOnly
             .evaluate(&ctx, &mut recording as &mut dyn PrivilegedGateSink)
             .await;
-        assert!(recording.decision.as_ref().unwrap().permits());
+        assert!(recording.decision().expect("decision recorded").permits());
+    }
+
+    #[tokio::test]
+    async fn pass_does_not_record_decision() {
+        struct PassingHook;
+        #[async_trait]
+        impl RestrictedBeforeCapabilityHook for PassingHook {
+            async fn evaluate(
+                &self,
+                _ctx: &BeforeCapabilityHookContext,
+                sink: &mut dyn RestrictedGateSink,
+            ) {
+                sink.pass();
+            }
+        }
+
+        let mut recording = RecordingGateSink::new();
+        let ctx = BeforeCapabilityHookContext::new(
+            ironclaw_host_api::TenantId::new("t".to_string()).expect("valid tenant"),
+            "cap.x".to_string(),
+            [0u8; 32],
+        );
+        PassingHook
+            .evaluate(&ctx, &mut recording as &mut dyn RestrictedGateSink)
+            .await;
+        assert!(recording.decision().is_none());
+        assert_eq!(recording.state, GateSinkState::Passed);
     }
 
     #[tokio::test]

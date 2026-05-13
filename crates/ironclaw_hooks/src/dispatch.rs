@@ -23,8 +23,8 @@ use crate::ordering::HookOrderKey;
 use crate::points::{BeforeCapabilityHookContext, BeforePromptHookContext, ObserverHookContext};
 use crate::registry::{HookBinding, HookPointSpec, HookRegistry};
 use crate::sink::{
-    ObserverHook, PrivilegedBeforeCapabilityHook, PrivilegedBeforePromptHook, RecordingGateSink,
-    RecordingMutatorSink, RecordingObserverSink, RestrictedBeforeCapabilityHook,
+    GateSinkState, ObserverHook, PrivilegedBeforeCapabilityHook, PrivilegedBeforePromptHook,
+    RecordingGateSink, RecordingMutatorSink, RecordingObserverSink, RestrictedBeforeCapabilityHook,
     RestrictedBeforePromptHook,
 };
 use crate::trust::HookTrustClass;
@@ -64,6 +64,17 @@ pub struct BeforeCapabilityDispatchOutcome {
     /// Per-hook failures encountered during this dispatch. Each entry tells
     /// downstream audit which hook misbehaved and how.
     pub failures: Vec<HookFailureRecord>,
+}
+
+/// Outcome of running a single `before_capability` hook to completion. The
+/// `Pass` variant lets a hook explicitly state "no opinion" — the dispatcher
+/// composes nothing for it, but does not treat the absence of a sink call
+/// as a protocol violation. The `Decision` variant carries a minted decision
+/// for the composer.
+#[derive(Debug)]
+pub(crate) enum GateHookOutcome {
+    Pass,
+    Decision(BeforeCapabilityHookDecision),
 }
 
 /// Per-hook record of misbehavior surfaced during a dispatch.
@@ -120,6 +131,19 @@ impl HookDispatcher {
         self
     }
 
+    /// Insert a new binding into the dispatcher's registry. Used by the
+    /// [`crate::registrar::HookRegistrar`] to wire manifest entries into a
+    /// live dispatcher. Returns the same errors as
+    /// [`HookRegistry::insert`].
+    pub fn insert_binding(&mut self, binding: HookBinding) -> Result<(), crate::error::HookError> {
+        let mut registry = self.registry.lock().map_err(|_| {
+            crate::error::HookError::RegistryConstruction(
+                "hook registry mutex poisoned".to_string(),
+            )
+        })?;
+        registry.insert(binding)
+    }
+
     /// Register a hook implementation against an existing binding.
     pub fn install_before_capability(&mut self, hook_id: HookId, hook: BeforeCapabilityHookImpl) {
         self.before_capability.insert(hook_id, hook);
@@ -172,7 +196,11 @@ impl HookDispatcher {
 
             let result = self.run_before_capability_hook(hook, &binding, ctx).await;
             match result {
-                Ok(decision) => {
+                Ok(GateHookOutcome::Pass) => {
+                    // Hook explicitly declared no opinion — contributes
+                    // nothing to the composed decision.
+                }
+                Ok(GateHookOutcome::Decision(decision)) => {
                     composed = compose_gate_decision(composed, decision);
                     if !matches!(composed.inner(), GateDecisionInner::Allow) {
                         short_circuited = true;
@@ -320,7 +348,7 @@ impl HookDispatcher {
         hook: &BeforeCapabilityHookImpl,
         binding: &HookBinding,
         ctx: &BeforeCapabilityHookContext,
-    ) -> Result<BeforeCapabilityHookDecision, HookFailureRecord> {
+    ) -> Result<GateHookOutcome, HookFailureRecord> {
         let timeout = self.timeout;
         let run = async {
             match hook {
@@ -330,7 +358,7 @@ impl HookDispatcher {
                         .catch_unwind()
                         .await
                         .map_err(|_| ())
-                        .map(|()| sink.decision)
+                        .map(|()| sink.state)
                 }
                 BeforeCapabilityHookImpl::Restricted(h) => {
                     let mut sink = RecordingGateSink::new();
@@ -338,14 +366,15 @@ impl HookDispatcher {
                         .catch_unwind()
                         .await
                         .map_err(|_| ())
-                        .map(|()| sink.decision)
+                        .map(|()| sink.state)
                 }
             }
         };
 
         match tokio::time::timeout(timeout, run).await {
-            Ok(Ok(Some(decision))) => Ok(decision),
-            Ok(Ok(None)) => {
+            Ok(Ok(GateSinkState::Decided(decision))) => Ok(GateHookOutcome::Decision(decision)),
+            Ok(Ok(GateSinkState::Passed)) => Ok(GateHookOutcome::Pass),
+            Ok(Ok(GateSinkState::Unset)) => {
                 let failure = self.classify_failure(
                     binding,
                     FailureCategory::Malformed,
@@ -647,6 +676,88 @@ mod tests {
         async fn observe(&self, _ctx: &ObserverHookContext, sink: &mut dyn ObserverSink) {
             sink.note(NoteCategory::HookFired, "fired");
         }
+    }
+
+    struct PassingInstalledHook;
+    #[async_trait]
+    impl RestrictedBeforeCapabilityHook for PassingInstalledHook {
+        async fn evaluate(
+            &self,
+            _ctx: &BeforeCapabilityHookContext,
+            sink: &mut dyn RestrictedGateSink,
+        ) {
+            sink.pass();
+        }
+    }
+
+    struct SilentInstalledHook;
+    #[async_trait]
+    impl RestrictedBeforeCapabilityHook for SilentInstalledHook {
+        async fn evaluate(
+            &self,
+            _ctx: &BeforeCapabilityHookContext,
+            _sink: &mut dyn RestrictedGateSink,
+        ) {
+            // Deliberately returns without calling any sink method.
+        }
+    }
+
+    #[tokio::test]
+    async fn pass_hook_does_not_short_circuit_allow() {
+        let id = ext_hook_id("passes");
+        let mut registry = HookRegistry::new();
+        registry
+            .insert(installed_binding(
+                id,
+                HookPointSpec::BeforeCapability,
+                HookPhase::Policy,
+            ))
+            .expect("ok");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_before_capability(
+            id,
+            BeforeCapabilityHookImpl::Restricted(Box::new(PassingInstalledHook)),
+        );
+
+        let outcome = dispatcher.dispatch_before_capability(&ctx()).await;
+        assert!(
+            outcome.decision.permits(),
+            "passing hook must not short-circuit the composed allow"
+        );
+        assert!(outcome.failures.is_empty(), "pass is not a failure");
+    }
+
+    #[tokio::test]
+    async fn no_sink_call_is_still_malformed() {
+        let id = ext_hook_id("silent");
+        let mut registry = HookRegistry::new();
+        registry
+            .insert(installed_binding(
+                id,
+                HookPointSpec::BeforeCapability,
+                HookPhase::Policy,
+            ))
+            .expect("ok");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_before_capability(
+            id,
+            BeforeCapabilityHookImpl::Restricted(Box::new(SilentInstalledHook)),
+        );
+
+        let outcome = dispatcher.dispatch_before_capability(&ctx()).await;
+        assert!(
+            !outcome.decision.permits(),
+            "missing sink call must fail closed"
+        );
+        assert_eq!(outcome.failures.len(), 1);
+        assert_eq!(outcome.failures[0].category, FailureCategory::Malformed);
+        assert!(
+            dispatcher
+                .registry
+                .lock()
+                .expect("registry")
+                .is_poisoned(id)
+        );
     }
 
     #[tokio::test]

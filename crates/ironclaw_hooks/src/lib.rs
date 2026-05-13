@@ -23,7 +23,9 @@ pub mod middleware;
 pub mod ordering;
 pub mod points;
 pub mod predicate;
+pub mod registrar;
 pub mod registry;
+pub mod self_authored;
 pub mod sink;
 pub mod trust;
 
@@ -31,5 +33,11 @@ pub use error::HookError;
 pub use failure_policy::{FailureCategory, FailureDisposition};
 pub use identity::{ExtensionId, HookId, HookLocalId, HookVersion};
 pub use ordering::{HookPhase, HookPriority};
+pub use registrar::HookRegistrar;
 pub use registry::{HookBinding, HookRegistry};
+pub use self_authored::{
+    GenerationTraceRef, SelfAuthoredBeforeCapabilityHook, SelfAuthoredEvaluator,
+    SelfAuthoredHookSink, SelfAuthoredHookSpec, SelfAuthoredReason, SelfAuthorshipProvenance,
+    UserRatificationProof,
+};
 pub use trust::HookTrustClass;

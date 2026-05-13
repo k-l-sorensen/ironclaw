@@ -8,6 +8,7 @@ description = "Reborn loop hook framework: trust-tiered points/kinds/decisions, 
 [dependencies]
 async-trait = "0.1"
 blake3 = "1"
+chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 ironclaw_host_api = { path = "../ironclaw_host_api" }
 ironclaw_turns = { path = "../ironclaw_turns" }

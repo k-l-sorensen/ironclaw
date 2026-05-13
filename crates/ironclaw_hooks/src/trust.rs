@@ -24,6 +24,15 @@ pub enum HookTrustClass {
     /// `InstalledHookSink` trait exposes only monotonic-restriction
     /// constructors so an Installed hook cannot mint `Allow`.
     Installed,
+    /// Hook authored at runtime by the agent itself (e.g., in response to a
+    /// near-miss or repetition). Same default kind permissions as
+    /// `Installed` — `Observer` / `Effect` only by default; `Gate` / `Mutator`
+    /// require an explicit grant. Because the agent cannot mint persistent
+    /// grants for itself, self-authored gates and mutators are only ever
+    /// authorized through the *run-scoped* registration path. Durable
+    /// self-authored hooks require the unforgeable channel from #3564 and
+    /// are not yet implemented.
+    SelfAuthored,
 }
 
 impl HookTrustClass {
@@ -38,6 +47,10 @@ impl HookTrustClass {
             (Self::Installed, DecisionKind::Effect) => true,
             (Self::Installed, DecisionKind::Gate) => false,
             (Self::Installed, DecisionKind::Mutator) => false,
+            (Self::SelfAuthored, DecisionKind::Observer) => true,
+            (Self::SelfAuthored, DecisionKind::Effect) => true,
+            (Self::SelfAuthored, DecisionKind::Gate) => false,
+            (Self::SelfAuthored, DecisionKind::Mutator) => false,
         }
     }
 }
@@ -70,6 +83,17 @@ mod tests {
         assert!(HookTrustClass::Installed.permits_kind_by_default(DecisionKind::Effect));
         assert!(!HookTrustClass::Installed.permits_kind_by_default(DecisionKind::Gate));
         assert!(!HookTrustClass::Installed.permits_kind_by_default(DecisionKind::Mutator));
+    }
+
+    #[test]
+    fn self_authored_mirrors_installed_default_kind_permissions() {
+        // Self-authored hooks have the same default kind permissions as
+        // Installed — Gate/Mutator require an explicit grant, which for
+        // self-authored only ever comes via run-scoped registration.
+        assert!(HookTrustClass::SelfAuthored.permits_kind_by_default(DecisionKind::Observer));
+        assert!(HookTrustClass::SelfAuthored.permits_kind_by_default(DecisionKind::Effect));
+        assert!(!HookTrustClass::SelfAuthored.permits_kind_by_default(DecisionKind::Gate));
+        assert!(!HookTrustClass::SelfAuthored.permits_kind_by_default(DecisionKind::Mutator));
     }
 
     #[test]

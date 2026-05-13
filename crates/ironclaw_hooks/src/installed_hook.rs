@@ -49,20 +49,10 @@ impl RestrictedBeforeCapabilityHook for PredicateBackedBeforeCapabilityHook {
         // Richer reasons surface in audit, not in the model-visible decision.
         match self.evaluator.evaluate(self.hook_id, &self.spec, ctx) {
             EvaluatorDecision::Allow => {
-                // Restricted sink has no Allow; absence of a sink call is
-                // treated as "this hook has no opinion" by the dispatcher
-                // composition. The current dispatcher classifies "no sink
-                // call" as a protocol violation (Malformed → fail-closed),
-                // so a real Installed hook must always emit something. To
-                // express "no opinion," we deny with a neutral category and
-                // tag it as such; downstream telemetry can distinguish
-                // predicate-pass vs predicate-fail.
-                //
-                // TODO: extend the RestrictedGateSink with an explicit
-                // `pass()` method that the dispatcher recognizes as
-                // no-opinion. Tracked alongside the dispatcher composition
-                // refactor.
-                sink.deny("hook_predicate_pass");
+                // The predicate did not match — the hook has no opinion. The
+                // dispatcher recognizes `pass()` as a no-opinion contribution
+                // and continues composing without short-circuiting.
+                sink.pass();
             }
             EvaluatorDecision::Deny { .. } => {
                 sink.deny("hook_predicate_denied");
@@ -110,7 +100,37 @@ mod tests {
 
         hook.evaluate(&ctx, &mut sink as &mut dyn RestrictedGateSink)
             .await;
-        let decision = sink.decision.expect("hook emitted a decision");
+        let decision = sink.decision().expect("hook emitted a decision");
         assert!(!decision.permits());
+    }
+
+    #[tokio::test]
+    async fn allow_predicate_routes_to_sink_pass() {
+        use crate::sink::GateSinkState;
+
+        let evaluator = Arc::new(PredicateEvaluator::new());
+        // Spec only fires on `shell.exec`; context invokes a different
+        // capability so the evaluator returns Allow.
+        let spec = HookPredicateSpec::DenyCapability {
+            when: CapabilityPredicate::NameEquals {
+                name: "shell.exec".to_string(),
+            },
+            reason: "shell denied".to_string(),
+        };
+        let hook = PredicateBackedBeforeCapabilityHook::new(hook_id(), spec, evaluator);
+        let mut sink = RecordingGateSink::new();
+        let ctx = BeforeCapabilityHookContext::new(
+            TenantId::new("alpha").expect("ok"),
+            "memory.read".to_string(),
+            [0u8; 32],
+        );
+
+        hook.evaluate(&ctx, &mut sink as &mut dyn RestrictedGateSink)
+            .await;
+        assert!(
+            sink.decision().is_none(),
+            "no-opinion path must not record a decision"
+        );
+        assert_eq!(sink.state, GateSinkState::Passed);
     }
 }
