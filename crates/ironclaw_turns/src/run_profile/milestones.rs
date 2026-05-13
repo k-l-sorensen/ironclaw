@@ -468,3 +468,221 @@ where
             .await
     }
 }
+
+#[cfg(test)]
+mod hook_milestone_schema_snapshots {
+    //! L3 schema-snapshot tests for hook milestone variants.
+    //!
+    //! These tests pin the JSON wire shape of each hook-related
+    //! [`LoopHostMilestoneKind`] variant against a frozen string fixture.
+    //! Downstream consumers (audit trails, trace replay, external dashboards)
+    //! parse this JSON; an accidental field rename, enum-tag rename, or type
+    //! change would silently break them. If any of these tests fail, the wire
+    //! format has changed — verify every consumer has been updated before
+    //! re-pinning the fixture.
+    //!
+    //! Fixtures are inlined as `&str` constants so a reviewer can read the
+    //! exact shape being pinned in the diff. We compare against
+    //! [`serde_json::to_string_pretty`] output to keep the fixtures legible.
+    use super::{HookDecisionSummary, LoopHostMilestoneKind};
+
+    fn pretty(kind: &LoopHostMilestoneKind) -> String {
+        match serde_json::to_string_pretty(kind) {
+            Ok(s) => s,
+            Err(e) => panic!("failed to serialize milestone kind for snapshot: {e}"),
+        }
+    }
+
+    #[test]
+    fn hook_dispatched_milestone_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookDispatched {
+            hook_id: "abcdef0123456789".to_string(),
+            point: "before_capability".to_string(),
+            trust_class: "installed".to_string(),
+        };
+        const EXPECTED: &str = r#"{
+  "hook_dispatched": {
+    "hook_id": "abcdef0123456789",
+    "point": "before_capability",
+    "trust_class": "installed"
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_decision_emitted_allow_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookDecisionEmitted {
+            hook_id: "abcdef0123456789".to_string(),
+            decision: HookDecisionSummary::Allow,
+        };
+        const EXPECTED: &str = r#"{
+  "hook_decision_emitted": {
+    "hook_id": "abcdef0123456789",
+    "decision": "allow"
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_decision_emitted_deny_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookDecisionEmitted {
+            hook_id: "abcdef0123456789".to_string(),
+            decision: HookDecisionSummary::Deny {
+                reason: "blocked by policy".to_string(),
+            },
+        };
+        const EXPECTED: &str = r#"{
+  "hook_decision_emitted": {
+    "hook_id": "abcdef0123456789",
+    "decision": {
+      "deny": {
+        "reason": "blocked by policy"
+      }
+    }
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_decision_emitted_pause_approval_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookDecisionEmitted {
+            hook_id: "abcdef0123456789".to_string(),
+            decision: HookDecisionSummary::PauseApproval {
+                reason: "user approval required".to_string(),
+            },
+        };
+        const EXPECTED: &str = r#"{
+  "hook_decision_emitted": {
+    "hook_id": "abcdef0123456789",
+    "decision": {
+      "pause_approval": {
+        "reason": "user approval required"
+      }
+    }
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_decision_emitted_pause_auth_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookDecisionEmitted {
+            hook_id: "abcdef0123456789".to_string(),
+            decision: HookDecisionSummary::PauseAuth {
+                reason: "re-authentication required".to_string(),
+            },
+        };
+        const EXPECTED: &str = r#"{
+  "hook_decision_emitted": {
+    "hook_id": "abcdef0123456789",
+    "decision": {
+      "pause_auth": {
+        "reason": "re-authentication required"
+      }
+    }
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_decision_emitted_pass_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookDecisionEmitted {
+            hook_id: "abcdef0123456789".to_string(),
+            decision: HookDecisionSummary::Pass,
+        };
+        const EXPECTED: &str = r#"{
+  "hook_decision_emitted": {
+    "hook_id": "abcdef0123456789",
+    "decision": "pass"
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_decision_emitted_patch_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookDecisionEmitted {
+            hook_id: "abcdef0123456789".to_string(),
+            decision: HookDecisionSummary::Patch,
+        };
+        const EXPECTED: &str = r#"{
+  "hook_decision_emitted": {
+    "hook_id": "abcdef0123456789",
+    "decision": "patch"
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_failed_timeout_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookFailed {
+            hook_id: "abcdef0123456789".to_string(),
+            category: "timeout".to_string(),
+            disposition: "fail_closed".to_string(),
+        };
+        const EXPECTED: &str = r#"{
+  "hook_failed": {
+    "hook_id": "abcdef0123456789",
+    "category": "timeout",
+    "disposition": "fail_closed"
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_failed_panic_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookFailed {
+            hook_id: "abcdef0123456789".to_string(),
+            category: "panic".to_string(),
+            disposition: "fail_closed".to_string(),
+        };
+        const EXPECTED: &str = r#"{
+  "hook_failed": {
+    "hook_id": "abcdef0123456789",
+    "category": "panic",
+    "disposition": "fail_closed"
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_failed_malformed_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookFailed {
+            hook_id: "abcdef0123456789".to_string(),
+            category: "malformed".to_string(),
+            disposition: "fail_closed".to_string(),
+        };
+        const EXPECTED: &str = r#"{
+  "hook_failed": {
+    "hook_id": "abcdef0123456789",
+    "category": "malformed",
+    "disposition": "fail_closed"
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+
+    #[test]
+    fn hook_failed_attenuation_violation_serialization_is_stable() {
+        let value = LoopHostMilestoneKind::HookFailed {
+            hook_id: "abcdef0123456789".to_string(),
+            category: "attenuation_violation".to_string(),
+            disposition: "fail_isolated".to_string(),
+        };
+        const EXPECTED: &str = r#"{
+  "hook_failed": {
+    "hook_id": "abcdef0123456789",
+    "category": "attenuation_violation",
+    "disposition": "fail_isolated"
+  }
+}"#;
+        assert_eq!(pretty(&value), EXPECTED);
+    }
+}

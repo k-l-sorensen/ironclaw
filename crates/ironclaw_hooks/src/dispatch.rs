@@ -1603,6 +1603,338 @@ mod tests {
         ));
     }
 
+    // ─── L4 pairing-invariant matrix ────────────────────────────────────
+
+    /// A hook that emits PauseApproval through the privileged sink. Used to
+    /// drive the matrix test through the pause-approval terminator.
+    struct PauseApprovalBuiltinHook;
+    #[async_trait]
+    impl PrivilegedBeforeCapabilityHook for PauseApprovalBuiltinHook {
+        async fn evaluate(
+            &self,
+            _ctx: &BeforeCapabilityHookContext,
+            sink: &mut dyn PrivilegedGateSink,
+        ) {
+            sink.pause_approval("needs human approval");
+        }
+    }
+
+    /// A hook that emits PauseAuth through the privileged sink.
+    struct PauseAuthBuiltinHook;
+    #[async_trait]
+    impl PrivilegedBeforeCapabilityHook for PauseAuthBuiltinHook {
+        async fn evaluate(
+            &self,
+            _ctx: &BeforeCapabilityHookContext,
+            sink: &mut dyn PrivilegedGateSink,
+        ) {
+            sink.pause_auth("needs re-authentication");
+        }
+    }
+
+    /// What terminator shape a scenario is expected to produce.
+    #[derive(Debug, Clone, Copy)]
+    enum ExpectedTerminator {
+        /// One `HookDispatched` followed by one `HookDecisionEmitted`.
+        Decision,
+        /// One `HookDispatched` followed by one `HookFailed`.
+        Failure,
+        /// A single `HookFailed` with no preceding `HookDispatched`. Used for
+        /// the missing-impl scenario, where the dispatcher discovers the
+        /// protocol violation *before* the hook is dispatched — the slot is
+        /// poisoned without a paired dispatched event. This is documented
+        /// here so future changes to the dispatcher's protocol-violation
+        /// path don't silently break consumers that depend on the pairing
+        /// invariant for *dispatched* hooks.
+        FailureWithoutDispatch,
+    }
+
+    /// Assert that the milestone sink recorded the expected pairing shape.
+    /// Checks shape only, not exact field values.
+    fn assert_milestone_sequence(
+        kinds: &[LoopHostMilestoneKind],
+        scenario: &str,
+        expected: ExpectedTerminator,
+    ) {
+        match expected {
+            ExpectedTerminator::Decision | ExpectedTerminator::Failure => {
+                assert_eq!(
+                    kinds.len(),
+                    2,
+                    "[{scenario}] expected exactly 2 milestones (HookDispatched + terminator), got {kinds:?}"
+                );
+                assert!(
+                    matches!(&kinds[0], LoopHostMilestoneKind::HookDispatched { .. }),
+                    "[{scenario}] first milestone must be HookDispatched, got {:?}",
+                    kinds[0]
+                );
+                match expected {
+                    ExpectedTerminator::Decision => assert!(
+                        matches!(&kinds[1], LoopHostMilestoneKind::HookDecisionEmitted { .. }),
+                        "[{scenario}] terminator must be HookDecisionEmitted, got {:?}",
+                        kinds[1]
+                    ),
+                    ExpectedTerminator::Failure => assert!(
+                        matches!(&kinds[1], LoopHostMilestoneKind::HookFailed { .. }),
+                        "[{scenario}] terminator must be HookFailed, got {:?}",
+                        kinds[1]
+                    ),
+                    ExpectedTerminator::FailureWithoutDispatch => unreachable!(),
+                }
+            }
+            ExpectedTerminator::FailureWithoutDispatch => {
+                assert_eq!(
+                    kinds.len(),
+                    1,
+                    "[{scenario}] missing-impl path emits exactly one HookFailed (no paired dispatched event), got {kinds:?}"
+                );
+                assert!(
+                    matches!(&kinds[0], LoopHostMilestoneKind::HookFailed { .. }),
+                    "[{scenario}] sole milestone must be HookFailed, got {:?}",
+                    kinds[0]
+                );
+            }
+        }
+    }
+
+    async fn run_single_hook_scenario_with_sink<F>(
+        scenario: &str,
+        install: F,
+    ) -> Vec<LoopHostMilestoneKind>
+    where
+        F: FnOnce(&mut HookDispatcher, HookId),
+    {
+        let id = ext_hook_id(scenario);
+        let mut registry = HookRegistry::new();
+        // Note: matrix scenarios run via direct `install_before_capability`,
+        // so we register the binding here. The "missing impl" scenario reuses
+        // this binding-only path (its `install` closure is a no-op).
+        registry
+            .insert(installed_binding(
+                id,
+                HookPointSpec::BeforeCapability,
+                HookPhase::Policy,
+            ))
+            .expect("ok");
+        let mut dispatcher = HookDispatcher::new(registry).with_timeout(Duration::from_millis(20));
+        install(&mut dispatcher, id);
+        let (dispatcher, sink) = install_milestone_sink(dispatcher);
+        let _ = dispatcher.dispatch_before_capability(&ctx()).await;
+        sink.kinds()
+    }
+
+    #[tokio::test]
+    async fn milestones_are_paired_for_all_outcomes() {
+        // For each scenario, install a hook (or skip install for "missing
+        // impl"), dispatch, and assert the milestone sink has exactly one
+        // HookDispatched followed by exactly one terminator. Builtin variant
+        // is used where the outcome requires `Privileged` sink access
+        // (Allow/PauseApproval/PauseAuth), but the matrix is exercising the
+        // milestone pairing invariant, not the trust-class taxonomy.
+
+        // 1. Allow (Privileged Builtin path)
+        let kinds = run_single_hook_scenario_with_sink("allow-out", |d, id| {
+            d.install_before_capability(
+                id,
+                BeforeCapabilityHookImpl::Privileged(Box::new(AllowingBuiltinHook)),
+            );
+        })
+        .await;
+        assert_milestone_sequence(&kinds, "allow", ExpectedTerminator::Decision);
+
+        // 2. Deny
+        let kinds = run_single_hook_scenario_with_sink("deny-out", |d, id| {
+            d.install_before_capability(
+                id,
+                BeforeCapabilityHookImpl::Restricted(Box::new(DenyingInstalledHook)),
+            );
+        })
+        .await;
+        assert_milestone_sequence(&kinds, "deny", ExpectedTerminator::Decision);
+
+        // 3. PauseApproval
+        let kinds = run_single_hook_scenario_with_sink("pause-approval-out", |d, id| {
+            d.install_before_capability(
+                id,
+                BeforeCapabilityHookImpl::Privileged(Box::new(PauseApprovalBuiltinHook)),
+            );
+        })
+        .await;
+        assert_milestone_sequence(&kinds, "pause_approval", ExpectedTerminator::Decision);
+
+        // 4. PauseAuth
+        let kinds = run_single_hook_scenario_with_sink("pause-auth-out", |d, id| {
+            d.install_before_capability(
+                id,
+                BeforeCapabilityHookImpl::Privileged(Box::new(PauseAuthBuiltinHook)),
+            );
+        })
+        .await;
+        assert_milestone_sequence(&kinds, "pause_auth", ExpectedTerminator::Decision);
+
+        // 5. Pass (no-opinion)
+        let kinds = run_single_hook_scenario_with_sink("pass-out", |d, id| {
+            d.install_before_capability(
+                id,
+                BeforeCapabilityHookImpl::Restricted(Box::new(PassingInstalledHook)),
+            );
+        })
+        .await;
+        assert_milestone_sequence(&kinds, "pass", ExpectedTerminator::Decision);
+
+        // 6. Panic
+        let kinds = run_single_hook_scenario_with_sink("panic-out", |d, id| {
+            d.install_before_capability(
+                id,
+                BeforeCapabilityHookImpl::Restricted(Box::new(PanickingHook)),
+            );
+        })
+        .await;
+        assert_milestone_sequence(&kinds, "panic", ExpectedTerminator::Failure);
+
+        // 7. Timeout
+        let kinds = run_single_hook_scenario_with_sink("timeout-out", |d, id| {
+            d.install_before_capability(
+                id,
+                BeforeCapabilityHookImpl::Restricted(Box::new(SlowHook)),
+            );
+        })
+        .await;
+        assert_milestone_sequence(&kinds, "timeout", ExpectedTerminator::Failure);
+
+        // 8. Malformed (silent hook — no sink call at all)
+        let kinds = run_single_hook_scenario_with_sink("malformed-out", |d, id| {
+            d.install_before_capability(
+                id,
+                BeforeCapabilityHookImpl::Restricted(Box::new(SilentInstalledHook)),
+            );
+        })
+        .await;
+        assert_milestone_sequence(&kinds, "malformed", ExpectedTerminator::Failure);
+
+        // 9. Missing impl (binding present but no installed hook impl)
+        let kinds =
+            run_single_hook_scenario_with_sink("missing-impl-out", |_d, _id| { /* no-op */ }).await;
+        assert_milestone_sequence(
+            &kinds,
+            "missing_impl",
+            ExpectedTerminator::FailureWithoutDispatch,
+        );
+    }
+
+    #[tokio::test]
+    async fn milestones_emit_paired_for_each_hook_in_multi_hook_dispatch() {
+        // Install 3 hooks at the same point with mixed outcomes (allow, deny,
+        // panic). Each hook must emit its own paired HookDispatched +
+        // terminator, and the sequences must be interleaved in deterministic
+        // (phase, priority, hook_id) order. Because all three share the same
+        // phase (Policy) and the default priority, ordering is by hook_id.
+        //
+        // hook_id derivation is a blake3 hash of the local id string; we can't
+        // predict the exact ordering analytically, so we capture the ordered
+        // list from the registry itself and assert the milestone stream
+        // matches it.
+        let allow_id = ext_hook_id("multi-allow");
+        let deny_id = ext_hook_id("multi-deny");
+        let panic_id = ext_hook_id("multi-panic");
+
+        let mut registry = HookRegistry::new();
+        for id in [allow_id, deny_id, panic_id] {
+            registry
+                .insert(installed_binding(
+                    id,
+                    HookPointSpec::BeforeCapability,
+                    HookPhase::Policy,
+                ))
+                .expect("ok");
+        }
+        let mut dispatcher = HookDispatcher::new(registry);
+        // Note: we use Privileged for Allow so the sink can mint allow; this
+        // is a test of milestone pairing in a multi-hook dispatch, not a
+        // trust-class taxonomy test, so mixed impl tiers are acceptable.
+        dispatcher.install_before_capability(
+            allow_id,
+            BeforeCapabilityHookImpl::Privileged(Box::new(AllowingBuiltinHook)),
+        );
+        dispatcher.install_before_capability(
+            deny_id,
+            BeforeCapabilityHookImpl::Restricted(Box::new(DenyingInstalledHook)),
+        );
+        dispatcher.install_before_capability(
+            panic_id,
+            BeforeCapabilityHookImpl::Restricted(Box::new(PanickingHook)),
+        );
+
+        // Capture the expected order from the dispatcher before sealing it.
+        let ordered = dispatcher.ordered_bindings(HookPointSpec::BeforeCapability);
+        let expected_order: Vec<HookId> = ordered.iter().map(|(_, b)| b.hook_id).collect();
+        assert_eq!(
+            expected_order.len(),
+            3,
+            "expected 3 ordered bindings, got {expected_order:?}"
+        );
+
+        let (dispatcher, sink) = install_milestone_sink(dispatcher);
+        let _ = dispatcher.dispatch_before_capability(&ctx()).await;
+        let kinds = sink.kinds();
+
+        // Each hook contributes exactly 2 events. The dispatch may short-
+        // circuit after a deny is composed, but the matrix is constructed so
+        // *all three* run (Allow first, then Deny short-circuits, but the
+        // Panic hook may still run if it sorts before Deny in hook-id order).
+        // We assert the structural invariant: every emitted dispatched event
+        // is followed by a terminator for the SAME hook id before the next
+        // dispatched event appears. Hooks that were short-circuited away
+        // emit no milestones at all (the loop `continue`s before
+        // `emit_dispatched`).
+        let mut i = 0;
+        let mut paired_hook_ids: Vec<String> = Vec::new();
+        while i < kinds.len() {
+            let dispatched_hook_id = match &kinds[i] {
+                LoopHostMilestoneKind::HookDispatched { hook_id, .. } => hook_id.clone(),
+                other => panic!(
+                    "expected HookDispatched at index {i}, got {other:?}; full stream: {kinds:?}"
+                ),
+            };
+            assert!(
+                i + 1 < kinds.len(),
+                "dangling HookDispatched at end of stream: {kinds:?}"
+            );
+            let terminator_hook_id = match &kinds[i + 1] {
+                LoopHostMilestoneKind::HookDecisionEmitted { hook_id, .. } => hook_id.clone(),
+                LoopHostMilestoneKind::HookFailed { hook_id, .. } => hook_id.clone(),
+                other => panic!(
+                    "expected terminator at index {}, got {other:?}; full stream: {kinds:?}",
+                    i + 1
+                ),
+            };
+            assert_eq!(
+                dispatched_hook_id, terminator_hook_id,
+                "milestone pair has mismatched hook ids; full stream: {kinds:?}"
+            );
+            paired_hook_ids.push(dispatched_hook_id);
+            i += 2;
+        }
+
+        // The order of paired-hook-ids must be a prefix of the deterministic
+        // ordering taken from the registry (some trailing hooks may be skipped
+        // by short-circuit, but no hook may be invoked out of order).
+        let expected_hex: Vec<String> = expected_order
+            .iter()
+            .map(|h| telemetry::hook_id_string(*h))
+            .collect();
+        assert!(
+            paired_hook_ids.len() <= expected_hex.len(),
+            "more paired hooks emitted than registered: paired={paired_hook_ids:?} expected={expected_hex:?}"
+        );
+        for (idx, paired) in paired_hook_ids.iter().enumerate() {
+            assert_eq!(
+                paired, &expected_hex[idx],
+                "milestone order diverges from deterministic registry order at index {idx}: paired={paired_hook_ids:?} expected={expected_hex:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn no_sink_emits_no_milestones_and_preserves_behavior() {
         // Sanity: dispatcher without a milestone sink still functions and
