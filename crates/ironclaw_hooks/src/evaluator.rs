@@ -742,8 +742,10 @@ mod tests {
         let alpha = ironclaw_host_api::TenantId::new("alpha").expect("ok");
         let beta = ironclaw_host_api::TenantId::new("beta").expect("ok");
 
-        let ctx_alpha = BeforeCapabilityHookContext::new(alpha, "cap.x".to_string(), [0u8; 32]);
-        let ctx_beta = BeforeCapabilityHookContext::new(beta, "cap.x".to_string(), [0u8; 32]);
+        let ctx_alpha =
+            BeforeCapabilityHookContext::new_unresolved(alpha, "cap.x".to_string(), [0u8; 32]);
+        let ctx_beta =
+            BeforeCapabilityHookContext::new_unresolved(beta, "cap.x".to_string(), [0u8; 32]);
 
         // Alpha hits the cap with one allowed call and a second deny.
         assert_eq!(
