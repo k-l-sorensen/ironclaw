@@ -596,7 +596,15 @@ pub struct LoopContextBundle {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopContextMessage {
-    pub message_ref: LoopMessageRef,
+    /// Reference to the persisted message content.
+    ///
+    /// `None` means "summary-only entry; prompt port MUST NOT resolve content —
+    /// use `safe_summary` verbatim instead." Mirrors the
+    /// `SkillTrustLevel::Installed` carrying `prompt_content: None` pattern.
+    /// See `docs/reborn/agent-loop-briefs/prompt-context-assembly.md` §3.2 for
+    /// the upstream invariant this enforces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_ref: Option<LoopMessageRef>,
     pub role: String,
     pub safe_summary: String,
 }
@@ -931,6 +939,24 @@ pub struct VisibleCapabilitySurface {
     pub descriptors: Vec<CapabilityDescriptorView>,
 }
 
+/// Concurrency hint for a capability surfaced to an agent loop driver.
+///
+/// Derived at the adapter boundary in WS-9 (`HostRuntimeLoopCapabilityPort::visible_capabilities`)
+/// from the underlying `CapabilityDescriptor.effects` Vec. The lower-layer
+/// `CapabilityDescriptor` is NOT modified; `effects` remains the source of
+/// truth and the hint is a computed projection. See WS-9 §3.2a for the
+/// per-`EffectKind` mapping table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConcurrencyHint {
+    /// Capability has no exclusive side effects; multiple invocations may run
+    /// in parallel without ordering hazards.
+    SafeForParallel,
+    /// Capability must be invoked serially within a loop run — parallel
+    /// invocation would violate ordering or isolation constraints.
+    Exclusive,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityDescriptorView {
     pub capability_id: CapabilityId,
@@ -938,6 +964,7 @@ pub struct CapabilityDescriptorView {
     pub runtime: RuntimeKind,
     pub safe_name: String,
     pub safe_description: String,
+    pub concurrency_hint: ConcurrencyHint,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1151,6 +1178,24 @@ pub struct LoopCheckpointRequest {
     pub state_ref: LoopCheckpointStateRef,
 }
 
+/// Request to stage a checkpoint payload's raw bytes before calling
+/// [`LoopCheckpointPort::checkpoint`] with the resulting state ref.
+///
+/// The two-step write keeps byte-storage and metadata-write responsibilities
+/// cleanly split. See `docs/reborn/agent-loop-briefs/state-and-checkpoints.md`
+/// §2 for the rationale and WS-10 for the read-side counterpart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageCheckpointPayloadRequest {
+    /// Schema id of the payload — usually the framework's
+    /// `CHECKPOINT_SCHEMA_ID` constant. Stored alongside the bytes so the
+    /// read-side can authenticate the boundary on resume.
+    pub schema_id: String,
+    /// Canonical payload bytes (e.g. `serde_json::to_vec(&state)`). The
+    /// implementation does not parse the bytes; it persists them and returns
+    /// an opaque ref.
+    pub payload: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopCheckpointKind {
@@ -1178,13 +1223,25 @@ pub trait LoopCheckpointPort: Send + Sync {
         request: LoopCheckpointRequest,
     ) -> Result<TurnCheckpointId, AgentLoopHostError>;
 
-    async fn load_checkpoint_payload(
+    /// Stage a checkpoint payload's raw bytes and return an opaque
+    /// [`LoopCheckpointStateRef`] that subsequent `checkpoint(...)` calls
+    /// can reference. The default impl fails closed; concrete impls live in
+    /// `ironclaw_loop_support` and wrap the host's `CheckpointStateStore`.
+    ///
+    /// The executor's `checkpoint(...)` helper (WS-6 §3.4) calls this method
+    /// before invoking `LoopCheckpointPort::checkpoint(...)` so the metadata
+    /// write references a payload that's already durably stored.
+    ///
+    /// Read-side `load_checkpoint_payload(...)` lives in WS-10 and will be
+    /// added to this same port. WS-0 intentionally does not pre-declare it
+    /// so the WS-10 signature can land without churn.
+    async fn stage_checkpoint_payload(
         &self,
-        _checkpoint_id: TurnCheckpointId,
-    ) -> Result<Vec<u8>, AgentLoopHostError> {
+        _request: StageCheckpointPayloadRequest,
+    ) -> Result<LoopCheckpointStateRef, AgentLoopHostError> {
         Err(AgentLoopHostError::new(
             AgentLoopHostErrorKind::Unavailable,
-            "load_checkpoint_payload not implemented",
+            "stage_checkpoint_payload not implemented",
         ))
     }
 }

@@ -18,7 +18,7 @@ use ironclaw_turns::{
         AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply,
         CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
         CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityInputRef,
-        CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion,
+        CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion, ConcurrencyHint,
         FinalizeAssistantMessage, HostManagedLoopModelPort, HostManagedLoopPromptPort,
         InMemoryInstructionMaterializationStore, InMemoryLoopHostMilestoneSink,
         InstructionBundleBuilder, InstructionBundleFingerprint, InstructionBundleRequest,
@@ -289,12 +289,12 @@ async fn instruction_bundle_builder_orders_sections_and_rebuilds_deterministical
     let request = InstructionBundleRequest {
         context_bundle: LoopContextBundle {
             identity_messages: vec![LoopContextMessage {
-                message_ref: LoopMessageRef::new("msg:identity").unwrap(),
+                message_ref: Some(LoopMessageRef::new("msg:identity").unwrap()),
                 role: "system".to_string(),
                 safe_summary: "identity safe".to_string(),
             }],
             messages: vec![LoopContextMessage {
-                message_ref: LoopMessageRef::new("msg:user-message").unwrap(),
+                message_ref: Some(LoopMessageRef::new("msg:user-message").unwrap()),
                 role: "user".to_string(),
                 safe_summary: "user safe".to_string(),
             }],
@@ -1747,6 +1747,7 @@ impl RecordingAgentLoopHost {
                     runtime: RuntimeKind::Wasm,
                     safe_name: "Echo".to_string(),
                     safe_description: "Returns an opaque result ref".to_string(),
+                    concurrency_hint: ConcurrencyHint::Exclusive,
                 }],
             },
             context_message_safe_summary: "hello".to_string(),
@@ -1768,7 +1769,7 @@ impl RecordingAgentLoopHost {
         safe_summary: impl Into<String>,
     ) -> Self {
         self.context_system_messages.push(LoopContextMessage {
-            message_ref: LoopMessageRef::new(message_ref.into()).unwrap(),
+            message_ref: Some(LoopMessageRef::new(message_ref.into()).unwrap()),
             role: "system".to_string(),
             safe_summary: safe_summary.into(),
         });
@@ -1782,7 +1783,7 @@ impl RecordingAgentLoopHost {
         safe_summary: impl Into<String>,
     ) -> Self {
         self.context_tail_messages.push(LoopContextMessage {
-            message_ref: LoopMessageRef::new(message_ref.into()).unwrap(),
+            message_ref: Some(LoopMessageRef::new(message_ref.into()).unwrap()),
             role: role.into(),
             safe_summary: safe_summary.into(),
         });
@@ -1881,7 +1882,7 @@ impl LoopContextPort for RecordingAgentLoopHost {
         self.context_requests.lock().unwrap().push(request);
         self.record("context");
         let mut messages = vec![LoopContextMessage {
-            message_ref: LoopMessageRef::new("msg:user-message").unwrap(),
+            message_ref: Some(LoopMessageRef::new("msg:user-message").unwrap()),
             role: "user".to_string(),
             safe_summary: self.context_message_safe_summary.clone(),
         }];
@@ -1936,9 +1937,11 @@ impl LoopPromptPort for RecordingAgentLoopHost {
             messages: context
                 .messages
                 .into_iter()
-                .map(|message| LoopModelMessage {
-                    role: message.role,
-                    content_ref: message.message_ref,
+                .filter_map(|message| {
+                    message.message_ref.map(|content_ref| LoopModelMessage {
+                        role: message.role,
+                        content_ref,
+                    })
                 })
                 .collect(),
             surface_version: request.surface_version,

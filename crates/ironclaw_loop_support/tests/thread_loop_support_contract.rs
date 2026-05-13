@@ -63,7 +63,11 @@ async fn thread_context_port_loads_policy_filtered_transcript_messages() {
     assert_eq!(bundle.messages[0].safe_summary, "user message available");
     assert!(!bundle.messages[0].safe_summary.contains("hello reborn"));
     assert_eq!(
-        bundle.messages[0].message_ref.as_str(),
+        bundle.messages[0]
+            .message_ref
+            .as_ref()
+            .expect("message_ref")
+            .as_str(),
         format!("msg:{}", fixture.user_message_id).as_str()
     );
     assert!(bundle.memory_snippets.is_empty());
@@ -110,6 +114,8 @@ async fn thread_context_port_preserves_summary_replacements_as_system_messages()
     assert!(
         bundle.messages[0]
             .message_ref
+            .as_ref()
+            .expect("message_ref")
             .as_str()
             .starts_with("msg:summary-")
     );
@@ -433,13 +439,14 @@ async fn prompt_and_model_ports_resolve_instruction_memory_and_identity_refs() {
     let context_port = Arc::new(StaticLoopContextPort {
         bundle: LoopContextBundle {
             identity_messages: vec![LoopContextMessage {
-                message_ref: LoopMessageRef::new("msg:identity-policy").unwrap(),
+                message_ref: Some(LoopMessageRef::new("msg:identity-policy").unwrap()),
                 role: "system".to_string(),
                 safe_summary: "identity policy summary".to_string(),
             }],
             messages: vec![LoopContextMessage {
-                message_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
+                message_ref: Some(
+                    LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
+                ),
                 role: "user".to_string(),
                 safe_summary: "user message available".to_string(),
             }],
@@ -1374,7 +1381,7 @@ async fn model_port_round_trips_tool_result_reference_context_as_system_model_in
         .await
         .unwrap();
     assert_eq!(context.messages[0].role, "tool_result_reference");
-    assert_eq!(context.messages[0].message_ref, tool_result_ref);
+    assert_eq!(context.messages[0].message_ref, Some(tool_result_ref));
 
     let gateway = Arc::new(RecordingGateway::reply("model says hi"));
     let model_port = ThreadBackedLoopModelPort::new(
@@ -1390,9 +1397,11 @@ async fn model_port_round_trips_tool_result_reference_context_as_system_model_in
             messages: context
                 .messages
                 .into_iter()
-                .map(|message| LoopModelMessage {
-                    role: message.role,
-                    content_ref: message.message_ref,
+                .filter_map(|message| {
+                    message.message_ref.map(|content_ref| LoopModelMessage {
+                        role: message.role,
+                        content_ref,
+                    })
                 })
                 .collect(),
             surface_version: None,

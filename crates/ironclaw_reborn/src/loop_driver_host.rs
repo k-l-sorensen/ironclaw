@@ -27,20 +27,19 @@ use ironclaw_turns::{
     LoopResultRef, PutLoopCheckpointRequest, RunProfileId, TurnCheckpointId, TurnError, TurnStatus,
     run_profile::{
         AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, BeginAssistantDraft,
-        CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
-        CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityFailure,
-        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, FinalizeAssistantMessage,
-        HostManagedLoopModelPort, HostManagedLoopPromptPort,
-        InMemoryInstructionMaterializationStore, InstructionMaterializationStore,
-        InstructionSafetyContext, LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest,
-        LoopContextBundle, LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter,
-        LoopHostMilestoneSink, LoopInputBatch, LoopInputCursor, LoopInputPort,
-        LoopModelBudgetAccountant, LoopModelGateway, LoopModelGatewayError,
-        LoopModelGatewayRequest, LoopModelPolicyGuard, LoopModelPort, LoopModelRequest,
-        LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
-        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary,
-        LoopTranscriptPort, NoOpBudgetAccountant, NoOpPolicyGuard, ProcessHandleSummary,
-        UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceVersion,
+        ConcurrencyHint, FinalizeAssistantMessage, HostManagedLoopModelPort,
+        HostManagedLoopPromptPort, InMemoryInstructionMaterializationStore,
+        InstructionMaterializationStore, InstructionSafetyContext, LoopCapabilityPort,
+        LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle, LoopContextPort,
+        LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputBatch,
+        LoopInputCursor, LoopInputPort, LoopModelBudgetAccountant, LoopModelGateway,
+        LoopModelGatewayError, LoopModelGatewayRequest, LoopModelPolicyGuard, LoopModelPort,
+        LoopModelRequest, LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort,
+        LoopPromptBundle, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
+        LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, NoOpBudgetAccountant,
+        NoOpPolicyGuard, ProcessHandleSummary, UpdateAssistantDraft, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -562,6 +561,12 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                     runtime: capability.descriptor.runtime,
                     safe_name: capability.descriptor.id.as_str().to_string(),
                     safe_description: capability.descriptor.description,
+                    // WS-9 derives this from the underlying
+                    // `CapabilityDescriptor.effects` Vec. Until that landing,
+                    // default to `Exclusive` (the conservative choice — forces
+                    // serial invocation and never accidentally enables
+                    // parallel side effects).
+                    concurrency_hint: ConcurrencyHint::Exclusive,
                 }
             })
             .collect();

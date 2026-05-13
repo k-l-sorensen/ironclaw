@@ -14,6 +14,14 @@ fn no_progress_detected_failure_kind_serializes_as_snake_case() {
 }
 
 #[test]
+fn policy_denied_failure_kind_serializes_as_snake_case() {
+    assert_eq!(
+        serde_json::to_value(LoopFailureKind::PolicyDenied).unwrap(),
+        json!("policy_denied")
+    );
+}
+
+#[test]
 fn validation_policy_named_constructors_keep_fail_closed_default_and_host_verified_evidence_explicit()
  {
     let default_policy = LoopExitValidationPolicy::recovery_required();
@@ -698,6 +706,7 @@ fn all_failure_kinds_produce_stable_sanitized_category_strings() {
             "interrupted_unexpectedly",
         ),
         (LoopFailureKind::NoProgressDetected, "no_progress_detected"),
+        (LoopFailureKind::PolicyDenied, "policy_denied"),
     ];
 
     for (kind, expected_category) in variants {

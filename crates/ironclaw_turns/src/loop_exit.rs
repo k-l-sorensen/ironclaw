@@ -422,6 +422,7 @@ pub struct LoopFailed {
     pub exit_id: LoopExitId,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoopFailureKind {
@@ -434,7 +435,16 @@ pub enum LoopFailureKind {
     TranscriptWriteFailed,
     DriverBug,
     InterruptedUnexpectedly,
+    /// Emitted by `DefaultStopConditionStrategy` when repetition or
+    /// repeated-same-error escapes fire. See agent-loop-skeleton.md §10.
     NoProgressDetected,
+    /// Emitted when a `CapabilityOutcome::Denied` reaches the recovery path
+    /// with no further retry possible. Distinct from `CapabilityProtocolError`
+    /// so the no-progress detector can count repeated denials without
+    /// conflating them with transport faults. Hook-induced denials (via the
+    /// middleware composition seam — see master doc §9.1 scenario A)
+    /// accumulate through this variant. See agent-loop-skeleton.md §9, §10.
+    PolicyDenied,
 }
 
 impl LoopFailureKind {
@@ -450,6 +460,7 @@ impl LoopFailureKind {
             Self::DriverBug => "driver_bug",
             Self::InterruptedUnexpectedly => "interrupted_unexpectedly",
             Self::NoProgressDetected => "no_progress_detected",
+            Self::PolicyDenied => "policy_denied",
         })
     }
 }

@@ -996,7 +996,7 @@ fn model_visible_status(status: MessageStatus) -> bool {
 fn context_message_to_loop_message(message: ContextMessage) -> Option<LoopContextMessage> {
     let message_ref = message_ref_from_context(&message)?;
     Some(LoopContextMessage {
-        message_ref,
+        message_ref: Some(message_ref),
         role: role_for_kind(message.kind).to_string(),
         safe_summary: safe_context_summary(message.kind).to_string(),
     })
