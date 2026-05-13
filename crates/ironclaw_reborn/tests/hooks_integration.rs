@@ -203,6 +203,30 @@ impl PrivilegedBeforeCapabilityHook for SelectiveDenyHook {
     }
 }
 
+/// Privileged builtin hook that panics on every invocation. Used to drive
+/// slot-poisoning in the dispatcher so we can prove that fresh dispatchers
+/// per host build do not inherit poisoning from an earlier run.
+struct PanickingHook;
+
+#[async_trait]
+impl PrivilegedBeforeCapabilityHook for PanickingHook {
+    async fn evaluate(
+        &self,
+        _ctx: &BeforeCapabilityHookContext,
+        _sink: &mut dyn PrivilegedGateSink,
+    ) {
+        panic!("panicking hook for isolation regression test");
+    }
+}
+
+fn panicking_dispatcher() -> Arc<HookDispatcher> {
+    let hook_id = HookId::for_builtin("tests::hooks_integration::panicking_hook", HookVersion::ONE);
+    HookDispatcherBuilder::new(HookRegistry::new())
+        .install_builtin_before_capability(hook_id, HookPhase::Policy, Box::new(PanickingHook))
+        .expect("install panicking hook")
+        .build_arc()
+}
+
 /// Installed-tier hook that always pause-approves. Used to prove the
 /// hook-middleware seam surfaces `PauseApproval` as
 /// `CapabilityOutcome::ApprovalRequired` with a real `LoopGateRef`, rather
@@ -448,9 +472,13 @@ async fn predicate_deny_hook_short_circuits_inner_port() {
     let inner = Arc::new(RecordingCapabilityPort::new());
     let surface_version = fixture.surface_version.clone();
 
+    // Exercises the new factory-closure path: a fresh dispatcher is minted
+    // for this single host build. The other tests in this file still pin the
+    // legacy `with_hook_dispatcher(Arc<HookDispatcher>)` adapter, so the
+    // backward-compat shape stays covered as well.
     let host = fixture
         .factory()
-        .with_hook_dispatcher(predicate_deny_dispatcher())
+        .with_hook_dispatcher_factory(predicate_deny_dispatcher)
         .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
         .await
         .expect("host builds with hook dispatcher installed");
@@ -601,6 +629,173 @@ async fn factory_without_hook_dispatcher_reaches_inner_port_for_blocked_capabili
     let invocations = inner.invocations();
     assert_eq!(invocations.len(), 1, "inner port invoked exactly once");
     assert_eq!(invocations[0].as_str(), "cap.blocked");
+}
+
+#[tokio::test]
+async fn per_build_dispatcher_state_does_not_leak_across_runs() {
+    // Regression for codex C2: dispatcher-owned mutable state (slot
+    // poisoning, in particular) must not survive across host builds when the
+    // factory-closure path is used. We install a panicking hook, build two
+    // hosts back-to-back, invoke each, and check that build 2 still actually
+    // *dispatched* the hook — i.e., it didn't inherit a poisoned slot from
+    // build 1.
+    let fixture = Fixture::new().await;
+
+    // Counter proves the closure was called once per build.
+    let build_count = Arc::new(Mutex::new(0usize));
+    let build_count_for_closure = Arc::clone(&build_count);
+
+    let closure_context = fixture.context.clone();
+    let closure_milestone_sink = Arc::clone(&fixture.milestone_sink);
+    let factory = fixture.factory().with_hook_dispatcher_factory(move || {
+        *build_count_for_closure
+            .lock()
+            .expect("build counter mutex not poisoned") += 1;
+        // Fresh dispatcher every call — no shared poison state.
+        let hook_id = HookId::for_builtin(
+            "tests::hooks_integration::panicking_hook_per_build",
+            HookVersion::ONE,
+        );
+        let sink: Arc<RunScopedHookMilestoneSink> = Arc::new(RunScopedHookMilestoneSink::new(
+            closure_context.clone(),
+            Arc::clone(&closure_milestone_sink) as _,
+        ));
+        HookDispatcherBuilder::new(HookRegistry::new())
+            .with_milestone_sink(sink)
+            .install_builtin_before_capability(hook_id, HookPhase::Policy, Box::new(PanickingHook))
+            .expect("install panicking hook")
+            .build_arc()
+    });
+
+    let surface_version = fixture.surface_version.clone();
+
+    // Build 1: dispatch panics, slot poisoned in *that* dispatcher.
+    let inner_one = Arc::new(RecordingCapabilityPort::new());
+    let host_one = factory
+        .build_text_only_host_with_capabilities(fixture.request(), inner_one.clone())
+        .await
+        .expect("first host builds");
+    let _ = host_one
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke returns an outcome");
+
+    // Build 2: fresh dispatcher, hook should NOT be inherited as poisoned.
+    let inner_two = Arc::new(RecordingCapabilityPort::new());
+    let host_two = factory
+        .build_text_only_host_with_capabilities(fixture.request(), inner_two.clone())
+        .await
+        .expect("second host builds");
+    let _ = host_two
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke returns an outcome");
+
+    assert_eq!(
+        *build_count
+            .lock()
+            .expect("build counter mutex not poisoned"),
+        2,
+        "factory closure must be invoked exactly once per build"
+    );
+
+    // If state had leaked across builds, build 2 would have inherited the
+    // slot poisoned by build 1 and skipped dispatch entirely — the panic
+    // would happen once and the inner port would then be reached on build 2
+    // (poisoned slot → no deny). With per-build dispatchers, each build gets
+    // a fresh, un-poisoned slot, so the hook actually runs (and panics) on
+    // every build, and the inner port is NEVER reached.
+    assert!(
+        inner_one.invocations().is_empty(),
+        "build 1: inner port must not be invoked when hook panics fail-closed"
+    );
+    assert!(
+        inner_two.invocations().is_empty(),
+        "build 2: with a fresh dispatcher, the hook still runs and still \
+         fails closed, so inner must not be invoked. If you see inner \
+         invocations here, poison state leaked from build 1's dispatcher \
+         into build 2."
+    );
+
+    // Milestones corroborate: each build emits its own HookDispatched +
+    // HookFailed (two of each across the run).
+    let milestones = fixture.milestone_sink.milestones();
+    let dispatched_count = milestones
+        .iter()
+        .filter(|m| {
+            matches!(
+                &m.kind,
+                LoopHostMilestoneKind::HookDispatched { point, .. } if point == "before_capability"
+            )
+        })
+        .count();
+    assert_eq!(
+        dispatched_count, 2,
+        "expected one HookDispatched per build; saw {dispatched_count}"
+    );
+
+    let failed_count = milestones
+        .iter()
+        .filter(|m| matches!(&m.kind, LoopHostMilestoneKind::HookFailed { .. }))
+        .count();
+    assert_eq!(
+        failed_count, 2,
+        "expected one HookFailed per build (per-build poisoning); saw {failed_count}"
+    );
+}
+
+#[tokio::test]
+async fn legacy_with_hook_dispatcher_shares_state_across_builds() {
+    // Documents (and pins) the legacy back-compat semantic: when callers use
+    // `with_hook_dispatcher(Arc<HookDispatcher>)`, all builds share one
+    // dispatcher and therefore share poison state. This is the behavior the
+    // codex C2 follow-up explicitly does NOT change for existing callers —
+    // we keep the shape so old wiring still works, but new code should use
+    // `with_hook_dispatcher_factory`.
+    let fixture = Fixture::new().await;
+    let dispatcher = panicking_dispatcher();
+    let factory = fixture
+        .factory()
+        .with_hook_dispatcher(Arc::clone(&dispatcher));
+    let surface_version = fixture.surface_version.clone();
+
+    let inner_one = Arc::new(RecordingCapabilityPort::new());
+    let host_one = factory
+        .build_text_only_host_with_capabilities(fixture.request(), inner_one.clone())
+        .await
+        .expect("first host builds");
+    let _ = host_one
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke returns outcome");
+
+    let inner_two = Arc::new(RecordingCapabilityPort::new());
+    let host_two = factory
+        .build_text_only_host_with_capabilities(fixture.request(), inner_two.clone())
+        .await
+        .expect("second host builds");
+    let _ = host_two
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke returns outcome");
+
+    // Build 1: hook runs, panics, dispatcher fail-closes -> inner NOT
+    // invoked, and the (shared) dispatcher poisons the slot for the rest of
+    // its lifetime.
+    assert!(
+        inner_one.invocations().is_empty(),
+        "build 1: inner not invoked (hook fail-closed on panic)"
+    );
+    // Build 2: same Arc<HookDispatcher> -> slot still poisoned -> hook is
+    // skipped entirely -> composed decision is Allow -> inner IS invoked.
+    // This is the legacy semantic that motivated the per-build factory: a
+    // single bad run permanently disables the hook for every subsequent
+    // build that shares the dispatcher.
+    assert_eq!(
+        inner_two.invocations().len(),
+        1,
+        "build 2 must reach the inner port via the shared+poisoned slot"
+    );
 }
 
 #[tokio::test]
