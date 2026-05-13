@@ -98,7 +98,7 @@ async fn manifest_to_dispatch_pipeline() {
     );
 
     // 4. Dispatch sees the deny decision; the composed outcome reflects it.
-    let ctx = BeforeCapabilityHookContext::new(
+    let ctx = BeforeCapabilityHookContext::new_unresolved(
         tenant(),
         "polymarket.place_order".to_string(),
         [42u8; 32],

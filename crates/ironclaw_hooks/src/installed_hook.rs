@@ -92,7 +92,7 @@ mod tests {
         };
         let hook = PredicateBackedBeforeCapabilityHook::new(hook_id(), spec, evaluator);
         let mut sink = RecordingGateSink::new();
-        let ctx = BeforeCapabilityHookContext::new(
+        let ctx = BeforeCapabilityHookContext::new_unresolved(
             TenantId::new("alpha").expect("ok"),
             "shell.exec".to_string(),
             [0u8; 32],
@@ -119,7 +119,7 @@ mod tests {
         };
         let hook = PredicateBackedBeforeCapabilityHook::new(hook_id(), spec, evaluator);
         let mut sink = RecordingGateSink::new();
-        let ctx = BeforeCapabilityHookContext::new(
+        let ctx = BeforeCapabilityHookContext::new_unresolved(
             TenantId::new("alpha").expect("ok"),
             "memory.read".to_string(),
             [0u8; 32],

@@ -13,6 +13,6 @@ pub mod capability;
 pub mod observer;
 pub mod prompt;
 
-pub use capability::BeforeCapabilityHookContext;
+pub use capability::{BeforeCapabilityHookContext, SanitizedArguments};
 pub use observer::ObserverHookContext;
 pub use prompt::BeforePromptHookContext;

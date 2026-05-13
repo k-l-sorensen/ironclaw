@@ -603,7 +603,7 @@ mod tests {
     }
 
     fn ctx() -> BeforeCapabilityHookContext {
-        BeforeCapabilityHookContext::new(tenant(), "cap.x".to_string(), [0u8; 32])
+        BeforeCapabilityHookContext::new_unresolved(tenant(), "cap.x".to_string(), [0u8; 32])
     }
 
     struct DenyingInstalledHook;
