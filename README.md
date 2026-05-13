@@ -293,6 +293,34 @@ External content passes through multiple security layers:
 | **Workspace** | Persistent memory with hybrid search |
 | **Safety Layer** | Prompt injection defense and content sanitization |
 
+### Reborn Crate Map
+
+IronClaw Reborn splits the runtime into small, reviewable crates under [`crates/`](crates/). See [`crates/README.md`](crates/README.md) for the full per-crate breakdown.
+
+**Contracts & host authority**
+
+[`ironclaw_host_api`](crates/ironclaw_host_api) · [`ironclaw_host_runtime`](crates/ironclaw_host_runtime) · [`ironclaw_capabilities`](crates/ironclaw_capabilities) · [`ironclaw_authorization`](crates/ironclaw_authorization) · [`ironclaw_approvals`](crates/ironclaw_approvals) · [`ironclaw_trust`](crates/ironclaw_trust) · [`ironclaw_runtime_policy`](crates/ironclaw_runtime_policy) · [`ironclaw_safety`](crates/ironclaw_safety) · [`ironclaw_secrets`](crates/ironclaw_secrets) · [`ironclaw_architecture`](crates/ironclaw_architecture)
+
+**Turn, loop & dispatch**
+
+[`ironclaw_engine`](crates/ironclaw_engine) · [`ironclaw_turns`](crates/ironclaw_turns) · [`ironclaw_loop_support`](crates/ironclaw_loop_support) · [`ironclaw_dispatcher`](crates/ironclaw_dispatcher) · [`ironclaw_run_state`](crates/ironclaw_run_state) · [`ironclaw_conversations`](crates/ironclaw_conversations) · [`ironclaw_threads`](crates/ironclaw_threads) · [`ironclaw_processes`](crates/ironclaw_processes)
+
+**Storage, events & memory**
+
+[`ironclaw_storage`](crates/ironclaw_storage) · [`ironclaw_filesystem`](crates/ironclaw_filesystem) · [`ironclaw_events`](crates/ironclaw_events) · [`ironclaw_event_projections`](crates/ironclaw_event_projections) · [`ironclaw_memory`](crates/ironclaw_memory) · [`ironclaw_resources`](crates/ironclaw_resources) · [`ironclaw_reborn_event_store`](crates/ironclaw_reborn_event_store)
+
+**Extensions, tools & models**
+
+[`ironclaw_extensions`](crates/ironclaw_extensions) · [`ironclaw_skills`](crates/ironclaw_skills) · [`ironclaw_wasm`](crates/ironclaw_wasm) · [`ironclaw_wasm_product_adapters`](crates/ironclaw_wasm_product_adapters) · [`ironclaw_product_adapters`](crates/ironclaw_product_adapters) · [`ironclaw_product_workflow`](crates/ironclaw_product_workflow) · [`ironclaw_telegram_v2_adapter`](crates/ironclaw_telegram_v2_adapter) · [`ironclaw_mcp`](crates/ironclaw_mcp) · [`ironclaw_llm`](crates/ironclaw_llm) · [`ironclaw_silk_decoder`](crates/ironclaw_silk_decoder)
+
+**Networking & I/O**
+
+[`ironclaw_network`](crates/ironclaw_network) · [`ironclaw_outbound`](crates/ironclaw_outbound) · [`ironclaw_gateway`](crates/ironclaw_gateway)
+
+**Composition & surfaces**
+
+[`ironclaw_reborn`](crates/ironclaw_reborn) · [`ironclaw_reborn_composition`](crates/ironclaw_reborn_composition) · [`ironclaw_reborn_config`](crates/ironclaw_reborn_config) · [`ironclaw_reborn_cli`](crates/ironclaw_reborn_cli) · [`ironclaw_tui`](crates/ironclaw_tui) · [`ironclaw_common`](crates/ironclaw_common) · [`ironclaw_scripts`](crates/ironclaw_scripts)
+
 ## Usage
 
 Engine v2 is opt-in right now. If you want to run the new engine instead of the legacy agent loop, start IronClaw with `ENGINE_V2=true`. See [Engine v2 architecture](docs/internal/engine-v2-architecture.md#enabling-engine-v2) for more details.
