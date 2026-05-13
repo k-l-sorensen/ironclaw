@@ -4261,12 +4261,12 @@ mod tests {
     }
 
     #[test]
-    fn test_image_generation_record_content_preserves_double_stringified_payload_under_cap() {
+    fn test_image_generation_record_content_compacts_double_stringified_payload_under_cap() {
         let base = serde_json::json!({
             "type": "image_generated",
             "data": "data:image/png;base64,",
             "media_type": "image/png",
-            "path": "/tmp/example.png"
+            "path": "default/thread/example.png"
         })
         .to_string();
         let filler_len = crate::generated_images::MAX_RECORDED_IMAGE_SENTINEL_BYTES - base.len();
@@ -4274,17 +4274,21 @@ mod tests {
             "type": "image_generated",
             "data": format!("data:image/png;base64,{}", "a".repeat(filler_len)),
             "media_type": "image/png",
-            "path": "/tmp/example.png"
+            "path": "default/thread/example.png"
         })
         .to_string();
         let wrapped = serde_json::to_string(&normalized).unwrap();
         let sentinel = GeneratedImageSentinel::from_output(&wrapped).expect("sentinel");
 
         let record = super::image_generation_record_content(&sentinel);
+        let parsed = GeneratedImageSentinel::from_output(&record).expect("record sentinel");
 
-        assert_eq!(record, normalized);
-        assert!(record.contains("data:image/png;base64"));
-        assert!(!record.contains("\"data_omitted\":true"));
+        assert_ne!(record, normalized);
+        assert!(record.contains("\"data_omitted\":true"));
+        assert!(!record.contains("data:image/png;base64"));
+        assert_eq!(parsed.path(), Some("default/thread/example.png"));
+        assert_eq!(parsed.media_type(), Some("image/png"));
+        assert!(parsed.data_url().is_none());
     }
 
     #[test]
