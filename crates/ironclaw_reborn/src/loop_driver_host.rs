@@ -973,6 +973,17 @@ where
     /// ports. When set, every capability invocation runs through
     /// `before_capability` dispatch before reaching the inner port, and every
     /// prompt-bundle build runs through `before_prompt` dispatch.
+    ///
+    /// **Hook telemetry**: to surface hook dispatch in the host's milestone
+    /// stream, the caller must attach a
+    /// [`ironclaw_turns::run_profile::HookMilestoneSink`] to the dispatcher
+    /// *before* wrapping it in `Arc`, via
+    /// [`HookDispatcher::with_milestone_sink`]. Wrap the factory's
+    /// `LoopHostMilestoneSink` in a
+    /// [`ironclaw_turns::run_profile::RunScopedHookMilestoneSink`] for the
+    /// active run to inject run-context before forwarding to the host's
+    /// milestone backend. Hook activity is invisible to observers when no
+    /// sink is attached.
     pub fn with_hook_dispatcher(mut self, dispatcher: Arc<HookDispatcher>) -> Self {
         self.hook_dispatcher = Some(dispatcher);
         self

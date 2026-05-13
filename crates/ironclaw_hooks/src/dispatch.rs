@@ -8,10 +8,11 @@
 
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::FutureExt;
+use ironclaw_turns::run_profile::{HookDecisionSummary, HookMilestoneSink, LoopHostMilestoneKind};
 
 use crate::error::SanitizedReason;
 use crate::failure_policy::{FailureCategory, FailureDisposition};
@@ -28,6 +29,7 @@ use crate::sink::{
     RecordingGateSink, RecordingMutatorSink, RecordingObserverSink, RestrictedBeforeCapabilityHook,
     RestrictedBeforePromptHook,
 };
+use crate::telemetry;
 use crate::trust::HookTrustClass;
 
 /// Default per-hook wall-clock budget. Tunable per dispatcher.
@@ -127,6 +129,7 @@ pub struct HookDispatcher {
     before_prompt: HashMap<HookId, BeforePromptHookImpl>,
     observers: HashMap<HookId, ObserverHookImpl>,
     timeout: Duration,
+    milestone_sink: Option<Arc<dyn HookMilestoneSink>>,
 }
 
 impl HookDispatcher {
@@ -137,12 +140,41 @@ impl HookDispatcher {
             before_prompt: HashMap::new(),
             observers: HashMap::new(),
             timeout: DEFAULT_HOOK_TIMEOUT,
+            milestone_sink: None,
         }
     }
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// Attach a [`HookMilestoneSink`] to this dispatcher. When set, the
+    /// dispatcher emits `HookDispatched`, `HookDecisionEmitted`, and
+    /// `HookFailed` kinds into the sink as hooks run. Default (no sink)
+    /// preserves the pre-telemetry behavior.
+    ///
+    /// Milestone payloads carry stringified hook ids, point names, and
+    /// failure labels — never raw hook implementation state or user-facing
+    /// content. See [`crate::telemetry`] for the conversion helpers.
+    ///
+    /// Because the dispatcher is typically held behind an `Arc` after it has
+    /// been installed into the Reborn factory, callers must wire the sink
+    /// *before* wrapping the dispatcher in `Arc`. This is the documented
+    /// composition order: build dispatcher, set sink, wrap in `Arc`, install
+    /// into the factory via `with_hook_dispatcher`. The sink should be a
+    /// [`ironclaw_turns::run_profile::RunScopedHookMilestoneSink`] (or
+    /// equivalent adapter) that injects run-context before forwarding to the
+    /// host's `LoopHostMilestoneSink`.
+    pub fn with_milestone_sink(mut self, sink: Arc<dyn HookMilestoneSink>) -> Self {
+        self.milestone_sink = Some(sink);
+        self
+    }
+
+    async fn emit_milestone(&self, kind: LoopHostMilestoneKind) {
+        if let Some(sink) = &self.milestone_sink {
+            sink.publish_hook_milestone(kind).await;
+        }
     }
 
     /// Insert a new binding into the dispatcher's registry. Used by the
@@ -400,7 +432,8 @@ impl HookDispatcher {
                     &crate::trust::DecisionKind::Gate,
                     "binding present without installed implementation",
                     &mut failures,
-                );
+                )
+                .await;
                 if !short_circuited {
                     composed = BeforeCapabilityHookDecision::deny(SanitizedReason::from_static(
                         "hook binding missing implementation",
@@ -410,19 +443,25 @@ impl HookDispatcher {
                 continue;
             };
 
+            self.emit_dispatched(&binding).await;
             let result = self.run_before_capability_hook(hook, &binding, ctx).await;
             match result {
                 Ok(GateHookOutcome::Pass) => {
                     // Hook explicitly declared no opinion — contributes
                     // nothing to the composed decision.
+                    self.emit_decision(&binding, HookDecisionSummary::Pass)
+                        .await;
                 }
                 Ok(GateHookOutcome::Decision(decision)) => {
+                    let summary = telemetry::gate_decision_summary(&decision);
+                    self.emit_decision(&binding, summary).await;
                     composed = compose_gate_decision(composed, decision);
                     if !matches!(composed.inner(), GateDecisionInner::Allow) {
                         short_circuited = true;
                     }
                 }
                 Err(failure) => {
+                    self.emit_failure(&failure).await;
                     let restrictive = match failure.disposition {
                         FailureDisposition::FailClosed => {
                             Some(BeforeCapabilityHookDecision::deny(failure.reason.clone()))
@@ -480,12 +519,25 @@ impl HookDispatcher {
                     &crate::trust::DecisionKind::Mutator,
                     "binding present without installed implementation",
                     &mut failures,
-                );
+                )
+                .await;
                 continue;
             };
+            self.emit_dispatched(&binding).await;
             match self.run_before_prompt_hook(hook, &binding, ctx).await {
-                Ok(mut emitted) => patches.append(&mut emitted),
-                Err(failure) => failures.push(failure),
+                Ok(mut emitted) => {
+                    let summary = if emitted.is_empty() {
+                        HookDecisionSummary::Pass
+                    } else {
+                        HookDecisionSummary::Patch
+                    };
+                    self.emit_decision(&binding, summary).await;
+                    patches.append(&mut emitted);
+                }
+                Err(failure) => {
+                    self.emit_failure(&failure).await;
+                    failures.push(failure);
+                }
             }
         }
 
@@ -538,12 +590,21 @@ impl HookDispatcher {
                     &crate::trust::DecisionKind::Observer,
                     "binding present without installed implementation",
                     &mut failures,
-                );
+                )
+                .await;
                 continue;
             };
+            self.emit_dispatched(&binding).await;
             match self.run_observer_hook(hook, &binding, &ctx).await {
-                Ok(mut emitted) => facts.append(&mut emitted),
-                Err(failure) => failures.push(failure),
+                Ok(mut emitted) => {
+                    self.emit_decision(&binding, HookDecisionSummary::Pass)
+                        .await;
+                    facts.append(&mut emitted);
+                }
+                Err(failure) => {
+                    self.emit_failure(&failure).await;
+                    failures.push(failure);
+                }
             }
         }
 
@@ -741,7 +802,7 @@ impl HookDispatcher {
         }
     }
 
-    fn poison_with_failure(
+    async fn poison_with_failure(
         &self,
         hook_id: HookId,
         category: FailureCategory,
@@ -761,12 +822,49 @@ impl HookDispatcher {
             ?kind,
             "hook protocol violation, slot poisoned"
         );
-        failures.push(HookFailureRecord {
+        let record = HookFailureRecord {
             hook_id,
             category,
             disposition,
             reason: SanitizedReason::from_static(reason),
-        });
+        };
+        self.emit_failure(&record).await;
+        failures.push(record);
+    }
+
+    async fn emit_dispatched(&self, binding: &HookBinding) {
+        if self.milestone_sink.is_none() {
+            return;
+        }
+        self.emit_milestone(LoopHostMilestoneKind::HookDispatched {
+            hook_id: telemetry::hook_id_string(binding.hook_id),
+            point: telemetry::point_label(binding.point).to_string(),
+            trust_class: telemetry::trust_class_label(binding.trust_class).to_string(),
+        })
+        .await;
+    }
+
+    async fn emit_decision(&self, binding: &HookBinding, decision: HookDecisionSummary) {
+        if self.milestone_sink.is_none() {
+            return;
+        }
+        self.emit_milestone(LoopHostMilestoneKind::HookDecisionEmitted {
+            hook_id: telemetry::hook_id_string(binding.hook_id),
+            decision,
+        })
+        .await;
+    }
+
+    async fn emit_failure(&self, record: &HookFailureRecord) {
+        if self.milestone_sink.is_none() {
+            return;
+        }
+        self.emit_milestone(LoopHostMilestoneKind::HookFailed {
+            hook_id: telemetry::hook_id_string(record.hook_id),
+            category: telemetry::failure_category_label(record.category).to_string(),
+            disposition: telemetry::failure_disposition_label(record.disposition).to_string(),
+        })
+        .await;
     }
 }
 
@@ -1340,5 +1438,196 @@ mod tests {
             second.decision.permits(),
             "with no live hooks, composed decision is allow"
         );
+    }
+
+    // ─── Milestone telemetry ────────────────────────────────────────────
+
+    use ironclaw_turns::run_profile::{InMemoryHookMilestoneSink, LoopHostMilestoneKind};
+
+    fn install_milestone_sink(
+        dispatcher: HookDispatcher,
+    ) -> (HookDispatcher, Arc<InMemoryHookMilestoneSink>) {
+        let sink = Arc::new(InMemoryHookMilestoneSink::default());
+        let dispatcher = dispatcher.with_milestone_sink(Arc::clone(&sink) as Arc<_>);
+        (dispatcher, sink)
+    }
+
+    #[tokio::test]
+    async fn before_capability_emits_dispatched_and_decision_milestones() {
+        let id = ext_hook_id("deny-with-tele");
+        let mut registry = HookRegistry::new();
+        registry
+            .insert(installed_binding(
+                id,
+                HookPointSpec::BeforeCapability,
+                HookPhase::Policy,
+            ))
+            .expect("ok");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_before_capability(
+            id,
+            BeforeCapabilityHookImpl::Restricted(Box::new(DenyingInstalledHook)),
+        );
+        let (dispatcher, sink) = install_milestone_sink(dispatcher);
+
+        let _ = dispatcher.dispatch_before_capability(&ctx()).await;
+
+        let kinds = sink.kinds();
+        // Expect: HookDispatched then HookDecisionEmitted(Deny). Trailing
+        // AfterCapability observer dispatch has no bindings so no extra
+        // milestones are produced.
+        assert!(
+            kinds
+                .iter()
+                .any(|k| matches!(k, LoopHostMilestoneKind::HookDispatched { .. })),
+            "expected HookDispatched milestone, got {kinds:?}"
+        );
+        let decision_kinds: Vec<_> = kinds
+            .iter()
+            .filter_map(|k| match k {
+                LoopHostMilestoneKind::HookDecisionEmitted { decision, .. } => Some(decision),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(decision_kinds.len(), 1, "expected exactly one decision");
+        assert_eq!(decision_kinds[0].kind_name(), "deny");
+    }
+
+    #[tokio::test]
+    async fn before_capability_emits_failed_milestone_on_panic() {
+        let id = ext_hook_id("panic-tele");
+        let mut registry = HookRegistry::new();
+        registry
+            .insert(installed_binding(
+                id,
+                HookPointSpec::BeforeCapability,
+                HookPhase::Policy,
+            ))
+            .expect("ok");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_before_capability(
+            id,
+            BeforeCapabilityHookImpl::Restricted(Box::new(PanickingHook)),
+        );
+        let (dispatcher, sink) = install_milestone_sink(dispatcher);
+
+        let _ = dispatcher.dispatch_before_capability(&ctx()).await;
+
+        let kinds = sink.kinds();
+        let failures: Vec<_> = kinds
+            .iter()
+            .filter_map(|k| match k {
+                LoopHostMilestoneKind::HookFailed {
+                    category,
+                    disposition,
+                    ..
+                } => Some((category.as_str(), disposition.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(failures.len(), 1, "expected one failure milestone");
+        assert_eq!(failures[0], ("panic", "fail_closed"));
+    }
+
+    #[tokio::test]
+    async fn before_prompt_emits_dispatched_and_patch_milestones() {
+        let id = ext_hook_id("envelope-tele");
+        let mut registry = HookRegistry::new();
+        registry
+            .insert(HookBinding {
+                hook_id: id,
+                hook_version: HookVersion::ONE,
+                trust_class: HookTrustClass::Installed,
+                phase: HookPhase::Policy,
+                point: HookPointSpec::BeforePrompt,
+                poisoned: false,
+            })
+            .expect("ok");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_before_prompt(
+            id,
+            BeforePromptHookImpl::Restricted(Box::new(EnvelopePatchHook)),
+        );
+        let (dispatcher, sink) = install_milestone_sink(dispatcher);
+
+        let ctx = BeforePromptHookContext::new(tenant(), 4096);
+        let _ = dispatcher.dispatch_before_prompt(&ctx).await;
+
+        let kinds = sink.kinds();
+        assert_eq!(
+            kinds.len(),
+            2,
+            "expected dispatched + decision, got {kinds:?}"
+        );
+        assert!(matches!(
+            &kinds[0],
+            LoopHostMilestoneKind::HookDispatched { point, .. } if point == "before_prompt"
+        ));
+        assert!(matches!(
+            &kinds[1],
+            LoopHostMilestoneKind::HookDecisionEmitted { decision, .. }
+                if decision.kind_name() == "patch"
+        ));
+    }
+
+    #[tokio::test]
+    async fn observer_dispatch_emits_milestones() {
+        let id = HookId::for_builtin("test::observer::tele", HookVersion::ONE);
+        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+        dispatcher
+            .install_builtin_observer(
+                id,
+                HookPhase::Telemetry,
+                HookPointSpec::AfterModel,
+                Box::new(NotingObserver),
+            )
+            .expect("install builtin observer");
+        let (dispatcher, sink) = install_milestone_sink(dispatcher);
+
+        let _ = dispatcher
+            .dispatch_observer_at(HookPointSpec::AfterModel, tenant())
+            .await;
+
+        let kinds = sink.kinds();
+        assert_eq!(kinds.len(), 2);
+        match &kinds[0] {
+            LoopHostMilestoneKind::HookDispatched {
+                point, trust_class, ..
+            } => {
+                assert_eq!(point, "after_model");
+                assert_eq!(trust_class, "builtin");
+            }
+            other => panic!("unexpected first milestone: {other:?}"),
+        }
+        assert!(matches!(
+            &kinds[1],
+            LoopHostMilestoneKind::HookDecisionEmitted { decision, .. }
+                if decision.kind_name() == "pass"
+        ));
+    }
+
+    #[tokio::test]
+    async fn no_sink_emits_no_milestones_and_preserves_behavior() {
+        // Sanity: dispatcher without a milestone sink still functions and
+        // emits nothing. Tested implicitly by the rest of the suite, but
+        // asserted explicitly here for the telemetry contract.
+        let id = ext_hook_id("no-tele");
+        let mut registry = HookRegistry::new();
+        registry
+            .insert(installed_binding(
+                id,
+                HookPointSpec::BeforeCapability,
+                HookPhase::Policy,
+            ))
+            .expect("ok");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_before_capability(
+            id,
+            BeforeCapabilityHookImpl::Restricted(Box::new(DenyingInstalledHook)),
+        );
+
+        // No `with_milestone_sink` call.
+        let outcome = dispatcher.dispatch_before_capability(&ctx()).await;
+        assert!(!outcome.decision.permits());
     }
 }

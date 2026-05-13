@@ -199,7 +199,10 @@ impl DurableLoopHostMilestoneSink {
             | LoopHostMilestoneKind::CapabilityInvoked { .. }
             | LoopHostMilestoneKind::CheckpointCreated { .. }
             | LoopHostMilestoneKind::Blocked { .. }
-            | LoopHostMilestoneKind::DriverNote { .. } => return Ok(None),
+            | LoopHostMilestoneKind::DriverNote { .. }
+            | LoopHostMilestoneKind::HookDispatched { .. }
+            | LoopHostMilestoneKind::HookDecisionEmitted { .. }
+            | LoopHostMilestoneKind::HookFailed { .. } => return Ok(None),
         };
         Ok(Some(event))
     }

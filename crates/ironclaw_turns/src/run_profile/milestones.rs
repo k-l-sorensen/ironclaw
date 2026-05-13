@@ -98,6 +98,59 @@ pub enum LoopHostMilestoneKind {
         kind: LoopDriverNoteKind,
         safe_summary: LoopSafeSummary,
     },
+    /// A hook was dispatched at a hook point. Emitted before the hook runs.
+    ///
+    /// `hook_id` is the hex form of the hook's blake3-derived identity (see
+    /// `ironclaw_hooks::HookId::to_hex`). The hook crate cannot be imported
+    /// here without breaking the architecture-enforced dependency direction
+    /// (`ironclaw_turns -> ironclaw_hooks` is forbidden), so the hook id is
+    /// carried as a `String` across this seam. The hooks crate's
+    /// `telemetry` module produces the value.
+    HookDispatched {
+        hook_id: String,
+        point: String,
+        trust_class: String,
+    },
+    /// A hook produced a decision (or explicitly passed) for a dispatch.
+    HookDecisionEmitted {
+        hook_id: String,
+        decision: HookDecisionSummary,
+    },
+    /// A hook misbehaved during dispatch. Captures the failure category and
+    /// the dispatcher's disposition (fail-closed vs fail-isolated).
+    HookFailed {
+        hook_id: String,
+        category: String,
+        disposition: String,
+    },
+}
+
+/// Closed-vocabulary summary of a hook decision suitable for telemetry. This
+/// mirrors the shape of the hooks crate's gate decision but stringifies the
+/// sanitized reason (the actual `SanitizedReason` type lives in the hooks
+/// crate and cannot be imported here).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookDecisionSummary {
+    Allow,
+    Deny { reason: String },
+    PauseApproval { reason: String },
+    PauseAuth { reason: String },
+    Pass,
+    Patch,
+}
+
+impl HookDecisionSummary {
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny { .. } => "deny",
+            Self::PauseApproval { .. } => "pause_approval",
+            Self::PauseAuth { .. } => "pause_auth",
+            Self::Pass => "pass",
+            Self::Patch => "patch",
+        }
+    }
 }
 
 impl LoopHostMilestoneKind {
@@ -114,6 +167,9 @@ impl LoopHostMilestoneKind {
             Self::Completed { .. } => "completed",
             Self::Failed { .. } => "failed",
             Self::DriverNote { .. } => "driver_note",
+            Self::HookDispatched { .. } => "hook_dispatched",
+            Self::HookDecisionEmitted { .. } => "hook_decision_emitted",
+            Self::HookFailed { .. } => "hook_failed",
         }
     }
 }
@@ -124,6 +180,55 @@ pub trait LoopHostMilestoneSink: Send + Sync {
         &self,
         milestone: LoopHostMilestone,
     ) -> Result<(), AgentLoopHostError>;
+}
+
+/// Lightweight sink for hook-dispatcher telemetry. The hook dispatcher in
+/// `ironclaw_hooks` is a process-wide shared object (`Arc<HookDispatcher>`)
+/// that does not own a `LoopRunContext`. It therefore cannot construct a full
+/// [`LoopHostMilestone`] on its own. Instead, the dispatcher emits the
+/// hook-specific *kind* into a [`HookMilestoneSink`], and host composition in
+/// `ironclaw_reborn` wraps the real [`LoopHostMilestoneSink`] in an adapter
+/// that injects the active run's context before forwarding.
+///
+/// The kinds emitted through this sink are always one of:
+/// [`LoopHostMilestoneKind::HookDispatched`],
+/// [`LoopHostMilestoneKind::HookDecisionEmitted`], or
+/// [`LoopHostMilestoneKind::HookFailed`]. Other variants are not valid here
+/// — adapters should ignore them or treat them as a host-side bug.
+#[async_trait]
+pub trait HookMilestoneSink: Send + Sync {
+    async fn publish_hook_milestone(&self, kind: LoopHostMilestoneKind);
+}
+
+/// Adapter that wraps a [`LoopHostMilestoneSink`] with a fixed
+/// [`LoopRunContext`] and exposes the [`HookMilestoneSink`] surface. Use this
+/// to plumb hook-dispatch telemetry through the same backend that receives
+/// the rest of the loop's milestones.
+pub struct RunScopedHookMilestoneSink {
+    context: LoopRunContext,
+    inner: Arc<dyn LoopHostMilestoneSink>,
+}
+
+impl RunScopedHookMilestoneSink {
+    pub fn new(context: LoopRunContext, inner: Arc<dyn LoopHostMilestoneSink>) -> Self {
+        Self { context, inner }
+    }
+}
+
+#[async_trait]
+impl HookMilestoneSink for RunScopedHookMilestoneSink {
+    async fn publish_hook_milestone(&self, kind: LoopHostMilestoneKind) {
+        let milestone = LoopHostMilestone::from_context(&self.context, kind);
+        if let Err(error) = self.inner.publish_loop_milestone(milestone).await {
+            // The dispatcher cannot meaningfully recover from a milestone-sink
+            // failure (audit data is best-effort). We log and drop so hook
+            // dispatch itself stays observable-only — never user-facing.
+            tracing::debug!(
+                error = %error.safe_summary,
+                "hook milestone publish failed; dropping telemetry record"
+            );
+        }
+    }
 }
 
 #[derive(Default)]
@@ -154,6 +259,33 @@ impl LoopHostMilestoneSink for InMemoryLoopHostMilestoneSink {
         })?;
         milestones.push(milestone);
         Ok(())
+    }
+}
+
+/// In-memory recording sink for hook-dispatch telemetry tests. Stores every
+/// emitted [`LoopHostMilestoneKind`] in publish order.
+#[derive(Default)]
+pub struct InMemoryHookMilestoneSink {
+    kinds: Mutex<Vec<LoopHostMilestoneKind>>,
+}
+
+impl InMemoryHookMilestoneSink {
+    pub fn kinds(&self) -> Vec<LoopHostMilestoneKind> {
+        match self.kinds.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
+
+#[async_trait]
+impl HookMilestoneSink for InMemoryHookMilestoneSink {
+    async fn publish_hook_milestone(&self, kind: LoopHostMilestoneKind) {
+        let mut guard = match self.kinds.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.push(kind);
     }
 }
 
@@ -291,6 +423,43 @@ where
     ) -> Result<(), AgentLoopHostError> {
         self.publish(LoopHostMilestoneKind::DriverNote { kind, safe_summary })
             .await
+    }
+
+    pub async fn hook_dispatched(
+        &self,
+        hook_id: String,
+        point: String,
+        trust_class: String,
+    ) -> Result<(), AgentLoopHostError> {
+        self.publish(LoopHostMilestoneKind::HookDispatched {
+            hook_id,
+            point,
+            trust_class,
+        })
+        .await
+    }
+
+    pub async fn hook_decision_emitted(
+        &self,
+        hook_id: String,
+        decision: HookDecisionSummary,
+    ) -> Result<(), AgentLoopHostError> {
+        self.publish(LoopHostMilestoneKind::HookDecisionEmitted { hook_id, decision })
+            .await
+    }
+
+    pub async fn hook_failed(
+        &self,
+        hook_id: String,
+        category: String,
+        disposition: String,
+    ) -> Result<(), AgentLoopHostError> {
+        self.publish(LoopHostMilestoneKind::HookFailed {
+            hook_id,
+            category,
+            disposition,
+        })
+        .await
     }
 
     async fn publish(&self, kind: LoopHostMilestoneKind) -> Result<(), AgentLoopHostError> {

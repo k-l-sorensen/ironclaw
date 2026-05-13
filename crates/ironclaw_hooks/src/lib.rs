@@ -27,6 +27,7 @@ pub mod registrar;
 pub mod registry;
 pub mod self_authored;
 pub mod sink;
+pub mod telemetry;
 pub mod trust;
 
 pub use error::HookError;
