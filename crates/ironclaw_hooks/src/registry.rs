@@ -117,6 +117,18 @@ fn default_priority() -> HookPriority {
     HookPriority::DEFAULT
 }
 
+/// Returns `true` if dispatches at `point` carry a resolved capability
+/// `provider` in their context. Only those points can meaningfully enforce
+/// `HookBindingScope::OwnCapabilities`. See finding #2.
+fn point_has_capability_context(point: HookPointSpec) -> bool {
+    match point {
+        HookPointSpec::BeforeCapability | HookPointSpec::AfterCapability => true,
+        HookPointSpec::BeforePrompt
+        | HookPointSpec::AfterModel
+        | HookPointSpec::AfterCheckpoint => false,
+    }
+}
+
 /// Identifies which dispatcher point a binding registers against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -159,6 +171,25 @@ impl HookRegistry {
             return Err(HookError::RegistryConstruction(format!(
                 "{:?}-tier hook cannot register at phase {:?}",
                 binding.trust_class, binding.phase
+            )));
+        }
+        // Scope-vs-point compatibility (serrrfirat finding #2). Some hook
+        // points have no per-capability invocation context (e.g.
+        // `BeforePrompt` fires once per prompt assembly, not per capability
+        // invocation). For those points the `OwnCapabilities` scope is
+        // meaningless — there is no `provider` to compare against, so the
+        // dispatcher cannot enforce manifest-declared capability scope.
+        // Rather than silently fire-against-everything (the pre-fix behavior)
+        // or silently never-fire (which hides misconfiguration), reject the
+        // binding at install time so the operator sees the mistake.
+        if matches!(binding.scope, HookBindingScope::OwnCapabilities)
+            && !point_has_capability_context(binding.point)
+        {
+            return Err(HookError::RegistryConstruction(format!(
+                "scope `OwnCapabilities` not supported at point {:?}: \
+                 this point has no per-capability invocation context. \
+                 Use `Global` or `SameTenant` instead.",
+                binding.point
             )));
         }
         // Hook IDs must be globally unique across the registry. A duplicate
@@ -371,6 +402,53 @@ mod tests {
             registry.insert(dup_at_other_point),
             Err(HookError::RegistryConstruction(_))
         ));
+    }
+
+    #[test]
+    fn rejects_own_capabilities_at_before_prompt() {
+        // serrrfirat finding #2 regression: `BeforePrompt` has no
+        // per-capability provider in its context, so `OwnCapabilities`
+        // cannot be enforced at dispatch. Reject at install time rather
+        // than silently fire-against-everything or silently never-fire.
+        let mut registry = HookRegistry::new();
+        let mut binding =
+            installed_binding("alpha", HookPhase::Policy, HookPointSpec::BeforePrompt);
+        binding.scope = HookBindingScope::OwnCapabilities;
+        binding.owning_extension = Some(ironclaw_host_api::ExtensionId::new("ext").expect("valid"));
+        match registry.insert(binding) {
+            Err(HookError::RegistryConstruction(msg)) => {
+                assert!(msg.contains("OwnCapabilities"), "unexpected msg: {msg}");
+                assert!(msg.contains("BeforePrompt"), "unexpected msg: {msg}");
+            }
+            other => panic!("expected registry construction error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_own_capabilities_at_after_model() {
+        // Same as BeforePrompt: AfterModel observers have no
+        // per-capability provider, so `OwnCapabilities` is meaningless.
+        let mut registry = HookRegistry::new();
+        let mut binding =
+            installed_binding("alpha", HookPhase::Telemetry, HookPointSpec::AfterModel);
+        binding.scope = HookBindingScope::OwnCapabilities;
+        binding.owning_extension = Some(ironclaw_host_api::ExtensionId::new("ext").expect("valid"));
+        assert!(matches!(
+            registry.insert(binding),
+            Err(HookError::RegistryConstruction(_))
+        ));
+    }
+
+    #[test]
+    fn accepts_own_capabilities_at_before_capability() {
+        // Sanity: capability-bound points still accept OwnCapabilities.
+        let mut registry = HookRegistry::new();
+        let mut binding =
+            installed_binding("alpha", HookPhase::Policy, HookPointSpec::BeforeCapability);
+        binding.scope = HookBindingScope::OwnCapabilities;
+        binding.owning_extension = Some(ironclaw_host_api::ExtensionId::new("ext").expect("valid"));
+        registry.insert(binding).expect("ok at before_capability");
+        assert_eq!(registry.len(), 1);
     }
 
     #[test]

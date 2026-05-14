@@ -113,15 +113,15 @@ impl HookedLoopCapabilityPort {
         self
     }
 
-    async fn hook_context(&self, invocation: &CapabilityInvocation) -> BeforeCapabilityHookContext {
+    async fn hook_context(
+        &self,
+        invocation: &CapabilityInvocation,
+        provider: Option<ironclaw_host_api::ExtensionId>,
+    ) -> BeforeCapabilityHookContext {
         let arguments = match self.resolver.resolve(invocation).await {
             Some(value) => SanitizedArguments::from_json(value),
             None => SanitizedArguments::unresolved(),
         };
-        let provider = self
-            .provider_resolver
-            .provider_for(&invocation.capability_id.to_string())
-            .await;
         BeforeCapabilityHookContext::new(
             self.tenant_id.clone(),
             invocation.capability_id.to_string(),
@@ -134,8 +134,9 @@ impl HookedLoopCapabilityPort {
     async fn run_dispatch(
         &self,
         invocation: &CapabilityInvocation,
+        provider: Option<ironclaw_host_api::ExtensionId>,
     ) -> BeforeCapabilityDispatchOutcome {
-        let ctx = self.hook_context(invocation).await;
+        let ctx = self.hook_context(invocation, provider).await;
         self.dispatcher.dispatch_before_capability(&ctx).await
     }
 }
@@ -156,7 +157,11 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
         &self,
         request: CapabilityInvocation,
     ) -> Result<CapabilityOutcome, AgentLoopHostError> {
-        let outcome = self.run_dispatch(&request).await;
+        let provider = self
+            .provider_resolver
+            .provider_for(&request.capability_id.to_string())
+            .await;
+        let outcome = self.run_dispatch(&request, provider.clone()).await;
         let result = match self.decision_to_outcome(&outcome).await {
             Some(translated) => Ok(translated),
             None => self.inner.invoke_capability(request).await,
@@ -164,12 +169,15 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
         // Fire AfterCapability observers regardless of whether the hook
         // short-circuited or the inner port ran. Observer-only point — no
         // gate decisions composed here. Telemetry must reflect both denied
-        // and allowed invocations.
+        // and allowed invocations. The resolved provider is threaded so the
+        // dispatcher can enforce `OwnCapabilities` scope on Installed
+        // observers (serrrfirat finding #3).
         let _ = self
             .dispatcher
-            .dispatch_observer_at(
+            .dispatch_observer_at_with_provider(
                 crate::registry::HookPointSpec::AfterCapability,
                 self.tenant_id.clone(),
+                provider,
             )
             .await;
         result
@@ -192,19 +200,25 @@ impl LoopCapabilityPort for HookedLoopCapabilityPort {
             if stopped_on_suspension {
                 break;
             }
-            let dispatch = self.run_dispatch(&invocation).await;
+            let provider = self
+                .provider_resolver
+                .provider_for(&invocation.capability_id.to_string())
+                .await;
+            let dispatch = self.run_dispatch(&invocation, provider.clone()).await;
             let outcome = match self.decision_to_outcome(&dispatch).await {
                 Some(translated) => translated,
                 None => self.inner.invoke_capability(invocation).await?,
             };
             // Fire AfterCapability observers per batch entry, mirroring the
-            // single-invocation path. Telemetry must reflect every batched
-            // invocation regardless of whether the hook short-circuited.
+            // single-invocation path. The provider is resolved per-invocation
+            // so the dispatcher can enforce `OwnCapabilities` scope on
+            // Installed observers (serrrfirat finding #3).
             let _ = self
                 .dispatcher
-                .dispatch_observer_at(
+                .dispatch_observer_at_with_provider(
                     crate::registry::HookPointSpec::AfterCapability,
                     self.tenant_id.clone(),
+                    provider,
                 )
                 .await;
             if outcome.is_suspension() && stop_on_first_suspension {

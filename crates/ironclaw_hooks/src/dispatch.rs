@@ -682,6 +682,21 @@ impl HookDispatcher {
         point: HookPointSpec,
         tenant: ironclaw_host_api::TenantId,
     ) -> ObserverDispatchOutcome {
+        self.dispatch_observer_at_with_provider(point, tenant, None)
+            .await
+    }
+
+    /// As [`Self::dispatch_observer_at`], but carries the capability provider
+    /// for scope-filter enforcement at [`HookPointSpec::AfterCapability`].
+    /// Other observer points pass `None`; the dispatcher rejects
+    /// `OwnCapabilities`-scoped bindings at non-capability points in the
+    /// registry, so this is just defense in depth there.
+    pub async fn dispatch_observer_at_with_provider(
+        &self,
+        point: HookPointSpec,
+        tenant: ironclaw_host_api::TenantId,
+        provider: Option<ironclaw_host_api::ExtensionId>,
+    ) -> ObserverDispatchOutcome {
         let ordered = self.ordered_bindings(point);
         let mut facts = Vec::new();
         let mut failures = Vec::new();
@@ -709,10 +724,24 @@ impl HookDispatcher {
                     return ObserverDispatchOutcome { facts, failures };
                 }
             },
+            provider: provider.clone(),
         };
 
         for (_key, binding) in ordered {
             if self.is_poisoned(binding.hook_id) {
+                continue;
+            }
+            // Scope filtering (serrrfirat finding #3). `OwnCapabilities` is
+            // legal at `AfterCapability` because that dispatch carries a
+            // resolved provider; for `AfterModel` and `AfterCheckpoint` the
+            // registry already rejects `OwnCapabilities` at install time
+            // (finding #2), so `provider` is `None` and the scope check would
+            // refuse to fire — but the only way to get here at those points
+            // is `Global`/`SameTenant`, which `permits` always allows.
+            if !binding
+                .scope
+                .permits(binding.owning_extension.as_ref(), provider.as_ref())
+            {
                 continue;
             }
             let Some(hook) = self.observers.get(&binding.hook_id) else {
@@ -1713,6 +1742,72 @@ mod tests {
             .await;
         assert_eq!(outcome.facts.len(), 1);
         assert!(outcome.failures.is_empty());
+    }
+
+    /// serrrfirat finding #3: an Installed observer scoped to
+    /// `OwnCapabilities` must fire only when the dispatch's resolved
+    /// capability provider equals the binding's owning extension. The
+    /// pre-fix dispatcher fired the observer for every invocation
+    /// regardless of provider.
+    #[tokio::test]
+    async fn own_capabilities_observer_filters_foreign_providers() {
+        let owner = ironclaw_host_api::ExtensionId::new("ext.owner").expect("ok");
+        let other = ironclaw_host_api::ExtensionId::new("ext.other").expect("ok");
+        let id = HookId::derive(
+            &crate::identity::ExtensionId("ext.owner".to_string()),
+            "1.0",
+            &crate::identity::HookLocalId("obs".to_string()),
+            HookVersion::ONE,
+        );
+        let mut registry = HookRegistry::new();
+        registry
+            .insert(HookBinding {
+                hook_id: id,
+                hook_version: HookVersion::ONE,
+                trust_class: HookTrustClass::Installed,
+                phase: HookPhase::Telemetry,
+                priority: HookPriority::DEFAULT,
+                point: HookPointSpec::AfterCapability,
+                owning_extension: Some(owner.clone()),
+                scope: HookBindingScope::OwnCapabilities,
+                poisoned: false,
+            })
+            .expect("ok");
+        let mut dispatcher = HookDispatcher::new(registry);
+        dispatcher.install_observer_impl(id, ObserverHookImpl::Any(Box::new(NotingObserver)));
+
+        // Foreign provider — observer must NOT fire.
+        let outcome = dispatcher
+            .dispatch_observer_at_with_provider(
+                HookPointSpec::AfterCapability,
+                tenant(),
+                Some(other.clone()),
+            )
+            .await;
+        assert!(
+            outcome.facts.is_empty(),
+            "OwnCapabilities observer fired for foreign provider"
+        );
+
+        // Matching provider — observer fires.
+        let outcome = dispatcher
+            .dispatch_observer_at_with_provider(
+                HookPointSpec::AfterCapability,
+                tenant(),
+                Some(owner.clone()),
+            )
+            .await;
+        assert_eq!(outcome.facts.len(), 1);
+
+        // Unresolved provider (`None`) — observer must NOT fire (conservative
+        // default in `HookBindingScope::permits`).
+        let outcome = dispatcher
+            .dispatch_observer_at_with_provider(HookPointSpec::AfterCapability, tenant(), None)
+            .await;
+        assert!(
+            outcome.facts.is_empty(),
+            "OwnCapabilities observer fired against unresolved provider"
+        );
     }
 
     // ── C1 regression: trust-class × impl-tier pairing is sealed ────────────
