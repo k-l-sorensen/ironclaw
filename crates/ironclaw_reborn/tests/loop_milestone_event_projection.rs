@@ -39,7 +39,8 @@ use ironclaw_turns::{
     run_profile::{
         AgentLoopHostErrorKind, FinalizeAssistantMessage, LoopDriverId, LoopHostMilestone,
         LoopHostMilestoneEmitter, LoopHostMilestoneKind, LoopHostMilestoneSink, LoopModelPort,
-        LoopModelRequest, LoopRunContext, LoopTranscriptPort, ParentLoopOutput,
+        LoopModelRequest, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
+        LoopTranscriptPort, ParentLoopOutput, PromptMode,
     },
     runner::ClaimedTurnRun,
 };
@@ -220,11 +221,7 @@ async fn drive_model_reply_milestones_and_assert_projection(
     .await;
     let success_host = success.build_host().await;
     let model_response = success_host
-        .stream_model(LoopModelRequest {
-            messages: Vec::new(),
-            surface_version: None,
-            model_preference: None,
-        })
+        .stream_model(prompted_model_request(&success_host).await)
         .await
         .unwrap();
     let ParentLoopOutput::AssistantReply(reply) = model_response.output else {
@@ -282,11 +279,7 @@ async fn drive_model_reply_milestones_and_assert_projection(
     .await;
     let failure_host = failure.build_host().await;
     let error = failure_host
-        .stream_model(LoopModelRequest {
-            messages: Vec::new(),
-            surface_version: None,
-            model_preference: None,
-        })
+        .stream_model(prompted_model_request(&failure_host).await)
         .await
         .unwrap_err();
     assert_eq!(error.kind, AgentLoopHostErrorKind::Unavailable);
@@ -533,6 +526,26 @@ fn read_all_file_bytes_lossy(root: &Path) -> String {
         }
     }
     output
+}
+
+async fn prompted_model_request(host: &ironclaw_reborn::RebornLoopDriverHost) -> LoopModelRequest {
+    let prompt_bundle = host
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+            inline_messages: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+    LoopModelRequest {
+        messages: prompt_bundle.messages,
+        surface_version: None,
+        model_preference: None,
+    }
 }
 
 struct HostFixture {

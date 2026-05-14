@@ -47,7 +47,7 @@ pub(crate) enum TurnEndKind {
 /// Strategy decision plus the new `stop_state` slot value.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[non_exhaustive]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", tag = "outcome")]
 pub(crate) enum StopOutcome {
     Continue {
         stop: StopStrategyState,
@@ -131,10 +131,10 @@ mod tests {
         };
 
         let value = serde_json::to_value(&outcome).unwrap();
-        // Variant tag must be snake_case on the wire, matching sibling enums.
-        assert!(
-            value.get("stop").is_some(),
-            "expected snake_case `stop` key, got {value}"
+        assert_eq!(
+            value.get("outcome").and_then(|value| value.as_str()),
+            Some("stop"),
+            "expected internally tagged outcome `stop`, got {value}"
         );
         assert!(
             value.get("Stop").is_none(),
@@ -148,9 +148,12 @@ mod tests {
             stop: StopStrategyState::default(),
         };
         let continue_value = serde_json::to_value(&continue_outcome).unwrap();
-        assert!(
-            continue_value.get("continue").is_some(),
-            "expected snake_case `continue` key, got {continue_value}"
+        assert_eq!(
+            continue_value
+                .get("outcome")
+                .and_then(|value| value.as_str()),
+            Some("continue"),
+            "expected internally tagged outcome `continue`, got {continue_value}"
         );
         assert_eq!(
             serde_json::from_value::<StopOutcome>(continue_value).unwrap(),
