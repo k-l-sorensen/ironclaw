@@ -473,6 +473,7 @@ async fn prompt_and_model_ports_resolve_instruction_memory_and_identity_refs() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -611,6 +612,7 @@ async fn prompt_port_records_multiple_active_skill_metadata_in_prompt_order() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -1347,6 +1349,7 @@ async fn prompt_port_builds_bundle_with_tool_result_reference_context() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();

@@ -15,8 +15,10 @@ use ironclaw_host_runtime::{
     RuntimeCapabilityRequest, RuntimeFailureKind,
 };
 use ironclaw_loop_support::{
-    CapabilitySurfaceProfileFilter, CapabilitySurfaceProfileResolver, EmptyLoopCapabilityPort,
-    HostInputQueue, HostManagedModelGateway, HostQueueLoopInputPort, HostSkillContextSource,
+    AlwaysAliveRunCancellationFactory, CapabilitySurfaceProfileFilter,
+    CapabilitySurfaceProfileResolver, EmptyLoopCapabilityPort, HostInputQueue,
+    HostManagedModelGateway, HostQueueLoopInputPort, HostSkillContextSource,
+    RunCancellationFactory, RunCancellationObservationKind, RunStateLoopCancellationPort,
     ThreadBackedLoopContextPort, ThreadBackedLoopModelPort, ThreadBackedLoopTranscriptPort,
 };
 use ironclaw_threads::{SessionThreadService, ThreadScope};
@@ -36,15 +38,16 @@ use ironclaw_turns::{
         FinalizeAssistantMessage, HostManagedLoopModelPort, HostManagedLoopPromptPort,
         InMemoryInstructionMaterializationStore, InstructionMaterializationStore,
         InstructionSafetyContext, LoadCheckpointPayloadRequest, LoadedCheckpointPayload,
-        LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle,
-        LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
-        LoopInputBatch, LoopInputCursor, LoopInputPort, LoopModelBudgetAccountant,
-        LoopModelGateway, LoopModelGatewayError, LoopModelGatewayRequest, LoopModelPolicyGuard,
-        LoopModelPort, LoopModelRequest, LoopModelResponse, LoopProcessRef, LoopProgressEvent,
-        LoopProgressPort, LoopPromptBundle, LoopPromptBundleAuthority, LoopPromptBundleRequest,
-        LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
-        NoOpBudgetAccountant, NoOpPolicyGuard, ProcessHandleSummary, StageCheckpointPayloadRequest,
-        UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        LoopCancellationPort, LoopCancellationSignal, LoopCapabilityPort, LoopCheckpointPort,
+        LoopCheckpointRequest, LoopContextBundle, LoopContextPort, LoopContextRequest,
+        LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputBatch, LoopInputCursor,
+        LoopInputPort, LoopModelBudgetAccountant, LoopModelGateway, LoopModelGatewayError,
+        LoopModelGatewayRequest, LoopModelPolicyGuard, LoopModelPort, LoopModelRequest,
+        LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
+        LoopPromptBundleAuthority, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
+        LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, NoOpBudgetAccountant,
+        NoOpPolicyGuard, ProcessHandleSummary, StageCheckpointPayloadRequest, UpdateAssistantDraft,
+        VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -941,6 +944,7 @@ where
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
     model_accountant: Arc<dyn LoopModelBudgetAccountant>,
     model_policy_guard: Arc<dyn LoopModelPolicyGuard>,
+    cancellation_factory: Arc<dyn RunCancellationFactory>,
     config: TextOnlyLoopHostConfig,
     skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
     safety_context: Option<InstructionSafetyContext>,
@@ -971,11 +975,25 @@ where
             milestone_sink,
             model_accountant: Arc::new(NoOpBudgetAccountant),
             model_policy_guard: Arc::new(NoOpPolicyGuard),
+            cancellation_factory: Arc::new(AlwaysAliveRunCancellationFactory),
             config,
             skill_context_source: None,
             safety_context: None,
             input_queue: None,
         }
+    }
+
+    pub fn with_cancellation_factory<F>(mut self, factory: Arc<F>) -> Self
+    where
+        F: RunCancellationFactory + 'static,
+    {
+        let factory: Arc<dyn RunCancellationFactory> = factory;
+        self.cancellation_factory = factory;
+        self
+    }
+
+    pub fn cancellation_observation_kind(&self) -> RunCancellationObservationKind {
+        self.cancellation_factory.observation_kind()
     }
 
     pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
@@ -1132,6 +1150,15 @@ where
             run_context.clone(),
             Arc::clone(&self.milestone_sink),
         ));
+        let cancellation_handle = self
+            .cancellation_factory
+            .handle_for_run(run_context.run_id)
+            .await
+            .map_err(|error| RebornLoopDriverHostError::InvalidRequest {
+                reason: error.safe_summary,
+            })?;
+        let cancellation: Arc<dyn LoopCancellationPort> =
+            Arc::new(RunStateLoopCancellationPort::new(cancellation_handle));
 
         Ok(RebornLoopDriverHost {
             run_context,
@@ -1143,6 +1170,7 @@ where
             capabilities,
             transcript,
             progress,
+            cancellation,
         })
     }
 
@@ -1283,6 +1311,7 @@ pub struct RebornLoopDriverHost {
     capabilities: Arc<dyn LoopCapabilityPort>,
     transcript: Arc<dyn LoopTranscriptPort>,
     progress: Arc<dyn LoopProgressPort>,
+    cancellation: Arc<dyn LoopCancellationPort>,
 }
 
 impl fmt::Debug for RebornLoopDriverHost {
@@ -1300,6 +1329,12 @@ impl fmt::Debug for RebornLoopDriverHost {
 impl LoopRunInfoPort for RebornLoopDriverHost {
     fn run_context(&self) -> &LoopRunContext {
         &self.run_context
+    }
+}
+
+impl LoopCancellationPort for RebornLoopDriverHost {
+    fn observe_cancellation(&self) -> Option<LoopCancellationSignal> {
+        self.cancellation.observe_cancellation()
     }
 }
 
