@@ -6,7 +6,8 @@
 
 use std::sync::Arc;
 
-use crate::family::{ComponentDigest, ComponentIdentity, LoopFamilyId};
+use crate::families::DEFAULT_FAMILY_DIGEST;
+use crate::family::{ComponentIdentity, LoopFamilyId};
 use crate::planner::{AgentLoopPlanner, AgentLoopPlannerInternal};
 use crate::strategies::{
     BatchPolicyStrategy, BudgetStrategy, CapabilityStrategy, ContextStrategy,
@@ -41,7 +42,7 @@ impl DefaultPlanner {
     pub(crate) fn compose_default() -> Self {
         Self::compose(
             LoopFamilyId::DEFAULT,
-            ComponentIdentity::from_static("default", ComponentDigest([0; 32])),
+            ComponentIdentity::from_static("default", DEFAULT_FAMILY_DIGEST),
             DefaultStrategySlots::default(),
         )
     }
@@ -192,10 +193,10 @@ impl Default for DefaultStrategySlots {
     fn default() -> Self {
         Self {
             context: Arc::new(DefaultContextStrategy::default()),
-            capability: Arc::new(DefaultCapabilityStrategy::default()),
-            model: Arc::new(DefaultModelStrategy::default()),
-            batch: Arc::new(DefaultBatchPolicyStrategy::default()),
-            gate: Arc::new(DefaultGateHandlingStrategy::default()),
+            capability: Arc::new(DefaultCapabilityStrategy),
+            model: Arc::new(DefaultModelStrategy),
+            batch: Arc::new(DefaultBatchPolicyStrategy),
+            gate: Arc::new(DefaultGateHandlingStrategy),
             recovery: Arc::new(DefaultRecoveryStrategy::default()),
             stop: Arc::new(DefaultStopConditionStrategy::default()),
             drain: Arc::new(DefaultInputDrainStrategy),
@@ -209,7 +210,8 @@ mod tests {
     use async_trait::async_trait;
     use ironclaw_host_api::{TenantId, ThreadId};
     use ironclaw_turns::{
-        AgentLoopDriverDescriptor, RunProfileId, RunProfileVersion, TurnId, TurnRunId, TurnScope,
+        AgentLoopDriverDescriptor, LoopGateRef, RunProfileId, RunProfileVersion, TurnId, TurnRunId,
+        TurnScope,
         run_profile::{
             CancellationPolicy, CapabilitySurfaceProfileId, CheckpointPolicy, CheckpointSchemaId,
             ConcurrencyClass, ContextProfileId, LoopDriverId, LoopPromptBundleRequest,
@@ -219,9 +221,13 @@ mod tests {
         },
     };
 
-    use crate::family::LoopFamilyId;
+    use crate::family::{ComponentDigest, LoopFamilyId};
     use crate::state::LoopExecutionState;
-    use crate::strategies::{BatchPolicy, CapabilityFilter, ContextStrategy};
+    use crate::strategies::{
+        BatchPolicy, CapabilityFilter, ContextStrategy, GateKind, GateOutcome, GateSummary,
+        ModelErrorClass, ModelErrorSummary, RecoveryOutcome, RetryAlteration, RetryScope,
+        SanitizedStrategySummary,
+    };
 
     use super::*;
 
@@ -243,7 +249,8 @@ mod tests {
 
         assert_eq!(planner.id(), &LoopFamilyId::DEFAULT);
         assert_eq!(planner.version().id, "default");
-        assert_eq!(planner.version().digest, ComponentDigest([0; 32]));
+        assert_ne!(planner.version().digest, ComponentDigest([0; 32]));
+        assert_eq!(planner.version().digest, DEFAULT_FAMILY_DIGEST);
     }
 
     #[test]
@@ -268,7 +275,7 @@ mod tests {
             }
         }
 
-        let id = LoopFamilyId::new("custom");
+        let id = LoopFamilyId::new("custom").expect("valid custom family id");
         let version = ComponentIdentity::from_static("custom", ComponentDigest([1; 32]));
         let planner = DefaultPlanner::compose_default()
             .with_id(id.clone())
@@ -293,6 +300,51 @@ mod tests {
 
         let filter = futures::executor::block_on(planner.capability().filter(&state));
         assert_eq!(filter, CapabilityFilter::All);
+    }
+
+    #[test]
+    fn default_gate_strategy_blocks_for_every_kind() {
+        let planner = DefaultPlanner::compose_default();
+        let state = LoopExecutionState::initial_for_run(&test_run_context());
+
+        for kind in [GateKind::Approval, GateKind::Auth, GateKind::Resource] {
+            let outcome = futures::executor::block_on(planner.gate().handle(
+                &state,
+                &GateSummary {
+                    kind,
+                    gate_ref: LoopGateRef::new("gate:default-planner-test").expect("valid"),
+                },
+            ));
+            assert!(
+                matches!(outcome, GateOutcome::Block { .. }),
+                "expected {kind:?} to block, got {outcome:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_recovery_strategy_uses_real_context_overflow_policy() {
+        let planner = DefaultPlanner::compose_default();
+        let state = LoopExecutionState::initial_for_run(&test_run_context());
+        let err = ModelErrorSummary {
+            class: ModelErrorClass::ContextOverflow,
+            safe_summary: SanitizedStrategySummary::from_trusted_static("context overflow"),
+            diagnostic_ref: None,
+        };
+
+        let outcome = futures::executor::block_on(planner.recovery().on_model_error(&state, &err));
+
+        assert!(
+            matches!(
+                outcome,
+                RecoveryOutcome::Retry {
+                    scope: RetryScope::Iteration,
+                    alter: Some(RetryAlteration::ShrinkContext { drop_messages: 4 }),
+                    ..
+                }
+            ),
+            "expected context overflow shrink retry, got {outcome:?}"
+        );
     }
 
     #[allow(clippy::too_many_lines)]

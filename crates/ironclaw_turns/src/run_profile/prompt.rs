@@ -424,7 +424,9 @@ mod tests {
         let msg = &bundle.messages[0];
         assert_eq!(msg.role, "system");
         assert!(
-            msg.content_ref.as_str().starts_with("msg:identity-summary."),
+            msg.content_ref
+                .as_str()
+                .starts_with("msg:identity-summary."),
             "summary-only identity ref must use the msg:identity-summary. prefix, got: {}",
             msg.content_ref.as_str()
         );

@@ -30,9 +30,10 @@ use ironclaw_turns::{
         LoopInputCursorToken, LoopInputPort, LoopModelBudgetAccountant, LoopModelGateway,
         LoopModelGatewayError, LoopModelGatewayRequest, LoopModelMessage, LoopModelPolicyGuard,
         LoopModelPort, LoopModelRequest, LoopModelResponse, LoopProgressEvent, LoopProgressPort,
-        LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest, LoopPromptPort,
-        LoopRunContext, LoopRunInfoPort, LoopTranscriptPort, ModelCallOutcome, ParentLoopOutput,
-        PromptMode, PromptSkillContextMetadata, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        LoopPromptBundle, LoopPromptBundleAuthority, LoopPromptBundleRef, LoopPromptBundleRequest,
+        LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopTranscriptPort, ModelCallOutcome,
+        ParentLoopOutput, PromptMode, PromptSkillContextMetadata, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
     runner::{ClaimRunRequest, TurnRunTransitionPort},
 };
@@ -284,6 +285,7 @@ async fn instruction_bundle_builder_orders_sections_and_rebuilds_deterministical
             runtime: RuntimeKind::FirstParty,
             safe_name: "Echo".to_string(),
             safe_description: "Echo safe input".to_string(),
+            concurrency_hint: ConcurrencyHint::SafeForParallel,
         }],
     };
     let request = InstructionBundleRequest {
@@ -526,6 +528,7 @@ async fn instruction_bundle_builder_allows_tool_result_reference_context_message
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: Some(8),
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -629,6 +632,33 @@ async fn loop_prompt_port_builds_text_only_bundle_from_context_refs() {
 }
 
 #[tokio::test]
+async fn prompt_bundle_authority_consumes_grant_after_successful_model_authorization() {
+    let context = claimed_run_context().await;
+    let authority = LoopPromptBundleAuthority::default();
+    let messages = vec![LoopModelMessage {
+        role: "user".to_string(),
+        content_ref: LoopMessageRef::new("msg:user-message").unwrap(),
+    }];
+    let bundle = LoopPromptBundle {
+        bundle_ref: LoopPromptBundleRef::for_run(&context, "bundle-once").unwrap(),
+        messages: messages.clone(),
+        surface_version: None,
+        instruction_fingerprint: None,
+    };
+    authority.issue_bundle(&context, &bundle).unwrap();
+
+    let grant = authority
+        .authorize_latest_model_request(&context, &messages, &None)
+        .unwrap();
+    assert_eq!(grant.messages, messages);
+
+    let error = authority
+        .authorize_latest_model_request(&context, &grant.messages, &None)
+        .unwrap_err();
+    assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
+}
+
+#[tokio::test]
 async fn loop_prompt_port_uses_current_surface_version_lookup_each_build() {
     let host = Arc::new(RecordingAgentLoopHost::new(claimed_run_context().await));
     let surface_v1 = CapabilitySurfaceVersion::new("surface:v1").unwrap();
@@ -659,6 +689,7 @@ async fn loop_prompt_port_uses_current_surface_version_lookup_each_build() {
             surface_version: Some(surface_v1.clone()),
             checkpoint_state_ref: None,
             max_messages: Some(8),
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -673,6 +704,7 @@ async fn loop_prompt_port_uses_current_surface_version_lookup_each_build() {
             surface_version: Some(surface_v1),
             checkpoint_state_ref: None,
             max_messages: Some(8),
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap_err();
@@ -1076,6 +1108,7 @@ async fn loop_prompt_port_materializes_memory_surface_and_safety_as_host_owned_r
             runtime: RuntimeKind::FirstParty,
             safe_name: "Echo".to_string(),
             safe_description: "Echo safe input".to_string(),
+            concurrency_hint: ConcurrencyHint::SafeForParallel,
         }],
     };
     let port = HostManagedLoopPromptPort::new(
@@ -1099,6 +1132,7 @@ async fn loop_prompt_port_materializes_memory_surface_and_safety_as_host_owned_r
             surface_version: Some(surface.version),
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();

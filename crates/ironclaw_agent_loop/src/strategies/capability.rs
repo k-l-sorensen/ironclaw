@@ -18,6 +18,9 @@ pub(crate) trait CapabilityStrategy: Send + Sync {
     async fn filter(&self, state: &LoopExecutionState) -> CapabilityFilter;
 }
 
+#[allow(dead_code)]
+fn _assert_object_safe(_: &dyn CapabilityStrategy) {}
+
 /// Reference baseline `CapabilityStrategy`: never narrow the host surface.
 ///
 /// The host applies its own scope/grant/auth filters on top — this default

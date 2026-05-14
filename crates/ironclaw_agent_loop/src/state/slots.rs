@@ -14,26 +14,56 @@ pub struct ModelStrategyState {
 /// Semantics: the retry budget is *not* durable across resume — on rehydration
 /// from a `BeforeSideEffect` checkpoint, `attempts` resets to 0 so a fresh
 /// retry budget is granted post-resume. See master doc §10 for the
-/// retry-budget durability note. WS-2 may grow this into a
-/// `HashMap<LoopFailureKind, u32>` when `DefaultRecoveryStrategy` needs it.
+/// retry-budget durability note.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryStrategyState {
     pub attempts: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_class: Option<RecoveryAttemptClass>,
 }
 
 impl RecoveryStrategyState {
-    /// Returns a new slot value with `attempts` incremented by one
-    /// (saturating at `u32::MAX`).
+    /// Returns the attempt count for `class`, resetting unrelated class
+    /// history to zero.
+    pub fn attempts_for(&self, class: RecoveryAttemptClass) -> u32 {
+        if self.attempt_class == Some(class) {
+            self.attempts
+        } else {
+            0
+        }
+    }
+
+    /// Returns a new slot value with the attempt count for `class`
+    /// incremented by one (saturating at `u32::MAX`).
     ///
     /// Used by `DefaultRecoveryStrategy` when classifying a fresh error so
     /// the next retry/abort decision sees the updated attempt count. See
     /// `docs/reborn/agent-loop-skeleton.md` §6 ("RecoveryStrategy") and §10
     /// ("Production-safe escape" — per-error retry budget).
-    pub fn with_incremented_attempts(&self) -> Self {
+    pub fn with_incremented_attempts_for(&self, class: RecoveryAttemptClass) -> Self {
         Self {
-            attempts: self.attempts.saturating_add(1),
+            attempts: self.attempts_for(class).saturating_add(1),
+            attempt_class: Some(class),
         }
     }
+
+    /// Clears retry accounting after a terminal or non-retry decision so it
+    /// cannot poison an unrelated later retryable error.
+    pub fn cleared_attempts(&self) -> Self {
+        Self::default()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryAttemptClass {
+    CapabilityTransient,
+    CapabilityUnavailable,
+    CapabilityInternal,
+    ModelTransient,
+    ModelContextOverflow,
+    ModelUnavailable,
+    ModelInternal,
 }
 
 /// Persistent state owned by `StopConditionStrategy`. Split from a previously

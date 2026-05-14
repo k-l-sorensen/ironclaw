@@ -559,9 +559,11 @@ where
                 .model_profile_id
                 .clone()
         });
-        let prompt_grant = self
-            .prompt_authority
-            .authorize_latest_model_request(&self.run_context, &request.messages)?;
+        let prompt_grant = self.prompt_authority.authorize_latest_model_request(
+            &self.run_context,
+            &request.messages,
+            &request.surface_version,
+        )?;
         let resolved_messages = self.resolve_model_messages(prompt_grant.messages).await?;
         self.emit_model_started(requested_model_profile_id).await;
         let gateway_response = match self

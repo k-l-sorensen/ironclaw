@@ -19,6 +19,9 @@ pub(crate) trait ContextStrategy: Send + Sync {
     async fn plan_context_request(&self, state: &LoopExecutionState) -> LoopPromptBundleRequest;
 }
 
+#[allow(dead_code)]
+fn _assert_object_safe(_: &dyn ContextStrategy) {}
+
 /// Reference baseline `ContextStrategy` implementation.
 ///
 /// Requests `PromptMode::TextOnly` with at most [`Self::DEFAULT_MAX_MESSAGES`]

@@ -123,7 +123,7 @@ async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
         .build_prompt_bundle(LoopPromptBundleRequest {
             mode: PromptMode::TextOnly,
             context_cursor: None,
-            surface_version: None,
+            surface_version: Some(surface.version.clone()),
             checkpoint_state_ref: None,
             max_messages: Some(8),
             inline_messages: Vec::new(),

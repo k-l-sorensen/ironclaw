@@ -33,8 +33,9 @@ use ironclaw_turns::{
         InMemoryRunProfileResolver, LoopCapabilityPort, LoopContextBundle, LoopContextMessage,
         LoopContextPort, LoopContextRequest, LoopContextSnippet, LoopHostMilestoneKind,
         LoopInputCursor, LoopInputCursorToken, LoopModelMessage, LoopModelPort, LoopModelRequest,
-        LoopModelRouteSnapshot, LoopPromptPort, LoopRunContext, LoopTranscriptPort,
-        ParentLoopOutput, PromptSkillContextMetadata, SkillVisibility, UpdateAssistantDraft,
+        LoopModelRouteSnapshot, LoopPromptBundle, LoopPromptBundleAuthority, LoopPromptBundleRef,
+        LoopPromptPort, LoopRunContext, LoopTranscriptPort, ParentLoopOutput,
+        PromptSkillContextMetadata, SkillVisibility, UpdateAssistantDraft,
         VisibleCapabilityRequest,
     },
 };
@@ -473,6 +474,7 @@ async fn prompt_and_model_ports_resolve_instruction_memory_and_identity_refs() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -611,6 +613,7 @@ async fn prompt_port_records_multiple_active_skill_metadata_in_prompt_order() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -1210,14 +1213,12 @@ async fn model_port_resolves_thread_message_refs_and_delegates_to_gateway() {
         gateway.clone(),
         16,
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let response = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1258,12 +1259,11 @@ async fn model_port_threads_resolved_model_route_snapshot_to_gateway() {
         gateway.clone(),
         16,
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     port.stream_model(LoopModelRequest {
-        messages: vec![LoopModelMessage {
-            role: "user".to_string(),
-            content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
-        }],
+        messages,
         surface_version: None,
         model_preference: None,
     })
@@ -1301,12 +1301,11 @@ async fn model_port_resolves_explicit_refs_that_fall_outside_context_window() {
         gateway.clone(),
         1,
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     port.stream_model(LoopModelRequest {
-        messages: vec![LoopModelMessage {
-            role: "user".to_string(),
-            content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
-        }],
+        messages,
         surface_version: None,
         model_preference: None,
     })
@@ -1347,6 +1346,7 @@ async fn prompt_port_builds_bundle_with_tool_result_reference_context() {
             surface_version: None,
             checkpoint_state_ref: None,
             max_messages: None,
+            inline_messages: Vec::new(),
         })
         .await
         .unwrap();
@@ -1391,19 +1391,21 @@ async fn model_port_round_trips_tool_result_reference_context_as_system_model_in
         gateway.clone(),
         16,
     );
+    let messages = context
+        .messages
+        .into_iter()
+        .filter_map(|message| {
+            message.message_ref.map(|content_ref| LoopModelMessage {
+                role: message.role,
+                content_ref,
+            })
+        })
+        .collect::<Vec<_>>();
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     model_port
         .stream_model(LoopModelRequest {
-            messages: context
-                .messages
-                .into_iter()
-                .filter_map(|message| {
-                    message.message_ref.map(|content_ref| LoopModelMessage {
-                        role: message.role,
-                        content_ref,
-                    })
-                })
-                .collect(),
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1436,14 +1438,12 @@ async fn model_port_emits_model_milestones_without_prompt_or_output_payloads() {
         16,
         milestone_sink.clone(),
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let response = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: Some(
                 fixture
@@ -1500,14 +1500,12 @@ async fn model_port_emits_started_and_failed_milestones_when_gateway_fails() {
         16,
         milestone_sink.clone(),
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let error = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1558,14 +1556,12 @@ async fn model_port_logs_model_started_milestone_failure_without_losing_response
         16,
         milestone_sink.clone(),
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let response = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1599,14 +1595,12 @@ async fn model_port_logs_model_completed_milestone_failure_without_losing_respon
         16,
         milestone_sink.clone(),
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let response = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1635,14 +1629,15 @@ async fn model_port_rejects_message_role_that_disagrees_with_thread_record() {
         gateway.clone(),
         16,
     );
+    let messages = vec![LoopModelMessage {
+        role: "system".to_string(),
+        content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
+    }];
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let error = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "system".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1664,14 +1659,12 @@ async fn model_port_surfaces_fail_closed_gateway_policy_errors_without_raw_detai
         gateway,
         16,
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let error = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1696,14 +1689,12 @@ async fn model_port_replaces_invalid_gateway_safe_summary_with_stable_summary() 
         gateway,
         16,
     );
+    let messages = user_model_messages(&fixture);
+    issue_prompt_grant(&fixture.run_context, &messages);
 
     let error = port
         .stream_model(LoopModelRequest {
-            messages: vec![LoopModelMessage {
-                role: "user".to_string(),
-                content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id))
-                    .unwrap(),
-            }],
+            messages,
             surface_version: None,
             model_preference: None,
         })
@@ -1789,6 +1780,25 @@ fn skill_md(name: &str, description: &str, prompt: &str) -> String {
     format!(
         "---\nname: {name}\ndescription: {description}\nactivation:\n  keywords: [{name}]\n---\n\n{prompt}\n"
     )
+}
+
+fn user_model_messages(fixture: &ThreadFixture) -> Vec<LoopModelMessage> {
+    vec![LoopModelMessage {
+        role: "user".to_string(),
+        content_ref: LoopMessageRef::new(format!("msg:{}", fixture.user_message_id)).unwrap(),
+    }]
+}
+
+fn issue_prompt_grant(context: &LoopRunContext, messages: &[LoopModelMessage]) {
+    let bundle = LoopPromptBundle {
+        bundle_ref: LoopPromptBundleRef::for_run(context, "test-bundle").unwrap(),
+        messages: messages.to_vec(),
+        surface_version: None,
+        instruction_fingerprint: None,
+    };
+    LoopPromptBundleAuthority::shared()
+        .issue_bundle(context, &bundle)
+        .unwrap();
 }
 
 struct ThreadFixture {

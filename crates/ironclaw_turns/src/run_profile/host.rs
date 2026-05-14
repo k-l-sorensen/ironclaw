@@ -844,6 +844,7 @@ pub struct LoopPromptBundle {
 pub struct LoopPromptBundleGrant {
     pub bundle_ref: LoopPromptBundleRef,
     pub messages: Vec<LoopModelMessage>,
+    pub surface_version: Option<CapabilitySurfaceVersion>,
     pub instruction_fingerprint: Option<InstructionBundleFingerprint>,
 }
 
@@ -880,6 +881,7 @@ impl LoopPromptBundleAuthority {
             LoopPromptBundleGrant {
                 bundle_ref: bundle.bundle_ref.clone(),
                 messages: bundle.messages.clone(),
+                surface_version: bundle.surface_version.clone(),
                 instruction_fingerprint: bundle.instruction_fingerprint.clone(),
             },
         );
@@ -890,12 +892,12 @@ impl LoopPromptBundleAuthority {
         &self,
         context: &LoopRunContext,
         messages: &[LoopModelMessage],
+        surface_version: &Option<CapabilitySurfaceVersion>,
     ) -> Result<LoopPromptBundleGrant, AgentLoopHostError> {
         let grant = self
             .lock_state()?
             .latest_by_run
-            .get(&context.run_id.to_string())
-            .cloned()
+            .remove(&context.run_id.to_string())
             .ok_or_else(|| {
                 AgentLoopHostError::new(
                     AgentLoopHostErrorKind::InvalidInvocation,
@@ -913,6 +915,12 @@ impl LoopPromptBundleAuthority {
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::InvalidInvocation,
                 "model request messages do not match the host-built prompt bundle",
+            ));
+        }
+        if &grant.surface_version != surface_version {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::StaleSurface,
+                "model request surface version does not match the host-built prompt bundle",
             ));
         }
 
@@ -962,28 +970,78 @@ pub fn sanitize_model_visible_text(value: impl Into<String>) -> String {
     let value = value.into();
     let mut sanitized = String::with_capacity(value.len());
     let mut token = String::new();
+    let mut credential_assignment = CredentialAssignmentState::None;
 
     for character in value.chars() {
         if character.is_whitespace() {
-            flush_sanitized_model_token(&mut sanitized, &mut token);
+            flush_sanitized_model_token(&mut sanitized, &mut token, &mut credential_assignment);
             sanitized.push(character);
         } else {
             token.push(character);
         }
     }
-    flush_sanitized_model_token(&mut sanitized, &mut token);
+    flush_sanitized_model_token(&mut sanitized, &mut token, &mut credential_assignment);
 
     sanitized
 }
 
-fn flush_sanitized_model_token(sanitized: &mut String, token: &mut String) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialAssignmentState {
+    None,
+    AwaitSeparator,
+    AwaitValue,
+}
+
+fn flush_sanitized_model_token(
+    sanitized: &mut String,
+    token: &mut String,
+    credential_assignment: &mut CredentialAssignmentState,
+) {
     if token.is_empty() {
         return;
     }
-    if model_token_needs_redaction(token) {
-        sanitized.push_str("[redacted]");
-    } else {
-        sanitized.push_str(token);
+
+    match model_token_assignment(token) {
+        ModelTokenAssignment::InlineCredentialValue => {
+            sanitized.push_str("[redacted]");
+            *credential_assignment = CredentialAssignmentState::None;
+        }
+        ModelTokenAssignment::CredentialKeyWithSeparator => {
+            sanitized.push_str(token);
+            *credential_assignment = CredentialAssignmentState::AwaitValue;
+        }
+        ModelTokenAssignment::CredentialKey => match *credential_assignment {
+            CredentialAssignmentState::AwaitValue => {
+                sanitized.push_str("[redacted]");
+                *credential_assignment = CredentialAssignmentState::None;
+            }
+            _ => {
+                sanitized.push_str(token);
+                *credential_assignment = CredentialAssignmentState::AwaitSeparator;
+            }
+        },
+        ModelTokenAssignment::Separator => match *credential_assignment {
+            CredentialAssignmentState::AwaitSeparator | CredentialAssignmentState::AwaitValue => {
+                sanitized.push_str(token);
+                *credential_assignment = CredentialAssignmentState::AwaitValue;
+            }
+            CredentialAssignmentState::None => sanitized.push_str(token),
+        },
+        ModelTokenAssignment::Other if model_token_needs_redaction(token) => {
+            sanitized.push_str("[redacted]");
+            *credential_assignment = CredentialAssignmentState::None;
+        }
+        ModelTokenAssignment::Other => match *credential_assignment {
+            CredentialAssignmentState::AwaitValue => {
+                sanitized.push_str("[redacted]");
+                *credential_assignment = CredentialAssignmentState::None;
+            }
+            CredentialAssignmentState::AwaitSeparator => {
+                sanitized.push_str(token);
+                *credential_assignment = CredentialAssignmentState::None;
+            }
+            CredentialAssignmentState::None => sanitized.push_str(token),
+        },
     }
     token.clear();
 }
@@ -993,10 +1051,102 @@ fn model_token_needs_redaction(token: &str) -> bool {
         .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_')
         .to_ascii_lowercase();
     normalized.starts_with("sk-")
-        || normalized.contains("api_key")
-        || normalized.contains("access_token")
+        || normalized.contains("sk-")
         || normalized.contains("raw_credential_sentinel")
         || normalized.contains("raw_provider_secret")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelTokenAssignment {
+    CredentialKey,
+    CredentialKeyWithSeparator,
+    InlineCredentialValue,
+    Separator,
+    Other,
+}
+
+fn model_token_assignment(token: &str) -> ModelTokenAssignment {
+    let trimmed = token.trim_matches(credential_assignment_wrapper);
+    if matches!(trimmed, "=" | ":") {
+        return ModelTokenAssignment::Separator;
+    }
+
+    if let Some(separator_index) = trimmed.find(['=', ':']) {
+        let key = trimmed[..separator_index].trim_matches(model_token_boundary);
+        let value = trimmed[separator_index + 1..].trim_matches(model_token_boundary);
+        if model_token_is_credential_key_name(key) {
+            if value.is_empty() {
+                return ModelTokenAssignment::CredentialKeyWithSeparator;
+            }
+            return ModelTokenAssignment::InlineCredentialValue;
+        }
+    }
+
+    if model_token_is_credential_key_name(trimmed.trim_matches(model_token_boundary)) {
+        ModelTokenAssignment::CredentialKey
+    } else {
+        ModelTokenAssignment::Other
+    }
+}
+
+fn model_token_is_credential_key_name(value: &str) -> bool {
+    let normalized = value.to_ascii_lowercase();
+    normalized == "api_key"
+        || normalized.ends_with("_api_key")
+        || normalized == "access_token"
+        || normalized.ends_with("_access_token")
+}
+
+fn credential_assignment_wrapper(character: char) -> bool {
+    matches!(
+        character,
+        '"' | '\'' | '`' | '{' | '}' | '[' | ']' | '(' | ')' | ','
+    )
+}
+
+fn model_token_boundary(character: char) -> bool {
+    !character.is_ascii_alphanumeric() && character != '_'
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_model_visible_text;
+
+    #[test]
+    fn model_visible_sanitizer_preserves_bare_env_var_names() {
+        assert_eq!(
+            sanitize_model_visible_text("Use OPENAI_API_KEY in the environment"),
+            "Use OPENAI_API_KEY in the environment"
+        );
+    }
+
+    #[test]
+    fn model_visible_sanitizer_redacts_credential_values() {
+        assert_eq!(
+            sanitize_model_visible_text("OPENAI_API_KEY=sk-production-secret"),
+            "[redacted]"
+        );
+        assert_eq!(
+            sanitize_model_visible_text("OPENAI_API_KEY: production-secret"),
+            "OPENAI_API_KEY: [redacted]"
+        );
+        assert_eq!(
+            sanitize_model_visible_text("api_key = production-secret"),
+            "api_key = [redacted]"
+        );
+        assert_eq!(
+            sanitize_model_visible_text(r#""api_key": "production-secret""#),
+            r#""api_key": [redacted]"#
+        );
+        assert_eq!(
+            sanitize_model_visible_text("token sk-production-secret"),
+            "token [redacted]"
+        );
+        assert_eq!(
+            sanitize_model_visible_text("RAW_CREDENTIAL_SENTINEL"),
+            "[redacted]"
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

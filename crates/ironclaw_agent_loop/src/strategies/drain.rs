@@ -17,6 +17,9 @@ pub(crate) trait InputDrainStrategy: Send + Sync {
     async fn drain_followup(&self, state: &LoopExecutionState) -> bool;
 }
 
+#[allow(dead_code)]
+fn assert_input_drain_strategy_object_safe(_: &dyn InputDrainStrategy) {}
+
 /// Reference baseline `InputDrainStrategy`: drain both queues every time the
 /// executor asks.
 ///
@@ -43,16 +46,13 @@ impl InputDrainStrategy for DefaultInputDrainStrategy {
 #[cfg(test)]
 mod tests {
     use async_trait::async_trait;
-
-    use crate::strategies::{TurnEndKind, TurnSummary};
     use ironclaw_turns::{LoopMessageRef, LoopResultRef};
 
     use super::*;
+    use crate::strategies::{TurnEndKind, TurnSummary};
 
     #[test]
     fn drain_strategy_is_object_safe() {
-        fn _check(_: &dyn InputDrainStrategy) {}
-
         struct NeverDrain;
 
         #[async_trait]
@@ -66,7 +66,7 @@ mod tests {
             }
         }
 
-        _check(&NeverDrain);
+        assert_input_drain_strategy_object_safe(&NeverDrain);
     }
 
     #[tokio::test]

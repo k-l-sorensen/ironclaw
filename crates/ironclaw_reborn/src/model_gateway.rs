@@ -153,7 +153,7 @@ where
             .build_prompt_bundle(LoopPromptBundleRequest {
                 mode: PromptMode::TextOnly,
                 context_cursor: None,
-                surface_version: None,
+                surface_version: request.surface_version.clone(),
                 checkpoint_state_ref: None,
                 max_messages: Some(self.max_messages.min(u32::MAX as usize) as u32),
                 inline_messages: Vec::new(),
@@ -165,6 +165,12 @@ where
             return Err(host_error_to_model_gateway_error(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::InvalidInvocation,
                 "model request does not match the host-built prompt bundle",
+            )));
+        }
+        if prompt_bundle.surface_version != request.surface_version {
+            return Err(host_error_to_model_gateway_error(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "model request surface version does not match the host-built prompt bundle",
             )));
         }
 
