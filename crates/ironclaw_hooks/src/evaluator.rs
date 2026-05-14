@@ -56,11 +56,20 @@ use crate::predicate::{
 pub enum EvaluatorDecision {
     /// Predicate did not fire; capability invocation proceeds.
     Allow,
-    /// Predicate fired and requested a deny. Carries the reason string to
-    /// propagate to the sink.
-    Deny { reason: String },
-    /// Predicate fired and requested an approval pause.
-    PauseApproval { reason: String },
+    /// Predicate fired and requested a deny. `code` selects the model-
+    /// visible closed-vocabulary label; `reason` is the free-form
+    /// audit-only payload.
+    Deny {
+        code: crate::predicate::DenyReasonCode,
+        reason: String,
+    },
+    /// Predicate fired and requested an approval pause. `code` selects
+    /// the model-visible closed-vocabulary label; `reason` is the
+    /// free-form audit-only payload.
+    PauseApproval {
+        code: crate::predicate::PauseReasonCode,
+        reason: String,
+    },
 }
 
 /// In-process evaluator. One evaluator per dispatcher / run; sliding-window
@@ -120,6 +129,7 @@ impl PredicateEvaluator {
             HookPredicateSpec::DenyCapability { when, reason } => {
                 if predicate_matches(when, ctx) {
                     EvaluatorDecision::Deny {
+                        code: crate::predicate::DenyReasonCode::Generic,
                         reason: reason.clone(),
                     }
                 } else {
@@ -129,6 +139,7 @@ impl PredicateEvaluator {
             HookPredicateSpec::PauseApproval { when, reason } => {
                 if predicate_matches(when, ctx) {
                     EvaluatorDecision::PauseApproval {
+                        code: crate::predicate::PauseReasonCode::Generic,
                         reason: reason.clone(),
                     }
                 } else {
@@ -329,11 +340,23 @@ fn evict_lru_value(
 fn restrictive_action(action: &OnExceededAction) -> EvaluatorDecision {
     match action {
         OnExceededAction::Deny { reason } => EvaluatorDecision::Deny {
+            code: crate::predicate::DenyReasonCode::Generic,
+            reason: reason.clone(),
+        },
+        OnExceededAction::DenyWithCode { code, reason } => EvaluatorDecision::Deny {
+            code: *code,
             reason: reason.clone(),
         },
         OnExceededAction::PauseApproval { reason } => EvaluatorDecision::PauseApproval {
+            code: crate::predicate::PauseReasonCode::Generic,
             reason: reason.clone(),
         },
+        OnExceededAction::PauseApprovalWithCode { code, reason } => {
+            EvaluatorDecision::PauseApproval {
+                code: *code,
+                reason: reason.clone(),
+            }
+        }
     }
 }
 
@@ -445,6 +468,7 @@ mod tests {
         assert_eq!(
             denied,
             EvaluatorDecision::Deny {
+                code: crate::predicate::DenyReasonCode::Generic,
                 reason: "shell disabled".to_string()
             }
         );
@@ -514,6 +538,7 @@ mod tests {
         assert_eq!(
             blocked,
             EvaluatorDecision::Deny {
+                code: crate::predicate::DenyReasonCode::Generic,
                 reason: "rate cap".to_string()
             }
         );
