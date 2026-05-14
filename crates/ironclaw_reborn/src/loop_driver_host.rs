@@ -8,8 +8,10 @@ use std::{
 use async_trait::async_trait;
 use ironclaw_hooks::dispatch::{HookDispatcher, HookDispatcherBuilder};
 use ironclaw_hooks::middleware::{
-    CapabilityInputResolver as HookCapabilityInputResolver, HookedLoopCapabilityPort,
-    HookedLoopCheckpointPort, HookedLoopModelPort, HookedLoopPromptPort, HookedLoopTranscriptPort,
+    CapabilityInputResolver as HookCapabilityInputResolver,
+    CapabilityProviderResolver as HookCapabilityProviderResolver, HookPromptMaterializationSink,
+    HookedLoopCapabilityPort, HookedLoopCheckpointPort, HookedLoopModelPort, HookedLoopPromptPort,
+    HookedLoopTranscriptPort,
 };
 use ironclaw_host_api::{
     CapabilityId, CorrelationId, ExecutionContext, ExtensionId, InvocationId, ResourceEstimate,
@@ -36,16 +38,17 @@ use ironclaw_turns::{
         CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityFailure,
         CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, FinalizeAssistantMessage,
         HostManagedLoopModelPort, HostManagedLoopPromptPort,
-        InMemoryInstructionMaterializationStore, InstructionMaterializationStore,
-        InstructionSafetyContext, LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest,
-        LoopContextBundle, LoopContextPort, LoopContextRequest, LoopHostMilestoneEmitter,
-        LoopHostMilestoneSink, LoopInputBatch, LoopInputCursor, LoopInputPort,
-        LoopModelBudgetAccountant, LoopModelGateway, LoopModelGatewayError,
-        LoopModelGatewayRequest, LoopModelPolicyGuard, LoopModelPort, LoopModelRequest,
-        LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort, LoopPromptBundle,
-        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort, LoopSafeSummary,
-        LoopTranscriptPort, NoOpBudgetAccountant, NoOpPolicyGuard, ProcessHandleSummary,
-        UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        InMemoryInstructionMaterializationStore, InstructionBundleMaterializedMessage,
+        InstructionMaterializationStore, InstructionSafetyContext, LoopCapabilityPort,
+        LoopCheckpointPort, LoopCheckpointRequest, LoopContextBundle, LoopContextPort,
+        LoopContextRequest, LoopHostMilestoneEmitter, LoopHostMilestoneSink, LoopInputBatch,
+        LoopInputCursor, LoopInputPort, LoopModelBudgetAccountant, LoopModelGateway,
+        LoopModelGatewayError, LoopModelGatewayRequest, LoopModelPolicyGuard, LoopModelPort,
+        LoopModelRequest, LoopModelResponse, LoopProcessRef, LoopProgressEvent, LoopProgressPort,
+        LoopPromptBundle, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopRunInfoPort,
+        LoopSafeSummary, LoopTranscriptPort, NoOpBudgetAccountant, NoOpPolicyGuard,
+        ProcessHandleSummary, UpdateAssistantDraft, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -91,6 +94,60 @@ impl Error for RebornLoopDriverHostError {}
 pub struct RebornLoopDriverHostRequest {
     pub claimed_run: ClaimedTurnRun,
     pub loop_run_context: LoopRunContext,
+}
+
+/// Provider resolver that consults the current visible-capability surface
+/// to map `capability_id` → `provider: ExtensionId`. Wires the hook
+/// middleware to the same surface the inner port already tracks via
+/// `SurfaceTrackingLoopCapabilityPort`. Without this, `OwnCapabilities`-
+/// scoped hooks never fire because `ctx.provider` stays `None`
+/// (henrypark133 Critical #2).
+struct SurfaceBackedProviderResolver {
+    surface_state: Arc<CapabilitySurfaceState>,
+}
+
+#[async_trait]
+impl HookCapabilityProviderResolver for SurfaceBackedProviderResolver {
+    async fn provider_for(&self, capability_id: &str) -> Option<ExtensionId> {
+        let surface = self.surface_state.current().ok().flatten()?;
+        surface
+            .descriptors
+            .iter()
+            .find(|d| d.capability_id.as_str() == capability_id)
+            .and_then(|d| d.provider.clone())
+    }
+}
+
+/// Adapter that lets `HookedLoopPromptPort` write hook-emitted
+/// `msg:hook.*` content into the host's `InstructionMaterializationStore`
+/// so the downstream model resolver can resolve those refs. Captures the
+/// `LoopRunContext` at construction time so the hook prompt port doesn't
+/// need to know about run-profile types.
+///
+/// Threat-model + henrypark133 Critical #1: without this adapter wired
+/// through the factory, hook prompt patches produce unresolvable refs and
+/// the request fails with `model message reference is unavailable`.
+struct InstructionStoreBackedHookSink {
+    store: Arc<dyn InstructionMaterializationStore>,
+    run_context: LoopRunContext,
+}
+
+impl HookPromptMaterializationSink for InstructionStoreBackedHookSink {
+    fn put(
+        &self,
+        role: &str,
+        content_ref: &ironclaw_turns::LoopMessageRef,
+        safe_content: String,
+    ) -> Result<(), AgentLoopHostError> {
+        self.store.put_materialized_messages(
+            &self.run_context,
+            vec![InstructionBundleMaterializedMessage {
+                role: role.to_string(),
+                content_ref: content_ref.clone(),
+                safe_content,
+            }],
+        )
+    }
 }
 
 #[derive(Default)]
@@ -1077,6 +1134,13 @@ where
     /// argument-dependent predicates (e.g., `NumericSum`) evaluate against
     /// real capability arguments instead of failing closed.
     capability_input_resolver: Option<Arc<dyn LoopCapabilityInputResolver>>,
+    /// Optional gate-ref factory for hook `PauseApproval` / `PauseAuth`
+    /// decisions. Default behavior (no factory) is fail-closed — the hook
+    /// suspension surfaces as `Denied`. Production deployments must install
+    /// a factory that talks to the host's approval/auth router; tests can
+    /// install `UuidHookGateRefFactory` to exercise the affirmative path.
+    /// See [`Self::with_hook_gate_ref_factory`].
+    hook_gate_ref_factory: Option<Arc<dyn ironclaw_hooks::middleware::HookGateRefFactory>>,
     safety_context: Option<InstructionSafetyContext>,
 }
 
@@ -1108,6 +1172,7 @@ where
             skill_context_source: None,
             hook_dispatcher_factory: None,
             capability_input_resolver: None,
+            hook_gate_ref_factory: None,
             safety_context: None,
         }
     }
@@ -1158,6 +1223,25 @@ where
         resolver: Arc<dyn LoopCapabilityInputResolver>,
     ) -> Self {
         self.capability_input_resolver = Some(resolver);
+        self
+    }
+
+    /// Install a `HookGateRefFactory` for hook-emitted `PauseApproval` /
+    /// `PauseAuth` decisions. The default (no factory) is fail-closed: the
+    /// suspension surfaces as `Denied` so the loop doesn't park on an
+    /// unresolvable ref.
+    ///
+    /// Production: install a factory that reserves a gate through the
+    /// host's real approval/auth router so the ref carries lease + one-shot
+    /// semantics. Tests/dev: install `UuidHookGateRefFactory` to exercise
+    /// the affirmative `ApprovalRequired { gate_ref }` shape (the refs are
+    /// locally unique but not router-registered — production must not use
+    /// this).
+    pub fn with_hook_gate_ref_factory(
+        mut self,
+        factory: Arc<dyn ironclaw_hooks::middleware::HookGateRefFactory>,
+    ) -> Self {
+        self.hook_gate_ref_factory = Some(factory);
         self
     }
 
@@ -1262,11 +1346,24 @@ where
             SurfaceTrackingLoopCapabilityPort::new(capabilities, Arc::clone(&surface_state)),
         );
         if let Some(dispatcher) = per_build_dispatcher.as_ref() {
+            // Wire a surface-backed provider resolver so OwnCapabilities-
+            // scoped hooks can see `ctx.provider` (henrypark133 Critical #2).
+            // Without this, the middleware keeps NullCapabilityProviderResolver
+            // and every OwnCapabilities hook is inert because provider stays
+            // None.
+            let provider_resolver: Arc<dyn HookCapabilityProviderResolver> =
+                Arc::new(SurfaceBackedProviderResolver {
+                    surface_state: Arc::clone(&surface_state),
+                });
             let mut hooked = HookedLoopCapabilityPort::new(
                 Arc::clone(&capabilities),
                 Arc::clone(dispatcher),
                 run_context.scope.tenant_id.clone(),
-            );
+            )
+            .with_provider_resolver(provider_resolver);
+            if let Some(factory) = self.hook_gate_ref_factory.as_ref() {
+                hooked = hooked.with_gate_ref_factory(Arc::clone(factory));
+            }
             if let Some(input_resolver) = self.capability_input_resolver.as_ref() {
                 let adapter: Arc<dyn HookCapabilityInputResolver> =
                     Arc::new(HookCapabilityInputResolverAdapter::new(
@@ -1297,11 +1394,24 @@ where
         }
         let mut prompt: Arc<dyn LoopPromptPort> = Arc::new(prompt_port);
         if let Some(dispatcher) = per_build_dispatcher.as_ref() {
-            prompt = Arc::new(HookedLoopPromptPort::new(
-                Arc::clone(&prompt),
-                Arc::clone(dispatcher),
-                run_context.scope.tenant_id.clone(),
-            ));
+            // Pass a sink backed by the host's instruction materialization
+            // store so hook-emitted `msg:hook.*` refs are resolvable by the
+            // downstream model resolver. Without this the resolver fails
+            // the request with `model message reference is unavailable`
+            // (henrypark133 review Critical #1).
+            let sink: Arc<dyn HookPromptMaterializationSink> =
+                Arc::new(InstructionStoreBackedHookSink {
+                    store: Arc::clone(&instruction_materialization_store),
+                    run_context: run_context.clone(),
+                });
+            prompt = Arc::new(
+                HookedLoopPromptPort::new(
+                    Arc::clone(&prompt),
+                    Arc::clone(dispatcher),
+                    run_context.scope.tenant_id.clone(),
+                )
+                .with_materialization_sink(sink),
+            );
         }
         let input: Arc<dyn LoopInputPort> =
             Arc::new(NoExtraLoopInputPort::new(run_context.clone()));

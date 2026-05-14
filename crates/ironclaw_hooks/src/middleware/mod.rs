@@ -19,9 +19,9 @@ pub mod transcript_port;
 
 pub use capability_port::HookedLoopCapabilityPort;
 pub use checkpoint_port::HookedLoopCheckpointPort;
-pub use gate_ref::{HookGateRefFactory, UuidHookGateRefFactory};
+pub use gate_ref::{FailClosedHookGateRefFactory, HookGateRefFactory, UuidHookGateRefFactory};
 pub use model_port::HookedLoopModelPort;
-pub use prompt_port::HookedLoopPromptPort;
+pub use prompt_port::{HookPromptMaterializationSink, HookedLoopPromptPort};
 pub use resolver::{
     CapabilityInputResolver, CapabilityProviderResolver, NullCapabilityInputResolver,
     NullCapabilityProviderResolver,

@@ -71,8 +71,8 @@ use ironclaw_turns::{
         CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceVersion,
         InMemoryLoopHostMilestoneSink, LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort,
         LoopCheckpointRequest, LoopHostMilestoneKind, LoopModelPort, LoopModelRequest,
-        LoopRunContext, RunScopedHookMilestoneSink, VisibleCapabilityRequest,
-        VisibleCapabilitySurface,
+        LoopPromptPort, LoopRunContext, LoopTranscriptPort, RunScopedHookMilestoneSink,
+        VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -150,10 +150,86 @@ impl LoopCapabilityPort for RecordingCapabilityPort {
     }
 }
 
+/// Capability port whose surface includes per-capability provider info.
+/// Used by the OwnCapabilities-scope tests to drive the provider-resolver
+/// path (henrypark133 Critical #2).
+struct ProviderAwareCapabilityPort {
+    invocations: Mutex<Vec<CapabilityId>>,
+    surface_version: CapabilitySurfaceVersion,
+    descriptors: Vec<CapabilityDescriptorView>,
+}
+
+impl ProviderAwareCapabilityPort {
+    fn new(descriptors: Vec<CapabilityDescriptorView>) -> Self {
+        Self {
+            invocations: Mutex::new(Vec::new()),
+            surface_version: CapabilitySurfaceVersion::new("hooks-integration:v1")
+                .expect("surface version literal is valid"),
+            descriptors,
+        }
+    }
+
+    fn invocations(&self) -> Vec<CapabilityId> {
+        self.invocations
+            .lock()
+            .expect("invocations mutex not poisoned")
+            .clone()
+    }
+}
+
+#[async_trait]
+impl LoopCapabilityPort for ProviderAwareCapabilityPort {
+    async fn visible_capabilities(
+        &self,
+        _request: VisibleCapabilityRequest,
+    ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+        Ok(VisibleCapabilitySurface {
+            version: self.surface_version.clone(),
+            descriptors: self.descriptors.clone(),
+        })
+    }
+
+    async fn invoke_capability(
+        &self,
+        request: CapabilityInvocation,
+    ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+        self.invocations
+            .lock()
+            .expect("invocations mutex not poisoned")
+            .push(request.capability_id.clone());
+        Ok(CapabilityOutcome::Completed(CapabilityResultMessage {
+            result_ref: LoopResultRef::new(format!("result:{}", request.capability_id))
+                .expect("result ref literal is valid"),
+            safe_summary: "stub capability completed".to_string(),
+        }))
+    }
+
+    async fn invoke_capability_batch(
+        &self,
+        request: CapabilityBatchInvocation,
+    ) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
+        let mut outcomes = Vec::with_capacity(request.invocations.len());
+        for invocation in request.invocations {
+            outcomes.push(self.invoke_capability(invocation).await?);
+        }
+        Ok(CapabilityBatchOutcome {
+            outcomes,
+            stopped_on_suspension: false,
+        })
+    }
+}
+
 fn descriptor(capability_id: &str) -> CapabilityDescriptorView {
+    descriptor_with_provider(capability_id, None)
+}
+
+fn descriptor_with_provider(
+    capability_id: &str,
+    provider: Option<ironclaw_host_api::ExtensionId>,
+) -> CapabilityDescriptorView {
     CapabilityDescriptorView {
         capability_id: CapabilityId::new(capability_id).expect("capability id literal is valid"),
-        provider: None,
+        provider,
         runtime: ironclaw_host_api::RuntimeKind::Wasm,
         safe_name: capability_id.to_string(),
         safe_description: format!("test capability {capability_id}"),
@@ -808,10 +884,11 @@ async fn legacy_with_hook_dispatcher_shares_state_across_builds() {
 
 #[tokio::test]
 async fn pause_approval_hook_surfaces_as_approval_required_with_real_gate_ref() {
-    // Proves that PauseApproval decisions no longer fall through to the
-    // degraded `Denied` mapping. The middleware uses the default
-    // `UuidHookGateRefFactory` to mint a real, validated `LoopGateRef` and
-    // surfaces the hook intent as `CapabilityOutcome::ApprovalRequired`.
+    // Proves that PauseApproval decisions can surface as `ApprovalRequired`
+    // when a gate-ref factory is wired. The factory's default is fail-
+    // closed (henrypark133 Critical #3 — refuse to mint a syntactically-
+    // valid but router-unregistered ref); tests must opt into the dev-only
+    // `UuidHookGateRefFactory` to exercise the affirmative path.
     let fixture = Fixture::new().await;
     let inner = Arc::new(RecordingCapabilityPort::new());
     let surface_version = fixture.surface_version.clone();
@@ -819,6 +896,7 @@ async fn pause_approval_hook_surfaces_as_approval_required_with_real_gate_ref() 
     let host = fixture
         .factory()
         .with_hook_dispatcher(pause_approval_dispatcher())
+        .with_hook_gate_ref_factory(Arc::new(ironclaw_hooks::middleware::UuidHookGateRefFactory))
         .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
         .await
         .expect("host builds with hook dispatcher installed");
@@ -841,6 +919,44 @@ async fn pause_approval_hook_surfaces_as_approval_required_with_real_gate_ref() 
             assert_eq!(safe_summary, "integration-test pause approval");
         }
         other => panic!("expected ApprovalRequired, got {other:?}"),
+    }
+    assert!(
+        inner.invocations().is_empty(),
+        "inner port must NOT be invoked when a hook pauses; got {:?}",
+        inner.invocations()
+    );
+}
+
+/// henrypark133 Critical #3 regression: with no gate-ref factory wired,
+/// a `PauseApproval` hook surfaces as `Denied`, not as `ApprovalRequired`
+/// with an unresolvable ref. The default middleware factory is fail-closed
+/// (`FailClosedHookGateRefFactory`) precisely so a hook can't park the
+/// loop on a ref the host's approval gateway has never heard of.
+#[tokio::test]
+async fn pause_approval_with_default_factory_fails_closed_as_denied() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(pause_approval_dispatcher())
+        // Deliberately NOT calling `with_hook_gate_ref_factory(...)` — the
+        // default behavior must fail-closed.
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with hook dispatcher installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke_capability returns a (denied) outcome, not an error");
+
+    match outcome {
+        CapabilityOutcome::Denied(_) => {} // expected
+        other => {
+            panic!("expected Denied (fail-closed) without a gate-ref factory wired; got {other:?}")
+        }
     }
     assert!(
         inner.invocations().is_empty(),
@@ -913,7 +1029,15 @@ fn model_request() -> LoopModelRequest {
 }
 
 #[tokio::test]
-async fn observer_hook_fires_after_model_through_factory() {
+async fn after_model_fires_exactly_once_at_durable_boundary() {
+    // henrypark133 Concerning #5 regression: previously, both the model
+    // port and the transcript port dispatched `AfterModel`, so one
+    // model exchange yielded two observer events — and the model-port
+    // event fired *before* the assistant reply was durable. Now AfterModel
+    // fires only from the transcript port's `finalize_assistant_message`,
+    // i.e. the post-durable boundary. Drive `stream_model` (should NOT
+    // fire) followed by `finalize_assistant_message` (SHOULD), and
+    // assert the counter advances by exactly one.
     let fixture = Fixture::new().await;
     let inner = Arc::new(RecordingCapabilityPort::new());
     let seen = Arc::new(Mutex::new(0u32));
@@ -931,12 +1055,27 @@ async fn observer_hook_fires_after_model_through_factory() {
     host.stream_model(model_request())
         .await
         .expect("stream_model returns Ok via the wrapped model port");
+    assert_eq!(
+        *seen.lock().expect("observer counter not poisoned"),
+        0,
+        "AfterModel must NOT fire from stream_model — the model port \
+         wrapper is a no-op for observers (the assistant reply is not \
+         yet durable at that boundary)"
+    );
+
+    host.finalize_assistant_message(ironclaw_turns::run_profile::FinalizeAssistantMessage {
+        reply: ironclaw_turns::run_profile::AssistantReply {
+            content: "exactly-once test reply".to_string(),
+        },
+    })
+    .await
+    .expect("finalize_assistant_message returns Ok via the wrapped transcript port");
 
     assert_eq!(
         *seen.lock().expect("observer counter not poisoned"),
         1,
-        "AfterModel observer must fire exactly once after a successful \
-         model stream — proves the factory wraps the model port"
+        "AfterModel must fire exactly once after finalize_assistant_message — \
+         the transcript port owns the durable boundary"
     );
 }
 
@@ -1060,10 +1199,20 @@ async fn observer_panic_does_not_fail_model_call() {
         .await
         .expect("host builds with panicking observer installed");
 
-    let response = host.stream_model(model_request()).await;
+    // Drive the post-durable boundary (finalize_assistant_message) since
+    // AfterModel now fires from the transcript port. The panic happens
+    // inside the observer dispatch — must NOT propagate into the outer
+    // finalize call (henrypark133 Concerning #5 + observer-fail-isolated).
+    let response = host
+        .finalize_assistant_message(ironclaw_turns::run_profile::FinalizeAssistantMessage {
+            reply: ironclaw_turns::run_profile::AssistantReply {
+                content: "panicking observer test reply".to_string(),
+            },
+        })
+        .await;
     assert!(
         response.is_ok(),
-        "observer panic must NOT propagate into the outer model call; got {response:?}"
+        "observer panic must NOT propagate into the outer finalize call; got {response:?}"
     );
 
     // The dispatcher emits a HookFailed milestone for the panicking observer;
@@ -1263,4 +1412,226 @@ async fn installed_hook_with_own_scope_does_not_fire_on_other_provider_capabilit
         "inner port should have been invoked exactly once; got {invocations:?}"
     );
     assert_eq!(invocations[0].as_str(), "cap.blocked");
+}
+
+// ─── henrypark133 Critical #2: OwnCapabilities provider resolver ──────────
+
+/// Build a dispatcher with an Installed-tier always-deny hook authored by
+/// `owning_ext`, scoped to `OwnCapabilities`.
+fn own_capabilities_dispatcher(owning_ext: &str, local_id: &str) -> Arc<HookDispatcher> {
+    let hook_id = HookId::derive(
+        &ExtensionId(owning_ext.to_string()),
+        "0.0.1",
+        &HookLocalId(local_id.to_string()),
+        HookVersion::ONE,
+    );
+    struct AlwaysDeny;
+    #[async_trait]
+    impl RestrictedBeforeCapabilityHook for AlwaysDeny {
+        async fn evaluate(
+            &self,
+            _ctx: &BeforeCapabilityHookContext,
+            sink: &mut dyn RestrictedGateSink,
+        ) {
+            sink.deny("own-scope-deny-fired");
+        }
+    }
+    HookDispatcherBuilder::new(HookRegistry::new())
+        .install_installed_before_capability(
+            hook_id,
+            HookPhase::Policy,
+            ironclaw_host_api::ExtensionId::new(owning_ext).expect("valid ext id"),
+            HookBindingScope::OwnCapabilities,
+            Box::new(AlwaysDeny),
+        )
+        .expect("install installed hook with own-scope")
+        .build_arc()
+}
+
+/// Positive case: hook owned by ext-a, capability has provider=ext-a.
+/// With the new surface-backed provider resolver wired by the factory,
+/// `ctx.provider == Some(ext-a)` matches the binding's `owning_extension`,
+/// so the OwnCapabilities filter permits the hook and the deny fires.
+#[tokio::test]
+async fn own_capabilities_hook_fires_when_provider_matches() {
+    let fixture = Fixture::new().await;
+    let ext_a = ironclaw_host_api::ExtensionId::new("ext-a").expect("valid ext id");
+    let inner = Arc::new(ProviderAwareCapabilityPort::new(vec![
+        descriptor_with_provider("cap.alpha", Some(ext_a.clone())),
+    ]));
+    let surface_version = CapabilitySurfaceVersion::new("hooks-integration:v1").expect("ok");
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(own_capabilities_dispatcher("ext-a", "cap-a-own-deny"))
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.alpha"))
+        .await
+        .expect("invoke returns an outcome");
+
+    match outcome {
+        CapabilityOutcome::Denied(_) => {} // expected: hook fired
+        other => panic!(
+            "OwnCapabilities hook must fire when provider matches the binding's owning_extension; got {other:?}"
+        ),
+    }
+    assert!(
+        inner.invocations().is_empty(),
+        "inner port must NOT be invoked when the hook denies; got {:?}",
+        inner.invocations()
+    );
+}
+
+/// Negative case: hook owned by ext-a, capability has provider=ext-b.
+/// The OwnCapabilities filter rejects this combination; the inner port
+/// completes the call normally.
+#[tokio::test]
+async fn own_capabilities_hook_does_not_fire_when_provider_differs() {
+    let fixture = Fixture::new().await;
+    let ext_b = ironclaw_host_api::ExtensionId::new("ext-b").expect("valid ext id");
+    let inner = Arc::new(ProviderAwareCapabilityPort::new(vec![
+        descriptor_with_provider("cap.beta", Some(ext_b)),
+    ]));
+    let surface_version = CapabilitySurfaceVersion::new("hooks-integration:v1").expect("ok");
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(own_capabilities_dispatcher("ext-a", "cap-a-foreign-deny"))
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.beta"))
+        .await
+        .expect("invoke returns an outcome");
+
+    assert!(
+        matches!(outcome, CapabilityOutcome::Completed(_)),
+        "ext-A's OwnCapabilities hook must NOT fire against ext-B's capability; got {outcome:?}"
+    );
+    assert_eq!(inner.invocations().len(), 1, "inner port should be invoked");
+}
+
+/// Unresolved-provider case: capability has provider=None. The
+/// `OwnCapabilities` filter is conservative — hook does NOT fire when the
+/// provider is unknown. This is the documented behavior from C3.
+#[tokio::test]
+async fn own_capabilities_hook_does_not_fire_when_provider_unknown() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(ProviderAwareCapabilityPort::new(vec![
+        descriptor_with_provider("cap.unattributed", None),
+    ]));
+    let surface_version = CapabilitySurfaceVersion::new("hooks-integration:v1").expect("ok");
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(own_capabilities_dispatcher(
+            "ext-a",
+            "cap-a-unresolved-deny",
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.unattributed"))
+        .await
+        .expect("invoke returns an outcome");
+
+    assert!(
+        matches!(outcome, CapabilityOutcome::Completed(_)),
+        "OwnCapabilities must NOT fire when provider is unknown; got {outcome:?}"
+    );
+}
+
+// ─── henrypark133 Critical #1: before_prompt hook resolver path ───────────
+
+/// Drives the full path: install a `before_prompt` hook that emits an
+/// envelope-wrapped snippet, build the prompt bundle through
+/// `RebornLoopDriverHostFactory`, and verify that (a) the bundle includes
+/// a synthetic `msg:hook.*` ref and (b) the build did NOT fail closed
+/// (which it would if the factory neglected to wire the materialization
+/// sink). The sink-wired path also writes the safe content into the
+/// `InstructionMaterializationStore` so the downstream model resolver
+/// can find it; that store write is what makes the ref resolvable.
+#[tokio::test]
+async fn before_prompt_hook_message_is_resolvable_via_factory_wiring() {
+    use ironclaw_hooks::dispatch::HookDispatcherBuilder as HDBuilder;
+    use ironclaw_hooks::registry::HookRegistry as HReg;
+    use ironclaw_hooks::sink::{RestrictedBeforePromptHook, RestrictedMutatorSink};
+
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+
+    let hook_id = HookId::derive(
+        &ExtensionId("ext-prompt".to_string()),
+        "0.0.1",
+        &HookLocalId("prompt-inject".to_string()),
+        HookVersion::ONE,
+    );
+
+    struct InjectingHook;
+    #[async_trait]
+    impl RestrictedBeforePromptHook for InjectingHook {
+        async fn evaluate(
+            &self,
+            _ctx: &ironclaw_hooks::points::BeforePromptHookContext,
+            sink: &mut dyn RestrictedMutatorSink,
+        ) {
+            let _ = sink.add_envelope_snippet(
+                "injected hook context".to_string(),
+                ironclaw_hooks::kinds::mutator::PatchOrdinalHint::Last,
+            );
+        }
+    }
+
+    let dispatcher = HDBuilder::new(HReg::new())
+        .install_installed_before_prompt(
+            hook_id,
+            HookPhase::Policy,
+            ironclaw_host_api::ExtensionId::new("ext-prompt").expect("valid ext id"),
+            HookBindingScope::Global,
+            Box::new(InjectingHook),
+        )
+        .expect("install installed before_prompt hook")
+        .build_arc();
+
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with before_prompt hook installed");
+
+    let bundle = host
+        .build_prompt_bundle(ironclaw_turns::run_profile::LoopPromptBundleRequest {
+            mode: ironclaw_turns::run_profile::PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+        })
+        .await
+        .expect(
+            "build_prompt_bundle must succeed; if this errors with `materialization sink \
+             is wired` the factory regressed (henrypark133 Critical #1)",
+        );
+
+    // The bundle should contain at least one hook-injected ref. Each hook
+    // message uses the `msg:hook.<ordinal>.<hash>` convention.
+    let hook_message_count = bundle
+        .messages
+        .iter()
+        .filter(|m| m.content_ref.as_str().starts_with("msg:hook."))
+        .count();
+    assert!(
+        hook_message_count >= 1,
+        "expected at least one msg:hook.* ref in the prompt bundle; got {:?}",
+        bundle.messages
+    );
 }

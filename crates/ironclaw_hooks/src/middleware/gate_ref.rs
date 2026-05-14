@@ -96,6 +96,51 @@ impl HookGateRefFactory for UuidHookGateRefFactory {
     }
 }
 
+/// Production-safe default factory: every mint call fails closed.
+///
+/// **Why this is the middleware default**: `UuidHookGateRefFactory` mints
+/// syntactically valid but router-unregistered refs. A hook that emits
+/// `PauseApproval` would surface as `CapabilityOutcome::ApprovalRequired`
+/// with a ref the approval gateway has never heard of — the loop would
+/// suspend on a ref that can never resolve, and there's no one-shot /
+/// lease semantics behind it. Shipping that as a default is worse than
+/// failing the call (henrypark133 review Critical #3).
+///
+/// Callers that *want* the local-only UUID behavior (tests, dev fixtures)
+/// must explicitly install [`UuidHookGateRefFactory`] via
+/// `with_gate_ref_factory`. Production deployments must install a factory
+/// that talks to the host's real approval/auth router.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct FailClosedHookGateRefFactory;
+
+impl FailClosedHookGateRefFactory {
+    pub fn new() -> Self {
+        Self
+    }
+
+    fn fail(kind: &str) -> AgentLoopHostError {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            format!(
+                "no production hook gate-ref factory installed; refusing to \
+                 mint a {kind} ref that the approval/auth router cannot \
+                 resolve (see HookedLoopCapabilityPort::with_gate_ref_factory)"
+            ),
+        )
+    }
+}
+
+#[async_trait]
+impl HookGateRefFactory for FailClosedHookGateRefFactory {
+    async fn mint_approval_ref(&self, _reason: &str) -> Result<LoopGateRef, AgentLoopHostError> {
+        Err(Self::fail("approval"))
+    }
+
+    async fn mint_auth_ref(&self, _reason: &str) -> Result<LoopGateRef, AgentLoopHostError> {
+        Err(Self::fail("auth"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

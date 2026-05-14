@@ -35,7 +35,7 @@ use ironclaw_turns::run_profile::{
 
 use crate::dispatch::{BeforeCapabilityDispatchOutcome, HookDispatcher};
 use crate::kinds::gate::GateDecisionInner;
-use crate::middleware::gate_ref::{HookGateRefFactory, UuidHookGateRefFactory};
+use crate::middleware::gate_ref::{FailClosedHookGateRefFactory, HookGateRefFactory};
 use crate::middleware::resolver::{
     CapabilityInputResolver, CapabilityProviderResolver, NullCapabilityInputResolver,
     NullCapabilityProviderResolver,
@@ -70,7 +70,12 @@ impl HookedLoopCapabilityPort {
             tenant_id,
             resolver: Arc::new(NullCapabilityInputResolver),
             provider_resolver: Arc::new(NullCapabilityProviderResolver),
-            gate_ref_factory: Arc::new(UuidHookGateRefFactory),
+            // Default to fail-closed: minting a syntactically-valid but
+            // router-unregistered ref is worse than refusing the suspension.
+            // Callers must explicitly opt into UuidHookGateRefFactory for
+            // tests/dev, or install a router-backed factory for production
+            // (henrypark133 review Critical #3).
+            gate_ref_factory: Arc::new(FailClosedHookGateRefFactory),
         }
     }
 
@@ -297,6 +302,7 @@ fn invocation_arguments_digest(invocation: &CapabilityInvocation) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::middleware::gate_ref::UuidHookGateRefFactory;
     use crate::dispatch::BeforeCapabilityHookImpl;
     use crate::identity::{ExtensionId, HookId, HookLocalId, HookVersion};
     use crate::ordering::HookPhase;
@@ -566,7 +572,10 @@ mod tests {
         let inner = Arc::new(AlwaysCompletedPort::new());
         let (dispatcher, _) =
             dispatcher_with_restricted_hook("pause-approval", Box::new(PauseApprovalHook));
-        let wrapped = HookedLoopCapabilityPort::new(inner.clone(), dispatcher, tenant());
+        // Explicitly opt into the dev-only UUID gate-ref factory; the
+        // middleware default is fail-closed (Critical #3).
+        let wrapped = HookedLoopCapabilityPort::new(inner.clone(), dispatcher, tenant())
+            .with_gate_ref_factory(Arc::new(UuidHookGateRefFactory));
 
         let outcome = wrapped
             .invoke_capability(invocation("cap.x"))
@@ -591,7 +600,8 @@ mod tests {
         let inner = Arc::new(AlwaysCompletedPort::new());
         let (dispatcher, _) =
             dispatcher_with_restricted_hook("pause-auth", Box::new(PauseAuthHook));
-        let wrapped = HookedLoopCapabilityPort::new(inner.clone(), dispatcher, tenant());
+        let wrapped = HookedLoopCapabilityPort::new(inner.clone(), dispatcher, tenant())
+            .with_gate_ref_factory(Arc::new(UuidHookGateRefFactory));
 
         let outcome = wrapped
             .invoke_capability(invocation("cap.x"))

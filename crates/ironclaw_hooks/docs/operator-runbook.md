@@ -17,7 +17,7 @@
 - `RuntimeEvent::HookFailed { hook_id, category, .. }` events for a
   specific `hook_id` followed by silence: the hook isn't invoked
   again, but capability invocations still flow.
-- Audit log shows `HookDispatched` for the hook stops appearing after
+- The durable runtime event stream shows `HookDispatched` for the hook stops appearing after
   the first failure event, even though the hook is still registered.
 
 ### Why this happens (by design)
@@ -202,7 +202,9 @@ resolution.
 
 The model-visible `GateDecisionView` carries only the closed-vocabulary
 label (`hook_predicate_denied` etc.). The rich manifest-supplied
-reason is in the audit log:
+reason is projected into the durable runtime event stream (the hook
+milestone projection — distinct from formal `AuditEnvelope`
+control-plane records, which a separate `Audit*` path would emit):
 
 ```
 RuntimeEvent::HookDecisionEmitted { hook_id, summary, .. }

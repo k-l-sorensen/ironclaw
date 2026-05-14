@@ -25,6 +25,25 @@ use ironclaw_turns::run_profile::{
     LoopPromptBundleRequest, LoopPromptPort,
 };
 
+/// Narrow seam for materializing hook-emitted `msg:hook.*` content refs so
+/// the downstream model resolver can find them. Production deployments
+/// adapter-wrap [`ironclaw_turns::run_profile::InstructionMaterializationStore`]
+/// (Reborn does this in `loop_driver_host.rs`); tests can supply a no-op
+/// or in-memory recorder.
+///
+/// The trait deliberately does **not** take `LoopRunContext` — the adapter
+/// in the production wiring captures the run context at construction time
+/// so this seam stays narrow and keeps `ironclaw_hooks` decoupled from
+/// run-profile types beyond what it already needs.
+pub trait HookPromptMaterializationSink: Send + Sync {
+    fn put(
+        &self,
+        role: &str,
+        content_ref: &LoopMessageRef,
+        safe_content: String,
+    ) -> Result<(), AgentLoopHostError>;
+}
+
 use crate::dispatch::HookDispatcher;
 use crate::kinds::mutator::{HookPatch, HookPatchView, SnippetBodyView};
 use crate::points::BeforePromptHookContext;
@@ -42,12 +61,25 @@ pub struct HookedLoopPromptPort {
     dispatcher: Arc<HookDispatcher>,
     tenant_id: TenantId,
     snippet_byte_budget: u32,
+    /// Materialization sink for the synthetic `msg:hook.*` refs emitted by
+    /// hook patches. Without this, the downstream model resolver cannot find
+    /// the hook messages and the request fails with
+    /// `model message reference is unavailable`. Required for production
+    /// wiring (Reborn's factory installs an adapter delegating to
+    /// [`ironclaw_turns::run_profile::InstructionMaterializationStore`]);
+    /// tests can use any [`HookPromptMaterializationSink`] impl.
+    materialization_sink: Option<Arc<dyn HookPromptMaterializationSink>>,
 }
 
 impl HookedLoopPromptPort {
     /// Construct a new hook-aware prompt port wrapping `inner`. The default
     /// snippet byte budget is 4 KiB and can be overridden via
     /// [`Self::with_snippet_byte_budget`].
+    ///
+    /// **Production wiring requires also calling
+    /// [`Self::with_materialization_sink`].** Without that, hook-emitted
+    /// prompt patches fail closed at resolve time because the model
+    /// resolver doesn't know about `msg:hook.*` refs.
     pub fn new(
         inner: Arc<dyn LoopPromptPort>,
         dispatcher: Arc<HookDispatcher>,
@@ -58,6 +90,7 @@ impl HookedLoopPromptPort {
             dispatcher,
             tenant_id,
             snippet_byte_budget: DEFAULT_SNIPPET_BYTE_BUDGET,
+            materialization_sink: None,
         }
     }
 
@@ -65,6 +98,17 @@ impl HookedLoopPromptPort {
     /// single prompt bundle.
     pub fn with_snippet_byte_budget(mut self, bytes: u32) -> Self {
         self.snippet_byte_budget = bytes;
+        self
+    }
+
+    /// Required for production: install the sink that records hook-emitted
+    /// `msg:hook.*` content so the downstream model resolver can find them.
+    #[must_use]
+    pub fn with_materialization_sink(
+        mut self,
+        sink: Arc<dyn HookPromptMaterializationSink>,
+    ) -> Self {
+        self.materialization_sink = Some(sink);
         self
     }
 }
@@ -87,8 +131,50 @@ impl LoopPromptPort for HookedLoopPromptPort {
             wrap_patches_to_messages(&dispatched.patches, self.snippet_byte_budget)?;
 
         let mut bundle = self.inner.build_prompt_bundle(request).await?;
+        if !extra_messages.is_empty() {
+            // Production correctness: hook-emitted `msg:hook.*` refs are
+            // synthetic — they exist in the bundle but the downstream model
+            // resolver doesn't know about them. Materialize them through
+            // the sink so the resolver can find them, otherwise the
+            // request fails with `model message reference is unavailable`.
+            // Fail closed when no sink is wired: better to refuse the call
+            // than ship unresolvable refs.
+            let sink = self.materialization_sink.as_ref().ok_or_else(|| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Unavailable,
+                    "hook prompt port emitted patches but no materialization \
+                     sink is wired; resolver would fail closed (see \
+                     HookedLoopPromptPort::with_materialization_sink)",
+                )
+            })?;
+            for (msg, patch) in extra_messages.iter().zip(dispatched.patches.iter()) {
+                if let Some(safe_content) = safe_content_for_patch(patch) {
+                    sink.put(&msg.role, &msg.content_ref, safe_content)?;
+                }
+            }
+        }
         bundle.messages.extend(extra_messages);
         Ok(bundle)
+    }
+}
+
+/// Recover the safe-to-emit content string for a hook patch, mirroring the
+/// branches inside [`wrap_patches_to_messages`] (the wrapping is what the
+/// model sees; the materialized store records that same string keyed by ref).
+/// Returns `None` for metadata-only patches that don't produce a message.
+fn safe_content_for_patch(patch: &HookPatch) -> Option<String> {
+    match patch.view() {
+        HookPatchView::AddSnippet {
+            body: SnippetBodyView::Enveloped { wrapped },
+            ..
+        } => Some(wrapped.to_string()),
+        HookPatchView::AddSnippet {
+            body: SnippetBodyView::Trusted { text },
+            ..
+        } => wrap_untrusted(EnvelopeSource::Hook, EnvelopeTrust::Trusted, text)
+            .ok()
+            .map(|env| env.into_string()),
+        HookPatchView::AddMilestoneMetadata { .. } => None,
     }
 }
 
@@ -190,10 +276,33 @@ mod tests {
     use crate::trust::HookTrustClass;
     use async_trait::async_trait;
     use ironclaw_turns::run_profile::{LoopPromptBundle, LoopPromptBundleRef, PromptMode};
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
     fn tenant() -> TenantId {
         TenantId::new("alpha").expect("ok")
+    }
+
+    /// In-memory sink for prompt-port tests. Records `(role, ref, content)`
+    /// tuples and exposes them for assertions.
+    #[derive(Default)]
+    struct RecordingMaterializationSink {
+        entries: Mutex<HashMap<String, (String, String)>>,
+    }
+
+    impl HookPromptMaterializationSink for RecordingMaterializationSink {
+        fn put(
+            &self,
+            role: &str,
+            content_ref: &LoopMessageRef,
+            safe_content: String,
+        ) -> Result<(), AgentLoopHostError> {
+            self.entries.lock().expect("ok").insert(
+                content_ref.as_str().to_string(),
+                (role.to_string(), safe_content),
+            );
+            Ok(())
+        }
     }
 
     struct StubPromptPort {
@@ -287,13 +396,40 @@ mod tests {
             HookTrustClass::Installed,
             BeforePromptHookImpl::Restricted(Box::new(EnvelopeHook)),
         );
-        let wrapped = HookedLoopPromptPort::new(inner.clone(), Arc::new(dispatcher), tenant());
+        let wrapped = HookedLoopPromptPort::new(inner.clone(), Arc::new(dispatcher), tenant())
+            .with_materialization_sink(Arc::new(RecordingMaterializationSink::default()));
 
         wrapped
             .build_prompt_bundle(default_request())
             .await
             .expect("ok");
         assert_eq!(inner.call_count(), 1);
+    }
+
+    /// henrypark133 review Critical #1 regression: hook patches without a
+    /// materialization sink must fail closed rather than producing
+    /// unresolvable `msg:hook.*` refs that crash downstream model resolution.
+    #[tokio::test]
+    async fn hook_patches_without_materialization_sink_fail_closed() {
+        let inner: Arc<StubPromptPort> = Arc::new(StubPromptPort::new());
+        let dispatcher = make_dispatcher(
+            HookTrustClass::Installed,
+            BeforePromptHookImpl::Restricted(Box::new(EnvelopeHook)),
+        );
+        let wrapped = HookedLoopPromptPort::new(inner.clone(), Arc::new(dispatcher), tenant());
+
+        let err = wrapped
+            .build_prompt_bundle(default_request())
+            .await
+            .expect_err("should fail closed");
+        assert!(
+            err.safe_summary.contains("materialization sink is wired")
+                || err
+                    .safe_summary
+                    .contains("hook prompt port emitted patches but no materialization"),
+            "unexpected error: {}",
+            err.safe_summary
+        );
     }
 
     #[tokio::test]
@@ -303,7 +439,8 @@ mod tests {
             HookTrustClass::Installed,
             BeforePromptHookImpl::Restricted(Box::new(EnvelopeHook)),
         );
-        let wrapped = HookedLoopPromptPort::new(inner, Arc::new(dispatcher), tenant());
+        let wrapped = HookedLoopPromptPort::new(inner, Arc::new(dispatcher), tenant())
+            .with_materialization_sink(Arc::new(RecordingMaterializationSink::default()));
 
         let bundle = wrapped
             .build_prompt_bundle(default_request())
@@ -349,6 +486,7 @@ mod tests {
             BeforePromptHookImpl::Restricted(Box::new(ManyPatchesHook { snippets })),
         );
         let wrapped = HookedLoopPromptPort::new(inner, Arc::new(dispatcher), tenant())
+            .with_materialization_sink(Arc::new(RecordingMaterializationSink::default()))
             .with_snippet_byte_budget(1024);
 
         let bundle = wrapped
@@ -392,7 +530,8 @@ mod tests {
             HookTrustClass::Installed,
             BeforePromptHookImpl::Restricted(Box::new(HijackHook)),
         );
-        let wrapped = HookedLoopPromptPort::new(inner, Arc::new(dispatcher), tenant());
+        let wrapped = HookedLoopPromptPort::new(inner, Arc::new(dispatcher), tenant())
+            .with_materialization_sink(Arc::new(RecordingMaterializationSink::default()));
         let bundle = wrapped
             .build_prompt_bundle(default_request())
             .await
@@ -423,7 +562,8 @@ mod tests {
             HookTrustClass::Builtin,
             BeforePromptHookImpl::Privileged(Box::new(TrustedHook)),
         );
-        let wrapped = HookedLoopPromptPort::new(inner, Arc::new(dispatcher), tenant());
+        let wrapped = HookedLoopPromptPort::new(inner, Arc::new(dispatcher), tenant())
+            .with_materialization_sink(Arc::new(RecordingMaterializationSink::default()));
         let bundle = wrapped
             .build_prompt_bundle(default_request())
             .await

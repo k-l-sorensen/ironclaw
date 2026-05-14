@@ -77,7 +77,7 @@ trusting the v1 framework end-to-end.
 | CRX | Manifest permissions declared at install; user can revoke; some permissions runtime-prompted |
 | VSC | None — extension has user-level privilege |
 | TAURI | Permission set + scope (allowlist/denylist patterns) attached to capability grant |
-| **ICLAW** | **Per-tier default attenuation + manifest-declared scope (`Global`/`OwnCapabilities`/`SameTenant`) enforced at dispatch + capability ↔ hook binding** | 
+| **ICLAW** | **Per-tier default attenuation + manifest-declared scope (`Global`/`OwnCapabilities`/`SameTenant`) enforced at dispatch + capability ↔ hook binding** |
 
 **Observation:** Tauri's permission+scope model is the closest analog. ICLAW adds the **tier-based default attenuation** layer on top — Installed hooks default to a smaller capability set than Trusted hooks, even before manifest-declared scope.
 
@@ -119,13 +119,13 @@ trusting the v1 framework end-to-end.
 | CRX | Service worker crash → restarted; ongoing request may not complete | declarativeNetRequest is declarative; no runtime per-rule | N/A |
 | VSC | Extension crash → reported to user; affected commands fail | N/A | N/A |
 | TAURI | Plugin panic → IPC call returns error; app continues | Per-command | N/A |
-| **ICLAW** | **`catch_unwind` per hook; failure_policy matrix: Gate=FailClosed, Observer=FailIsolated, Mutator=FailIsolated, Effect=FailClosed; poison sticks for process lifetime** | **`tokio::time::timeout` per hook; same policy matrix** | **AttenuationViolation = FailClosed** |
+| **ICLAW** | **`catch_unwind` per hook; failure_policy matrix: Gate=FailClosed, Observer=FailIsolated, Mutator=FailIsolated, Effect=FailClosed; poison scoped to the dispatcher's lifetime (per-host-build when `with_hook_dispatcher_factory` is used; shared across all builds for the legacy `with_hook_dispatcher` adapter)** | **`tokio::time::timeout` per hook; same policy matrix** | **AttenuationViolation = FailClosed** |
 
 **Observation:** The `failure_policy` matrix — different defaults for different *kinds* of hooks at the same point — is unusual. K8S has a single `failurePolicy` per webhook config. Envoy has per-filter trap behavior but not differentiated by what the filter was doing.
 
 **Divergence:** ICLAW's "Gate failures FailClosed, Observer failures FailIsolated" is the right call: a crashed gate is unsafe (you can't tell whether it would have allowed), but a crashed observer just loses telemetry for one event. LSM gets this wrong (panic on bug = no syscall mediation at all). K8S gets this right but only on operator say-so. ✓
 
-**Divergence:** Poison sticks for process lifetime. K8S retries failed webhooks per request. Why ICLAW diverges: in an agent loop, a hook that's panicking repeatedly is more likely buggy than transiently faulty, and retrying it makes the loop unobservable. The cost is operator action (process restart or hook reinstall) to recover. Worth documenting as a known property. ✓ (with doc nit)
+**Divergence:** Poison sticks for the dispatcher's lifetime. With the recommended `with_hook_dispatcher_factory` path that scope is one host build — the next run starts with a fresh dispatcher and the poison is gone. With the legacy `with_hook_dispatcher` adapter the dispatcher is shared across every build the factory produces, so poison persists for the process lifetime. K8S retries failed webhooks per request; ICLAW does neither. Why ICLAW diverges: in an agent loop, a hook that's panicking repeatedly is more likely buggy than transiently faulty, and retrying it makes the loop unobservable. The cost is operator action (legacy: process restart or hook reinstall; factory: just wait for the next run) to recover. Worth documenting as a known property. ✓
 
 ---
 
@@ -210,7 +210,7 @@ trusting the v1 framework end-to-end.
 ## Where IronClaw is conventional but **shouldn't** be (open questions)
 
 1. **In-process execution for Installed hooks.** K8S/OPA/VSC isolate untrusted code out-of-process; ICLAW keeps Installed hooks in-process and relies on predicate-language audit-by-hand for safety. This is fine while there's no Installed-WASM path. **Once Installed-WASM lands, revisit out-of-process or VM-per-extension isolation.**
-2. **Sticky poison for process lifetime.** K8S retries; ICLAW does not. Right call for now, but document the failure mode for operators.
+2. **Sticky poison.** Scope depends on factory choice: per-host-build with `with_hook_dispatcher_factory` (recommended), process-lifetime with the legacy `with_hook_dispatcher` adapter. K8S retries; ICLAW does neither within a scope. Right call for now, but document the failure mode for operators.
 3. **No formal model of the dispatch invariants.** OPA has Rego semantics; LSM-BPF has the verifier. ICLAW has tests. A short typed-state-machine spec for dispatch (states: Idle → Dispatching → DecisionEmitted/Failed → Quiescent) would close the loop. **TODO — add to design doc.**
 4. **No per-tenant rate limit on hook *installation*.** If an Installed extension can register N hooks, a malicious extension can flood the dispatcher. Cap N somewhere reasonable. **TODO — add to manifest validator.**
 

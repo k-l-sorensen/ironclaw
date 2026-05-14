@@ -1,17 +1,19 @@
-//! Model-port middleware that fires `after_model` observer hooks after each
-//! successful `stream_model` call.
+//! Model-port middleware: pass-through wrapper.
 //!
-//! By design, observers only learn that a model exchange happened — they
-//! never see the raw model output. The trust model documented in
-//! `CLAUDE.md` is explicit that Installed/Trusted hooks must not receive
-//! ambient model data; the `ObservedKind::AfterModel` signal is the entire
-//! payload an observer sees here.
+//! **`AfterModel` does NOT fire here.** Earlier slices dispatched
+//! `HookPointSpec::AfterModel` from `stream_model`, but
+//! `HookedLoopTranscriptPort::finalize_assistant_message` also dispatches
+//! the same point. That double-fire combined with the fact that the
+//! model-port dispatch happened **before** the assistant reply was durable
+//! could leave an observer event recorded for a reply that never finalized
+//! (henrypark133 Concerning #5).
 //!
-//! Observers fail isolated: an observer panic / timeout / missing impl
-//! does not affect the model call's return value. Errors from the inner
-//! `LoopModelPort` are forwarded unchanged and short-circuit observation
-//! (we don't fire `after_model` on a failed exchange — that lands on a
-//! distinct error point in a follow-up slice).
+//! Authoritative `AfterModel` boundary: the transcript port (after
+//! `finalize_assistant_message` succeeds). The wrapper here is preserved
+//! as a no-op forwarding shim so the factory's wrap-every-port pattern
+//! stays symmetric and so we have a hook point for a future
+//! `model-response-observed` (pre-durable) signal if a use case justifies
+//! it.
 
 use std::sync::Arc;
 
@@ -22,14 +24,18 @@ use ironclaw_turns::run_profile::{
 };
 
 use crate::dispatch::HookDispatcher;
-use crate::registry::HookPointSpec;
 
 /// Wraps an inner `LoopModelPort`, forwards `stream_model` unchanged, and
 /// dispatches `after_model` observer hooks once the inner call returns
 /// successfully.
 pub struct HookedLoopModelPort {
     inner: Arc<dyn LoopModelPort>,
+    /// Kept for future point-specific observers (e.g., `model-response-
+    /// observed` at the pre-durable boundary). Currently unused — the
+    /// model port is a no-op wrapper.
+    #[allow(dead_code)]
     dispatcher: Arc<HookDispatcher>,
+    #[allow(dead_code)]
     tenant_id: TenantId,
 }
 
@@ -53,17 +59,10 @@ impl LoopModelPort for HookedLoopModelPort {
         &self,
         request: LoopModelRequest,
     ) -> Result<LoopModelResponse, AgentLoopHostError> {
-        let response = self.inner.stream_model(request).await?;
-        let observed = self
-            .dispatcher
-            .dispatch_observer_at(HookPointSpec::AfterModel, self.tenant_id.clone())
-            .await;
-        tracing::debug!(
-            facts = observed.facts.len(),
-            failures = observed.failures.len(),
-            "after_model observer dispatch completed"
-        );
-        Ok(response)
+        // No-op wrapper. AfterModel observers fire from the transcript
+        // port at the durable-finalization boundary, not here. See module
+        // docs.
+        self.inner.stream_model(request).await
     }
 }
 
@@ -76,6 +75,7 @@ mod tests {
     use crate::ordering::HookPhase;
     use crate::ordering::HookPriority;
     use crate::points::ObserverHookContext;
+    use crate::registry::HookPointSpec;
     use crate::registry::{HookBinding, HookRegistry};
     use crate::sink::{ObserverHook, ObserverSink};
     use crate::trust::HookTrustClass;
@@ -197,8 +197,12 @@ mod tests {
         assert_eq!(inner.call_count(), 1);
     }
 
+    /// After Concerning #5 (AfterModel exactly-once), the model port no
+    /// longer fires AfterModel — the transcript port owns that boundary.
+    /// This test pins the new behavior: an AfterModel observer wired
+    /// against a model-port wrapper sees nothing.
     #[tokio::test]
-    async fn observer_fires_after_inner_call() {
+    async fn model_port_does_not_fire_after_model_observers() {
         let inner = Arc::new(StubModelPort::new());
         let seen = Arc::new(Mutex::new(0u32));
         let dispatcher =
@@ -209,7 +213,11 @@ mod tests {
 
         wrapped.stream_model(request()).await.expect("ok");
         assert_eq!(inner.call_count(), 1);
-        assert_eq!(*seen.lock().expect("not poisoned"), 1);
+        assert_eq!(
+            *seen.lock().expect("not poisoned"),
+            0,
+            "AfterModel must NOT fire from the model port — the transcript port owns it"
+        );
     }
 
     #[tokio::test]

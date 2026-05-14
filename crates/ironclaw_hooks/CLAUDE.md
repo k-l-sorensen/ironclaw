@@ -25,8 +25,9 @@ proves the `ironclaw_turns -> ironclaw_hooks` edge stays absent.
 
 ## Trust model
 
-Hooks have three trust classes and the framework enforces the differences
-*at the type level*, not by convention:
+Hooks have **four** trust classes; the framework enforces the differences
+*at the type level*, not by convention. The first three are loadable from
+an external source; the fourth is run-scoped only.
 
 - **Builtin** — compiled into IronClaw, identity = crate path + symbol. May
   produce any decision kind via `BuiltinHookSink`.
@@ -38,6 +39,14 @@ Hooks have three trust classes and the framework enforces the differences
   explicit per-extension grant. Uses `InstalledHookSink`, which exposes only
   monotonic-restriction constructors. An `Installed` hook cannot mint
   `Decision::Allow` — that variant is not reachable from the sink trait.
+- **SelfAuthored** — the agent authors a hook for the current run via
+  `SelfAuthoredEvaluator` (typically after user ratification). The sink
+  (`SelfAuthoredHookSink`) is monotonic-restriction only: no `Allow`, no
+  `Effect`. **Run-scoped only**: the dispatcher discards self-authored
+  hooks at run end; durable persistence requires the channel-to-user path
+  tracked at #3567. This tier exists in the trust enum + threat model but
+  has no manifest representation and is not loadable from an external
+  source.
 
 Trust class is *fixed by source*, never declarable. The extension manifest's
 `[[hooks]]` section can describe the hook but cannot claim a trust class higher
