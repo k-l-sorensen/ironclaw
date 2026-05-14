@@ -5619,7 +5619,78 @@ pub(crate) async fn handle_mission_notification(
     // is a bug: the gateway has no way to surface that UUID coherently, and
     // SSE Response events tagged with it bleed into whatever chat happens to
     // be active on the frontend.
-    let target_thread = if let Some(parent) = notif.parent_thread_id {
+    //
+    // Defense-in-depth ownership check on `parent_thread_id`: a sibling fix
+    // at the chat ingress (`chat_send_handler`) already rejects requests
+    // tagged with another user's conversation UUID, but a missed surface
+    // upstream (a future channel, a missed validation, a v1-only path) must
+    // not turn into a cross-user `add_conversation_message` write here. We
+    // re-verify against the v1 ownership predicate; on mismatch or DB error
+    // we fall back to the assistant conversation. With `db = None` (test
+    // harness) there is no v1 table to write into, so the check is skipped
+    // and the parent is trusted — there is no IDOR risk in that path.
+    // Ownership semantics mirror the chat-ingress gate at
+    // `chat_send_handler` (src/channels/web/features/chat/mod.rs): only
+    // reject `parent_thread_id` when a v1 conversation row exists and is
+    // owned by someone other than `notif.user_id`. A missing row is
+    // harmless — the FK on `add_conversation_message` would fail
+    // independently — and rejecting it would needlessly redirect every
+    // legitimate parent-routed mission whose v1 row was deleted or never
+    // created (e.g. a non-`gateway` channel that didn't pre-write to
+    // `conversations`). With `db = None` (test harness) there is no v1
+    // table to write into, so the check is skipped and the parent is
+    // trusted — no IDOR risk in that path.
+    let verified_parent: Option<ironclaw_engine::ThreadId> = match notif.parent_thread_id {
+        Some(parent) => match db {
+            Some(db_ref) => match db_ref
+                .conversation_belongs_to_user(parent.0, &notif.user_id)
+                .await
+            {
+                Ok(true) => Some(parent),
+                Ok(false) => match db_ref.get_conversation_metadata(parent.0).await {
+                    Ok(Some(_)) => {
+                        // Row exists but is owned by a different user — IDOR
+                        // attempt. Redirect to assistant conversation.
+                        tracing::warn!(
+                            user = %notif.user_id,
+                            parent = %parent.0,
+                            mission = %notif.mission_name,
+                            "mission parent_thread_id refers to another user's conversation; \
+                             falling back to assistant conversation",
+                        );
+                        None
+                    }
+                    Ok(None) => Some(parent),
+                    Err(error) => {
+                        tracing::warn!(
+                            user = %notif.user_id,
+                            parent = %parent.0,
+                            mission = %notif.mission_name,
+                            %error,
+                            "failed to inspect mission parent_thread_id metadata; \
+                             falling back to assistant conversation",
+                        );
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        user = %notif.user_id,
+                        parent = %parent.0,
+                        mission = %notif.mission_name,
+                        %error,
+                        "failed to verify mission parent_thread_id ownership; \
+                         falling back to assistant conversation",
+                    );
+                    None
+                }
+            },
+            None => Some(parent),
+        },
+        None => None,
+    };
+
+    let target_thread = if let Some(parent) = verified_parent {
         parent
     } else if let Some(db) = db
         && let Some(channel_name) = notif.notify_channels.first()
@@ -5681,9 +5752,13 @@ pub(crate) async fn handle_mission_notification(
             .is_ok();
         // If the chosen target was a parent conversation thread and the write
         // failed (e.g. the V1 row was deleted), fall back to the assistant
-        // conversation so the output still surfaces somewhere visible.
+        // conversation so the output still surfaces somewhere visible. Keyed
+        // on `verified_parent` rather than the raw `parent_thread_id` —
+        // otherwise an ownership rejection (which already redirected
+        // `target_thread` to the assistant conversation) would retry the same
+        // write needlessly.
         if !write_ok
-            && notif.parent_thread_id.is_some()
+            && verified_parent.is_some()
             && let Ok(assistant_conv_id) = db
                 .get_or_create_assistant_conversation(&notif.user_id, channel_name)
                 .await
@@ -5699,10 +5774,22 @@ pub(crate) async fn handle_mission_notification(
     // mission output. Without this step, the engine v2 conversation history
     // (`build_history_from_entries`) is unaware of the mission and the user
     // can't ask follow-ups about its content.
+    //
+    // Scope the lookup key by `<channel>:<parent>` when a verified parent is
+    // present, matching the foreground key shape that
+    // `handle_with_engine_inner` uses for chat-thread messages. Without this,
+    // the mission output lands in the unscoped `gateway` v2 conversation
+    // while the next chat turn loads from `gateway:<parent>` — two different
+    // conversations in `ConversationManager`, so `build_history_from_entries`
+    // never sees the mission output and the agent says "I haven't sent that".
     if let Some(conv_mgr) = conv_mgr {
         for channel_name in &notif.notify_channels {
+            let channel_key = match verified_parent {
+                Some(parent) => format!("{}:{}", channel_name, parent.0),
+                None => channel_name.clone(),
+            };
             match conv_mgr
-                .get_or_create_conversation(channel_name, &notif.user_id)
+                .get_or_create_conversation(&channel_key, &notif.user_id)
                 .await
             {
                 Ok(conv_id) => {

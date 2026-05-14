@@ -684,3 +684,292 @@ async fn mission_notification_v1_history_falls_back_to_assistant_when_no_parent(
          conversation so cron/learning output stays visible"
     );
 }
+
+/// IDOR regression at the mission-notification sink. Defense-in-depth pair to
+/// the chat-ingress check in
+/// `src/channels/web/features/chat/mod.rs::chat_send_handler`: even when an
+/// attacker-controlled `parent_thread_id` slips past the entry — e.g. a future
+/// channel implementation forgets the ownership gate, or a v1-only path is
+/// re-added — the mission notification handler MUST NOT write the mission
+/// output to another user's `conversation_messages` row. The v1
+/// `add_conversation_message` SQL only enforces the conversation FK, not
+/// ownership, so without this check the FK is satisfied and the cross-user
+/// write succeeds.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn mission_notification_idor_does_not_write_to_other_users_conversation() {
+    use crate::channels::ChannelManager;
+    use crate::db::Database;
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test_idor_parent.db");
+    let backend = crate::db::libsql::LibSqlBackend::new_local(&db_path)
+        .await
+        .unwrap();
+    Database::run_migrations(&backend).await.unwrap();
+    let store: Arc<dyn Database> = Arc::new(backend);
+
+    let gw = test_gateway().with_store(store.clone());
+    let sse = Arc::clone(&gw.state.sse);
+    let mgr = ChannelManager::new();
+    mgr.add(Box::new(gw)).await;
+    let channels = Arc::new(mgr);
+
+    // Victim owns a v1 conversation row.
+    let victim_thread = store
+        .create_conversation("gateway", "victim", None)
+        .await
+        .expect("victim's v1 conversation");
+
+    // Attacker has their own assistant conversation row that the fallback
+    // path can route to.
+    let attacker_assistant = store
+        .get_or_create_assistant_conversation("attacker", "gateway")
+        .await
+        .expect("attacker's assistant conv");
+
+    // The mission was created by the attacker, but the `parent_thread_id` on
+    // the notification points at the victim's conversation UUID — the exact
+    // shape an upstream ownership gap would produce.
+    let notif = ironclaw_engine::MissionNotification {
+        mission_id: ironclaw_engine::MissionId(uuid::Uuid::new_v4()),
+        mission_name: "idor-attempt".to_string(),
+        thread_id: ironclaw_engine::ThreadId(uuid::Uuid::new_v4()),
+        parent_thread_id: Some(ironclaw_engine::ThreadId(victim_thread)),
+        user_id: "attacker".to_string(),
+        notify_channels: vec!["gateway".to_string()],
+        notify_user: None,
+        response: Some("attacker-controlled mission output".to_string()),
+        is_error: false,
+        gate: None,
+    };
+
+    crate::bridge::handle_mission_notification(
+        &notif,
+        &channels,
+        Some(&sse),
+        Some(&store),
+        None,
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // The victim's conversation row must NOT have received the write. This is
+    // the load-bearing assertion: without the ownership check at the sink, the
+    // attacker's mission output would be persisted under victim's
+    // `conversation_id` and surface in victim's `/api/chat/history` response.
+    let victim_messages = store
+        .list_conversation_messages_paginated(victim_thread, None, 50)
+        .await
+        .expect("listing victim messages")
+        .0;
+    assert!(
+        victim_messages
+            .iter()
+            .all(|m| !m.content.contains("attacker-controlled mission output")),
+        "mission output must NOT leak into another user's conversation \
+         (victim messages: {victim_messages:?})",
+    );
+
+    // The attacker's own assistant conversation must have received the
+    // fallback write so the output is still visible somewhere for the
+    // legitimate owner (the attacker). This keeps the user-facing semantics
+    // intact for non-attack cases (a deleted v1 row, a non-`gateway` parent
+    // channel) where ownership intentionally falls through to the assistant.
+    let attacker_messages = store
+        .list_conversation_messages_paginated(attacker_assistant, None, 50)
+        .await
+        .expect("listing attacker assistant messages")
+        .0;
+    assert!(
+        attacker_messages
+            .iter()
+            .any(|m| m.role == "assistant"
+                && m.content.contains("attacker-controlled mission output")),
+        "ownership rejection must redirect the v1 write to the mission \
+         user's own assistant conversation (attacker assistant: {attacker_messages:?})",
+    );
+}
+
+/// v2 conversation-key scoping regression. When a verified parent thread is
+/// present, `handle_mission_notification` must record the external-agent entry
+/// against the scoped engine v2 conversation `<channel>:<parent>` — matching
+/// the foreground key at `handle_with_engine_inner` ~line 4373 — so the next
+/// chat turn in the same thread can see the mission output in its v2 history.
+/// Without scoping, the entry lands in the unscoped `<channel>` conversation
+/// and `build_history_from_entries` for the follow-up turn never includes it.
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn mission_notification_v2_entry_lands_in_scoped_conversation() {
+    use crate::channels::ChannelManager;
+    use crate::db::Database;
+    use ironclaw_engine::{
+        CapabilityRegistry, ConversationManager, LeaseManager, LlmBackend, LlmCallConfig,
+        LlmOutput, LlmResponse, PolicyEngine, ThreadManager, TokenUsage,
+    };
+    use std::sync::Arc;
+
+    // Minimal LLM/effects stubs — the test never spins up an execution loop.
+    struct NoopLlm;
+    #[async_trait::async_trait]
+    impl LlmBackend for NoopLlm {
+        async fn complete(
+            &self,
+            _: &[ironclaw_engine::ThreadMessage],
+            _: &[ironclaw_engine::ActionDef],
+            _: &LlmCallConfig,
+        ) -> Result<LlmOutput, ironclaw_engine::EngineError> {
+            Ok(LlmOutput {
+                response: LlmResponse::Text("noop".into()),
+                usage: TokenUsage::default(),
+            })
+        }
+        fn model_name(&self) -> &str {
+            "noop"
+        }
+    }
+    struct NoopEffects;
+    #[async_trait::async_trait]
+    impl ironclaw_engine::EffectExecutor for NoopEffects {
+        async fn execute_action(
+            &self,
+            _: &str,
+            _: serde_json::Value,
+            _: &ironclaw_engine::CapabilityLease,
+            _: &ironclaw_engine::ThreadExecutionContext,
+        ) -> Result<ironclaw_engine::ActionResult, ironclaw_engine::EngineError> {
+            unreachable!("test does not drive execution")
+        }
+        async fn available_actions(
+            &self,
+            _: &[ironclaw_engine::CapabilityLease],
+            _: &ironclaw_engine::ThreadExecutionContext,
+        ) -> Result<Vec<ironclaw_engine::ActionDef>, ironclaw_engine::EngineError> {
+            Ok(vec![])
+        }
+        async fn available_capabilities(
+            &self,
+            _: &[ironclaw_engine::CapabilityLease],
+            _: &ironclaw_engine::ThreadExecutionContext,
+        ) -> Result<Vec<ironclaw_engine::CapabilitySummary>, ironclaw_engine::EngineError> {
+            Ok(vec![])
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("test_v2_scope.db");
+    let backend = crate::db::libsql::LibSqlBackend::new_local(&db_path)
+        .await
+        .unwrap();
+    Database::run_migrations(&backend).await.unwrap();
+    let store: Arc<dyn Database> = Arc::new(backend);
+
+    // A verified parent: a v1 conversation row owned by the mission user.
+    let parent_uuid = store
+        .create_conversation("gateway", "owner-user", None)
+        .await
+        .expect("parent v1 conversation");
+    let parent = ironclaw_engine::ThreadId(parent_uuid);
+
+    let gw = test_gateway().with_store(store.clone());
+    let sse = Arc::clone(&gw.state.sse);
+    let mgr = ChannelManager::new();
+    mgr.add(Box::new(gw)).await;
+    let channels = Arc::new(mgr);
+
+    // Real v2 ConversationManager — backed by the host's `HybridStore`. The
+    // engine Store and the v1 `Database` are decoupled by design; the v2
+    // path uses `HybridStore` (which can be workspace-less for tests) and
+    // the v1 path uses the libsql `store` above.
+    let engine_store: Arc<dyn ironclaw_engine::Store> =
+        Arc::new(crate::bridge::store_adapter::HybridStore::new(None));
+    let thread_manager = Arc::new(ThreadManager::new(
+        Arc::new(NoopLlm),
+        Arc::new(NoopEffects),
+        Arc::clone(&engine_store),
+        Arc::new(CapabilityRegistry::new()),
+        Arc::new(LeaseManager::new()),
+        Arc::new(PolicyEngine::new()),
+    ));
+    let conv_mgr = ConversationManager::new(thread_manager, Arc::clone(&engine_store));
+
+    let notif = ironclaw_engine::MissionNotification {
+        mission_id: ironclaw_engine::MissionId(uuid::Uuid::new_v4()),
+        mission_name: "v2-scope-test".to_string(),
+        thread_id: ironclaw_engine::ThreadId(uuid::Uuid::new_v4()),
+        parent_thread_id: Some(parent),
+        user_id: "owner-user".to_string(),
+        notify_channels: vec!["gateway".to_string()],
+        notify_user: None,
+        response: Some("scoped mission output".to_string()),
+        is_error: false,
+        gate: None,
+    };
+
+    crate::bridge::handle_mission_notification(
+        &notif,
+        &channels,
+        Some(&sse),
+        Some(&store),
+        Some(&conv_mgr),
+        None,
+        None,
+        None,
+    )
+    .await;
+
+    // The scoped conversation MUST exist and carry the mission entry. Calling
+    // `get_or_create_conversation` with the scoped key is the exact pattern
+    // the foreground turn uses; matching keys means the v2 history for the
+    // user's next message will include this entry.
+    let scoped_key = format!("gateway:{}", parent.0);
+    let scoped_id = conv_mgr
+        .get_or_create_conversation(&scoped_key, "owner-user")
+        .await
+        .expect("scoped conversation lookup");
+    let scoped_conv = conv_mgr
+        .get_conversation(scoped_id)
+        .await
+        .expect("scoped conversation snapshot");
+    assert!(
+        scoped_conv
+            .entries
+            .iter()
+            .any(|e| e.content.contains("scoped mission output")),
+        "scoped v2 conversation must contain the mission entry under \
+         `<channel>:<parent>` so follow-up turns see it (entries: {:?})",
+        scoped_conv.entries,
+    );
+
+    // Defense-in-depth: the unscoped `gateway` conversation must NOT carry
+    // the entry. Two separate conversations means the v2 follow-up turn
+    // reading from the scoped key would miss the mission output entirely if
+    // we wrote to the unscoped key — the exact correctness bug Fix 3
+    // addresses.
+    let unscoped_id = conv_mgr
+        .get_or_create_conversation("gateway", "owner-user")
+        .await
+        .expect("unscoped conversation lookup");
+    assert_ne!(
+        scoped_id, unscoped_id,
+        "scoped and unscoped keys must resolve to different conversations \
+         — if they're equal, the scoping is a no-op and the assertion above \
+         is hollow",
+    );
+    let unscoped_conv = conv_mgr
+        .get_conversation(unscoped_id)
+        .await
+        .expect("unscoped conversation snapshot");
+    assert!(
+        unscoped_conv
+            .entries
+            .iter()
+            .all(|e| !e.content.contains("scoped mission output")),
+        "mission output must not leak into the unscoped v2 conversation \
+         (entries: {:?})",
+        unscoped_conv.entries,
+    );
+}
