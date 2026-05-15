@@ -312,6 +312,7 @@ impl ExtensionPackage {
     }
 }
 
+mod installation;
 mod lifecycle;
 mod registry;
 pub mod v2;
@@ -319,7 +320,14 @@ pub mod v2;
 pub use v2::{
     CapabilityDeclV2, CapabilityVisibility, ExtensionManifestV2, ExtensionRuntimeV2,
     MANIFEST_SCHEMA_VERSION, MAX_MANIFEST_BYTES, ManifestSource, ManifestV2Error,
-    RESERVED_HOST_BUNDLED_ID_PREFIX,
+    ProductAdapterExtensionDecl, RESERVED_HOST_BUNDLED_ID_PREFIX,
+};
+
+pub use installation::{
+    ExtensionActivationState, ExtensionCredentialBinding, ExtensionHealthSnapshot,
+    ExtensionHealthStatus, ExtensionInstallation, ExtensionInstallationId, ExtensionManifestRecord,
+    ExtensionManifestRef, ExtensionRegistryError, ExtensionRegistryStore,
+    InMemoryExtensionRegistryStore, ManifestHash,
 };
 
 pub use lifecycle::{

@@ -42,7 +42,11 @@ use ironclaw_host_api::{
     HostApiError, HostPortCatalog, HostPortId, PermissionMode, RequestedTrustClass,
     ResourceProfile, RuntimeKind, TrustClass,
 };
-use serde::{Deserialize, Deserializer};
+use ironclaw_product_adapters::{
+    AuthRequirement, DeclaredEgressTarget, EgressCredentialHandle, ProductAdapterCapabilities,
+    ProductAdapterId, ProductSurfaceKind,
+};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 /// Required value of the `schema_version` field for v2 manifests.
@@ -183,6 +187,95 @@ pub struct ExtensionManifestV2 {
     pub descriptor_trust_default: TrustClass,
     pub runtime: ExtensionRuntimeV2,
     pub capabilities: Vec<CapabilityDeclV2>,
+    /// Optional external-product adapter declaration. This replaces the old
+    /// ProductAdapter-specific manifest document while keeping installation
+    /// state in the generic extension registry.
+    pub product_adapter: Option<ProductAdapterExtensionDecl>,
+}
+
+/// ProductAdapter control-plane metadata declared inside Extension Manifest v2.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProductAdapterExtensionDecl {
+    adapter_id: ProductAdapterId,
+    surface_kind: ProductSurfaceKind,
+    capabilities: ProductAdapterCapabilities,
+    auth_requirement: AuthRequirement,
+    declared_egress: Vec<DeclaredEgressTarget>,
+    required_credentials: Vec<EgressCredentialHandle>,
+}
+
+impl ProductAdapterExtensionDecl {
+    pub fn new(
+        adapter_id: ProductAdapterId,
+        surface_kind: ProductSurfaceKind,
+        capabilities: ProductAdapterCapabilities,
+        auth_requirement: AuthRequirement,
+        declared_egress: Vec<DeclaredEgressTarget>,
+        required_credentials: Vec<EgressCredentialHandle>,
+    ) -> Result<Self, ManifestV2Error> {
+        let decl = Self {
+            adapter_id,
+            surface_kind,
+            capabilities,
+            auth_requirement,
+            declared_egress,
+            required_credentials,
+        };
+        decl.validate()?;
+        Ok(decl)
+    }
+
+    pub fn adapter_id(&self) -> &ProductAdapterId {
+        &self.adapter_id
+    }
+
+    pub fn surface_kind(&self) -> ProductSurfaceKind {
+        self.surface_kind
+    }
+
+    pub fn capabilities(&self) -> &ProductAdapterCapabilities {
+        &self.capabilities
+    }
+
+    pub fn auth_requirement(&self) -> &AuthRequirement {
+        &self.auth_requirement
+    }
+
+    pub fn declared_egress(&self) -> &[DeclaredEgressTarget] {
+        &self.declared_egress
+    }
+
+    pub fn required_credentials(&self) -> &[EgressCredentialHandle] {
+        &self.required_credentials
+    }
+
+    fn validate(&self) -> Result<(), ManifestV2Error> {
+        validate_auth_requirement(&self.auth_requirement)?;
+        let mut required = BTreeSet::new();
+        for handle in &self.required_credentials {
+            if !required.insert(handle.clone()) {
+                return Err(ManifestV2Error::DuplicateProductAdapterCredential {
+                    handle: handle.clone(),
+                });
+            }
+        }
+
+        let mut egress_pairs = BTreeSet::new();
+        for target in &self.declared_egress {
+            if let Some(handle) = target.credential_handle.as_ref()
+                && !required.contains(handle)
+            {
+                return Err(ManifestV2Error::UndeclaredProductAdapterEgressCredential {
+                    handle: handle.clone(),
+                });
+            }
+            let pair = (target.host.clone(), target.credential_handle.clone());
+            if !egress_pairs.insert(pair) {
+                return Err(ManifestV2Error::DuplicateProductAdapterEgressTarget);
+            }
+        }
+        Ok(())
+    }
 }
 
 /// v2 manifest parser/validator errors.
@@ -259,6 +352,16 @@ pub enum ManifestV2Error {
     InvalidWasmModuleRef { value: String, reason: String },
     #[error("invalid mcp runtime: {reason}")]
     InvalidMcpRuntime { reason: String },
+    #[error("product adapter declaration is invalid: {field}: {reason}")]
+    InvalidProductAdapterField { field: &'static str, reason: String },
+    #[error("product adapter declares duplicate credential handle {handle}")]
+    DuplicateProductAdapterCredential { handle: EgressCredentialHandle },
+    #[error("product adapter egress references undeclared credential handle {handle}")]
+    UndeclaredProductAdapterEgressCredential { handle: EgressCredentialHandle },
+    #[error("product adapter declares duplicate egress target")]
+    DuplicateProductAdapterEgressTarget,
+    #[error("inline secret material is not allowed in manifest field {field}")]
+    InlineSecretMaterial { field: String },
 }
 
 impl ExtensionManifestV2 {
@@ -278,9 +381,16 @@ impl ExtensionManifestV2 {
                 max: MAX_MANIFEST_BYTES,
             });
         }
-        let raw: RawManifestV2 = toml::from_str(input).map_err(|error| ManifestV2Error::Parse {
+        let value: toml::Value = toml::from_str(input).map_err(|error| ManifestV2Error::Parse {
             reason: error.to_string(),
         })?;
+        reject_inline_secret_material_value("$", &value)?;
+        let raw: RawManifestV2 =
+            value
+                .try_into()
+                .map_err(|error: toml::de::Error| ManifestV2Error::Parse {
+                    reason: error.to_string(),
+                })?;
         Self::from_raw(raw, source, host_port_catalog)
     }
 
@@ -362,6 +472,19 @@ impl ExtensionManifestV2 {
             capabilities.push(cap);
         }
 
+        let product_adapter = raw
+            .product_adapter
+            .map(|raw| {
+                let adapter_id = ProductAdapterId::new(id.as_str()).map_err(|err| {
+                    ManifestV2Error::InvalidProductAdapterField {
+                        field: "product_adapter.adapter_id",
+                        reason: err.to_string(),
+                    }
+                })?;
+                raw.into_decl(adapter_id)
+            })
+            .transpose()?;
+
         Ok(Self {
             schema_version: raw.schema_version,
             id,
@@ -373,6 +496,7 @@ impl ExtensionManifestV2 {
             descriptor_trust_default,
             runtime,
             capabilities,
+            product_adapter,
         })
     }
 }
@@ -615,6 +739,172 @@ fn requested_trust_to_descriptor_trust(requested: RequestedTrustClass) -> TrustC
     }
 }
 
+fn validate_auth_requirement(requirement: &AuthRequirement) -> Result<(), ManifestV2Error> {
+    match requirement {
+        AuthRequirement::RequestSignature {
+            header_name,
+            timestamp_header_name,
+        } => {
+            validate_http_token("product_adapter.auth.header_name", header_name)?;
+            if let Some(timestamp_header) = timestamp_header_name.as_deref() {
+                validate_http_token(
+                    "product_adapter.auth.timestamp_header_name",
+                    timestamp_header,
+                )?;
+            }
+        }
+        AuthRequirement::SharedSecretHeader { header_name } => {
+            validate_http_token("product_adapter.auth.header_name", header_name)?;
+        }
+        AuthRequirement::SessionCookie { name } => {
+            validate_http_token("product_adapter.auth.name", name)?;
+        }
+        AuthRequirement::BearerToken => {}
+    }
+    Ok(())
+}
+
+/// RFC 7230 §3.2.6 `token` = 1*tchar.
+fn validate_http_token(field: &'static str, value: &str) -> Result<(), ManifestV2Error> {
+    if value.is_empty() {
+        return Err(ManifestV2Error::InvalidProductAdapterField {
+            field,
+            reason: "must not be empty".to_string(),
+        });
+    }
+    for c in value.chars() {
+        if !is_http_tchar(c) {
+            return Err(ManifestV2Error::InvalidProductAdapterField {
+                field,
+                reason: format!(
+                    "must be an RFC 7230 token (no CTL, whitespace, or separators); got {value:?}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn is_http_tchar(c: char) -> bool {
+    matches!(
+        c,
+        '!' | '#' | '$' | '%' | '&' | '\'' | '*' | '+' | '-' | '.' | '^' | '_' | '`' | '|' | '~'
+    ) || c.is_ascii_alphanumeric()
+}
+
+fn reject_inline_secret_material_value(
+    path: &str,
+    value: &toml::Value,
+) -> Result<(), ManifestV2Error> {
+    match value {
+        toml::Value::Table(table) => {
+            for (key, value) in table {
+                let child_path = format!("{path}.{key}");
+                if is_secret_key_name(key) {
+                    return Err(ManifestV2Error::InlineSecretMaterial { field: child_path });
+                }
+                reject_inline_secret_material_value(&child_path, value)?;
+            }
+        }
+        toml::Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                reject_inline_secret_material_value(&format!("{path}[{index}]"), value)?;
+            }
+        }
+        toml::Value::String(value) if looks_like_inline_secret(value) => {
+            return Err(ManifestV2Error::InlineSecretMaterial {
+                field: path.to_string(),
+            });
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn is_secret_key_name(key: &str) -> bool {
+    let normalised: String = key
+        .chars()
+        .map(|c| {
+            if c == '-' {
+                '_'
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect();
+    matches!(
+        normalised.as_str(),
+        "secret"
+            | "secrets"
+            | "secret_value"
+            | "client_secret"
+            | "webhook_secret"
+            | "token"
+            | "raw_token"
+            | "access_token"
+            | "refresh_token"
+            | "bearer_token"
+            | "oauth_token"
+            | "auth_token"
+            | "id_token"
+            | "api_key"
+            | "apikey"
+            | "api_secret"
+            | "private_key"
+            | "password"
+            | "passphrase"
+    )
+}
+
+fn looks_like_inline_secret(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("sha256:") {
+        return false;
+    }
+    const PREFIXES: &[&str] = &[
+        "sk-", "xoxb-", "xoxa-", "xoxp-", "xoxs-", "xoxe-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
+    ];
+    PREFIXES.iter().any(|p| lower.starts_with(p))
+        || looks_like_aws_access_key(value)
+        || lower.contains("begin private key")
+        || lower.contains("begin rsa private key")
+        || (value.len() >= 30 && value.starts_with("eyJ") && value.contains('.'))
+        || has_uri_userinfo(value)
+        || looks_like_telegram_token(value)
+}
+
+fn looks_like_aws_access_key(value: &str) -> bool {
+    if value.len() != 20 {
+        return false;
+    }
+    let Some(prefix) = value.get(..4) else {
+        return false;
+    };
+    (prefix.eq_ignore_ascii_case("AKIA") || prefix.eq_ignore_ascii_case("ASIA"))
+        && value[4..]
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+fn has_uri_userinfo(value: &str) -> bool {
+    let Some((_, rest)) = value.split_once("://") else {
+        return false;
+    };
+    rest.split('/').next().unwrap_or_default().contains('@')
+}
+
+fn looks_like_telegram_token(value: &str) -> bool {
+    let Some((prefix, suffix)) = value.split_once(':') else {
+        return false;
+    };
+    prefix.len() >= 6
+        && prefix.chars().all(|c| c.is_ascii_digit())
+        && suffix.len() >= 10
+        && suffix
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
 // ---- Raw deserialization shapes --------------------------------------------
 
 #[derive(Debug, Deserialize)]
@@ -633,6 +923,8 @@ struct RawManifestV2 {
     runtime: RawRuntimeV2,
     #[serde(default)]
     capabilities: Vec<RawCapabilityV2>,
+    #[serde(default)]
+    product_adapter: Option<RawProductAdapterDecl>,
 }
 
 fn default_requested_trust() -> RequestedTrustClass {
@@ -652,6 +944,87 @@ where
         other => Err(serde::de::Error::custom(format!(
             "unsupported trust value {other:?}; expected one of untrusted, third_party, first_party_requested, system_requested"
         ))),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProductAdapterDecl {
+    surface_kind: ProductSurfaceKind,
+    auth: RawProductAdapterAuth,
+    capabilities: RawProductAdapterCapabilities,
+    #[serde(default)]
+    required_credentials: Vec<RawProductAdapterCredential>,
+    #[serde(default)]
+    egress: Vec<DeclaredEgressTarget>,
+}
+
+impl RawProductAdapterDecl {
+    fn into_decl(
+        self,
+        adapter_id: ProductAdapterId,
+    ) -> Result<ProductAdapterExtensionDecl, ManifestV2Error> {
+        ProductAdapterExtensionDecl::new(
+            adapter_id,
+            self.surface_kind,
+            ProductAdapterCapabilities::new(self.capabilities.flags),
+            self.auth.into_requirement()?,
+            self.egress,
+            self.required_credentials
+                .into_iter()
+                .map(|credential| credential.handle)
+                .collect(),
+        )
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProductAdapterCapabilities {
+    flags: Vec<ironclaw_product_adapters::ProductCapabilityFlag>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProductAdapterCredential {
+    handle: EgressCredentialHandle,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum RawProductAdapterAuth {
+    RequestSignature {
+        header_name: String,
+        #[serde(default)]
+        timestamp_header_name: Option<String>,
+    },
+    SharedSecretHeader {
+        header_name: String,
+    },
+    SessionCookie {
+        name: String,
+    },
+    BearerToken,
+}
+
+impl RawProductAdapterAuth {
+    fn into_requirement(self) -> Result<AuthRequirement, ManifestV2Error> {
+        let requirement = match self {
+            Self::RequestSignature {
+                header_name,
+                timestamp_header_name,
+            } => AuthRequirement::RequestSignature {
+                header_name,
+                timestamp_header_name,
+            },
+            Self::SharedSecretHeader { header_name } => {
+                AuthRequirement::SharedSecretHeader { header_name }
+            }
+            Self::SessionCookie { name } => AuthRequirement::SessionCookie { name },
+            Self::BearerToken => AuthRequirement::BearerToken,
+        };
+        validate_auth_requirement(&requirement)?;
+        Ok(requirement)
     }
 }
 

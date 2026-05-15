@@ -90,7 +90,10 @@ Use this path for Telegram, Slack, Discord, Signal-like protocol adapters, exter
 ### Target shape
 
 ```text
-external protocol payload
+Extension Manifest v2 with [product_adapter]
+  → generic ExtensionRegistry installation/activation state
+  → enabled WASM ProductAdapter runtime entry
+  → external protocol payload
   → Reborn host verifies protocol auth
   → WASM ProductAdapter parses payload
   → ParsedProductInbound
@@ -311,6 +314,7 @@ For native host surfaces:
 
 This guide can be used now for planning and native-core work, but the full production WASM ProductAdapter path still depends on follow-up work:
 
+- ProductAdapter declarations now live inside Extension Manifest v2 `[product_adapter]` blocks and generic extension installation state; the runtime projection/loader is not wired yet.
 - ProductAdapter WIT exists at `crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit`, but wasmtime component bindings/loader are not wired yet.
 - Reborn WASM ProductAdapter host runtime that loads components and exposes egress/secrets/delivery/logging capabilities beyond the current native runner.
 - Component-level ProductAdapter contract test harness.

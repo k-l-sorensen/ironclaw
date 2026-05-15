@@ -51,7 +51,7 @@ A good rule of thumb: if a change adds new authority or persistence, put it in t
 | `ironclaw_mcp` | `ironclaw_mcp` | Adapts manifest-declared MCP tools into IronClaw capabilities without granting ambient filesystem, secret, or network authority. |
 | `ironclaw_wasm` | `ironclaw_wasm` | Reborn WASM component runtime lane. Owns component-model/WIT runtime surface and sandboxed WASM execution details. |
 | `ironclaw_wasm_product_adapters` | `ironclaw_wasm_product_adapters` | WASM-side adapters that bridge guest components into product-facing shapes. Keeps host-only authority out of the guest. |
-| `ironclaw_extensions` | `ironclaw_extensions` | Extension manifest, lifecycle, and registration contracts. Owns install/activate/remove semantics; runtime crates consume validated descriptors from here. |
+| `ironclaw_extensions` | `ironclaw_extensions` | Extension Manifest v2, lifecycle, generic installation registry, and registration contracts. Owns install/activate/remove state plus ProductAdapter manifest metadata; runtime crates consume validated descriptors from here. |
 | `ironclaw_host_runtime` | `ironclaw_host_runtime` | Narrow facade upper Reborn services depend on. Provides `HostRuntime` plus production composition around capability hosting. |
 
 ### Durable state, eventing, and read models
