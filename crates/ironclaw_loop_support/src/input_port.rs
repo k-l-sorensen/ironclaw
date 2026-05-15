@@ -8,7 +8,7 @@ use std::{
 use async_trait::async_trait;
 use ironclaw_turns::run_profile::{
     AgentLoopHostError, AgentLoopHostErrorKind, LoopInputAck, LoopInputAckToken, LoopInputBatch,
-    LoopInputCursor, LoopInputCursorToken, LoopInputPort, LoopRunContext, LoopRunInfoPort,
+    LoopInputCursor, LoopInputPort, LoopRunContext, LoopRunInfoPort,
 };
 
 use crate::{HostInputQueue, HostInputQueueError};
@@ -18,22 +18,14 @@ const MAX_HOST_INPUT_POLL_LIMIT: usize = 128;
 pub struct HostQueueLoopInputPort {
     queue: Arc<dyn HostInputQueue>,
     run_context: LoopRunContext,
-    // TODO: issued_cursors accumulates every cursor ever issued for this port instance.
-    // Once the underlying queue substrate lands, add cursor eviction (ack-d cursors can be
-    // dropped from the set; the loop never reuses an advanced-past cursor).
-    issued_cursors: Mutex<HashSet<LoopInputCursorToken>>,
     issued_ack_tokens: Mutex<HashSet<LoopInputAckToken>>,
 }
 
 impl HostQueueLoopInputPort {
     pub fn new(queue: Arc<dyn HostInputQueue>, run_context: LoopRunContext) -> Self {
-        let issued_cursors = HashSet::from([LoopInputCursor::origin_for_run(&run_context)
-            .token()
-            .clone()]);
         Self {
             queue,
             run_context,
-            issued_cursors: Mutex::new(issued_cursors),
             issued_ack_tokens: Mutex::new(HashSet::new()),
         }
     }
@@ -53,7 +45,6 @@ impl LoopInputPort for HostQueueLoopInputPort {
         limit: usize,
     ) -> Result<LoopInputBatch, AgentLoopHostError> {
         validate_cursor_for_run(&after, &self.run_context)?;
-        self.validate_issued_cursor(after.token())?;
         let bounded_limit = bounded_limit(limit, MAX_HOST_INPUT_POLL_LIMIT);
         let host_batch = self
             .queue
@@ -68,12 +59,6 @@ impl LoopInputPort for HostQueueLoopInputPort {
         let mut inputs = Vec::with_capacity(host_batch.inputs.len());
         let mut input_acks = Vec::with_capacity(host_batch.inputs.len());
         {
-            let mut issued_cursors = self.issued_cursors.lock().map_err(|_| {
-                AgentLoopHostError::new(
-                    AgentLoopHostErrorKind::Internal,
-                    "input cursor provenance cache unavailable",
-                )
-            })?;
             let mut issued_ack_tokens = self.issued_ack_tokens.lock().map_err(|_| {
                 AgentLoopHostError::new(
                     AgentLoopHostErrorKind::Internal,
@@ -82,7 +67,6 @@ impl LoopInputPort for HostQueueLoopInputPort {
             })?;
             for envelope in host_batch.inputs {
                 let cursor = LoopInputCursor::from_host_token(&self.run_context, envelope.cursor);
-                issued_cursors.insert(cursor.token().clone());
                 issued_ack_tokens.insert(envelope.ack_token.clone());
                 inputs.push(envelope.input);
                 input_acks.push(LoopInputAck {
@@ -90,7 +74,6 @@ impl LoopInputPort for HostQueueLoopInputPort {
                     token: envelope.ack_token,
                 });
             }
-            issued_cursors.insert(host_batch.next_cursor.clone());
         }
 
         Ok(LoopInputBatch {
@@ -113,26 +96,6 @@ impl LoopInputPort for HostQueueLoopInputPort {
 }
 
 impl HostQueueLoopInputPort {
-    fn validate_issued_cursor(
-        &self,
-        cursor: &LoopInputCursorToken,
-    ) -> Result<(), AgentLoopHostError> {
-        let issued = self.issued_cursors.lock().map_err(|_| {
-            AgentLoopHostError::new(
-                AgentLoopHostErrorKind::Internal,
-                "input cursor provenance cache unavailable",
-            )
-        })?;
-        if issued.contains(cursor) {
-            Ok(())
-        } else {
-            Err(AgentLoopHostError::new(
-                AgentLoopHostErrorKind::InvalidInvocation,
-                "input cursor was not issued by this host",
-            ))
-        }
-    }
-
     fn validate_issued_ack_tokens(
         &self,
         tokens: &[LoopInputAckToken],
@@ -351,21 +314,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forged_future_cursor_is_rejected_for_poll_inputs() {
-        let run_context = test_run_context("run-forged-poll").await;
+    async fn durable_cursor_is_accepted_after_port_rebuild() {
+        let run_context = test_run_context("run-durable-cursor").await;
+        let queue = Arc::new(FakeInputQueue::new(vec![
+            LoopInput::UserMessage {
+                message_ref: message_ref("msg:first"),
+            },
+            LoopInput::UserMessage {
+                message_ref: message_ref("msg:second"),
+            },
+        ]));
+        let first_port = HostQueueLoopInputPort::new(queue.clone(), run_context.clone());
+        let first = first_port
+            .poll_inputs(LoopInputCursor::origin_for_run(&run_context), 1)
+            .await
+            .expect("first poll should succeed");
+
+        let rebuilt_port = HostQueueLoopInputPort::new(queue, run_context.clone());
+        let second = rebuilt_port
+            .poll_inputs(first.next_cursor, 8)
+            .await
+            .expect("rebuilt port should accept durable cursor");
+
+        assert_eq!(
+            second.inputs,
+            vec![LoopInput::UserMessage {
+                message_ref: message_ref("msg:second")
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_cursor_token_is_rejected_by_host_queue() {
+        let run_context = test_run_context("run-invalid-poll").await;
         let queue = Arc::new(FakeInputQueue::new(vec![LoopInput::UserMessage {
             message_ref: message_ref("msg:user"),
         }]));
         let port = HostQueueLoopInputPort::new(queue.clone(), run_context.clone());
-        let forged = LoopInputCursor::from_host_token(&run_context, cursor_token(99));
+        let invalid = LoopInputCursor::from_host_token(
+            &run_context,
+            LoopInputCursorToken::new("input-cursor:not-a-sequence").unwrap(),
+        );
 
         let error = port
-            .poll_inputs(forged, 8)
+            .poll_inputs(invalid, 8)
             .await
-            .expect_err("forged cursor should be rejected before queue access");
+            .expect_err("invalid cursor should be rejected by queue");
 
         assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
-        assert_eq!(queue.call_count(), 0);
+        assert_eq!(queue.call_count(), 1);
     }
 
     #[tokio::test]

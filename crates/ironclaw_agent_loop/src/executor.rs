@@ -148,6 +148,7 @@ struct DrainedInputs {
     state: LoopExecutionState,
     drained: bool,
     ack_tokens: Vec<LoopInputAckToken>,
+    cancelled_reason_kind: Option<LoopCancelledReasonKind>,
 }
 
 impl CanonicalAgentLoopExecutor {
@@ -176,6 +177,16 @@ impl CanonicalAgentLoopExecutor {
                 let drained = self.drain_user_inputs(host, state).await?;
                 state = drained.state;
                 pending_input_ack.replace(drained.ack_tokens)?;
+                if let Some(reason_kind) = drained.cancelled_reason_kind {
+                    let checked = self.checkpoint(host, state, CheckpointKind::Final).await?;
+                    pending_input_ack.ack(host).await?;
+                    return cancelled_exit_with_reason(
+                        host,
+                        checked.state,
+                        reason_kind,
+                        Some(checked.checkpoint_id),
+                    );
+                }
             }
 
             let context_request = planner.context().plan_context_request(&state).await;
@@ -256,6 +267,17 @@ impl CanonicalAgentLoopExecutor {
                                 let drained_inputs = self.drain_followup(host, state).await?;
                                 state = drained_inputs.state;
                                 pending_input_ack.replace(drained_inputs.ack_tokens)?;
+                                if let Some(reason_kind) = drained_inputs.cancelled_reason_kind {
+                                    let checked =
+                                        self.checkpoint(host, state, CheckpointKind::Final).await?;
+                                    pending_input_ack.ack(host).await?;
+                                    return cancelled_exit_with_reason(
+                                        host,
+                                        checked.state,
+                                        reason_kind,
+                                        Some(checked.checkpoint_id),
+                                    );
+                                }
                                 if drained_inputs.drained {
                                     state.iteration = state.iteration.saturating_add(1);
                                     continue;
@@ -796,12 +818,13 @@ impl CanonicalAgentLoopExecutor {
             .map_err(|_| AgentLoopExecutorError::HostUnavailable {
                 stage: HostStage::Input,
             })?;
-        let (drained, ack_tokens) =
-            consume_user_facing_prefix(&batch, UserFacingInputDrainMode::Steering, &mut state)?;
+        let (drained, ack_tokens, cancelled_reason_kind) =
+            consume_drainable_inputs(&batch, UserFacingInputDrainMode::Steering, &mut state)?;
         Ok(DrainedInputs {
             state,
             drained,
             ack_tokens,
+            cancelled_reason_kind,
         })
     }
 
@@ -816,12 +839,13 @@ impl CanonicalAgentLoopExecutor {
             .map_err(|_| AgentLoopExecutorError::HostUnavailable {
                 stage: HostStage::Input,
             })?;
-        let (drained, ack_tokens) =
-            consume_user_facing_prefix(&batch, UserFacingInputDrainMode::FollowUp, &mut state)?;
+        let (drained, ack_tokens, cancelled_reason_kind) =
+            consume_drainable_inputs(&batch, UserFacingInputDrainMode::FollowUp, &mut state)?;
         Ok(DrainedInputs {
             state,
             drained,
             ack_tokens,
+            cancelled_reason_kind,
         })
     }
 }
@@ -832,34 +856,63 @@ enum UserFacingInputDrainMode {
     FollowUp,
 }
 
-fn consume_user_facing_prefix(
+fn consume_drainable_inputs(
     batch: &LoopInputBatch,
     mode: UserFacingInputDrainMode,
     state: &mut LoopExecutionState,
-) -> Result<(bool, Vec<LoopInputAckToken>), AgentLoopExecutorError> {
-    let prefix_len = batch
-        .inputs
-        .iter()
-        .take_while(|input| user_facing_input_matches_drain_mode(input, mode))
-        .count();
-
-    if prefix_len == 0 {
-        return Ok((false, Vec::new()));
+) -> Result<
+    (
+        bool,
+        Vec<LoopInputAckToken>,
+        Option<LoopCancelledReasonKind>,
+    ),
+    AgentLoopExecutorError,
+> {
+    let mut consumed_len = 0;
+    let mut drained = false;
+    let mut cancelled_reason_kind = None;
+    for input in &batch.inputs {
+        if user_facing_input_matches_drain_mode(input, mode) {
+            consumed_len += 1;
+            drained = true;
+            continue;
+        }
+        match input {
+            LoopInput::Cancel { .. } => {
+                consumed_len += 1;
+                cancelled_reason_kind = Some(LoopCancelledReasonKind::HostCancellation);
+                break;
+            }
+            LoopInput::Interrupt { .. } => {
+                consumed_len += 1;
+                cancelled_reason_kind = Some(LoopCancelledReasonKind::HostInterrupt);
+                break;
+            }
+            LoopInput::GateResolved { .. } | LoopInput::CapabilitySurfaceChanged { .. } => break,
+            LoopInput::UserMessage { .. }
+            | LoopInput::FollowUp { .. }
+            | LoopInput::Steering { .. } => {
+                break;
+            }
+        }
     }
-    if batch.input_acks.len() < prefix_len {
+    if consumed_len == 0 {
+        return Ok((false, Vec::new(), None));
+    }
+    if batch.input_acks.len() < consumed_len {
         return Err(AgentLoopExecutorError::PlannerContract {
             detail: "input batch omitted ack metadata for consumed inputs",
         });
     }
-    let last_ack = &batch.input_acks[prefix_len - 1];
+    let last_ack = &batch.input_acks[consumed_len - 1];
     state.input_cursor = last_ack.cursor.clone();
     let ack_tokens = batch
         .input_acks
         .iter()
-        .take(prefix_len)
+        .take(consumed_len)
         .map(|ack| ack.token.clone())
         .collect();
-    Ok((true, ack_tokens))
+    Ok((drained, ack_tokens, cancelled_reason_kind))
 }
 
 fn user_facing_input_matches_drain_mode(input: &LoopInput, mode: UserFacingInputDrainMode) -> bool {
@@ -923,13 +976,27 @@ fn failed_exit(
 
 fn cancelled_exit(
     host: &(dyn AgentLoopDriverHost + Send + Sync),
-    _state: LoopExecutionState,
+    state: LoopExecutionState,
+    checkpoint_id: Option<ironclaw_turns::TurnCheckpointId>,
+) -> Result<LoopExit, AgentLoopExecutorError> {
+    cancelled_exit_with_reason(
+        host,
+        state,
+        LoopCancelledReasonKind::HostCancellation,
+        checkpoint_id,
+    )
+}
+
+fn cancelled_exit_with_reason(
+    host: &(dyn AgentLoopDriverHost + Send + Sync),
+    state: LoopExecutionState,
+    reason_kind: LoopCancelledReasonKind,
     checkpoint_id: Option<ironclaw_turns::TurnCheckpointId>,
 ) -> Result<LoopExit, AgentLoopExecutorError> {
     Ok(LoopExit::Cancelled(LoopCancelled {
-        reason_kind: LoopCancelledReasonKind::HostCancellation,
+        reason_kind,
         checkpoint_id,
-        interrupted_message_refs: Vec::new(),
+        interrupted_message_refs: state.assistant_refs,
         exit_id: exit_id(host, "cancelled")?,
     }))
 }
@@ -1612,7 +1679,6 @@ mod tests {
     async fn steering_drain_does_not_ack_cancel_before_user_message() {
         let host = MockHost::new(Vec::new());
         let run_context = host.run_context().clone();
-        let initial_cursor = LoopInputCursor::origin_for_run(&run_context);
         let next_cursor = input_cursor(&run_context, "input-cursor:after-cancel");
         let host = host.with_input_batches(vec![LoopInputBatch {
             inputs: vec![
@@ -1641,9 +1707,172 @@ mod tests {
             .await
             .expect("drain");
 
-        assert_eq!(next.state.input_cursor, initial_cursor);
+        assert_eq!(
+            next.state.input_cursor,
+            input_cursor(&run_context, "input-cursor:cancel")
+        );
+        assert!(!next.drained);
+        assert_eq!(
+            next.ack_tokens,
+            vec![LoopInputAckToken::new("input-ack:cancel").expect("valid ack token")]
+        );
+        assert_eq!(
+            next.cancelled_reason_kind,
+            Some(LoopCancelledReasonKind::HostCancellation)
+        );
+        assert!(host.acked_input_tokens().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_exits_before_prompt_or_model_call() {
+        let host = MockHost::new(Vec::new());
+        let run_context = host.run_context().clone();
+        let host = host.with_input_batches(vec![LoopInputBatch {
+            inputs: vec![
+                LoopInput::Cancel {
+                    reason_kind: LoopCancelReasonKind::UserRequested,
+                },
+                LoopInput::UserMessage {
+                    message_ref: message_ref("msg:after-cancel"),
+                },
+            ],
+            input_acks: vec![
+                input_ack(&run_context, "input-cursor:cancel", "input-ack:cancel"),
+                input_ack(
+                    &run_context,
+                    "input-cursor:after-cancel",
+                    "input-ack:after-cancel",
+                ),
+            ],
+            next_cursor: input_cursor(&run_context, "input-cursor:after-cancel"),
+        }]);
+        let executor = CanonicalAgentLoopExecutor;
+        let state = LoopExecutionState::initial_for_run(host.run_context());
+
+        let exit = executor
+            .execute_family(&crate::families::default(), &host, state)
+            .await
+            .expect("queued cancel should produce a loop exit");
+
+        match exit {
+            LoopExit::Cancelled(cancelled) => {
+                assert_eq!(
+                    cancelled.reason_kind,
+                    LoopCancelledReasonKind::HostCancellation
+                );
+                assert!(cancelled.checkpoint_id.is_some());
+            }
+            other => panic!("expected queued cancel to return Cancelled, got {other:?}"),
+        }
+        assert!(host.model_requests().is_empty());
+        assert_eq!(host.checkpoint_kinds(), vec![LoopCheckpointKind::Final]);
+        assert_eq!(
+            host.acked_input_tokens(),
+            vec![LoopInputAckToken::new("input-ack:cancel").expect("valid ack token")]
+        );
+        assert_eq!(
+            host.events(),
+            vec!["checkpoint:final".to_string(), "ack_inputs".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_cancel_after_user_prefix_exits_before_model_call() {
+        let host = MockHost::new(Vec::new());
+        let run_context = host.run_context().clone();
+        let host = host.with_input_batches(vec![LoopInputBatch {
+            inputs: vec![
+                LoopInput::UserMessage {
+                    message_ref: message_ref("msg:before-cancel"),
+                },
+                LoopInput::Cancel {
+                    reason_kind: LoopCancelReasonKind::UserRequested,
+                },
+                LoopInput::UserMessage {
+                    message_ref: message_ref("msg:after-cancel"),
+                },
+            ],
+            input_acks: vec![
+                input_ack(
+                    &run_context,
+                    "input-cursor:before-cancel",
+                    "input-ack:before-cancel",
+                ),
+                input_ack(&run_context, "input-cursor:cancel", "input-ack:cancel"),
+                input_ack(
+                    &run_context,
+                    "input-cursor:after-cancel",
+                    "input-ack:after-cancel",
+                ),
+            ],
+            next_cursor: input_cursor(&run_context, "input-cursor:after-cancel"),
+        }]);
+        let executor = CanonicalAgentLoopExecutor;
+        let state = LoopExecutionState::initial_for_run(host.run_context());
+
+        let exit = executor
+            .execute_family(&crate::families::default(), &host, state)
+            .await
+            .expect("queued cancel should produce a loop exit");
+
+        assert!(matches!(exit, LoopExit::Cancelled(_)));
+        assert!(host.model_requests().is_empty());
+        assert_eq!(host.checkpoint_kinds(), vec![LoopCheckpointKind::Final]);
+        assert_eq!(
+            host.acked_input_tokens(),
+            vec![
+                LoopInputAckToken::new("input-ack:before-cancel").expect("valid"),
+                LoopInputAckToken::new("input-ack:cancel").expect("valid"),
+            ]
+        );
+        assert_eq!(
+            host.events(),
+            vec!["checkpoint:final".to_string(), "ack_inputs".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_drain_leaves_unhandled_control_at_head_unacked() {
+        let host = MockHost::new(Vec::new());
+        let run_context = host.run_context().clone();
+        let host = host.with_input_batches(vec![LoopInputBatch {
+            inputs: vec![
+                LoopInput::GateResolved {
+                    gate_ref: LoopGateRef::new("gate:resolved").expect("valid"),
+                },
+                LoopInput::CapabilitySurfaceChanged {
+                    version: surface_version(),
+                },
+                LoopInput::UserMessage {
+                    message_ref: message_ref("msg:after-control"),
+                },
+            ],
+            input_acks: vec![
+                input_ack(&run_context, "input-cursor:gate", "input-ack:gate"),
+                input_ack(&run_context, "input-cursor:surface", "input-ack:surface"),
+                input_ack(
+                    &run_context,
+                    "input-cursor:after-control",
+                    "input-ack:after-control",
+                ),
+            ],
+            next_cursor: input_cursor(&run_context, "input-cursor:after-control"),
+        }]);
+        let executor = CanonicalAgentLoopExecutor;
+        let state = LoopExecutionState::initial_for_run(host.run_context());
+
+        let next = executor
+            .drain_user_inputs(&host, state)
+            .await
+            .expect("drain");
+
         assert!(!next.drained);
         assert!(next.ack_tokens.is_empty());
+        assert!(next.cancelled_reason_kind.is_none());
+        assert_eq!(
+            next.state.input_cursor,
+            LoopInputCursor::origin_for_run(&run_context)
+        );
         assert!(host.acked_input_tokens().is_empty());
     }
 
@@ -1651,7 +1880,6 @@ mod tests {
     async fn followup_drain_does_not_ack_interrupt_before_followup() {
         let host = MockHost::new(Vec::new());
         let run_context = host.run_context().clone();
-        let initial_cursor = LoopInputCursor::origin_for_run(&run_context);
         let next_cursor = input_cursor(&run_context, "input-cursor:after-interrupt");
         let host = host.with_input_batches(vec![LoopInputBatch {
             inputs: vec![
@@ -1682,8 +1910,18 @@ mod tests {
         let next = executor.drain_followup(&host, state).await.expect("drain");
 
         assert!(!next.drained);
-        assert_eq!(next.state.input_cursor, initial_cursor);
-        assert!(next.ack_tokens.is_empty());
+        assert_eq!(
+            next.state.input_cursor,
+            input_cursor(&run_context, "input-cursor:interrupt")
+        );
+        assert_eq!(
+            next.ack_tokens,
+            vec![LoopInputAckToken::new("input-ack:interrupt").expect("valid ack token")]
+        );
+        assert_eq!(
+            next.cancelled_reason_kind,
+            Some(LoopCancelledReasonKind::HostInterrupt)
+        );
         assert!(host.acked_input_tokens().is_empty());
     }
 
