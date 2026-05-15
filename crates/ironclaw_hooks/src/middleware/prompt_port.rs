@@ -22,7 +22,7 @@ use ironclaw_prompt_envelope::{EnvelopeSource, EnvelopeTrust, wrap_untrusted};
 use ironclaw_turns::LoopMessageRef;
 use ironclaw_turns::run_profile::{
     AgentLoopHostError, AgentLoopHostErrorKind, LoopModelMessage, LoopPromptBundle,
-    LoopPromptBundleRequest, LoopPromptPort,
+    LoopPromptBundleAuthority, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
 };
 
 /// Narrow seam for materializing hook-emitted `msg:hook.*` content refs so
@@ -69,6 +69,16 @@ pub struct HookedLoopPromptPort {
     /// [`ironclaw_turns::run_profile::InstructionMaterializationStore`]);
     /// tests can use any [`HookPromptMaterializationSink`] impl.
     materialization_sink: Option<Arc<dyn HookPromptMaterializationSink>>,
+    /// Authority + run-context pair used to re-issue the prompt bundle grant
+    /// after hook patches are appended. The inner port (typically
+    /// `HostManagedLoopPromptPort`) issues the initial grant for the
+    /// pre-hook bundle; we then mutate `bundle.messages`, which causes the
+    /// downstream `grant.messages != messages` rejection in
+    /// `LoopPromptBundleAuthority::authorize_latest_model_request`. Wiring
+    /// the authority + run context here lets us refresh the grant to match
+    /// the post-hook bundle that actually reaches the model.
+    /// serrrfirat P1 #1 on PR #3573.
+    bundle_authority: Option<(LoopPromptBundleAuthority, LoopRunContext)>,
 }
 
 impl HookedLoopPromptPort {
@@ -91,7 +101,24 @@ impl HookedLoopPromptPort {
             tenant_id,
             snippet_byte_budget: DEFAULT_SNIPPET_BYTE_BUDGET,
             materialization_sink: None,
+            bundle_authority: None,
         }
+    }
+
+    /// Required for production: wire the prompt bundle authority + run
+    /// context so the wrapper can re-issue the grant for the post-hook
+    /// bundle. Without this, hook-emitted snippets cause downstream model
+    /// requests to fail with `model request messages do not match the
+    /// host-built prompt bundle` because the inner port issued the grant
+    /// for the pre-hook messages. serrrfirat P1 #1 on PR #3573.
+    #[must_use]
+    pub fn with_bundle_authority(
+        mut self,
+        authority: LoopPromptBundleAuthority,
+        run_context: LoopRunContext,
+    ) -> Self {
+        self.bundle_authority = Some((authority, run_context));
+        self
     }
 
     /// Override the maximum total bytes hook patches may contribute to a
@@ -160,9 +187,21 @@ impl LoopPromptPort for HookedLoopPromptPort {
                 )?;
             }
         }
+        let wrapped_was_nonempty = !wrapped.is_empty();
         bundle
             .messages
             .extend(wrapped.into_iter().map(|w| w.message));
+        // Re-issue the prompt bundle authority grant so it covers the
+        // post-hook messages. The inner port issued a grant for the
+        // pre-hook bundle; without this refresh the downstream model
+        // request fails closed at
+        // `LoopPromptBundleAuthority::authorize_latest_model_request`
+        // because `grant.messages != messages`. serrrfirat P1 #1.
+        if wrapped_was_nonempty
+            && let Some((authority, run_context)) = self.bundle_authority.as_ref()
+        {
+            authority.issue_bundle(run_context, &bundle)?;
+        }
         Ok(bundle)
     }
 }

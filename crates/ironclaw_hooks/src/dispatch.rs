@@ -440,6 +440,25 @@ impl HookDispatcher {
         scope: HookBindingScope,
         hook: Box<dyn ObserverHook>,
     ) -> Result<(), crate::error::HookError> {
+        // Reject non-observer points at install time. Previously this path
+        // accepted any `HookPointSpec`, populated the binding registry, but
+        // only inserted into the observer map — so a `BeforeCapability`
+        // observer installation would later cause `dispatch_before_capability`
+        // to see a binding without a gate impl, poison the slot, and
+        // fail-close the capability. Catch the misuse at install time
+        // instead. (serrrfirat P2 #2 on PR #3573.)
+        match point {
+            HookPointSpec::AfterModel
+            | HookPointSpec::AfterCapability
+            | HookPointSpec::AfterCheckpoint => {}
+            HookPointSpec::BeforeCapability | HookPointSpec::BeforePrompt => {
+                return Err(crate::error::HookError::RegistryConstruction(format!(
+                    "observer hooks cannot be installed at {point:?}; that \
+                     point dispatches gate/mutator implementations, not \
+                     observers"
+                )));
+            }
+        }
         let binding = HookBinding {
             hook_id,
             hook_version: HookVersion::ONE,
@@ -2257,6 +2276,51 @@ mod tests {
             &kinds[1],
             LoopHostMilestoneKind::HookDecisionEmitted { decision, .. }
                 if decision.kind_name() == "pass"
+        ));
+    }
+
+    /// serrrfirat P2 #2 on PR #3573: installing an observer at a
+    /// gate/mutator point used to succeed (binding was inserted, but only
+    /// the observer map was populated). Dispatch would later poison the
+    /// slot and fail-close the capability. Reject at install time.
+    #[test]
+    fn install_observer_rejects_before_capability_point() {
+        let id = HookId::for_builtin("test::observer::misuse-bc", HookVersion::ONE);
+        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+        let err = dispatcher
+            .install_builtin_observer(
+                id,
+                HookPhase::Telemetry,
+                HookPointSpec::BeforeCapability,
+                Box::new(NotingObserver),
+            )
+            .expect_err("observer install at before_capability must be rejected");
+        match err {
+            crate::error::HookError::RegistryConstruction(msg) => {
+                assert!(
+                    msg.contains("observer") && msg.contains("BeforeCapability"),
+                    "unexpected error message: {msg}"
+                );
+            }
+            other => panic!("expected RegistryConstruction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn install_observer_rejects_before_prompt_point() {
+        let id = HookId::for_builtin("test::observer::misuse-bp", HookVersion::ONE);
+        let mut dispatcher = HookDispatcher::new(HookRegistry::new());
+        let err = dispatcher
+            .install_builtin_observer(
+                id,
+                HookPhase::Telemetry,
+                HookPointSpec::BeforePrompt,
+                Box::new(NotingObserver),
+            )
+            .expect_err("observer install at before_prompt must be rejected");
+        assert!(matches!(
+            err,
+            crate::error::HookError::RegistryConstruction(_)
         ));
     }
 

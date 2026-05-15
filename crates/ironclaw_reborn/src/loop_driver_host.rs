@@ -723,7 +723,8 @@ where
                     Arc::clone(dispatcher),
                     run_context.scope.tenant_id.clone(),
                 )
-                .with_materialization_sink(sink),
+                .with_materialization_sink(sink)
+                .with_bundle_authority(prompt_authority.clone(), run_context.clone()),
             );
         }
         let input: Arc<dyn LoopInputPort> =
