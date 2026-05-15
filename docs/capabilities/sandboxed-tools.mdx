@@ -4,7 +4,7 @@ sidebarTitle: Sandboxed Tools
 description: Sandboxed tool execution via WebAssembly (wasmtime)
 ---
 
-WASM tools run inside a WebAssembly sandbox powered by [wasmtime](https://wasmtime.dev/). They have access to IronClaw's host functions (logging, time, workspace), but all other capabilities — network, filesystem, credentials — must be explicitly declared in a `capabilities.json` file.
+WASM tools run inside a WebAssembly sandbox powered by [wasmtime](https://wasmtime.dev/). They get a small, fixed set of host functions ([see below](#host-functions)) and nothing else: no syscalls, no environment access, no ambient network. Every capability the tool actually uses — which hosts it can reach, which secrets the host injects on its behalf, which workspace paths it can read — must be declared in a sidecar `capabilities.json` file.
 
 This is IronClaw's recommended approach for custom integrations that need stronger isolation than a built-in Rust tool provides.
 
@@ -58,14 +58,12 @@ export WASM_MEMORY_LIMIT=16777216
 
 Each WASM tool has a per-tool rate limiter to prevent a misbehaving or compromised tool from making excessive API calls.
 
-Rate limits are declared in `capabilities.json`:
+Rate limits are declared inside the relevant capability section of `capabilities.json` (for HTTP requests, under `http.rate_limit`):
 
 ```json
-{
-  "rate_limit": {
-    "requests_per_minute": 60,
-    "requests_per_day": 1000
-  }
+"rate_limit": {
+  "requests_per_minute": 60,
+  "requests_per_hour": 1000
 }
 ```
 
@@ -73,56 +71,70 @@ Rate limits are declared in `capabilities.json`:
 
 ## capabilities.json
 
-Every WASM tool must include a `capabilities.json` alongside its `.wasm` binary. This file is the single source of truth for what the tool is allowed to do.
+Every WASM tool ships a `capabilities.json` alongside its `.wasm` binary. This file is the single source of truth for what the tool is allowed to do. Capabilities live under a top-level `capabilities` key; metadata (`description`, `version`, etc.) sits at the root.
 
 ```json
 {
-  "name": "my-tool",
   "version": "0.1.0",
-  "description": "Fetches data from example.com API",
-
-  "network": {
-    "allowed_hosts": [
-      "api.example.com",
-      "auth.example.com"
-    ]
-  },
-
-  "filesystem": {
-    "read": ["/workspace/data/*"],
-    "write": ["/workspace/output/*"]
-  },
-
-  "credentials": [
-    {
-      "name": "example_api_key",
-      "inject_as": "Authorization",
-      "format": "Bearer {value}"
+  "description": "Fetches data from example.com",
+  "capabilities": {
+    "http": {
+      "allowlist": [
+        {
+          "host": "api.example.com",
+          "path_prefix": "/",
+          "methods": ["GET", "POST"]
+        }
+      ],
+      "credentials": {
+        "example_api_key": {
+          "secret_name": "example_api_key",
+          "location": { "type": "bearer" },
+          "host_patterns": ["api.example.com"]
+        }
+      },
+      "rate_limit": {
+        "requests_per_minute": 30,
+        "requests_per_hour": 500
+      }
+    },
+    "secrets": {
+      "allowed_names": ["example_api_key"]
+    },
+    "workspace": {
+      "allowed_prefixes": ["context/", "daily/"]
     }
-  ],
-
-  "rate_limit": {
-    "requests_per_minute": 30,
-    "requests_per_day": 500
   }
 }
 ```
 
-### Network allowlist
+### HTTP allowlist
 
-The `network.allowed_hosts` list controls which domains the tool can reach. Requests to any domain not in this list are rejected by the network proxy before the TCP connection is established.
-
-HTTPS traffic uses the `CONNECT` tunnel method. The proxy validates the target hostname against the allowlist before establishing the tunnel.
-
-### Filesystem access
-
-WASM tools cannot access the host filesystem by default. Paths declared under `filesystem.read` and `filesystem.write` are mounted into the WASM module's sandbox at the declared paths.
+`capabilities.http.allowlist` controls which destinations the tool can reach via the `http_request` host function. Each entry pins a `host`, an optional `path_prefix`, and the allowed `methods`. Requests that don't match an entry are rejected by the host before any connection opens.
 
 ### Credential injection
 
-Credentials listed in `capabilities.json` are never passed into the WASM module's memory. Instead, when the module makes an outbound HTTP request, the proxy intercepts the request and injects the specified header before forwarding it.
+`capabilities.http.credentials` declares which secrets the host will attach to outbound requests, and where. The credential value is never passed into the WASM module's memory — the tool builds an unauthenticated request, the host matches the destination against `host_patterns`, decrypts the secret in its own address space, and writes it into the request just before sending.
 
-The WASM module never sees the raw credential value — it only makes an unauthenticated HTTP request, and the proxy adds the auth header transparently.
+`location.type` selects the injection point:
+
+| `type` | Effect |
+|--------|--------|
+| `bearer` | Sets `Authorization: Bearer <secret>` |
+| `basic` | Sets `Authorization: Basic <base64(username:secret)>`; requires `username` |
+| `header` | Sets a custom header; requires `name`, optional `prefix` |
+| `query_param` | Appends `?name=<secret>`; requires `name` |
+| `url_path` | Substitutes a placeholder in the URL or body template; requires `placeholder` |
+
+For the full end-to-end injection flow (and why this can't be bypassed by a misbehaving tool), see [Secrets & Sandboxing](/security/secrets-and-sandboxing#how-a-tool-uses-a-secret).
+
+### Secrets allowlist
+
+`capabilities.secrets.allowed_names` is the second half of the credential gate. A tool can only resolve secrets whose names appear in this list (glob patterns like `github_*` are allowed). Even if a credential mapping references a secret, the host will refuse to load it unless the name is allowlisted here.
+
+### Workspace read
+
+`capabilities.workspace.allowed_prefixes` declares which workspace path prefixes the tool can read via the `workspace_read` host function. There is no `workspace_write` host function exposed to tools — workspace mutations happen through the agent's `memory_write` tool, which carries its own dispatch and audit trail.
 
 ---
 

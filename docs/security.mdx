@@ -19,7 +19,7 @@ Everything below exists to make that rule hold up in practice.
   </Card>
 
   <Card title="Sandboxed execution" icon="cubes">
-    Tools run in containers, are resource limited and can only contact allowlisted endpoints.
+    Tools run inside a WebAssembly sandbox, are resource limited, and can only contact allowlisted endpoints.
   </Card>
 
   <Card title="Leak Detection" icon="shield">
@@ -40,7 +40,7 @@ The security architecture illustrates IronClaw's **defense in depth** approach w
 
 ![Data Flow Diagram](/images/security/data-flow.png)
 
-At all point, secrets are separated from regular data and handled with extra care. They are encrypted at rest, never enter the container, and are injected into outgoing requests at the network proxy layer.
+At every point, secrets are separated from regular data and handled with extra care. They are encrypted at rest, never enter the WASM sandbox, and are injected into outgoing requests at the host boundary.
 
 ---
 
@@ -51,7 +51,7 @@ Multiple layers protect against prompt injection:
 1. **Input validation:** Length, encoding, forbidden patterns
 2. **Sanitizer:** Escapes dangerous content
 3. **Policy engine:** Severity-based actions
-4. **Leak detector:** Scans for 15+ secret patterns
+4. **Leak detector:** Scans for 20+ secret patterns
 5. **Tool output wrapping:** XML format with escape hints
 
 ---
@@ -97,13 +97,20 @@ cat ../../../etc/passwd
 Tools cannot access secrets directly, instead, they define what keys, oauth tokens, or API credential they need. Then they proceed to create the necessary requests, and the network proxy injects these credentials into outgoing requests without exposing them to the container.
 
 ```json
-  "credentials": {
-    "google_oauth_token": {
-      "secret_name": "google_oauth_token",
-      "location": { "type": "bearer" },
-      "host_patterns": ["gmail.googleapis.com"]
+"capabilities": {
+  "http": {
+    "credentials": {
+      "google_oauth_token": {
+        "secret_name": "google_oauth_token",
+        "location": { "type": "bearer" },
+        "host_patterns": ["gmail.googleapis.com"]
+      }
     }
+  },
+  "secrets": {
+    "allowed_names": ["google_oauth_token"]
   }
+}
 ```
 
 <Card title="Deep dive: how credentials are injected at runtime" href="/security/secrets-and-sandboxing" icon="arrow-right">
