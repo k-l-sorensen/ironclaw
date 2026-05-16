@@ -5,7 +5,12 @@ use ironclaw_reborn::planned_driver_factory::PLANNED_DEFAULT_PROFILE_ID;
 use ironclaw_threads::MessageStatus;
 use ironclaw_turns::TurnStatus;
 
-use support::planned_agent_loop::{ProductLiveAgentLoopHarness, ProductLiveAgentLoopHarnessConfig};
+use ironclaw_loop_support::HostManagedModelResponse;
+
+use support::planned_agent_loop::{
+    HarnessCapabilityConfig, ProductLiveAgentLoopHarness, ProductLiveAgentLoopHarnessConfig,
+    capability_call_response,
+};
 
 #[tokio::test]
 async fn product_live_harness_runs_planned_loop_and_persists_reply() {
@@ -125,6 +130,54 @@ async fn ported_product_live_fixture_cancels_through_public_turn_path() {
         message.status == MessageStatus::Finalized
             && message.turn_run_id.as_deref() == Some(submitted_run_id.to_string().as_str())
             && message.content.as_deref() == Some("reply after cancel")
+    }));
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn product_live_harness_invokes_capability_then_persists_final_reply() {
+    let harness = ProductLiveAgentLoopHarness::new(ProductLiveAgentLoopHarnessConfig {
+        assistant_reply: "unused fallback".to_string(),
+        model_responses: vec![
+            capability_call_response("harness.echo", "input:harness-echo-1"),
+            HostManagedModelResponse::assistant_reply("final reply after capability"),
+        ],
+        capability: Some(HarnessCapabilityConfig {
+            capability_id: "harness.echo".to_string(),
+            result_ref: "result:harness-echo-1".to_string(),
+            safe_summary: "echo completed".to_string(),
+            terminate_hint: false,
+        }),
+        ..ProductLiveAgentLoopHarnessConfig::default()
+    })
+    .await;
+    let envelope = harness.user_message("planned-harness-capability", "use echo");
+
+    let outcome = harness
+        .accept_user_message(&envelope)
+        .await
+        .expect("harness inbound turn should submit");
+    let InboundTurnOutcome::Submitted {
+        submitted_run_id, ..
+    } = outcome
+    else {
+        panic!("expected submitted outcome, got {outcome:?}");
+    };
+    let state = harness.wait_for_terminal(submitted_run_id).await;
+
+    assert_eq!(state.status, TurnStatus::Completed);
+    assert_eq!(harness.model_requests().len(), 2);
+    let invocations = harness.capability_invocations();
+    assert_eq!(invocations.len(), 1);
+    assert_eq!(invocations[0].capability_id.as_str(), "harness.echo");
+    assert_eq!(invocations[0].input_ref.as_str(), "input:harness-echo-1");
+
+    let history = harness.thread_history().await;
+    assert!(history.iter().any(|message| {
+        message.status == MessageStatus::Finalized
+            && message.turn_run_id.as_deref() == Some(submitted_run_id.to_string().as_str())
+            && message.content.as_deref() == Some("final reply after capability")
     }));
 
     harness.shutdown().await;

@@ -1,10 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{
+    AgentId, CapabilityId, ExtensionId, RuntimeKind, TenantId, ThreadId, UserId,
+};
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
     EmptyLoopCapabilityPort, HostIdentityContextBuildError, HostIdentityContextCandidate,
@@ -38,12 +40,17 @@ use ironclaw_threads::{
 };
 use ironclaw_turns::{
     CancelRunRequest, GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore,
-    InMemoryLoopCheckpointStore, InMemoryTurnStateStore, SanitizedCancelReason, TurnActor,
-    TurnCoordinator, TurnRunId, TurnRunState, TurnRunWake, TurnScope, TurnStateStore, TurnStatus,
+    InMemoryLoopCheckpointStore, InMemoryTurnStateStore, LoopResultRef, SanitizedCancelReason,
+    TurnActor, TurnCoordinator, TurnRunId, TurnRunState, TurnRunWake, TurnScope, TurnStateStore,
+    TurnStatus,
     run_profile::{
-        AgentLoopHostError, InMemoryLoopHostMilestoneSink, InstructionSafetyContext,
+        AgentLoopHostError, CapabilityBatchInvocation, CapabilityBatchOutcome,
+        CapabilityCallCandidate, CapabilityDescriptorView, CapabilityInputRef,
+        CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceVersion,
+        ConcurrencyHint, InMemoryLoopHostMilestoneSink, InstructionSafetyContext,
         LoopCancelReasonKind, LoopCapabilityPort, LoopInputAckToken, LoopInputCursorToken,
-        LoopRunContext, NoOpBudgetAccountant, NoOpPolicyGuard, PromptMode,
+        LoopRunContext, NoOpBudgetAccountant, NoOpPolicyGuard, ParentLoopOutput, PromptMode,
+        VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
 };
 use tokio::task::JoinHandle;
@@ -63,6 +70,7 @@ pub struct ProductLiveAgentLoopHarness {
         RecordingModelGateway,
     >,
     model_requests: Arc<Mutex<Vec<HostManagedModelRequest>>>,
+    capability_invocations: Arc<Mutex<Vec<CapabilityInvocation>>>,
     model_release: Option<CancellationToken>,
     worker_cancel: CancellationToken,
     worker_handle: JoinHandle<()>,
@@ -78,6 +86,8 @@ pub struct ProductLiveAgentLoopHarnessConfig {
     pub model_provider: String,
     pub model_id: String,
     pub pause_model_until_released: bool,
+    pub model_responses: Vec<HostManagedModelResponse>,
+    pub capability: Option<HarnessCapabilityConfig>,
 }
 
 impl Default for ProductLiveAgentLoopHarnessConfig {
@@ -91,7 +101,31 @@ impl Default for ProductLiveAgentLoopHarnessConfig {
             model_provider: "nearai".to_string(),
             model_id: "qwen3-coder".to_string(),
             pause_model_until_released: false,
+            model_responses: Vec::new(),
+            capability: None,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct HarnessCapabilityConfig {
+    pub capability_id: String,
+    pub result_ref: String,
+    pub safe_summary: String,
+    pub terminate_hint: bool,
+}
+
+pub fn capability_call_response(
+    capability_id: impl Into<String>,
+    input_ref: impl Into<String>,
+) -> HostManagedModelResponse {
+    HostManagedModelResponse {
+        safe_text_deltas: Vec::new(),
+        output: ParentLoopOutput::CapabilityCalls(vec![CapabilityCallCandidate {
+            surface_version: harness_surface_version(),
+            capability_id: harness_capability_id(capability_id.into()),
+            input_ref: CapabilityInputRef::new(input_ref.into()).expect("valid harness input ref"),
+        }]),
     }
 }
 
@@ -116,14 +150,24 @@ impl ProductLiveAgentLoopHarness {
         let turn_store = Arc::new(InMemoryTurnStateStore::default());
         let checkpoint_store = Arc::new(InMemoryLoopCheckpointStore::default());
         let model_requests = Arc::new(Mutex::new(Vec::new()));
+        let model_responses = VecDeque::from(config.model_responses);
         let model_release = config
             .pause_model_until_released
             .then(CancellationToken::new);
         let model_gateway = Arc::new(RecordingModelGateway {
             reply: config.assistant_reply,
             requests: Arc::clone(&model_requests),
+            responses: Mutex::new(model_responses),
             release: model_release.clone(),
         });
+        let capability_invocations = Arc::new(Mutex::new(Vec::new()));
+        let capability_factory: Arc<dyn LoopCapabilityPortFactory> = match config.capability {
+            Some(capability) => Arc::new(RecordingCapabilityFactory {
+                capability,
+                invocations: Arc::clone(&capability_invocations),
+            }),
+            None => Arc::new(EmptyCapabilityFactory),
+        };
         let model_route_resolver = Arc::new(
             StaticModelRouteResolver::new(ModelRoutePolicy::new(
                 ModelSelectionMode::DeveloperAnyConfigured,
@@ -143,7 +187,7 @@ impl ProductLiveAgentLoopHarness {
             checkpoint_state_store: Arc::new(InMemoryCheckpointStateStore::default()),
             loop_checkpoint_store: checkpoint_store.clone(),
             milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
-            capability_factory: Arc::new(EmptyCapabilityFactory),
+            capability_factory,
             capability_surface_resolver: Arc::new(AllowAllCapabilitySurfaceResolver),
             loop_exit_evidence: Arc::new(
                 ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
@@ -180,6 +224,7 @@ impl ProductLiveAgentLoopHarness {
             cancellation_factory,
             composition,
             model_requests,
+            capability_invocations,
             model_release,
             worker_cancel,
             worker_handle,
@@ -190,6 +235,13 @@ impl ProductLiveAgentLoopHarness {
         self.model_requests
             .lock()
             .expect("harness model requests lock poisoned")
+            .clone()
+    }
+
+    pub fn capability_invocations(&self) -> Vec<CapabilityInvocation> {
+        self.capability_invocations
+            .lock()
+            .expect("harness capability invocation lock poisoned")
             .clone()
     }
 
@@ -323,6 +375,7 @@ impl ProductLiveAgentLoopHarness {
 struct RecordingModelGateway {
     reply: String,
     requests: Arc<Mutex<Vec<HostManagedModelRequest>>>,
+    responses: Mutex<VecDeque<HostManagedModelResponse>>,
     release: Option<CancellationToken>,
 }
 
@@ -339,9 +392,96 @@ impl HostManagedModelGateway for RecordingModelGateway {
         if let Some(release) = &self.release {
             release.cancelled().await;
         }
+        if let Some(response) = self
+            .responses
+            .lock()
+            .expect("recording model gateway responses lock poisoned")
+            .pop_front()
+        {
+            return Ok(response);
+        }
         Ok(HostManagedModelResponse::assistant_reply(
             self.reply.clone(),
         ))
+    }
+}
+
+struct RecordingCapabilityFactory {
+    capability: HarnessCapabilityConfig,
+    invocations: Arc<Mutex<Vec<CapabilityInvocation>>>,
+}
+
+#[async_trait]
+impl LoopCapabilityPortFactory for RecordingCapabilityFactory {
+    async fn create_capability_port(
+        &self,
+        _run_context: &LoopRunContext,
+    ) -> Result<Arc<dyn LoopCapabilityPort>, AgentLoopHostError> {
+        Ok(Arc::new(RecordingCapabilityPort {
+            capability: self.capability.clone(),
+            invocations: Arc::clone(&self.invocations),
+        }))
+    }
+}
+
+struct RecordingCapabilityPort {
+    capability: HarnessCapabilityConfig,
+    invocations: Arc<Mutex<Vec<CapabilityInvocation>>>,
+}
+
+#[async_trait]
+impl LoopCapabilityPort for RecordingCapabilityPort {
+    async fn visible_capabilities(
+        &self,
+        _request: VisibleCapabilityRequest,
+    ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+        Ok(VisibleCapabilitySurface {
+            version: harness_surface_version(),
+            descriptors: vec![CapabilityDescriptorView {
+                capability_id: harness_capability_id(&self.capability.capability_id),
+                provider: Some(ExtensionId::new("harness.provider").expect("valid provider id")),
+                runtime: RuntimeKind::FirstParty,
+                safe_name: self.capability.capability_id.clone(),
+                safe_description: "harness capability".to_string(),
+                concurrency_hint: ConcurrencyHint::Exclusive,
+            }],
+        })
+    }
+
+    async fn invoke_capability(
+        &self,
+        request: CapabilityInvocation,
+    ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+        self.invocations
+            .lock()
+            .expect("harness capability invocation lock poisoned")
+            .push(request);
+        Ok(CapabilityOutcome::Completed(CapabilityResultMessage {
+            result_ref: LoopResultRef::new(self.capability.result_ref.clone())
+                .expect("valid harness result ref"),
+            safe_summary: self.capability.safe_summary.clone(),
+            terminate_hint: self.capability.terminate_hint,
+        }))
+    }
+
+    async fn invoke_capability_batch(
+        &self,
+        request: CapabilityBatchInvocation,
+    ) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
+        let mut outcomes = Vec::new();
+        let mut stopped_on_suspension = false;
+        for invocation in request.invocations {
+            let outcome = self.invoke_capability(invocation).await?;
+            stopped_on_suspension |= request.stop_on_first_suspension && outcome.is_suspension();
+            outcomes.push(outcome);
+            if stopped_on_suspension {
+                break;
+            }
+        }
+        Ok(CapabilityBatchOutcome {
+            outcomes,
+            stopped_on_suspension,
+        })
     }
 }
 
@@ -523,4 +663,12 @@ fn user_message_envelope(event_suffix: &str, text: &str) -> ProductInboundEnvelo
 fn test_safety_context() -> InstructionSafetyContext {
     InstructionSafetyContext::new("policy:test", "test safety context")
         .expect("test safety context")
+}
+
+fn harness_surface_version() -> CapabilitySurfaceVersion {
+    CapabilitySurfaceVersion::new("surface:harness-v1").expect("valid harness surface version")
+}
+
+fn harness_capability_id(capability_id: impl Into<String>) -> CapabilityId {
+    CapabilityId::new(capability_id.into()).expect("valid harness capability id")
 }
