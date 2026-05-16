@@ -21,6 +21,7 @@
 mod error;
 mod factory;
 mod input;
+mod product_live_adapters;
 mod profile;
 mod readiness;
 mod runtime;
@@ -29,6 +30,10 @@ mod runtime_input;
 pub use error::RebornBuildError;
 pub use factory::{RebornServices, build_reborn_services};
 pub use input::RebornBuildInput;
+pub use product_live_adapters::{
+    ProductLiveModelRouteSettings, ProductLivePlannedRuntimeAdapterConfig,
+    ProductLivePlannedRuntimeAdapterError, ProductLivePlannedRuntimeAdapters, capability_allowlist,
+};
 pub use profile::{RebornCompositionProfile, RebornCompositionProfileParseError};
 pub use readiness::{RebornFacadeReadiness, RebornReadiness, RebornReadinessState};
 pub use runtime::{
