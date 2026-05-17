@@ -3,11 +3,13 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use ironclaw_host_api::{
-    AgentId, CapabilityId, CapabilitySet, ExecutionContext, ExtensionId, RuntimeKind, TenantId,
-    ThreadId, TrustClass, UserId,
+    AgentId, CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, EffectKind,
+    ExecutionContext, ExtensionId, GrantConstraints, NetworkPolicy, Principal, RuntimeKind,
+    TenantId, ThreadId, TrustClass, UserId,
 };
 use ironclaw_host_runtime::{
-    CapabilitySurfacePolicy, SurfaceKind, VisibleCapabilityRequest as HostVisibleCapabilityRequest,
+    CapabilitySurfacePolicy, ECHO_CAPABILITY_ID, SurfaceKind,
+    VisibleCapabilityRequest as HostVisibleCapabilityRequest,
 };
 use ironclaw_loop_support::{
     HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
@@ -35,10 +37,10 @@ use ironclaw_turns::{
     InMemoryTurnStateStore, LoopCheckpointStore, LoopResultRef, RunProfileResolutionRequest,
     RunProfileResolver, TurnId, TurnRunId, TurnScope, TurnStateStore,
     run_profile::{
-        AgentLoopHostError, CapabilityInputRef, InMemoryLoopHostMilestoneSink,
-        InstructionSafetyContext, LoopCancelReasonKind, LoopModelBudgetAccountant,
-        LoopModelPolicyGuard, LoopRunContext, NoOpBudgetAccountant, NoOpPolicyGuard, PromptMode,
-        VisibleCapabilityRequest,
+        AgentLoopHostError, CapabilityInputRef, CapabilityInvocation, CapabilityOutcome,
+        InMemoryLoopHostMilestoneSink, InstructionSafetyContext, LoopCancelReasonKind,
+        LoopModelBudgetAccountant, LoopModelPolicyGuard, LoopRunContext, NoOpBudgetAccountant,
+        NoOpPolicyGuard, PromptMode, VisibleCapabilityRequest,
     },
 };
 
@@ -149,6 +151,91 @@ async fn visible_capability_request_builder_scopes_context_to_loop_run() {
         request
             .provider_trust
             .contains_key(&ExtensionId::new("demo").unwrap())
+    );
+}
+
+#[tokio::test]
+async fn local_dev_adapter_invokes_builtin_echo_through_host_runtime_port() {
+    let root = tempfile::tempdir().unwrap();
+    let services = build_reborn_services(RebornBuildInput::local_dev(
+        "builtin-echo-owner",
+        root.path().join("local-dev"),
+    ))
+    .await
+    .unwrap();
+    let run_context = loop_run_context("builtin-echo").await;
+    let io = Arc::new(ProductLiveCapabilityIo::default());
+    let input_ref = io
+        .stage_input(
+            &run_context,
+            serde_json::json!({ "message": "hello product live" }),
+        )
+        .unwrap();
+    let capability_id = capability_id(ECHO_CAPABILITY_ID);
+    let adapters = ProductLivePlannedRuntimeAdapters::from_services(
+        &services,
+        ProductLivePlannedRuntimeAdapterConfig {
+            visible_capability_request: visible_capability_request_for_run(
+                &run_context,
+                ProductLiveVisibleCapabilityRequestConfig::new(
+                    UserId::new("user-builtin-echo").unwrap(),
+                    ExtensionId::new("planned-driver").unwrap(),
+                    RuntimeKind::FirstParty,
+                    TrustClass::FirstParty,
+                    SurfaceKind::new("agent_loop").unwrap(),
+                    CapabilitySurfacePolicy::allow_all(),
+                )
+                .with_grants(dispatch_grants_for_user(
+                    UserId::new("user-builtin-echo").unwrap(),
+                    [ECHO_CAPABILITY_ID],
+                ))
+                .with_provider_trust(
+                    ExtensionId::new("builtin").unwrap(),
+                    EffectiveTrustClass::user_trusted(),
+                ),
+            )
+            .unwrap(),
+            capability_input_resolver: io.clone(),
+            capability_result_writer: io.clone(),
+            capability_allow_set: capability_allowlist([capability_id.clone()]),
+            ..adapter_config()
+        },
+    )
+    .unwrap();
+    let capability_port = adapters
+        .capability_factory
+        .create_capability_port(&run_context)
+        .await
+        .unwrap();
+
+    let surface = capability_port
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    assert!(
+        surface
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.capability_id == capability_id),
+        "builtin echo must be visible through the product-live adapter surface"
+    );
+
+    let outcome = capability_port
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface.version,
+            capability_id: capability_id.clone(),
+            input_ref,
+        })
+        .await
+        .unwrap();
+    let CapabilityOutcome::Completed(completed) = outcome else {
+        panic!("expected completed builtin echo outcome, got {outcome:?}");
+    };
+    assert_eq!(completed.safe_summary, "capability completed");
+    assert_eq!(
+        io.result_for_ref(&run_context, &completed.result_ref)
+            .unwrap(),
+        serde_json::json!("hello product live")
     );
 }
 
@@ -372,6 +459,36 @@ fn thread_scope(label: &str) -> ThreadScope {
 
 fn capability_id(value: &str) -> CapabilityId {
     CapabilityId::new(value).unwrap()
+}
+
+fn dispatch_grants_for_user<const N: usize>(
+    user_id: UserId,
+    capabilities: [&str; N],
+) -> CapabilitySet {
+    CapabilitySet {
+        grants: capabilities
+            .into_iter()
+            .map(|capability| dispatch_grant_for_user(user_id.clone(), capability))
+            .collect(),
+    }
+}
+
+fn dispatch_grant_for_user(user_id: UserId, capability: &str) -> CapabilityGrant {
+    CapabilityGrant {
+        id: CapabilityGrantId::new(),
+        capability: capability_id(capability),
+        grantee: Principal::User(user_id),
+        issued_by: Principal::HostRuntime,
+        constraints: GrantConstraints {
+            allowed_effects: vec![EffectKind::DispatchCapability],
+            mounts: ironclaw_host_api::MountView::default(),
+            network: NetworkPolicy::default(),
+            secrets: Vec::new(),
+            resource_ceiling: None,
+            expires_at: None,
+            max_invocations: None,
+        },
+    }
 }
 
 struct EmptyInputQueue;

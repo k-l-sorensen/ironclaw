@@ -690,13 +690,7 @@ fn invocation_context_from_visible(
     allowed_effects: &[EffectKind],
 ) -> Result<ExecutionContext, AgentLoopHostError> {
     let mut context = base.clone();
-    let loop_driver_extension =
-        ExtensionId::new(run_context.loop_driver_id.as_str()).map_err(|_| {
-            AgentLoopHostError::new(
-                AgentLoopHostErrorKind::Internal,
-                "loop driver id could not be represented as an execution extension",
-            )
-        })?;
+    let loop_driver_extension = loop_driver_execution_extension_id(run_context)?;
     context.extension_id = loop_driver_extension.clone();
     context.runtime = capability.runtime;
     context.trust = trust;
@@ -720,6 +714,20 @@ fn invocation_context_from_visible(
         )
     })?;
     Ok(context)
+}
+
+fn loop_driver_execution_extension_id(
+    run_context: &LoopRunContext,
+) -> Result<ExtensionId, AgentLoopHostError> {
+    let raw = run_context.loop_driver_id.as_str();
+    ExtensionId::new(raw)
+        .or_else(|_| ExtensionId::new(raw.replace(':', "-")))
+        .map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Internal,
+                "loop driver id could not be represented as an execution extension",
+            )
+        })
 }
 
 fn invocation_grants_from_visible(
@@ -986,8 +994,8 @@ mod tests {
         MountPermissions, NetworkPolicy, ProjectId, TenantId, TrustClass, UserId, VirtualPath,
     };
     use ironclaw_turns::{
-        InMemoryRunProfileResolver, RunProfileResolutionRequest, RunProfileResolver, TurnId,
-        TurnRunId, TurnScope,
+        InMemoryRunProfileResolver, LoopDriverId, RunProfileResolutionRequest, RunProfileResolver,
+        TurnId, TurnRunId, TurnScope,
     };
 
     #[test]
@@ -1219,6 +1227,51 @@ mod tests {
             &invocation_context.grants.grants[0].grantee,
             Principal::Thread(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn invocation_context_derives_extension_id_for_planned_driver_namespaced_id() {
+        let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
+        let mut context = execution_context("thread-planned-driver-id");
+        let mut run_context = loop_run_context(&context).await;
+        run_context.loop_driver_id =
+            LoopDriverId::new("reborn:planned-default").expect("valid loop driver id");
+        context.grants.grants.push(CapabilityGrant {
+            id: CapabilityGrantId::new(),
+            capability: capability_id.clone(),
+            grantee: Principal::User(context.user_id.clone()),
+            issued_by: Principal::HostRuntime,
+            constraints: GrantConstraints {
+                allowed_effects: vec![EffectKind::DispatchCapability],
+                mounts: MountView::default(),
+                network: NetworkPolicy::default(),
+                secrets: Vec::new(),
+                resource_ceiling: None,
+                expires_at: None,
+                max_invocations: None,
+            },
+        });
+        let capability = SurfaceCapabilitySnapshot {
+            provider: ExtensionId::new("demo").expect("valid provider"),
+            runtime: RuntimeKind::FirstParty,
+            estimate: ResourceEstimate::default(),
+        };
+
+        let invocation_context = invocation_context_from_visible(
+            &context,
+            &run_context,
+            &capability_id,
+            &capability,
+            TrustClass::FirstParty,
+            &[EffectKind::DispatchCapability],
+        )
+        .expect("planned driver id should derive a valid execution principal");
+
+        assert_eq!(
+            invocation_context.extension_id,
+            ExtensionId::new("reborn-planned-default").expect("valid extension")
+        );
+        assert_eq!(invocation_context.grants.grants.len(), 1);
     }
 
     #[tokio::test]
