@@ -386,6 +386,70 @@ mod tests {
         assert!(matches!(err, HookError::RegistryConstruction(_)));
     }
 
+    /// End-to-end registrar test for `DenyWithCode`: a manifest carrying
+    /// `OnExceededAction::DenyWithCode { code, reason }` installs cleanly
+    /// AND dispatches with the code's static label as the model-visible
+    /// reason. Bridges the gap codex flagged: prior tests covered the
+    /// enum serde + direct hook evaluation; this one drives the full
+    /// install-then-dispatch path the registrar exposes.
+    #[tokio::test]
+    async fn install_deny_with_code_manifest_surfaces_code_label_on_dispatch() {
+        use crate::predicate::{DenyReasonCode, OnExceededAction, ValueOrRateBound};
+
+        let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()));
+        let builder = HookDispatcherBuilder::new(HookRegistry::new());
+        let entry = HookManifestEntry {
+            id: HookLocalId("rate-cap-with-code".to_string()),
+            kind: HookManifestKind::BeforeCapability,
+            scope: HookManifestScope::OwnCapabilities,
+            phase: HookPhase::Policy,
+            priority: HookPriority::DEFAULT,
+            description: None,
+            requires_grant: None,
+            body: HookManifestBody::Predicate {
+                spec: HookPredicateSpec::RateOrValueCap {
+                    when: CapabilityPredicate::NameEquals {
+                        name: "polymarket.place_order".to_string(),
+                    },
+                    bound: ValueOrRateBound::InvocationCount {
+                        max: 0,
+                        window: "1h".to_string(),
+                    },
+                    on_exceeded: OnExceededAction::DenyWithCode {
+                        code: DenyReasonCode::RateLimit,
+                        reason: "audit-only".to_string(),
+                    },
+                },
+            },
+        };
+        let (builder, ids) = registrar
+            .install(extension(), "0.4.2".to_string(), vec![entry], builder)
+            .expect("install ok");
+        assert_eq!(ids.len(), 1);
+        let dispatcher = builder.build_arc();
+
+        let tenant = ironclaw_host_api::TenantId::new("alpha").expect("tenant");
+        let ctx = BeforeCapabilityHookContext::new(
+            tenant,
+            "polymarket.place_order".to_string(),
+            [0u8; 32],
+            crate::points::SanitizedArguments::unresolved(),
+            Some(extension()),
+        );
+        let outcome = dispatcher.dispatch_before_capability(&ctx).await;
+        match outcome.decision.view() {
+            crate::kinds::gate::GateDecisionView::Deny { reason } => {
+                assert_eq!(
+                    reason.as_str(),
+                    "hook_rate_limit",
+                    "DenyWithCode manifest must surface the code's label \
+                     (hook_rate_limit) through the registrar→dispatcher path"
+                );
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn install_returns_hook_ids_in_input_order() {
         let registrar = HookRegistrar::new(Arc::new(PredicateEvaluator::new()));

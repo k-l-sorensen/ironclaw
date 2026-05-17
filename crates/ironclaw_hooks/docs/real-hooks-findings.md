@@ -243,7 +243,7 @@ deviate from `DEFAULT`. Optionally add named constants (`EARLY`,
 | ID | Severity | Status |
 |---|---|---|
 | F1 — Sealed `unresolved()` blocks external dispatch tests | High | **Fixed** — `pub fn unresolved()` |
-| F2 — Closed-vocabulary deny reason is undocumented | Med | **Fixed** — rustdoc on `OnExceededAction` and `GateDecisionView`. The `DenyReasonCode` enum is deferred (still worth doing but not blocking) |
+| F2 — Closed-vocabulary deny reason is undocumented | Med | **Fixed** — rustdoc on `OnExceededAction` and `GateDecisionView` in PR #3573; the `DenyReasonCode` + `PauseReasonCode` enums followed in successor PR #3636 (this branch) |
 | F3 — NumericSum can't be TDD'd outside Reborn | Med | **Fixed** — `SanitizedArguments::for_tests(value)` under `test-support` feature flag |
 | F4 — Trusted Rust before_prompt hooks (no friction) | — | — |
 | F5 — Two `ExtensionId` types are confusing | Low | **Fixed** — `From<&ironclaw_host_api::ExtensionId>` impl + cross-link rustdoc |
