@@ -31,13 +31,23 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
-use ironclaw_loop_support::{
-    CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
-    EmptyLoopCapabilityPort, HostIdentityContextBuildError, HostIdentityContextCandidate,
-    HostIdentityContextSource,
+use ironclaw_host_api::{
+    AgentId, CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, EffectKind,
+    ExtensionId, GrantConstraints, MountAlias, MountGrant, MountPermissions, MountView,
+    NetworkPolicy, Principal, RuntimeKind, TenantId, ThreadId, TrustClass, UserId, VirtualPath,
 };
-use ironclaw_reborn::loop_driver_host::LoopCapabilityPortFactory;
+use ironclaw_host_runtime::{
+    APPLY_PATCH_CAPABILITY_ID, BUILTIN_FIRST_PARTY_PROVIDER, CapabilitySurfacePolicy,
+    ECHO_CAPABILITY_ID, GLOB_CAPABILITY_ID, GREP_CAPABILITY_ID, JSON_CAPABILITY_ID,
+    LIST_DIR_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, SurfaceKind, TIME_CAPABILITY_ID,
+    WRITE_FILE_CAPABILITY_ID,
+};
+use ironclaw_loop_support::{
+    HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
+    HostInputBatch, HostInputEnvelope, HostInputQueue, HostInputQueueError,
+    TurnStateRunCancellationFactory,
+};
+use ironclaw_reborn::loop_driver_host::LoopCapabilityPortFactory as _;
 use ironclaw_reborn::loop_exit_applier::ThreadCheckpointLoopExitEvidencePort;
 use ironclaw_reborn::runtime::{
     DefaultPlannedRuntimeBuildError, DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts,
@@ -48,6 +58,7 @@ use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
+use ironclaw_trust::EffectiveTrustClass;
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunRequest, CancelRunResponse, GetRunStateRequest, IdempotencyKey,
     InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore, InMemoryTurnStateStore,
@@ -55,11 +66,18 @@ use ironclaw_turns::{
     SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError, TurnRunId,
     TurnScope, TurnStatus,
     run_profile::{
-        AgentLoopHostError, InMemoryLoopHostMilestoneSink, LoopCapabilityPort, LoopRunContext,
-        PromptMode,
+        InMemoryLoopHostMilestoneSink, InstructionSafetyContext, LoopHostMilestoneSink,
+        LoopModelBudgetAccountant, LoopModelPolicyGuard, LoopRunContext, NoOpBudgetAccountant,
+        NoOpPolicyGuard, PromptMode,
     },
 };
 
+use crate::product_live_adapters::{
+    ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
+    ProductLivePlannedRuntimeAdapterConfig, ProductLivePlannedRuntimeAdapterError,
+    ProductLivePlannedRuntimeAdapters, ProductLiveVisibleCapabilityRequestConfig,
+    capability_allowlist,
+};
 use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
 use crate::{RebornBuildError, RebornCompositionProfile, RebornServices, build_reborn_services};
 
@@ -555,6 +573,14 @@ pub async fn build_reborn_runtime(
         Arc::clone(&loop_checkpoint_store) as Arc<dyn ironclaw_turns::LoopCheckpointStore>,
         thread_scope.clone(),
     ));
+    let milestone_sink = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let product_live_adapters = build_local_dev_repl_adapters(
+        &services,
+        Arc::clone(&turn_state_store) as Arc<dyn ironclaw_turns::TurnStateStore>,
+        actor_user_id.clone(),
+        milestone_sink.clone(),
+    )?
+    .adapters;
 
     let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {
         turn_state: Arc::clone(&turn_state_store),
@@ -565,9 +591,9 @@ pub async fn build_reborn_runtime(
             as Arc<dyn ironclaw_turns::CheckpointStateStore>,
         loop_checkpoint_store: Arc::clone(&loop_checkpoint_store)
             as Arc<dyn ironclaw_turns::LoopCheckpointStore>,
-        milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
-        capability_factory: Arc::new(EmptyCapabilityFactory),
-        capability_surface_resolver: Arc::new(AllowAllCapabilitySurfaceResolver),
+        milestone_sink,
+        capability_factory: product_live_adapters.capability_factory,
+        capability_surface_resolver: product_live_adapters.capability_surface_resolver,
         loop_exit_evidence,
         config: DefaultPlannedRuntimeConfig {
             worker: TurnRunnerWorkerConfig {
@@ -577,14 +603,14 @@ pub async fn build_reborn_runtime(
             },
             ..DefaultPlannedRuntimeConfig::default()
         },
-        model_route_resolver: None,
-        cancellation_factory: None,
+        model_route_resolver: Some(product_live_adapters.model_route_resolver),
+        cancellation_factory: Some(product_live_adapters.cancellation_factory),
         skill_context_source: None,
-        input_queue: None,
-        identity_context_source: Arc::new(EmptyIdentityContextSource),
-        model_policy_guard: None,
-        model_budget_accountant: None,
-        safety_context: None,
+        input_queue: Some(product_live_adapters.input_queue),
+        identity_context_source: product_live_adapters.identity_context_source,
+        model_policy_guard: Some(product_live_adapters.model_policy_guard),
+        model_budget_accountant: Some(product_live_adapters.model_budget_accountant),
+        safety_context: Some(product_live_adapters.safety_context),
     })?;
     let default_run_profile_id = composition
         .run_profile_resolver
@@ -660,27 +686,208 @@ fn validate_runtime_identity(
     })
 }
 
-struct EmptyCapabilityFactory;
+struct LocalDevReplAdapters {
+    adapters: ProductLivePlannedRuntimeAdapters,
+    #[cfg_attr(not(test), allow(dead_code))]
+    capability_io: Arc<ProductLiveCapabilityIo>,
+}
+
+fn build_local_dev_repl_adapters(
+    services: &RebornServices,
+    turn_state_store: Arc<dyn ironclaw_turns::TurnStateStore>,
+    actor_user_id: UserId,
+    milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+) -> Result<LocalDevReplAdapters, RebornRuntimeError> {
+    let capability_io = Arc::new(ProductLiveCapabilityIo::default());
+    let allowed_capabilities = local_dev_repl_builtin_capability_ids()?;
+    let cancellation_factory = Arc::new(TurnStateRunCancellationFactory::new(turn_state_store));
+    let model_routes = ProductLiveModelRouteSettings::new("local-dev", "interactive_model")
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("local-dev model routes: {error}"),
+        })?;
+    let safety_context = InstructionSafetyContext::new(
+        "policy:local-dev-repl",
+        "Local-dev REPL runtime. Use host-managed tools only through scoped grants.",
+    )
+    .map_err(|error| RebornRuntimeError::InvalidArgument {
+        reason: format!("local-dev safety context: {error}"),
+    })?;
+
+    let adapters = ProductLivePlannedRuntimeAdapters::from_services(
+        services,
+        ProductLivePlannedRuntimeAdapterConfig {
+            capability_authority_resolver: Arc::new(LocalDevReplCapabilityAuthorityResolver {
+                user_id: actor_user_id,
+            }),
+            capability_input_resolver: capability_io.clone(),
+            capability_result_writer: capability_io.clone(),
+            capability_allow_set: capability_allowlist(allowed_capabilities),
+            model_routes,
+            cancellation_factory,
+            input_queue: Arc::new(EmptyInputQueue),
+            identity_context_source: Arc::new(EmptyIdentityContextSource),
+            model_policy_guard: Arc::new(NoOpPolicyGuard) as Arc<dyn LoopModelPolicyGuard>,
+            model_budget_accountant: Arc::new(NoOpBudgetAccountant)
+                as Arc<dyn LoopModelBudgetAccountant>,
+            safety_context,
+            milestone_sink: Some(milestone_sink),
+        },
+    )
+    .map_err(|error| RebornRuntimeError::InvalidArgument {
+        reason: format!("local-dev product-live adapters: {error}"),
+    })?;
+    Ok(LocalDevReplAdapters {
+        adapters,
+        capability_io,
+    })
+}
+
+fn local_dev_repl_builtin_capability_ids() -> Result<Vec<CapabilityId>, RebornRuntimeError> {
+    local_dev_repl_builtin_capability_names()
+        .into_iter()
+        .map(|name| {
+            CapabilityId::new(name).map_err(|reason| RebornRuntimeError::InvalidArgument {
+                reason: format!("built-in capability id {name}: {reason}"),
+            })
+        })
+        .collect()
+}
+
+fn local_dev_repl_builtin_capability_names() -> [&'static str; 9] {
+    [
+        ECHO_CAPABILITY_ID,
+        TIME_CAPABILITY_ID,
+        JSON_CAPABILITY_ID,
+        READ_FILE_CAPABILITY_ID,
+        WRITE_FILE_CAPABILITY_ID,
+        LIST_DIR_CAPABILITY_ID,
+        GLOB_CAPABILITY_ID,
+        GREP_CAPABILITY_ID,
+        APPLY_PATCH_CAPABILITY_ID,
+    ]
+}
+
+struct LocalDevReplCapabilityAuthorityResolver {
+    user_id: UserId,
+}
 
 #[async_trait::async_trait]
-impl LoopCapabilityPortFactory for EmptyCapabilityFactory {
-    async fn create_capability_port(
+impl ProductLiveCapabilityAuthorityResolver for LocalDevReplCapabilityAuthorityResolver {
+    async fn resolve_capability_authority(
         &self,
-        _run_context: &LoopRunContext,
-    ) -> Result<Arc<dyn LoopCapabilityPort>, AgentLoopHostError> {
-        Ok(Arc::new(EmptyLoopCapabilityPort))
+        run_context: &LoopRunContext,
+    ) -> Result<ProductLiveVisibleCapabilityRequestConfig, ProductLivePlannedRuntimeAdapterError>
+    {
+        let user_id = self.user_id.clone();
+        let mounts = local_dev_repl_mounts()?;
+        Ok(ProductLiveVisibleCapabilityRequestConfig::new(
+            user_id.clone(),
+            RuntimeKind::FirstParty,
+            TrustClass::FirstParty,
+            SurfaceKind::new("agent_loop").map_err(|reason| {
+                ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                    reason: format!("surface kind: {reason}"),
+                }
+            })?,
+            CapabilitySurfacePolicy::allow_all(),
+        )
+        .with_mounts(mounts.clone())
+        .with_grants(local_dev_repl_grants(user_id, mounts)?)
+        .with_provider_trust_for_effects(
+            ExtensionId::new(BUILTIN_FIRST_PARTY_PROVIDER).map_err(|reason| {
+                ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                    reason: format!("built-in provider id: {reason}"),
+                }
+            })?,
+            EffectiveTrustClass::user_trusted(),
+            local_dev_repl_allowed_effects(),
+        ))
     }
 }
 
-struct AllowAllCapabilitySurfaceResolver;
+fn local_dev_repl_grants(
+    user_id: UserId,
+    mounts: MountView,
+) -> Result<CapabilitySet, ProductLivePlannedRuntimeAdapterError> {
+    let allowed_effects = local_dev_repl_allowed_effects();
+    let grants = local_dev_repl_builtin_capability_names()
+        .into_iter()
+        .map(|capability| {
+            Ok(CapabilityGrant {
+                id: CapabilityGrantId::new(),
+                capability: CapabilityId::new(capability).map_err(|reason| {
+                    ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                        reason: format!("built-in capability id {capability}: {reason}"),
+                    }
+                })?,
+                grantee: Principal::User(user_id.clone()),
+                issued_by: Principal::HostRuntime,
+                constraints: GrantConstraints {
+                    allowed_effects: allowed_effects.clone(),
+                    mounts: mounts.clone(),
+                    network: NetworkPolicy::default(),
+                    secrets: Vec::new(),
+                    resource_ceiling: None,
+                    expires_at: None,
+                    max_invocations: None,
+                },
+            })
+        })
+        .collect::<Result<Vec<_>, ProductLivePlannedRuntimeAdapterError>>()?;
+    Ok(CapabilitySet { grants })
+}
+
+fn local_dev_repl_allowed_effects() -> Vec<EffectKind> {
+    vec![
+        EffectKind::DispatchCapability,
+        EffectKind::ReadFilesystem,
+        EffectKind::WriteFilesystem,
+    ]
+}
+
+fn local_dev_repl_mounts() -> Result<MountView, ProductLivePlannedRuntimeAdapterError> {
+    MountView::new(vec![MountGrant::new(
+        MountAlias::new("/workspace").map_err(|reason| {
+            ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                reason: format!("workspace mount alias: {reason}"),
+            }
+        })?,
+        VirtualPath::new("/projects").map_err(|reason| {
+            ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                reason: format!("workspace mount target: {reason}"),
+            }
+        })?,
+        MountPermissions::read_write(),
+    )])
+    .map_err(
+        |error| ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+            reason: error.to_string(),
+        },
+    )
+}
+
+struct EmptyInputQueue;
 
 #[async_trait::async_trait]
-impl CapabilitySurfaceProfileResolver for AllowAllCapabilitySurfaceResolver {
-    async fn resolve(
+impl HostInputQueue for EmptyInputQueue {
+    async fn next_after(
         &self,
-        _run_context: &LoopRunContext,
-    ) -> Result<CapabilityAllowSet, CapabilityResolveError> {
-        Ok(CapabilityAllowSet::All)
+        _run_id: TurnRunId,
+        after: ironclaw_turns::run_profile::LoopInputCursorToken,
+        _limit: usize,
+    ) -> Result<HostInputBatch, HostInputQueueError> {
+        Ok(HostInputBatch {
+            inputs: Vec::<HostInputEnvelope>::new(),
+            next_cursor: after,
+        })
+    }
+
+    async fn ack_consumed(
+        &self,
+        _run_id: TurnRunId,
+        _tokens: Vec<ironclaw_turns::run_profile::LoopInputAckToken>,
+    ) -> Result<(), HostInputQueueError> {
+        Ok(())
     }
 }
 
@@ -788,16 +995,27 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use ironclaw_host_api::{AgentId, CapabilityId, TenantId, ThreadId};
+    use ironclaw_host_runtime::ECHO_CAPABILITY_ID;
     use ironclaw_loop_support::{
-        HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
-        HostManagedModelResponse,
+        HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
+        HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
     };
-    use ironclaw_turns::TurnStatus;
+    use ironclaw_reborn::planned_driver_factory::default_planned_run_profile_resolver;
+    use ironclaw_turns::{
+        InMemoryTurnStateStore, RunProfileResolutionRequest, RunProfileResolver, TurnId, TurnRunId,
+        TurnScope, TurnStatus,
+        run_profile::{
+            CapabilityInvocation, CapabilityOutcome, LoopCapabilityPort, ProviderToolCall,
+            VisibleCapabilityRequest,
+        },
+    };
 
+    use crate::build_reborn_services;
     use crate::input::RebornBuildInput;
     use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
 
-    use super::build_reborn_runtime;
+    use super::{build_local_dev_repl_adapters, build_reborn_runtime};
 
     #[derive(Debug)]
     struct RecordingGateway {
@@ -819,6 +1037,233 @@ mod tests {
                 self.reply.clone(),
             ))
         }
+    }
+
+    #[derive(Debug)]
+    struct ScriptedToolGateway {
+        requests: Arc<StdMutex<Vec<HostManagedModelRequest>>>,
+    }
+
+    #[async_trait]
+    impl HostManagedModelGateway for ScriptedToolGateway {
+        async fn stream_model(
+            &self,
+            _request: HostManagedModelRequest,
+        ) -> Result<HostManagedModelResponse, HostManagedModelError> {
+            Err(HostManagedModelError::safe(
+                HostManagedModelErrorKind::Unavailable,
+                "scripted tool gateway expected capability-aware model calls",
+            ))
+        }
+
+        async fn stream_model_with_capabilities(
+            &self,
+            request: HostManagedModelRequest,
+            capabilities: Arc<dyn LoopCapabilityPort>,
+        ) -> Result<HostManagedModelResponse, HostManagedModelError> {
+            let call_index = {
+                let mut requests = self
+                    .requests
+                    .lock()
+                    .expect("scripted gateway requests lock poisoned");
+                requests.push(request.clone());
+                requests.len()
+            };
+            match call_index {
+                1 => {
+                    assert!(request.surface_version.is_some());
+                    assert!(
+                        request
+                            .messages
+                            .iter()
+                            .any(|message| message.content.contains(ECHO_CAPABILITY_ID))
+                    );
+                    let echo_tool = capabilities
+                        .tool_definitions()
+                        .map_err(model_gateway_host_error)?
+                        .into_iter()
+                        .find(|definition| definition.capability_id.as_str() == ECHO_CAPABILITY_ID)
+                        .ok_or_else(|| {
+                            HostManagedModelError::safe(
+                                HostManagedModelErrorKind::InvalidRequest,
+                                "builtin echo tool definition unavailable",
+                            )
+                        })?;
+                    let call = capabilities
+                        .register_provider_tool_call(ProviderToolCall {
+                            provider_id: "scripted-provider".to_string(),
+                            provider_model_id: "scripted-model".to_string(),
+                            turn_id: Some("scripted-turn".to_string()),
+                            id: "scripted-call-1".to_string(),
+                            name: echo_tool.name,
+                            arguments: serde_json::json!({ "message": "hello repl" }),
+                            response_reasoning: None,
+                            reasoning: None,
+                            signature: None,
+                        })
+                        .await
+                        .map_err(model_gateway_host_error)?;
+                    Ok(HostManagedModelResponse::capability_calls(vec![call], ""))
+                }
+                2 => {
+                    let tool_result = request
+                        .messages
+                        .iter()
+                        .find(|message| {
+                            message.role == HostManagedModelMessageRole::ToolResult
+                                && message.content.contains("capability completed")
+                                && message.tool_result_provider_call.is_some()
+                        })
+                        .expect("provider replay tool-result message");
+                    let provider_call = tool_result
+                        .tool_result_provider_call
+                        .as_ref()
+                        .expect("tool result provider call metadata");
+                    assert_eq!(provider_call.provider_id, "scripted-provider");
+                    assert_eq!(provider_call.provider_model_id, "scripted-model");
+                    assert_eq!(provider_call.provider_turn_id, "scripted-turn");
+                    assert_eq!(provider_call.provider_call_id, "scripted-call-1");
+                    assert_eq!(provider_call.capability_id.as_str(), ECHO_CAPABILITY_ID);
+                    assert_eq!(
+                        provider_call.arguments["message"],
+                        serde_json::json!("hello repl")
+                    );
+                    Ok(HostManagedModelResponse::assistant_reply("tool worked"))
+                }
+                _ => Err(HostManagedModelError::safe(
+                    HostManagedModelErrorKind::InvalidRequest,
+                    "scripted tool gateway received unexpected model call",
+                )),
+            }
+        }
+    }
+
+    fn model_gateway_host_error(
+        error: ironclaw_turns::run_profile::AgentLoopHostError,
+    ) -> HostManagedModelError {
+        HostManagedModelError::safe(HostManagedModelErrorKind::InvalidRequest, error.to_string())
+    }
+
+    #[tokio::test]
+    async fn local_dev_repl_adapters_expose_and_invoke_builtin_echo() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let services = build_reborn_services(RebornBuildInput::local_dev(
+            "runtime-tools-owner",
+            root.path().join("local-dev"),
+        ))
+        .await
+        .expect("services build");
+        let turn_state_store = Arc::new(InMemoryTurnStateStore::default());
+        let adapters = build_local_dev_repl_adapters(
+            &services,
+            turn_state_store,
+            ironclaw_host_api::UserId::new("runtime-tools-owner").expect("user id"),
+            Arc::new(ironclaw_turns::run_profile::InMemoryLoopHostMilestoneSink::default()),
+        )
+        .expect("adapters build");
+        let resolved = default_planned_run_profile_resolver()
+            .expect("planned profile resolver")
+            .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+            .await
+            .expect("planned profile");
+        let run_context = ironclaw_turns::run_profile::LoopRunContext::new(
+            TurnScope::new(
+                TenantId::new("runtime-tools-tenant").expect("tenant id"),
+                Some(AgentId::new("runtime-tools-agent").expect("agent id")),
+                None,
+                ThreadId::new("runtime-tools-thread").expect("thread id"),
+            ),
+            TurnId::new(),
+            TurnRunId::new(),
+            resolved,
+        );
+        let capability_id = CapabilityId::new(ECHO_CAPABILITY_ID).expect("echo capability id");
+        let input_ref = adapters
+            .capability_io
+            .stage_input(&run_context, serde_json::json!({ "message": "hello repl" }))
+            .expect("stage input");
+        let port = adapters
+            .adapters
+            .capability_factory
+            .create_capability_port(&run_context)
+            .await
+            .expect("capability port");
+        let surface = port
+            .visible_capabilities(VisibleCapabilityRequest)
+            .await
+            .expect("visible surface");
+        assert!(!surface.descriptors.is_empty());
+        assert!(
+            surface
+                .descriptors
+                .iter()
+                .any(|descriptor| descriptor.capability_id == capability_id)
+        );
+
+        let outcome = port
+            .invoke_capability(CapabilityInvocation {
+                surface_version: surface.version,
+                capability_id,
+                input_ref,
+            })
+            .await
+            .expect("invoke echo");
+        let CapabilityOutcome::Completed(completed) = outcome else {
+            panic!("expected completed echo outcome, got {outcome:?}");
+        };
+        assert_eq!(
+            adapters
+                .capability_io
+                .result_for_ref(&run_context, &completed.result_ref)
+                .expect("echo result"),
+            serde_json::json!("hello repl")
+        );
+    }
+
+    #[tokio::test]
+    async fn send_user_message_routes_model_tool_call_through_local_dev_adapters() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let requests = Arc::new(StdMutex::new(Vec::new()));
+        let gateway = Arc::new(ScriptedToolGateway {
+            requests: Arc::clone(&requests),
+        });
+        let input = RebornRuntimeInput::from_services(RebornBuildInput::local_dev(
+            "runtime-tool-loop-owner",
+            root.path().join("local-dev"),
+        ))
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-tool-loop-tenant".to_string(),
+            agent_id: "runtime-tool-loop-agent".to_string(),
+            source_binding_id: "runtime-tool-loop-source".to_string(),
+            reply_target_binding_id: "runtime-tool-loop-reply".to_string(),
+        })
+        .with_poll_settings(PollSettings {
+            interval: Duration::from_millis(10),
+            max_total: Duration::from_secs(3),
+        })
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+        let conversation = runtime.new_conversation().await.expect("conversation");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(3),
+            runtime.send_user_message(&conversation, "use echo tool"),
+        )
+        .await
+        .expect("runtime send should finish")
+        .expect("runtime send should succeed");
+
+        assert_eq!(reply.status, TurnStatus::Completed);
+        assert_eq!(reply.text.as_deref(), Some("tool worked"));
+        assert_eq!(
+            requests
+                .lock()
+                .expect("scripted gateway requests lock poisoned")
+                .len(),
+            2
+        );
+
+        runtime.shutdown().await.expect("runtime shutdown");
     }
 
     #[tokio::test]
@@ -857,13 +1302,18 @@ mod tests {
 
         assert_eq!(reply.status, TurnStatus::Completed);
         assert_eq!(reply.text.as_deref(), Some("recorded runtime reply"));
-        assert_eq!(
-            requests
-                .lock()
-                .expect("recording gateway requests lock poisoned")
-                .len(),
-            1
+        let recorded_requests = requests
+            .lock()
+            .expect("recording gateway requests lock poisoned");
+        assert_eq!(recorded_requests.len(), 1);
+        assert!(recorded_requests[0].surface_version.is_some());
+        assert!(
+            recorded_requests[0]
+                .messages
+                .iter()
+                .any(|message| message.content.contains(ECHO_CAPABILITY_ID))
         );
+        drop(recorded_requests);
 
         runtime.shutdown().await.expect("runtime shutdown");
     }
