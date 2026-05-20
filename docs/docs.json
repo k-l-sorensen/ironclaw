@@ -57,6 +57,8 @@
                           "security/secrets-and-sandboxing"
                         ]
                       },
+                      "capabilities/database",
+                      "capabilities/configuration",
                       {
                         "group": "Memory",
                         "pages": [
@@ -102,6 +104,13 @@
                       "channels/signal"
                     ]
                   }
+                ]
+              },
+              {
+                "group": "API",
+                "icon": "code",
+                "pages": [
+                  "api/responses"
                 ]
               },
               {
