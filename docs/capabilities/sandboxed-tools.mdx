@@ -19,11 +19,13 @@ IronClaw loads WASM module (from cache or disk)
     ↓
 Tool executes inside wasmtime sandbox
     ↓
-Network requests route through the network proxy
+Tool calls the http_request host function
     ↓
-Proxy validates domain against allowlist
+Host validates the destination against the allowlist
     ↓
-Proxy injects credentials from encrypted store
+Host injects credentials from the encrypted store
+    ↓
+Host scans the response for leaked secrets
     ↓
 Response returns to WASM module
     ↓
@@ -41,17 +43,17 @@ LLM receives sanitized result
 Every WASM instruction consumes "fuel." When a module runs out of fuel, it is terminated immediately. This prevents infinite loops and runaway computation.
 
 ```bash
-# Configure fuel limit (default: 100,000,000 instructions)
-export WASM_FUEL_LIMIT=100000000
+# Configure fuel limit (default: 500,000,000 instructions)
+export WASM_DEFAULT_FUEL_LIMIT=500000000
 ```
 
 ### Memory Limits
 
-WASM modules are allocated a fixed linear memory. Attempting to allocate beyond the limit traps and terminates the module.
+WASM modules run with a capped linear memory. An attempt to grow past the cap traps and terminates the module.
 
 ```bash
-# Configure memory limit (default: 16 MB)
-export WASM_MEMORY_LIMIT=16777216
+# Configure memory limit (default: 10 MB)
+export WASM_DEFAULT_MEMORY_LIMIT=10485760
 ```
 
 ### Rate Limiting
@@ -132,7 +134,9 @@ For the full end-to-end injection flow (and why this can't be bypassed by a misb
 
 ### Secrets allowlist
 
-`secrets.allowed_names` is the second half of the credential gate. A tool can only resolve secrets whose names appear in this list (glob patterns like `github_*` are allowed). Even if a credential mapping references a secret, the host will refuse to load it unless the name is allowlisted here.
+`secrets.allowed_names` controls which secret names the tool may probe with the `secret_exists` host function — an existence check that returns only a boolean, never the value. Glob patterns like `github_*` are supported.
+
+This list does **not** gate credential injection. Which secrets get attached to outbound requests is determined entirely by the `http.credentials` mappings above; a tool that needs a credential must declare a mapping for it there.
 
 ### Workspace read
 
@@ -204,7 +208,7 @@ Review `capabilities.json` before installing any WASM tool from an untrusted sou
 
 <AccordionGroup>
   <Accordion title="Credential injection is one-way" icon="lock">
-    The proxy injects credentials into outgoing requests. There is no mechanism for a WASM module to read stored secrets directly. Even if a WASM module is compromised, it cannot access the secrets store.
+    The host injects credentials into outgoing requests. There is no mechanism for a WASM module to read stored secrets directly. Even if a WASM module is compromised, it cannot access the secrets store.
   </Accordion>
 
   <Accordion title="No process spawning" icon="shield">
