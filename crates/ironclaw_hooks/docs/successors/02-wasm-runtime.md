@@ -8,10 +8,21 @@
 ## Scope
 
 Add a programmatic-hook execution path for Installed-tier hooks. The
-WASM module exports a function (`evaluate` for capability/prompt
-points, observer-specific for after-* points) and the dispatcher
-invokes it inside a sandbox with the hook context as input and a typed
-sink as host imports.
+WASM module exports a single function — by convention named
+`evaluate`, but the actual export name is whatever the manifest
+declares in `HookManifestBody::Wasm.export` — and the dispatcher
+invokes it inside a sandbox. The signature is intentionally simple:
+`(): ()`. Hook context flows in through the `ic:hooks/context@1` host
+imports (`ctx_size` / `ctx_read`); decisions, patches, and observer
+facts flow out through the per-point host imports
+(`ic:hooks/before-capability@1`, `ic:hooks/before-prompt@1`,
+`ic:hooks/observer@1`).
+
+This is deliberately distinct from `WitToolRuntime`, which hard-codes
+a richer WIT-bindgen-derived interface for the tool surface; the
+hook runtime uses a hand-rolled `wasmtime::Linker` per the design
+discussion below so the host-import surface area stays explicit and
+auditable.
 
 ## What lands in this PR
 
@@ -49,10 +60,29 @@ PR brings it in scope; the new threat-model-wasm.md must cover:
   filesystem, network, system time, RNG.
 - **Fuel exhaustion**: trap → FailIsolated for observers, FailClosed
   for gates (existing failure_policy matrix already covers this).
+  Terminology: `FailIsolated` / `FailClosed` are
+  `FailureDisposition` values (`crate::failure_policy`) that the
+  dispatcher derives from a `FailureCategory` (Panic / Timeout /
+  Malformed / etc.) crossed with the binding's
+  `HookTrustClass`. They are *not* `HookFailureMode` variants —
+  `HookFailureMode::{FailOpen, FailClosed}` is the older
+  installed-hook policy switch used elsewhere in the crate and
+  applies to predicates, not the WASM dispatch path. The WASM
+  runtime never produces `FailOpen`; gates fail closed, observers
+  fail isolated.
 - **Memory exhaustion**: `memory_mb` cap enforced via the tool-WASM
   `WasmResourceLimiter` resource limiter.
-- **Wall-clock exhaustion**: `wall_ms` cap enforced via `tokio::time::timeout`
-  on the host side + epoch-interrupt on the wasmtime side.
+- **Wall-clock exhaustion**: `wall_ms` cap enforced via
+  `tokio::time::timeout` wrapped around `tokio::task::spawn_blocking`
+  on the host side, plus epoch-interrupt on the wasmtime side. The
+  blocking-pool indirection is load-bearing: a bare
+  `tokio::time::timeout` over a synchronous wasmtime call cannot cancel
+  the call (wasmtime runs on the awaiting task), so the timeout would
+  never fire and a wedged module would pin the dispatcher's caller.
+  The wasmtime epoch interrupt is the authoritative in-WASM cancel
+  signal; the outer timeout governs *when the dispatcher's future
+  resolves* if a blocking-pool worker is still spinning when the
+  deadline passes.
 - **Module substitution**: `HookId` content-addressing must include the
   module bytes (or a digest of them).
 - **Side channels**: WASM doesn't get access to ambient time, RNG, or
