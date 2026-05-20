@@ -20,7 +20,7 @@ async fn postgres_substrate_builder_wires_production_components_without_local_on
 
     let services =
         build_postgres_production_host_runtime_services(PostgresProductionSubstrateConfig {
-            pool,
+            pool: pool.clone(),
             event_store: RebornEventStoreConfig::Postgres {
                 url: SecretString::from(database_url),
             },
@@ -36,6 +36,19 @@ async fn postgres_substrate_builder_wires_production_components_without_local_on
     services
         .validate_production_wiring(&production_config)
         .expect("postgres substrate production wiring should not use fake seams");
+
+    let client = pool.get().await.unwrap();
+    let row = client
+        .query_opt(
+            "SELECT 1 FROM root_filesystem_entries WHERE path = $1",
+            &[&"/secrets/key-check/active.json"],
+        )
+        .await
+        .unwrap();
+    assert!(
+        row.is_some(),
+        "secret readiness sentinel should be stored through root filesystem entries"
+    );
 }
 
 #[tokio::test]
@@ -61,6 +74,41 @@ async fn postgres_substrate_builder_rejects_missing_secret_master_key() {
         result,
         Err(RebornCompositionError::MissingSecretMasterKey)
     ));
+}
+
+#[tokio::test]
+async fn postgres_substrate_builder_rejects_wrong_secret_master_key_from_filesystem_store() {
+    let Some((_container, pool, database_url)) = postgres_pool_or_skip().await else {
+        return;
+    };
+
+    build_postgres_production_host_runtime_services(PostgresProductionSubstrateConfig {
+        pool: pool.clone(),
+        event_store: RebornEventStoreConfig::Postgres {
+            url: SecretString::from(database_url.clone()),
+        },
+        secret_master_key: Some(SecretString::from("01234567890123456789012345678901")),
+        trust_policy: Arc::new(ironclaw_trust::HostTrustPolicy::fail_closed()),
+        turn_run_wake_notifier: Arc::new(RecordingSchedulerWakeNotifier),
+        surface_version: CapabilitySurfaceVersion::new("test-surface").unwrap(),
+    })
+    .await
+    .unwrap();
+
+    let result =
+        build_postgres_production_host_runtime_services(PostgresProductionSubstrateConfig {
+            pool,
+            event_store: RebornEventStoreConfig::Postgres {
+                url: SecretString::from(database_url),
+            },
+            secret_master_key: Some(SecretString::from("abcdefghijklmnopqrstuvwxyzABCDEF")),
+            trust_policy: Arc::new(ironclaw_trust::HostTrustPolicy::fail_closed()),
+            turn_run_wake_notifier: Arc::new(RecordingSchedulerWakeNotifier),
+            surface_version: CapabilitySurfaceVersion::new("test-surface").unwrap(),
+        })
+        .await;
+
+    assert!(matches!(result, Err(RebornCompositionError::Secret(_))));
 }
 
 async fn postgres_pool_or_skip() -> Option<(

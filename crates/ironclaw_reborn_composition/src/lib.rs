@@ -238,15 +238,14 @@ where
     TPolicy: TrustPolicy + 'static,
     TWake: TurnRunWakeNotifier + 'static,
 {
+    let filesystem = Arc::new(LibSqlRootFilesystem::new(Arc::clone(&config.database)));
+    filesystem.run_migrations().await?;
+
     let secret_master_key = config
         .secret_master_key
         .ok_or(RebornCompositionError::MissingSecretMasterKey)?;
     let secret_store =
-        secret_store::build_libsql_secret_store(Arc::clone(&config.database), secret_master_key)
-            .await?;
-
-    let filesystem = Arc::new(LibSqlRootFilesystem::new(Arc::clone(&config.database)));
-    filesystem.run_migrations().await?;
+        secret_store::build_libsql_secret_store(Arc::clone(&filesystem), secret_master_key).await?;
 
     let process_services = ProcessServices::filesystem(Arc::clone(&filesystem));
 
@@ -308,14 +307,15 @@ where
     TPolicy: TrustPolicy + 'static,
     TWake: TurnRunWakeNotifier + 'static,
 {
+    let filesystem = Arc::new(PostgresRootFilesystem::new(config.pool.clone()));
+    filesystem.run_migrations().await?;
+
     let secret_master_key = config
         .secret_master_key
         .ok_or(RebornCompositionError::MissingSecretMasterKey)?;
     let secret_store =
-        secret_store::build_postgres_secret_store(config.pool.clone(), secret_master_key).await?;
-
-    let filesystem = Arc::new(PostgresRootFilesystem::new(config.pool.clone()));
-    filesystem.run_migrations().await?;
+        secret_store::build_postgres_secret_store(Arc::clone(&filesystem), secret_master_key)
+            .await?;
 
     let process_services = ProcessServices::filesystem(Arc::clone(&filesystem));
 

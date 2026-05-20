@@ -1,25 +1,23 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+#[cfg(feature = "libsql")]
+use ironclaw_filesystem::LibSqlRootFilesystem;
+#[cfg(feature = "postgres")]
+use ironclaw_filesystem::PostgresRootFilesystem;
 use ironclaw_host_api::{ResourceScope, SecretHandle};
 use ironclaw_secrets::{
-    ScopedSecretsStoreAdapter, SecretError, SecretLease, SecretLeaseId, SecretMaterial,
-    SecretMetadata, SecretStore, SecretStoreError, SecretsCrypto,
+    FilesystemSecretsStore, ScopedSecretsStoreAdapter, SecretError, SecretLease, SecretLeaseId,
+    SecretMaterial, SecretMetadata, SecretStore, SecretStoreError, SecretsCrypto,
 };
 
 #[cfg(feature = "libsql")]
-use ironclaw_secrets::LibSqlSecretsStore;
-#[cfg(feature = "postgres")]
-use ironclaw_secrets::PostgresSecretsStore;
-
-#[cfg(feature = "libsql")]
 pub(crate) async fn build_libsql_secret_store(
-    database: Arc<libsql::Database>,
+    filesystem: Arc<LibSqlRootFilesystem>,
     master_key: SecretMaterial,
 ) -> Result<Arc<SharedSecretStore>, SecretError> {
     let crypto = Arc::new(SecretsCrypto::new(master_key)?);
-    let backend = Arc::new(LibSqlSecretsStore::new(database, crypto));
-    backend.run_migrations().await?;
+    let backend = Arc::new(FilesystemSecretsStore::over_root(filesystem, crypto)?);
     backend.verify_can_decrypt_existing_secrets().await?;
     let store: Arc<dyn SecretStore> = Arc::new(ScopedSecretsStoreAdapter::new(backend));
     Ok(Arc::new(SharedSecretStore::new(store)))
@@ -27,12 +25,11 @@ pub(crate) async fn build_libsql_secret_store(
 
 #[cfg(feature = "postgres")]
 pub(crate) async fn build_postgres_secret_store(
-    pool: deadpool_postgres::Pool,
+    filesystem: Arc<PostgresRootFilesystem>,
     master_key: SecretMaterial,
 ) -> Result<Arc<SharedSecretStore>, SecretError> {
     let crypto = Arc::new(SecretsCrypto::new(master_key)?);
-    let backend = Arc::new(PostgresSecretsStore::new(pool, crypto));
-    backend.run_migrations().await?;
+    let backend = Arc::new(FilesystemSecretsStore::over_root(filesystem, crypto)?);
     backend.verify_can_decrypt_existing_secrets().await?;
     let store: Arc<dyn SecretStore> = Arc::new(ScopedSecretsStoreAdapter::new(backend));
     Ok(Arc::new(SharedSecretStore::new(store)))

@@ -10,6 +10,7 @@
 mod crypto;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 mod db;
+mod filesystem;
 mod legacy_store;
 
 #[cfg(feature = "libsql")]
@@ -18,6 +19,7 @@ pub use db::{LibSqlCredentialStore, LibSqlSecretsStore};
 pub use db::{PostgresCredentialStore, PostgresSecretsStore};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 pub use db::{credential_account_aad, credential_session_aad};
+pub use filesystem::FilesystemSecretsStore;
 
 use std::collections::HashMap;
 use std::fmt;

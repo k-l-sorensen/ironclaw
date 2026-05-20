@@ -259,7 +259,8 @@ async fn build_libsql_production(
     leases.run_migrations().await?;
 
     let secret_store =
-        crate::secret_store::build_libsql_secret_store(Arc::clone(&db), secret_master_key).await?;
+        crate::secret_store::build_libsql_secret_store(Arc::clone(&filesystem), secret_master_key)
+            .await?;
 
     let event_store = ironclaw_reborn_event_store::RebornEventStoreConfig::Libsql {
         path_or_url,
@@ -318,8 +319,11 @@ async fn build_postgres_production(
     let leases = Arc::new(PostgresCapabilityLeaseStore::new(pool.clone()));
     leases.run_migrations().await?;
 
-    let secret_store =
-        crate::secret_store::build_postgres_secret_store(pool.clone(), secret_master_key).await?;
+    let secret_store = crate::secret_store::build_postgres_secret_store(
+        Arc::clone(&filesystem),
+        secret_master_key,
+    )
+    .await?;
 
     let event_store = ironclaw_reborn_event_store::RebornEventStoreConfig::Postgres { url };
 
