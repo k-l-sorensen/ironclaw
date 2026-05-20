@@ -268,6 +268,19 @@ impl ConversationBindingService for LibSqlConversationBindingService {
             Err(other) => Err(libsql_error(other)),
         }
     }
+
+    async fn lookup_binding(
+        &self,
+        request: ResolveBindingRequest,
+    ) -> Result<ResolvedBinding, ProductWorkflowError> {
+        let conn = self.connect().await?;
+        self.lookup_existing(&conn, &request).await?.ok_or_else(|| {
+            ProductWorkflowError::BindingRequired {
+                reason: "no existing binding for adapter+installation+conversation+actor"
+                    .to_string(),
+            }
+        })
+    }
 }
 
 #[cfg(test)]
@@ -275,8 +288,8 @@ mod tests {
     use super::*;
     use ironclaw_product_adapters::AuthRequirement;
     use ironclaw_product_adapters::{
-        AdapterInstallationId, ExternalActorRef, ExternalConversationRef, ProductAdapterId,
-        ProtocolAuthEvidence,
+        AdapterInstallationId, ExternalActorRef, ExternalConversationRef, ExternalEventId,
+        ProductAdapterId, ProtocolAuthEvidence,
     };
     use ironclaw_threads::InMemorySessionThreadService;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -343,6 +356,9 @@ CREATE TABLE IF NOT EXISTS product_bindings (
                 None,
             )
             .expect("conv"),
+            external_event_id: ExternalEventId::new(format!("evt:{actor_id}:{conversation_id}"))
+                .expect("event id"),
+            route_kind: ironclaw_product_workflow::ProductConversationRouteKind::Direct,
             auth_claim,
         }
     }
@@ -461,6 +477,14 @@ CREATE TABLE IF NOT EXISTS product_bindings (
             unreachable!("binding service tests do not call append_assistant_draft")
         }
 
+        async fn append_tool_result_reference(
+            &self,
+            _request: ironclaw_threads::AppendToolResultReferenceRequest,
+        ) -> Result<ironclaw_threads::ThreadMessageRecord, ironclaw_threads::SessionThreadError>
+        {
+            unreachable!("binding service tests do not call append_tool_result_reference")
+        }
+
         async fn update_assistant_draft(
             &self,
             _request: ironclaw_threads::UpdateAssistantDraftRequest,
@@ -493,6 +517,14 @@ CREATE TABLE IF NOT EXISTS product_bindings (
             _request: ironclaw_threads::LoadContextWindowRequest,
         ) -> Result<ironclaw_threads::ContextWindow, ironclaw_threads::SessionThreadError> {
             unreachable!("binding service tests do not call load_context_window")
+        }
+
+        async fn load_context_messages(
+            &self,
+            _request: ironclaw_threads::LoadContextMessagesRequest,
+        ) -> Result<ironclaw_threads::ContextMessages, ironclaw_threads::SessionThreadError>
+        {
+            unreachable!("binding service tests do not call load_context_messages")
         }
 
         async fn list_thread_history(

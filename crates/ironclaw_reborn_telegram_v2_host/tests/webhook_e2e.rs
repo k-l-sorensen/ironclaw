@@ -136,6 +136,7 @@ async fn build_harness() -> Harness {
     let workflow = Arc::new(DefaultProductWorkflow::new(
         Arc::new(inbound_turn_service),
         Arc::clone(&ledger) as _,
+        Arc::clone(&binding) as _,
     ));
 
     let auth = WebhookAuth::SharedSecretHeader(SharedSecretHeaderAuth {

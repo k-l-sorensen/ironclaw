@@ -54,6 +54,12 @@ impl InboundTurnService for StubInboundTurnService {
             installation_id: envelope.installation_id().clone(),
             external_actor_ref: envelope.external_actor_ref().clone(),
             external_conversation_ref: envelope.external_conversation_ref().clone(),
+            external_event_id: envelope.external_event_id().clone(),
+            // Stub path: classify Telegram inbound as Direct. The real
+            // `DefaultInboundTurnService` derives `route_kind` from
+            // `payload.trigger` via `route_kind_for_user_message` once the
+            // Reborn agent loop replaces this stub.
+            route_kind: ironclaw_product_workflow::ProductConversationRouteKind::Direct,
             auth_claim: envelope.auth_claim().clone(),
         };
         let binding = self.binding.resolve_binding(resolve_request).await?;

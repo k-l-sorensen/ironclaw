@@ -257,4 +257,17 @@ impl ConversationBindingService for PostgresConversationBindingService {
                     .to_string(),
             })
     }
+
+    async fn lookup_binding(
+        &self,
+        request: ResolveBindingRequest,
+    ) -> Result<ResolvedBinding, ProductWorkflowError> {
+        let client = self.pool.get().await.map_err(pool_error)?;
+        self.lookup_existing(&client, &request)
+            .await?
+            .ok_or_else(|| ProductWorkflowError::BindingRequired {
+                reason: "no existing binding for adapter+installation+conversation+actor"
+                    .to_string(),
+            })
+    }
 }

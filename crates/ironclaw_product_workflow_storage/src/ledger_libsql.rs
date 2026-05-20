@@ -379,7 +379,8 @@ impl IdempotencyLedger for LibSqlProductIdempotencyLedger {
 mod tests {
     use super::*;
     use ironclaw_product_adapters::{
-        AdapterInstallationId, ExternalEventId, ProductAdapterId, ProductInboundAck,
+        AdapterInstallationId, ExternalActorRef, ExternalEventId, ProductAdapterId,
+        ProductInboundAck,
     };
     use ironclaw_product_workflow::SourceBindingKey;
     use ironclaw_turns::{AcceptedMessageRef, TurnRunId};
@@ -417,6 +418,7 @@ CREATE TABLE IF NOT EXISTS product_inbound_actions (
         ActionFingerprintKey::new(
             ProductAdapterId::new("telegram_v2").expect("adapter id"),
             AdapterInstallationId::new("install_default").expect("installation id"),
+            ExternalActorRef::new("user", "12345", None::<String>).expect("actor ref"),
             SourceBindingKey::new("chat:12345").expect("binding key"),
             ExternalEventId::new(event_id).expect("event id"),
         )

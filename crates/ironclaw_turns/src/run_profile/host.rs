@@ -4,13 +4,14 @@ use std::{
 };
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use ironclaw_host_api::{CapabilityId, ExtensionId, RuntimeKind, ThreadId};
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 
 use crate::{
-    LoopDiagnosticRef, LoopGateRef, LoopMessageRef, LoopResultRef, RunProfileVersion,
-    TurnCheckpointId, TurnId, TurnRunId, TurnScope,
+    LoopDiagnosticRef, LoopGateRef, LoopMessageRef, LoopResultRef, RedactedCheckpointPayload,
+    RunProfileVersion, TurnCheckpointId, TurnId, TurnRunId, TurnScope,
 };
 
 use super::{
@@ -224,6 +225,7 @@ bounded_loop_ref!(
     "input-cursor:",
     256
 );
+bounded_loop_ref!(LoopInputAckToken, "loop input ack token", "input-ack:", 256);
 bounded_loop_ref!(LoopProcessRef, "loop process ref", "process:", 256);
 
 impl LoopCheckpointStateRef {
@@ -529,6 +531,9 @@ pub enum AgentLoopHostErrorKind {
     ScopeMismatch,
     StaleSurface,
     InvalidInvocation,
+    /// The request payload itself is well-formed but its content is invalid in
+    /// the current host state (e.g. schema id/version mismatch on checkpoint load).
+    Invalid,
     PolicyDenied,
     BudgetExceeded,
     Unavailable,
@@ -546,6 +551,7 @@ impl AgentLoopHostErrorKind {
             Self::ScopeMismatch => "scope_mismatch",
             Self::StaleSurface => "stale_surface",
             Self::InvalidInvocation => "invalid_invocation",
+            Self::Invalid => "invalid",
             Self::PolicyDenied => "policy_denied",
             Self::BudgetExceeded => "budget_exceeded",
             Self::Unavailable => "unavailable",
@@ -588,6 +594,12 @@ pub trait LoopRunInfoPort: Send + Sync {
 pub struct LoopContextRequest {
     pub after: Option<LoopInputCursor>,
     pub limit: usize,
+    #[serde(default = "default_prompt_mode")]
+    pub mode: PromptMode,
+}
+
+fn default_prompt_mode() -> PromptMode {
+    PromptMode::TextOnly
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -606,8 +618,6 @@ pub struct LoopContextMessage {
     /// `None` means "summary-only entry; prompt port MUST NOT resolve content —
     /// use `safe_summary` verbatim instead." Mirrors the
     /// `SkillTrustLevel::Installed` carrying `prompt_content: None` pattern.
-    /// See `docs/reborn/agent-loop-briefs/prompt-context-assembly.md` §3.2 for
-    /// the upstream invariant this enforces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_ref: Option<LoopMessageRef>,
     pub role: String,
@@ -683,7 +693,15 @@ impl LoopInputCursor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopInputBatch {
     pub inputs: Vec<LoopInput>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub input_acks: Vec<LoopInputAck>,
     pub next_cursor: LoopInputCursor,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopInputAck {
+    pub cursor: LoopInputCursor,
+    pub token: LoopInputAckToken,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -721,7 +739,7 @@ pub trait LoopInputPort: Send + Sync {
         limit: usize,
     ) -> Result<LoopInputBatch, AgentLoopHostError>;
 
-    async fn ack_inputs(&self, cursor: LoopInputCursor) -> Result<(), AgentLoopHostError>;
+    async fn ack_inputs(&self, tokens: Vec<LoopInputAckToken>) -> Result<(), AgentLoopHostError>;
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -761,10 +779,19 @@ impl<'de> Deserialize<'de> for CapabilitySurfaceVersion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoopModelCapabilityView {
+    /// Final capability IDs visible to this model call after the loop driver has
+    /// applied its strategy to the host-owned capability surface.
+    pub visible_capability_ids: Vec<CapabilityId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopModelRequest {
     pub messages: Vec<LoopModelMessage>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
     pub model_preference: Option<ModelProfileId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_view: Option<LoopModelCapabilityView>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -820,6 +847,8 @@ pub struct LoopPromptBundleRequest {
     pub mode: PromptMode,
     pub context_cursor: Option<LoopInputCursor>,
     pub surface_version: Option<CapabilitySurfaceVersion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capability_view: Option<LoopModelCapabilityView>,
     pub checkpoint_state_ref: Option<LoopCheckpointStateRef>,
     pub max_messages: Option<u32>,
     #[serde(default)]
@@ -838,6 +867,10 @@ pub struct LoopPromptBundle {
     pub surface_version: Option<CapabilitySurfaceVersion>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub instruction_fingerprint: Option<InstructionBundleFingerprint>,
+    #[serde(default)]
+    pub identity_message_count: u32,
+    #[serde(default)]
+    pub instruction_snippet_count: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1024,6 +1057,34 @@ pub struct CapabilityCallCandidate {
     pub surface_version: CapabilitySurfaceVersion,
     pub capability_id: CapabilityId,
     pub input_ref: CapabilityInputRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_replay: Option<ProviderToolCallReplay>,
+}
+
+/// Provider-originated tool-call metadata needed to replay tool results back to the same provider.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCallReplay {
+    /// Provider identity selected by the host route.
+    pub provider_id: String,
+    /// Concrete provider model selected by the host route.
+    pub provider_model_id: String,
+    /// Provider turn grouping token for reconstructing assistant tool calls.
+    pub provider_turn_id: String,
+    /// Provider call id referenced by the matching tool result.
+    pub provider_call_id: String,
+    /// Provider-facing tool name advertised to the model.
+    pub provider_tool_name: String,
+    /// Provider-facing tool arguments captured from the model tool call.
+    pub arguments: serde_json::Value,
+    /// Provider response-level reasoning attached to the tool-call batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_reasoning: Option<String>,
+    /// Provider call-level reasoning attached to this tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Opaque provider thought-signature metadata, not an IronClaw auth signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[async_trait]
@@ -1045,11 +1106,10 @@ pub struct VisibleCapabilitySurface {
 
 /// Concurrency hint for a capability surfaced to an agent loop driver.
 ///
-/// Derived at the adapter boundary in WS-9 (`HostRuntimeLoopCapabilityPort::visible_capabilities`)
-/// from the underlying `CapabilityDescriptor.effects` Vec. The lower-layer
-/// `CapabilityDescriptor` is NOT modified; `effects` remains the source of
-/// truth and the hint is a computed projection. See WS-9 §3.2a for the
-/// per-`EffectKind` mapping table.
+/// Derived at the adapter boundary from the underlying
+/// `CapabilityDescriptor.effects` Vec. The lower-layer `CapabilityDescriptor`
+/// is NOT modified; `effects` remains the source of truth and the hint is a
+/// computed projection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConcurrencyHint {
@@ -1069,6 +1129,76 @@ pub struct CapabilityDescriptorView {
     pub safe_name: String,
     pub safe_description: String,
     pub concurrency_hint: ConcurrencyHint,
+    #[serde(default)]
+    pub parameters_schema: serde_json::Value,
+}
+
+/// Provider-facing tool definition derived from a visible IronClaw capability.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolDefinition {
+    /// Canonical IronClaw capability id backing this provider tool.
+    pub capability_id: CapabilityId,
+    /// Provider-safe tool name sent to the model.
+    pub name: String,
+    /// Provider-safe tool description sent to the model.
+    pub description: String,
+    /// JSON object schema for provider tool arguments.
+    pub parameters: serde_json::Value,
+}
+
+/// Tool call emitted by a provider-backed model.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCall {
+    /// Provider identity selected by the host route.
+    pub provider_id: String,
+    /// Concrete provider model selected by the host route.
+    pub provider_model_id: String,
+    /// Provider turn grouping token for reconstructing assistant tool calls.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    /// Provider call id referenced by the matching tool result.
+    pub id: String,
+    /// Provider-facing tool name returned by the model.
+    pub name: String,
+    /// Provider-facing tool arguments returned by the model.
+    pub arguments: serde_json::Value,
+    /// Provider response-level reasoning attached to the tool-call batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_reasoning: Option<String>,
+    /// Provider call-level reasoning attached to this tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Opaque provider thought-signature metadata, not an IronClaw auth signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// Durable reference to provider tool-call metadata for tool-result replay.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderToolCallReference {
+    /// Provider identity selected by the host route.
+    pub provider_id: String,
+    /// Concrete provider model selected by the host route.
+    pub provider_model_id: String,
+    /// Provider turn grouping token for reconstructing assistant tool calls.
+    pub provider_turn_id: String,
+    /// Provider call id referenced by the matching tool result.
+    pub provider_call_id: String,
+    /// Provider-facing tool name returned by the model.
+    pub provider_tool_name: String,
+    /// Canonical IronClaw capability id backing this provider tool.
+    pub capability_id: CapabilityId,
+    /// Provider-facing tool arguments returned by the model.
+    pub arguments: serde_json::Value,
+    /// Provider response-level reasoning attached to the tool-call batch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_reasoning: Option<String>,
+    /// Provider call-level reasoning attached to this tool call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Opaque provider thought-signature metadata, not an IronClaw auth signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1127,6 +1257,11 @@ impl CapabilityOutcome {
 pub struct CapabilityResultMessage {
     pub result_ref: LoopResultRef,
     pub safe_summary: String,
+    /// Host hint that this completed capability result should end the loop
+    /// naturally after the current batch. Defaults to false for compatibility
+    /// with older hosts.
+    #[serde(default)]
+    pub terminate_hint: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1141,6 +1276,7 @@ pub struct CapabilityDenied {
     pub safe_summary: String,
 }
 
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CapabilityDeniedReasonKind {
     EmptySurface,
@@ -1203,12 +1339,133 @@ impl<'de> Deserialize<'de> for CapabilityDeniedReasonKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CapabilityFailure {
-    pub error_kind: String,
+    pub error_kind: CapabilityFailureKind,
     pub safe_summary: String,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CapabilityFailureKind {
+    Authorization,
+    Backend,
+    Cancelled,
+    Dispatcher,
+    InvalidInput,
+    MissingRuntime,
+    Network,
+    OutputTooLarge,
+    PolicyDenied,
+    Process,
+    Resource,
+    Transient,
+    Unavailable,
+    Internal,
+    Permanent,
+    Unknown(CapabilityFailureKindValue),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CapabilityFailureKindValue(String);
+
+impl CapabilityFailureKindValue {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        validate_loop_safe_identifier(value.into(), "capability failure kind", 128).map(Self)
+    }
+
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+impl CapabilityFailureKind {
+    pub fn unknown(value: impl Into<String>) -> Result<Self, String> {
+        CapabilityFailureKindValue::new(value).map(Self::Unknown)
+    }
+
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Authorization => "authorization",
+            Self::Backend => "backend",
+            Self::Cancelled => "cancelled",
+            Self::Dispatcher => "dispatcher",
+            Self::InvalidInput => "invalid_input",
+            Self::MissingRuntime => "missing_runtime",
+            Self::Network => "network",
+            Self::OutputTooLarge => "output_too_large",
+            Self::PolicyDenied => "policy_denied",
+            Self::Process => "process",
+            Self::Resource => "resource",
+            Self::Transient => "transient",
+            Self::Unavailable => "unavailable",
+            Self::Internal => "internal",
+            Self::Permanent => "permanent",
+            Self::Unknown(value) => value.as_str(),
+        }
+    }
+}
+
+impl std::fmt::Display for CapabilityFailureKind {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Serialize for CapabilityFailureKind {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for CapabilityFailureKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        match value.as_str() {
+            "authorization" => Ok(Self::Authorization),
+            "backend" => Ok(Self::Backend),
+            "cancelled" => Ok(Self::Cancelled),
+            "dispatcher" => Ok(Self::Dispatcher),
+            "invalid_input" => Ok(Self::InvalidInput),
+            "missing_runtime" => Ok(Self::MissingRuntime),
+            "network" => Ok(Self::Network),
+            "output_too_large" => Ok(Self::OutputTooLarge),
+            "policy_denied" => Ok(Self::PolicyDenied),
+            "process" => Ok(Self::Process),
+            "resource" => Ok(Self::Resource),
+            "transient" => Ok(Self::Transient),
+            "unavailable" => Ok(Self::Unavailable),
+            "internal" => Ok(Self::Internal),
+            "permanent" => Ok(Self::Permanent),
+            _ => Self::unknown(value).map_err(serde::de::Error::custom),
+        }
+    }
 }
 
 #[async_trait]
 pub trait LoopCapabilityPort: Send + Sync {
+    fn tool_definitions(&self) -> Result<Vec<ProviderToolDefinition>, AgentLoopHostError> {
+        Ok(Vec::new())
+    }
+
+    fn validate_provider_tool_call(
+        &self,
+        _tool_call: &ProviderToolCall,
+    ) -> Result<(), AgentLoopHostError> {
+        Ok(())
+    }
+
+    async fn register_provider_tool_call(
+        &self,
+        _tool_call: ProviderToolCall,
+    ) -> Result<CapabilityCallCandidate, AgentLoopHostError> {
+        Err(unsupported_host_method("register_provider_tool_call"))
+    }
+
     async fn visible_capabilities(
         &self,
         request: VisibleCapabilityRequest,
@@ -1245,6 +1502,8 @@ pub struct FinalizeAssistantMessage {
 pub struct AppendCapabilityResultRef {
     pub result_ref: LoopResultRef,
     pub safe_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_call: Option<ProviderToolCallReference>,
 }
 
 #[async_trait]
@@ -1282,12 +1541,26 @@ pub struct LoopCheckpointRequest {
     pub state_ref: LoopCheckpointStateRef,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadCheckpointPayloadRequest {
+    pub checkpoint_id: TurnCheckpointId,
+    pub expected_schema_id: CheckpointSchemaId,
+    pub expected_schema_version: RunProfileVersion,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedCheckpointPayload {
+    pub kind: LoopCheckpointKind,
+    pub schema_id: CheckpointSchemaId,
+    pub schema_version: RunProfileVersion,
+    pub payload: RedactedCheckpointPayload,
+}
+
 /// Request to stage a checkpoint payload's raw bytes before calling
 /// [`LoopCheckpointPort::checkpoint`] with the resulting state ref.
 ///
 /// The two-step write keeps byte-storage and metadata-write responsibilities
-/// cleanly split. See `docs/reborn/agent-loop-briefs/state-and-checkpoints.md`
-/// §2 for the rationale and WS-10 for the read-side counterpart.
+/// cleanly split.
 ///
 /// `kind` is required so adapters that bridge to
 /// `CheckpointStateStore::put_checkpoint_state` can persist the correct kind
@@ -1342,13 +1615,9 @@ pub trait LoopCheckpointPort: Send + Sync {
     /// can reference. The default impl fails closed; concrete impls live in
     /// `ironclaw_loop_support` and wrap the host's `CheckpointStateStore`.
     ///
-    /// The executor's `checkpoint(...)` helper (WS-6 §3.4) calls this method
-    /// before invoking `LoopCheckpointPort::checkpoint(...)` so the metadata
-    /// write references a payload that's already durably stored.
-    ///
-    /// Read-side `load_checkpoint_payload(...)` lives in WS-10 and will be
-    /// added to this same port. WS-0 intentionally does not pre-declare it
-    /// so the WS-10 signature can land without churn.
+    /// The executor's checkpoint helper calls this method before invoking
+    /// `LoopCheckpointPort::checkpoint(...)` so the metadata write references
+    /// a payload that's already durably stored.
     async fn stage_checkpoint_payload(
         &self,
         _request: StageCheckpointPayloadRequest,
@@ -1358,6 +1627,16 @@ pub trait LoopCheckpointPort: Send + Sync {
             "stage_checkpoint_payload not implemented",
         ))
     }
+
+    /// Load the redacted state payload behind a previously-written
+    /// checkpoint. Resume callers go through this host port so metadata
+    /// validation stays with the backend that owns checkpoint storage.
+    async fn load_checkpoint_payload(
+        &self,
+        _request: LoadCheckpointPayloadRequest,
+    ) -> Result<LoadedCheckpointPayload, AgentLoopHostError> {
+        Err(unsupported_host_method("load_checkpoint_payload"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1366,6 +1645,38 @@ pub enum LoopProgressEvent {
     DriverNote {
         kind: LoopDriverNoteKind,
         safe_summary: LoopSafeSummary,
+    },
+    IterationStarted {
+        iteration: u32,
+    },
+    PromptBundleBuilt {
+        iteration: u32,
+        bundle_ref: LoopPromptBundleRef,
+        mode: PromptMode,
+        surface_version: Option<CapabilitySurfaceVersion>,
+        message_count: u32,
+        identity_message_count: u32,
+        instruction_snippet_count: u32,
+    },
+    CapabilityBatchStarted {
+        iteration: u32,
+        call_count: u32,
+        policy: BatchPolicyKind,
+    },
+    CapabilityBatchCompleted {
+        iteration: u32,
+        result_count: u32,
+        denied_count: u32,
+        gated_count: u32,
+        failed_count: u32,
+    },
+    GateBlocked {
+        iteration: u32,
+        gate_kind: LoopGateKind,
+    },
+    CheckpointWritten {
+        iteration: u32,
+        kind: LoopCheckpointKind,
     },
 }
 
@@ -1383,13 +1694,35 @@ impl LoopProgressEvent {
     pub fn kind_name(&self) -> &'static str {
         match self {
             Self::DriverNote { .. } => "driver_note",
+            Self::IterationStarted { .. } => "iteration_started",
+            Self::PromptBundleBuilt { .. } => "prompt_bundle_built",
+            Self::CapabilityBatchStarted { .. } => "capability_batch_started",
+            Self::CapabilityBatchCompleted { .. } => "capability_batch_completed",
+            Self::GateBlocked { .. } => "gate_blocked",
+            Self::CheckpointWritten { .. } => "checkpoint_written",
         }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum BatchPolicyKind {
+    Sequential,
+    Parallel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoopGateKind {
+    Approval,
+    Auth,
+    ResourceWait,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum LoopDriverNoteKind {
+    Context,
     Planning,
     Waiting,
     Retrying,
@@ -1397,7 +1730,42 @@ pub enum LoopDriverNoteKind {
 
 #[async_trait]
 pub trait LoopProgressPort: Send + Sync {
+    /// Emit observational progress for UI/status consumers.
+    ///
+    /// Progress events are best-effort and must not be used as
+    /// recoverability-critical durability markers. A failed progress emission
+    /// must not invalidate already-completed durable work; callers should treat
+    /// this like host model milestone projection, where sink failures are
+    /// logged/observed without changing the provider or checkpoint outcome.
     async fn emit_loop_progress(&self, event: LoopProgressEvent) -> Result<(), AgentLoopHostError>;
+}
+
+/// Per-run cancellation observation point.
+///
+/// The canonical executor consults this between strategy calls. The method is
+/// intentionally synchronous and non-blocking: implementations should expose a
+/// cheap snapshot, usually backed by an atomic flag plus immutable signal data.
+///
+/// **Cancellation is cooperative and boundary-observation only — it is not
+/// preempted across in-flight host calls.** `build_prompt_bundle`,
+/// `stream_model`, and `invoke_capability` are awaited to completion before
+/// the next observation point is reached. A stuck model stream or long-running
+/// capability call will not observe cancellation until control returns to the
+/// executor. Implementations of those host methods that need finer-grained
+/// cancellation must integrate their own abort signal internally; this port
+/// only covers the between-call boundaries that the executor controls.
+pub trait LoopCancellationPort: Send + Sync {
+    /// Returns `Some(signal)` once cancellation has been requested for this run.
+    ///
+    /// Implementations must be idempotent across reads. After the request fires,
+    /// repeated calls must keep returning the same signal.
+    fn observe_cancellation(&self) -> Option<LoopCancellationSignal>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoopCancellationSignal {
+    pub reason_kind: LoopCancelReasonKind,
+    pub requested_at: DateTime<Utc>,
 }
 
 pub trait AgentLoopDriverHost:
@@ -1410,6 +1778,7 @@ pub trait AgentLoopDriverHost:
     + LoopTranscriptPort
     + LoopCheckpointPort
     + LoopProgressPort
+    + LoopCancellationPort
     + Send
     + Sync
 {
@@ -1425,6 +1794,7 @@ impl<T> AgentLoopDriverHost for T where
         + LoopTranscriptPort
         + LoopCheckpointPort
         + LoopProgressPort
+        + LoopCancellationPort
         + Send
         + Sync
 {

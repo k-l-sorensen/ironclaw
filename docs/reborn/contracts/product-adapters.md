@@ -136,7 +136,15 @@ to avoid timing oracles.
 - `method`, `path`, `headers`, `body`
 - `credential_handle: Option<EgressCredentialHandle>`
 
-The host:
+Component runtime uses v1-style minimal WASI p2 for wasm32-wasip2 guest compatibility:
+clock/random are available, but env, args, stdio, preopened directories, and
+network are not inherited. The first WASM runtime slice is parse/render-only:
+`render-outbound` returns a host-validated typed `EgressRequest`, while the
+component `http-egress` import fails closed until follow-up host-runtime wiring
+injects the production `ProtocolHttpEgress` path. Native adapters already use
+`ProtocolHttpEgress` directly.
+
+The production host egress path:
 
 1. Validates the host against the adapter manifest's declared list.
 2. Validates the credential handle against the per-installation
@@ -180,6 +188,6 @@ slots into `ironclaw-reborn run` behind its own Cargo feature on
 | `NativeProductAdapterRunner` | `[implemented slice]` |
 | Telegram v2 native adapter | `[implemented slice]` (`ironclaw_telegram_v2_adapter`) |
 | Telegram v2 production host | `[implemented slice, stub reply]` (`ironclaw_reborn_telegram_v2_host`, wired into the `ironclaw-reborn` binary behind the `telegram-v2` feature) — full inbound contract end-to-end; reply path stubbed until Reborn agent loop ships (PRs #3544 / #3550 / #3586) |
-| wasmtime component-model glue | `[contract exists]` (WIT in `crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit`) |
+| wasmtime component-model glue | `[implemented slice]` (`ProductAdapterComponentRuntime` loads `crates/ironclaw_wasm_product_adapters/wit/product_adapter.wit`; parse/render-only, component `http-egress` import fails closed until production egress wiring lands) |
 | Web / Slack / Discord / WhatsApp / Feishu / Signal v2 adapters | `[not implemented]` |
 | Production wiring of v2 webhook route | `[not implemented]` (default-off flag exists; route registration is a follow-up) |

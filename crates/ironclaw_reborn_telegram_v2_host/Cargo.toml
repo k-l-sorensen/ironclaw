@@ -18,6 +18,7 @@ publish = false
 
 [dependencies]
 # Reborn product-layer stack
+ironclaw_filesystem = { path = "../ironclaw_filesystem", version = "0.1.0" }
 ironclaw_host_api = { path = "../ironclaw_host_api", version = "0.1.0" }
 ironclaw_outbound = { path = "../ironclaw_outbound", version = "0.1.0" }
 ironclaw_product_adapters = { path = "../ironclaw_product_adapters", version = "0.1.0" }
@@ -70,10 +71,9 @@ tempfile = "3"
 default = ["libsql"]
 libsql = [
     "dep:libsql",
+    "ironclaw_filesystem/libsql",
     "ironclaw_outbound/libsql",
     "ironclaw_product_workflow_storage/libsql",
-    "ironclaw_threads/libsql",
-    "ironclaw_turns/libsql",
 ]
 postgres = [
     "dep:deadpool-postgres",
@@ -83,8 +83,7 @@ postgres = [
     "dep:rustls-native-certs",
     "dep:tokio-postgres-rustls",
     "dep:webpki-roots",
+    "ironclaw_filesystem/postgres",
     "ironclaw_outbound/postgres",
     "ironclaw_product_workflow_storage/postgres",
-    "ironclaw_threads/postgres",
-    "ironclaw_turns/postgres",
 ]

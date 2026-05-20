@@ -104,6 +104,8 @@ fn fingerprint(event_id: &str) -> ActionFingerprintKey {
     ActionFingerprintKey::new(
         ProductAdapterId::new("telegram_v2").expect("adapter"),
         AdapterInstallationId::new("install_pg_test").expect("install"),
+        ironclaw_product_adapters::ExternalActorRef::new("user", "42", None::<String>)
+            .expect("actor ref"),
         SourceBindingKey::new("chat:42").expect("binding key"),
         ironclaw_product_adapters::ExternalEventId::new(event_id).expect("event id"),
     )
@@ -271,6 +273,11 @@ fn binding_request(actor_id: &str, conv_id: &str) -> ResolveBindingRequest {
         external_actor_ref: ExternalActorRef::new("user", actor_id, None::<String>).expect("actor"),
         external_conversation_ref: ExternalConversationRef::new(None, conv_id, None, None)
             .expect("conv"),
+        external_event_id: ironclaw_product_adapters::ExternalEventId::new(format!(
+            "evt:{actor_id}:{conv_id}"
+        ))
+        .expect("event id"),
+        route_kind: ironclaw_product_workflow::ProductConversationRouteKind::Direct,
         auth_claim,
     }
 }

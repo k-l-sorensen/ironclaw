@@ -105,30 +105,56 @@ pub async fn build_reborn_product_runtime(
     })
 }
 
+/// Build the single-tenant fixed [`MountView`] this host owns. The standalone
+/// Reborn binary runs one bot per process, so each alias resolves to itself
+/// rather than a per-invocation tenant/user rewrite. Once the Reborn agent
+/// loop and per-user scoping land, this should move to
+/// `ironclaw_reborn_composition::invocation_mount_view` (which routes the
+/// same aliases through tenant/user prefixes).
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn fixed_host_mount_view() -> Result<ironclaw_host_api::MountView, HostError> {
+    use ironclaw_host_api::{MountAlias, MountGrant, MountPermissions, MountView, VirtualPath};
+
+    let aliases = ["/threads", "/outbound"];
+    let mut grants = Vec::with_capacity(aliases.len());
+    for alias in aliases {
+        grants.push(MountGrant::new(
+            MountAlias::new(alias)
+                .map_err(|e| HostError::Startup(format!("{alias} mount alias: {e}")))?,
+            VirtualPath::new(alias)
+                .map_err(|e| HostError::Startup(format!("{alias} mount path: {e}")))?,
+            MountPermissions::read_write_list_delete(),
+        ));
+    }
+    MountView::new(grants).map_err(|e| HostError::Startup(format!("host mount view: {e}")))
+}
+
 #[cfg(feature = "libsql")]
 async fn build_libsql_layer(
     db: Arc<libsql::Database>,
     default_tenant_id: &TenantId,
     default_agent_id: &AgentId,
 ) -> Result<StorageLayer, HostError> {
-    use ironclaw_outbound::LibSqlOutboundStateStore;
+    use ironclaw_filesystem::{LibSqlRootFilesystem, ScopedFilesystem};
+    use ironclaw_outbound::FilesystemOutboundStateStore;
     use ironclaw_product_workflow_storage::{
         LibSqlConversationBindingService, LibSqlProductIdempotencyLedger,
     };
-    use ironclaw_threads::LibSqlSessionThreadService;
+    use ironclaw_threads::FilesystemSessionThreadService;
 
-    let thread_service_concrete = LibSqlSessionThreadService::new(Arc::clone(&db));
-    thread_service_concrete
+    let filesystem = Arc::new(LibSqlRootFilesystem::new(Arc::clone(&db)));
+    filesystem
         .run_migrations()
         .await
-        .map_err(|e| HostError::Storage(format!("thread service migrations: {e}")))?;
-    let thread_service: Arc<dyn SessionThreadService> = Arc::new(thread_service_concrete);
-
-    let outbound = LibSqlOutboundStateStore::new(Arc::clone(&db));
-    outbound
-        .run_migrations()
-        .await
-        .map_err(|e| HostError::Storage(format!("outbound migrations: {e}")))?;
+        .map_err(|e| HostError::Storage(format!("filesystem migrations: {e}")))?;
+    let scoped = Arc::new(ScopedFilesystem::with_fixed_view(
+        filesystem,
+        fixed_host_mount_view()?,
+    ));
+    let thread_service: Arc<dyn SessionThreadService> =
+        Arc::new(FilesystemSessionThreadService::new(Arc::clone(&scoped)));
+    let outbound: Arc<dyn OutboundStateStore> =
+        Arc::new(FilesystemOutboundStateStore::new(Arc::clone(&scoped)));
 
     let ledger = Arc::new(LibSqlProductIdempotencyLedger::new(Arc::clone(&db)));
     let binding = Arc::new(LibSqlConversationBindingService::new(
@@ -137,7 +163,7 @@ async fn build_libsql_layer(
         default_tenant_id.clone(),
         default_agent_id.clone(),
     ));
-    Ok((ledger, binding, Arc::new(outbound), thread_service))
+    Ok((ledger, binding, outbound, thread_service))
 }
 
 #[cfg(feature = "postgres")]
@@ -146,24 +172,26 @@ async fn build_postgres_layer(
     default_tenant_id: &TenantId,
     default_agent_id: &AgentId,
 ) -> Result<StorageLayer, HostError> {
-    use ironclaw_outbound::PostgresOutboundStateStore;
+    use ironclaw_filesystem::{PostgresRootFilesystem, ScopedFilesystem};
+    use ironclaw_outbound::FilesystemOutboundStateStore;
     use ironclaw_product_workflow_storage::{
         PostgresConversationBindingService, PostgresProductIdempotencyLedger,
     };
-    use ironclaw_threads::PostgresSessionThreadService;
+    use ironclaw_threads::FilesystemSessionThreadService;
 
-    let thread_service_concrete = PostgresSessionThreadService::new(pool.clone());
-    thread_service_concrete
+    let filesystem = Arc::new(PostgresRootFilesystem::new(pool.clone()));
+    filesystem
         .run_migrations()
         .await
-        .map_err(|e| HostError::Storage(format!("thread service migrations: {e}")))?;
-    let thread_service: Arc<dyn SessionThreadService> = Arc::new(thread_service_concrete);
-
-    let outbound = PostgresOutboundStateStore::new(pool.clone());
-    outbound
-        .run_migrations()
-        .await
-        .map_err(|e| HostError::Storage(format!("outbound migrations: {e}")))?;
+        .map_err(|e| HostError::Storage(format!("filesystem migrations: {e}")))?;
+    let scoped = Arc::new(ScopedFilesystem::with_fixed_view(
+        filesystem,
+        fixed_host_mount_view()?,
+    ));
+    let thread_service: Arc<dyn SessionThreadService> =
+        Arc::new(FilesystemSessionThreadService::new(Arc::clone(&scoped)));
+    let outbound: Arc<dyn OutboundStateStore> =
+        Arc::new(FilesystemOutboundStateStore::new(Arc::clone(&scoped)));
 
     let ledger = Arc::new(PostgresProductIdempotencyLedger::new(pool.clone()));
     let binding = Arc::new(PostgresConversationBindingService::new(
@@ -172,5 +200,5 @@ async fn build_postgres_layer(
         default_tenant_id.clone(),
         default_agent_id.clone(),
     ));
-    Ok((ledger, binding, Arc::new(outbound), thread_service))
+    Ok((ledger, binding, outbound, thread_service))
 }

@@ -15,33 +15,39 @@ publish = false
 [package.metadata.dist]
 dist = false
 
+[features]
+default = ["root-llm-provider", "telegram-v2", "libsql"]
+# Wire a real LLM provider into the assembled runtime. Mirrors the same
+# `root-llm-provider` feature on `ironclaw_reborn_composition` /
+# `ironclaw_reborn`, so building without it produces a CLI binary that
+# can still boot the runtime substrate but will surface an "LLM gateway
+# not wired" error on the first `send_user_message`.
+root-llm-provider = ["ironclaw_reborn_composition/root-llm-provider"]
+# Telegram v2 channel host. Future channels (Slack, Discord, WeChat per
+# #3577) follow the same pattern — each ships as its own optional dep
+# behind its own feature flag, and `commands/run.rs` env-detects and
+# boots whichever are enabled. Storage backend features (`libsql`,
+# `postgres`) forward to the host crate via the `?` syntax so we never
+# pull libSQL/Postgres in unless `telegram-v2` is on.
+telegram-v2 = ["dep:ironclaw_reborn_telegram_v2_host"]
+libsql = ["ironclaw_reborn_telegram_v2_host?/libsql"]
+postgres = ["ironclaw_reborn_telegram_v2_host?/postgres"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4.5.0"
-ironclaw_reborn = { path = "../ironclaw_reborn", version = "0.1.0" }
+ironclaw_reborn_composition = { path = "../ironclaw_reborn_composition", version = "0.1.0" }
 ironclaw_reborn_config = { path = "../ironclaw_reborn_config", version = "0.1.0" }
-serde_json = "1"
-
-# Optional: Telegram v2 channel host. Gated behind the `telegram-v2` feature
-# (default-on). Future channels (Slack, Discord, WeChat per #3577) follow
-# the same pattern — each ships as its own optional dep behind its own
-# feature flag, and `commands/run.rs` env-detects and boots whichever are
-# enabled. Storage backend features (`libsql`, `postgres`) forward to the
-# host crate via the `?` syntax so we never pull libSQL/Postgres in unless
-# `telegram-v2` is on.
 ironclaw_reborn_telegram_v2_host = { path = "../ironclaw_reborn_telegram_v2_host", version = "0.1.0", optional = true, default-features = false }
-tokio = { version = "1", features = ["rt-multi-thread"], optional = true }
+secrecy = "0.10"
+serde_json = "1"
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-util", "io-std", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 [[bin]]
 name = "ironclaw-reborn"
 path = "src/main.rs"
-
-[features]
-default = ["telegram-v2", "libsql"]
-telegram-v2 = ["dep:ironclaw_reborn_telegram_v2_host", "dep:tokio"]
-libsql = ["ironclaw_reborn_telegram_v2_host?/libsql"]
-postgres = ["ironclaw_reborn_telegram_v2_host?/postgres"]
-
-[dev-dependencies]
-tempfile = "3"

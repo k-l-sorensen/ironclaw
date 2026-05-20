@@ -118,8 +118,11 @@ pub async fn boot(
     let adapter_arc = Arc::new(adapter);
 
     let inbound_turn_service = StubInboundTurnService::new(Arc::clone(&runtime.binding));
-    let workflow =
-        DefaultProductWorkflow::new(Arc::new(inbound_turn_service), Arc::clone(&runtime.ledger));
+    let workflow = DefaultProductWorkflow::new(
+        Arc::new(inbound_turn_service),
+        Arc::clone(&runtime.ledger),
+        Arc::clone(&runtime.binding),
+    );
     let auth = WebhookAuth::SharedSecretHeader(SharedSecretHeaderAuth {
         header_name: TELEGRAM_SECRET_HEADER.into(),
         // `SharedSecretHeaderAuth` keeps the expected secret as a plain
