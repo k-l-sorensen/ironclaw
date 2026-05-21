@@ -55,14 +55,18 @@ prompt_doc_ref = "prompt/example/echo.md"
 }
 
 #[test]
-fn parses_minimum_valid_v2_manifest_for_installed_third_party_extension() {
+fn parses_minimum_valid_v2_legacy_capabilities_manifest() {
+    // Legacy top-level `[[capabilities]]` is HostBundled-only per the readiness
+    // gate. Installed third-party packages must use the host_api shape, which
+    // is exercised end-to-end in
+    // `crates/ironclaw_host_runtime/tests/extension_v2_lifecycle_e2e.rs`.
     let toml = third_party_wasm_manifest("acme-tools", "acme-tools.echo");
     let manifest =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap();
 
     assert_eq!(manifest.schema_version, MANIFEST_SCHEMA_VERSION);
     assert_eq!(manifest.id, ExtensionId::new("acme-tools").unwrap());
-    assert_eq!(manifest.source, ManifestSource::InstalledLocal);
+    assert_eq!(manifest.source, ManifestSource::HostBundled);
     assert_eq!(manifest.requested_trust, RequestedTrustClass::ThirdParty);
     assert_eq!(manifest.descriptor_trust_default, TrustClass::UserTrusted);
     assert_eq!(manifest.runtime.kind(), RuntimeKind::Wasm);
@@ -97,7 +101,7 @@ input_schema_ref = "schemas/acme/echo.input.v1.json"
 output_schema_ref = "schemas/acme/echo.output.v1.json"
 "#;
     let err =
-        ExtensionManifestV2::parse(toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(matches!(err, ManifestV2Error::Parse { .. }), "{err:?}");
 }
 
@@ -110,12 +114,15 @@ fn rejects_unknown_top_level_tables_in_legacy_capability_manifests() {
 enabled = true
 "#;
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(matches!(err, ManifestV2Error::Parse { .. }), "{err:?}");
 }
 
 #[test]
 fn rejects_first_party_trust_for_installed_source() {
+    // This test specifically asserts the privileged-trust rejection path for
+    // non-HostBundled sources; the source argument and the asserted error
+    // variant must both reference InstalledLocal.
     let toml = format!(
         r#"
 schema_version = "{schema}"
@@ -299,7 +306,7 @@ fn rejects_reserved_id_prefix_for_installed_source() {
 fn rejects_capability_id_without_provider_prefix() {
     let toml = third_party_wasm_manifest("acme-tools", "other.echo");
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(
         matches!(err, ManifestV2Error::CapabilityIdNotPrefixed { .. }),
         "{err:?}"
@@ -333,7 +340,7 @@ required_host_ports = ["host.does.not.exist"]
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(
         matches!(err, ManifestV2Error::UnknownHostPort { .. }),
         "{err:?}"
@@ -366,7 +373,7 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(
         matches!(err, ManifestV2Error::MissingPromptDocRef { .. }),
         "{err:?}"
@@ -405,8 +412,8 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
             schema = MANIFEST_SCHEMA_VERSION,
             bad = bad_ref,
         );
-        let err = ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
-            .unwrap_err();
+        let err =
+            ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
         assert!(
             matches!(
                 err,
@@ -443,7 +450,7 @@ input_schema_ref = "schemas/acme/echo.input.v1.json"
 output_schema_ref = "schemas/acme/echo.output.v1.json"
 "#;
     let err =
-        ExtensionManifestV2::parse(toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(
         matches!(err, ManifestV2Error::SchemaVersion { .. }),
         "{err:?}"
@@ -475,7 +482,7 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let manifest =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap();
     assert_eq!(manifest.requested_trust, RequestedTrustClass::Untrusted);
     assert_eq!(manifest.descriptor_trust_default, TrustClass::Sandbox);
 }
@@ -509,8 +516,8 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
             version = if field == "version" { value } else { "0.1" },
             description = if field == "description" { value } else { "x" },
         );
-        let err = ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
-            .unwrap_err();
+        let err =
+            ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
         assert!(
             matches!(err, ManifestV2Error::Invalid { .. }),
             "{field}={value:?} should be rejected, got {err:?}"
@@ -557,8 +564,8 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
             schema = MANIFEST_SCHEMA_VERSION,
             bad = bad.replace('\\', "\\\\"),
         );
-        let err = ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
-            .unwrap_err();
+        let err =
+            ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
         assert!(
             matches!(err, ManifestV2Error::InvalidWasmModuleRef { .. }),
             "wasm module {bad:?} should be rejected, got {err:?}"
@@ -596,7 +603,7 @@ trust = "third_party"
         "[runtime]\nkind = \"mcp\"\ntransport = \"sse\"\nurl = \"https://example.com/mcp\"\n",
     ] {
         let toml = format!("{header}\n{runtime}\n{cap_block}");
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog())
             .unwrap_or_else(|err| panic!("valid mcp runtime rejected: {err:?}\n{runtime}"));
     }
 
@@ -611,8 +618,8 @@ trust = "third_party"
         "[runtime]\nkind = \"mcp\"\ntransport = \"\"\n",
     ] {
         let toml = format!("{header}\n{runtime}\n{cap_block}");
-        let err = ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog())
-            .unwrap_err();
+        let err =
+            ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
         assert!(
             matches!(err, ManifestV2Error::InvalidMcpRuntime { .. }),
             "runtime should be rejected:\n{runtime}\n got {err:?}"
@@ -647,7 +654,7 @@ required_host_ports = ["host.events.audit", "host.events.audit"]
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(
         matches!(err, ManifestV2Error::DuplicateRequiredHostPort { .. }),
         "{err:?}"
@@ -681,7 +688,7 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(
         matches!(err, ManifestV2Error::DuplicateImplementedProfile { .. }),
         "{err:?}"
@@ -715,7 +722,7 @@ sneaky = true
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(matches!(err, ManifestV2Error::Parse { .. }), "{err:?}");
 }
 
@@ -753,7 +760,7 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(
         matches!(err, ManifestV2Error::DuplicateCapability { .. }),
         "{err:?}"
@@ -814,7 +821,7 @@ prompt_doc_ref = "prompt/acme/reverse.md"
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let manifest =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap();
     assert_eq!(manifest.capabilities.len(), 2);
     assert_eq!(
         manifest.capabilities[0].implements,
@@ -840,7 +847,7 @@ fn rejects_manifest_exceeding_max_size() {
         huge.push_str("# filler line to defeat short-circuit eval\n");
     }
     let err =
-        ExtensionManifestV2::parse(&huge, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&huge, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(
         matches!(err, ManifestV2Error::ManifestTooLarge { bytes, max } if bytes == huge.len() && max == MAX_MANIFEST_BYTES),
         "{err:?}"
@@ -874,7 +881,7 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     assert!(
         matches!(err, ManifestV2Error::DuplicateEffect { .. }),
         "{err:?}"
@@ -910,7 +917,7 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
         schema = MANIFEST_SCHEMA_VERSION,
     );
     let err =
-        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+        ExtensionManifestV2::parse(&toml, ManifestSource::HostBundled, &catalog()).unwrap_err();
     match err {
         ManifestV2Error::InvalidSchemaRef { field, .. } => {
             assert_eq!(field, "input_schema_ref");
@@ -1040,7 +1047,7 @@ fn parses_multi_host_api_extension_contracts_with_explicit_sections() {
     let registry = host_api_registry();
     let manifest = ExtensionManifestV2::parse_with_host_api_contracts(
         &telegram_multi_host_api_manifest(),
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
         &registry,
     )
@@ -1071,7 +1078,7 @@ fn parses_multi_host_api_extension_contracts_with_explicit_sections() {
 fn host_api_manifests_require_contract_registry() {
     let err = ExtensionManifestV2::parse(
         &telegram_multi_host_api_manifest(),
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
     )
     .unwrap_err();
@@ -1085,7 +1092,7 @@ fn rejects_unknown_host_api_fail_closed() {
         .replace("ironclaw.product_adapter/v1", "ironclaw.unknown/v1");
     let err = ExtensionManifestV2::parse_with_host_api_contracts(
         &toml,
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
         &registry,
     )
@@ -1111,7 +1118,7 @@ capabilities = [{ id = "edit_message" }]
 "#;
     let err = ExtensionManifestV2::parse_with_host_api_contracts(
         &toml,
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
         &registry,
     )
@@ -1137,7 +1144,7 @@ surface_kind = "telegram_admin"
 "#;
     let manifest = ExtensionManifestV2::parse_with_host_api_contracts(
         &toml,
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
         &registry,
     )
@@ -1154,7 +1161,7 @@ fn rejects_missing_referenced_host_api_section() {
     );
     let err = ExtensionManifestV2::parse_with_host_api_contracts(
         &toml,
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
         &registry,
     )
@@ -1182,7 +1189,7 @@ note = "ignored by core parser"
 "#;
     let err = ExtensionManifestV2::parse_with_host_api_contracts(
         &toml,
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
         &registry,
     )
@@ -1209,7 +1216,7 @@ output_schema_ref = "schemas/telegram/legacy.output.v1.json"
 "#;
     let err = ExtensionManifestV2::parse_with_host_api_contracts(
         &toml,
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
         &registry,
     )
@@ -1251,7 +1258,7 @@ fn duplicate_contract_registration_does_not_replace_existing_contract() {
 
     ExtensionManifestV2::parse_with_host_api_contracts(
         &telegram_multi_host_api_manifest(),
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
         &registry,
     )
@@ -1293,7 +1300,7 @@ surface_kind = "telegram"
 
     let err = ExtensionManifestV2::parse_with_host_api_contracts(
         &toml,
-        ManifestSource::InstalledLocal,
+        ManifestSource::HostBundled,
         &catalog(),
         &registry,
     )
