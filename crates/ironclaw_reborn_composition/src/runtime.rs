@@ -31,12 +31,11 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use ironclaw_host_api::{AgentId, ScopedPath, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
-    FilesystemSkillBundleRoot, FilesystemSkillBundleSource, HostIdentityContextBuildError,
-    HostIdentityContextCandidate, HostIdentityContextSource, HostSkillContextSource,
-    SkillBundleContextSource,
+    HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
+    HostSkillContextSource,
 };
 use ironclaw_reborn::loop_exit_applier::ThreadCheckpointLoopExitEvidencePort;
 use ironclaw_reborn::runtime::{
@@ -44,6 +43,7 @@ use ironclaw_reborn::runtime::{
     build_default_planned_runtime,
 };
 use ironclaw_reborn::turn_runner::{TurnRunnerWakeSender, TurnRunnerWorkerConfig};
+use ironclaw_reborn_extensions::{FirstPartySkillsExtension, FirstPartySkillsExtensionHandles};
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadScope,
@@ -658,21 +658,15 @@ pub async fn build_reborn_runtime(
 fn local_dev_filesystem_skill_context_source(
     local_runtime: &crate::factory::RebornLocalRuntimeServices,
 ) -> Result<Arc<dyn HostSkillContextSource>, RebornRuntimeError> {
-    let bundle_source = Arc::new(FilesystemSkillBundleSource::new(
+    let extension = FirstPartySkillsExtension::new(
         Arc::clone(&local_runtime.skill_filesystem),
-        vec![
-            FilesystemSkillBundleRoot::system(scoped_skill_root("/system/skills")?),
-            FilesystemSkillBundleRoot::tenant_shared(scoped_skill_root("/tenant-shared/skills")?),
-            FilesystemSkillBundleRoot::user(scoped_skill_root("/skills")?),
-        ],
-    ));
-    Ok(Arc::new(SkillBundleContextSource::new(bundle_source)))
-}
-
-fn scoped_skill_root(path: &str) -> Result<ScopedPath, RebornRuntimeError> {
-    ScopedPath::new(path).map_err(|reason| RebornRuntimeError::InvalidArgument {
-        reason: format!("skill root path: {reason}"),
-    })
+        FirstPartySkillsExtensionHandles::reborn_default().map_err(|reason| {
+            RebornRuntimeError::InvalidArgument {
+                reason: format!("first-party skills extension handles: {reason}"),
+            }
+        })?,
+    );
+    Ok(extension.host_skill_context_source())
 }
 
 struct ValidatedRuntimeIdentity {
