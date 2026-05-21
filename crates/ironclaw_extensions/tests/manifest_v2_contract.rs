@@ -193,6 +193,45 @@ output_schema_ref = "schemas/acme/echo.output.v1.json"
 }
 
 #[test]
+fn rejects_system_runtime_for_installed_source() {
+    let toml = format!(
+        r#"
+schema_version = "{schema}"
+id = "acme-tools"
+name = "x"
+version = "0.1"
+description = "x"
+trust = "third_party"
+
+[runtime]
+kind = "system"
+service = "native_system_provider"
+
+[[capabilities]]
+id = "acme-tools.echo"
+description = "echo"
+default_permission = "allow"
+visibility = "host_internal"
+input_schema_ref = "schemas/acme/echo.input.v1.json"
+output_schema_ref = "schemas/acme/echo.output.v1.json"
+"#,
+        schema = MANIFEST_SCHEMA_VERSION,
+    );
+    let err =
+        ExtensionManifestV2::parse(&toml, ManifestSource::InstalledLocal, &catalog()).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            ManifestV2Error::RuntimeForbiddenForSource {
+                manifest_source: ManifestSource::InstalledLocal,
+                kind: RuntimeKind::System,
+            }
+        ),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn host_bundled_source_may_assert_first_party_and_reserved_id() {
     let toml = format!(
         r#"
