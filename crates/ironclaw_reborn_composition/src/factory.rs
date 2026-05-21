@@ -1,3 +1,4 @@
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ironclaw_authorization::GrantAuthorizer;
@@ -43,6 +44,8 @@ pub(crate) struct RebornLocalRuntimeServices {
     pub(crate) loop_checkpoint_store: Arc<InMemoryLoopCheckpointStore>,
     pub(crate) thread_service: Arc<InMemorySessionThreadService>,
     pub(crate) skill_filesystem: Arc<ScopedFilesystem<LocalFilesystem>>,
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) default_skill_roots: Vec<PathBuf>,
 }
 
 impl std::fmt::Debug for RebornServices {
@@ -118,6 +121,17 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     std::fs::create_dir_all(&workspace_root).map_err(|_| RebornBuildError::InvalidConfig {
         reason: "local-dev workspace root could not be initialized".to_string(),
     })?;
+    let default_skill_roots = local_dev_default_skill_roots(&root);
+    for skill_root in &default_skill_roots {
+        std::fs::create_dir_all(skill_root).map_err(|_| RebornBuildError::InvalidConfig {
+            reason: "local-dev skill root could not be initialized".to_string(),
+        })?;
+    }
+    let canonical_workspace_root = canonicalize_local_dev_path(&workspace_root, "workspace root")?;
+    let canonical_skill_roots = default_skill_roots
+        .iter()
+        .map(|root| canonicalize_local_dev_path(root, "skill root"))
+        .collect::<Result<Vec<_>, _>>()?;
     let mut filesystem = LocalFilesystem::new();
     let projects_root = ironclaw_host_api::VirtualPath::new("/projects").map_err(|error| {
         RebornBuildError::InvalidConfig {
@@ -152,6 +166,8 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         loop_checkpoint_store: Arc::new(InMemoryLoopCheckpointStore::default()),
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         skill_filesystem,
+        workspace_root: canonical_workspace_root,
+        default_skill_roots: canonical_skill_roots,
     });
 
     let mut services = HostRuntimeServices::new(
@@ -198,11 +214,20 @@ fn local_dev_skill_mount_view() -> Result<MountView, RebornBuildError> {
     };
     MountView::new(vec![
         grant("/skills", "/projects/skills")?,
-        grant("/tenant-shared/skills", "/projects/tenant-shared/skills")?,
         grant("/system/skills", "/projects/system/skills")?,
     ])
     .map_err(|error| RebornBuildError::InvalidConfig {
         reason: error.to_string(),
+    })
+}
+
+fn local_dev_default_skill_roots(root: &Path) -> [PathBuf; 2] {
+    [root.join("system").join("skills"), root.join("skills")]
+}
+
+fn canonicalize_local_dev_path(path: &Path, label: &str) -> Result<PathBuf, RebornBuildError> {
+    std::fs::canonicalize(path).map_err(|error| RebornBuildError::InvalidConfig {
+        reason: format!("local-dev {label} could not be canonicalized: {error}"),
     })
 }
 
@@ -531,6 +556,8 @@ fn readiness_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironclaw_filesystem::FilesystemError;
+    use ironclaw_host_api::{ResourceScope, ScopedPath};
 
     #[tokio::test]
     async fn local_dev_services_include_repl_runtime_substrate() {
@@ -546,6 +573,50 @@ mod tests {
         assert!(services.turn_coordinator.is_some());
         assert!(services.local_runtime.is_some());
         assert_eq!(services.readiness.state, RebornReadinessState::DevOnly);
+    }
+
+    #[tokio::test]
+    async fn local_dev_skill_filesystem_rejects_writes_to_default_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let services = build_reborn_services(RebornBuildInput::local_dev(
+            "local-dev-skill-fs-owner",
+            dir.path().join("local-dev"),
+        ))
+        .await
+        .expect("local-dev services build");
+        let local_runtime = services
+            .local_runtime
+            .as_ref()
+            .expect("local-dev runtime services");
+
+        for path in [
+            "/skills/generated/SKILL.md",
+            "/system/skills/generated/SKILL.md",
+        ] {
+            let scoped_path = ScopedPath::new(path).expect("valid scoped path");
+            let write_error = local_runtime
+                .skill_filesystem
+                .write_file(&ResourceScope::system(), &scoped_path, b"blocked")
+                .await
+                .expect_err("skill filesystem write should be denied");
+            assert!(matches!(
+                write_error,
+                FilesystemError::PermissionDenied { .. }
+            ));
+        }
+
+        for path in ["/skills/generated", "/system/skills/generated"] {
+            let scoped_path = ScopedPath::new(path).expect("valid scoped path");
+            let mkdir_error = local_runtime
+                .skill_filesystem
+                .create_dir_all(&ResourceScope::system(), &scoped_path)
+                .await
+                .expect_err("skill filesystem mkdir should be denied");
+            assert!(matches!(
+                mkdir_error,
+                FilesystemError::PermissionDenied { .. }
+            ));
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::future::try_join_all;
+use futures::stream::{self, StreamExt};
 
 use crate::{
     HostSkillContextBuildError, HostSkillContextCandidate, HostSkillContextSource,
@@ -9,6 +9,8 @@ use crate::{
     sort_skill_bundle_descriptors,
 };
 use ironclaw_turns::run_profile::{LoopRunContext, SkillVisibility};
+
+const MAX_CONCURRENT_SKILL_CONTEXT_READS: usize = 8;
 
 /// Adapts portable skill bundles into model-context candidates.
 ///
@@ -68,16 +70,18 @@ where
 
         validate_descriptor_policy_metadata(&descriptors)?;
 
-        let visible_candidates = try_join_all(
-            descriptors
-                .iter()
-                .enumerate()
-                .filter(|(_, descriptor)| {
-                    descriptor.visibility() == Some(&SkillVisibility::Visible)
-                })
-                .map(|(index, descriptor)| async move {
-                    let skill_md = self
-                        .bundle_source
+        let visible_descriptors = descriptors
+            .iter()
+            .enumerate()
+            .filter(|(_, descriptor)| descriptor.visibility() == Some(&SkillVisibility::Visible))
+            .map(|(index, descriptor)| (index, descriptor.clone()))
+            .collect::<Vec<_>>();
+        let bundle_source = Arc::clone(&self.bundle_source);
+        let visible_candidates = stream::iter(visible_descriptors)
+            .map(|(index, descriptor)| {
+                let bundle_source = Arc::clone(&bundle_source);
+                async move {
+                    let skill_md = bundle_source
                         .read_skill_bundle_file(
                             run_context,
                             descriptor.id(),
@@ -95,11 +99,15 @@ where
                             descriptor.trust().cloned(),
                             descriptor.visibility().copied(),
                         )
-                        .with_ordering_key(descriptor_context_ordering_key(descriptor)),
+                        .with_ordering_key(descriptor_context_ordering_key(&descriptor)),
                     ))
-                }),
-        )
-        .await?;
+                }
+            })
+            .buffered(MAX_CONCURRENT_SKILL_CONTEXT_READS)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()?;
         let mut visible_candidates = visible_candidates.into_iter().peekable();
         let mut candidates = Vec::with_capacity(descriptors.len());
         for (index, descriptor) in descriptors.iter().enumerate() {

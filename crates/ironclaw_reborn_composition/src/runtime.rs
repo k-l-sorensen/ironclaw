@@ -658,15 +658,36 @@ pub async fn build_reborn_runtime(
 fn local_dev_filesystem_skill_context_source(
     local_runtime: &crate::factory::RebornLocalRuntimeServices,
 ) -> Result<Arc<dyn HostSkillContextSource>, RebornRuntimeError> {
+    validate_default_skill_workspace_isolation(local_runtime)?;
     let bundle_source = Arc::new(FilesystemSkillBundleSource::new(
         Arc::clone(&local_runtime.skill_filesystem),
         vec![
             FilesystemSkillBundleRoot::system(scoped_skill_root("/system/skills")?),
-            FilesystemSkillBundleRoot::tenant_shared(scoped_skill_root("/tenant-shared/skills")?),
             FilesystemSkillBundleRoot::user(scoped_skill_root("/skills")?),
         ],
     ));
     Ok(Arc::new(SkillBundleContextSource::new(bundle_source)))
+}
+
+fn validate_default_skill_workspace_isolation(
+    local_runtime: &crate::factory::RebornLocalRuntimeServices,
+) -> Result<(), RebornRuntimeError> {
+    for skill_root in &local_runtime.default_skill_roots {
+        if paths_overlap(&local_runtime.workspace_root, skill_root) {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: format!(
+                    "local-dev workspace root {} must not overlap filesystem skill root {} when using the default skill context source",
+                    local_runtime.workspace_root.display(),
+                    skill_root.display()
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn paths_overlap(left: &std::path::Path, right: &std::path::Path) -> bool {
+    left == right || left.starts_with(right) || right.starts_with(left)
 }
 
 fn scoped_skill_root(path: &str) -> Result<ScopedPath, RebornRuntimeError> {
@@ -860,7 +881,7 @@ mod tests {
     use crate::runtime_input::{PollSettings, RebornRuntimeIdentity, RebornRuntimeInput};
     use crate::webui::build_webui_services;
 
-    use super::build_reborn_runtime;
+    use super::{RebornRuntimeError, build_reborn_runtime};
 
     fn local_dev_runtime_policy() -> EffectiveRuntimePolicy {
         EffectiveRuntimePolicy {
@@ -1346,6 +1367,18 @@ mod tests {
     #[tokio::test]
     async fn local_dev_runtime_wires_input_skill_context_source_to_model_calls() {
         let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().join("local-dev");
+        std::fs::create_dir_all(storage_root.join("system/skills/default-helper"))
+            .expect("default system skill dir");
+        std::fs::write(
+            storage_root.join("system/skills/default-helper/SKILL.md"),
+            skill_md(
+                "default-helper",
+                "default helper description",
+                "DEFAULT_HELPER_PROMPT_SENTINEL",
+            ),
+        )
+        .expect("write default system skill");
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let gateway = Arc::new(RecordingGateway {
             reply: "skill context ok".to_string(),
@@ -1364,7 +1397,8 @@ mod tests {
         ]));
         let skill_context_source: Arc<dyn HostSkillContextSource> = skill_source;
         let input = RebornRuntimeInput::from_services(
-            RebornBuildInput::local_dev("runtime-skill-owner", root.path().join("local-dev"))
+            RebornBuildInput::local_dev("runtime-skill-owner", storage_root)
+                .with_local_dev_workspace_root(root.path().to_path_buf())
                 .with_runtime_policy(local_dev_runtime_policy()),
         )
         .with_identity(RebornRuntimeIdentity {
@@ -1412,6 +1446,8 @@ mod tests {
         assert_eq!(request_count, 1);
         assert!(skill_message_content.contains("review helper description"));
         assert!(skill_message_content.contains("Use review helper prompt content."));
+        assert!(!skill_message_content.contains("default helper description"));
+        assert!(!skill_message_content.contains("DEFAULT_HELPER_PROMPT_SENTINEL"));
 
         runtime.shutdown().await.expect("runtime shutdown");
     }
@@ -1441,6 +1477,17 @@ mod tests {
             ),
         )
         .expect("write user skill");
+        std::fs::create_dir_all(storage_root.join("tenant-shared/skills/shared-helper"))
+            .expect("tenant-shared skill dir");
+        std::fs::write(
+            storage_root.join("tenant-shared/skills/shared-helper/SKILL.md"),
+            skill_md(
+                "shared-helper",
+                "shared helper description",
+                "TENANT_SHARED_HELPER_PROMPT_SENTINEL",
+            ),
+        )
+        .expect("write tenant-shared skill");
         let requests = Arc::new(StdMutex::new(Vec::new()));
         let gateway = Arc::new(RecordingGateway {
             reply: "filesystem skill context ok".to_string(),
@@ -1497,8 +1544,43 @@ mod tests {
         assert!(combined_skill_context.contains("SYSTEM_HELPER_PROMPT_SENTINEL"));
         assert!(combined_skill_context.contains("local helper description"));
         assert!(!combined_skill_context.contains("USER_HELPER_PROMPT_SENTINEL"));
+        assert!(!combined_skill_context.contains("shared helper description"));
+        assert!(!combined_skill_context.contains("TENANT_SHARED_HELPER_PROMPT_SENTINEL"));
 
         runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[tokio::test]
+    async fn local_dev_runtime_rejects_default_skill_source_when_workspace_overlaps_skill_roots() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().join("local-dev");
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::local_dev("runtime-overlap-owner", storage_root)
+                .with_local_dev_workspace_root(root.path().to_path_buf())
+                .with_runtime_policy(local_dev_runtime_policy()),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-overlap-tenant".to_string(),
+            agent_id: "runtime-overlap-agent".to_string(),
+            source_binding_id: "runtime-overlap-source".to_string(),
+            reply_target_binding_id: "runtime-overlap-reply".to_string(),
+        });
+
+        let error = match build_reborn_runtime(input).await {
+            Ok(runtime) => {
+                runtime.shutdown().await.expect("runtime shutdown");
+                panic!("default skill source should reject overlapping workspace");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            matches!(
+                error,
+                RebornRuntimeError::InvalidArgument { ref reason }
+                    if reason.contains("must not overlap filesystem skill root")
+            ),
+            "unexpected error: {error}"
+        );
     }
 
     #[tokio::test]
