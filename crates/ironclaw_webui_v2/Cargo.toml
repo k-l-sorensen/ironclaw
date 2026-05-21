@@ -40,7 +40,7 @@ ironclaw_product_workflow = { path = "../ironclaw_product_workflow", version = "
 # Optional — only used when `webui-v2-beta` is enabled.
 async-trait = { version = "0.1", optional = true }
 async-stream = { version = "0.3", optional = true }
-axum = { version = "0.8", optional = true }
+axum = { version = "0.8", optional = true, features = ["ws"] }
 futures = { version = "0.3", optional = true }
 tokio = { version = "1", features = ["sync", "time"], optional = true }
 

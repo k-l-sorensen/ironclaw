@@ -19,13 +19,16 @@ use axum::Json;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::HeaderMap;
 use axum::response::sse::{Event, KeepAlive, Sse};
+use futures::SinkExt;
 use futures::stream::Stream;
 use ironclaw_product_workflow::{
     ProjectionCursor, RebornCancelRunResponse, RebornCreateThreadResponse,
-    RebornResolveGateResponse, RebornServicesApi, RebornServicesError, RebornServicesErrorCode,
-    RebornStreamEventsRequest, RebornSubmitTurnResponse, RebornTimelineRequest,
-    RebornTimelineResponse, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
-    WebUiCreateThreadRequest, WebUiResolveGateRequest, WebUiSendMessageRequest,
+    RebornListThreadsResponse, RebornResolveGateResponse, RebornServicesApi, RebornServicesError,
+    RebornServicesErrorCode, RebornSetupExtensionResponse, RebornStreamEventsRequest,
+    RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse,
+    WebUiAuthenticatedCaller, WebUiCancelRunRequest, WebUiCreateThreadRequest,
+    WebUiListThreadsRequest, WebUiResolveGateRequest, WebUiSendMessageRequest,
+    WebUiSetupExtensionRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -354,4 +357,167 @@ pub struct ResolveGatePath {
     pub thread_id: String,
     pub run_id: String,
     pub gate_ref: String,
+}
+
+/// `GET /api/webchat/v2/threads`
+///
+/// Lists threads scoped to the authenticated caller. Pagination is
+/// opaque: the response carries an optional `next_cursor` the browser
+/// echoes back as `?cursor=...` on the next page request.
+pub async fn list_threads(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Query(query): Query<ListThreadsQuery>,
+) -> Result<Json<RebornListThreadsResponse>, WebUiV2HttpError> {
+    let request = WebUiListThreadsRequest {
+        limit: query.limit,
+        cursor: query.cursor,
+    };
+    let response = state.services().list_threads(caller, request).await?;
+    Ok(Json(response))
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub struct ListThreadsQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub cursor: Option<String>,
+}
+
+/// `POST /api/webchat/v2/extensions/{extension_name}/setup`
+///
+/// Skeleton route — the v2 native extension lifecycle is not wired
+/// yet, so the underlying facade returns
+/// `RebornSetupExtensionStatus::NotImplemented`. The route exists so
+/// the v2 entrypoint inventory is complete and so future onboarding
+/// port work has a stable surface to fill in.
+pub async fn setup_extension(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Path(SetupExtensionPath { extension_name }): Path<SetupExtensionPath>,
+    Json(mut body): Json<WebUiSetupExtensionRequest>,
+) -> Result<Json<RebornSetupExtensionResponse>, WebUiV2HttpError> {
+    // Path wins over body so a `?extension_name=x` body field cannot
+    // override the route binding.
+    body.extension_name = extension_name;
+    let response = state.services().setup_extension(caller, body).await?;
+    Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SetupExtensionPath {
+    pub extension_name: String,
+}
+
+/// `GET /api/webchat/v2/threads/{thread_id}/ws`
+///
+/// WebSocket transport variant of [`stream_events`]. The handler
+/// accepts the WS upgrade, drains the same `RebornServicesApi::
+/// stream_events` facade as the SSE handler, and writes each event as
+/// a JSON text frame. Same lifetime + per-caller concurrency caps as
+/// SSE.
+///
+/// Same-origin enforcement is the responsibility of host composition's
+/// origin-check middleware — the descriptor declares
+/// `WebSocketOriginPolicy::SameOriginRequired` so a future override
+/// to a host-allowlist is one descriptor change away. This handler
+/// trusts the composition layer to have already rejected
+/// disallowed-origin upgrades.
+pub async fn stream_events_ws(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Path(thread_id): Path<String>,
+    upgrade: axum::extract::ws::WebSocketUpgrade,
+) -> Result<axum::response::Response, WebUiV2HttpError> {
+    let slot = state
+        .sse_capacity()
+        .try_acquire(&caller.tenant_id, &caller.user_id)
+        .ok_or_else(sse_concurrency_exhausted)?;
+    let services = state.services().clone();
+    Ok(upgrade.on_upgrade(move |socket| ws_drain_loop(services, caller, thread_id, slot, socket)))
+}
+
+async fn ws_drain_loop(
+    services: std::sync::Arc<dyn RebornServicesApi>,
+    caller: WebUiAuthenticatedCaller,
+    thread_id: String,
+    slot: SseSlot,
+    mut socket: axum::extract::ws::WebSocket,
+) {
+    // Mirror the SSE generator: own the slot guard, bound stream
+    // lifetime, drain stream_events on the same poll cadence, emit
+    // each envelope as a JSON text frame.
+    let _slot_guard = slot;
+    let started_at = tokio::time::Instant::now();
+    let mut after_cursor: Option<ProjectionCursor> = None;
+    loop {
+        let remaining = SSE_MAX_LIFETIME.saturating_sub(started_at.elapsed());
+        if remaining.is_zero() {
+            let _ = socket.close().await;
+            return;
+        }
+        let request = RebornStreamEventsRequest {
+            thread_id: thread_id.clone(),
+            after_cursor: after_cursor.clone(),
+        };
+        match tokio::time::timeout(remaining, services.stream_events(caller.clone(), request)).await
+        {
+            Err(_elapsed) => {
+                let _ = socket.close().await;
+                return;
+            }
+            Ok(Ok(response)) => {
+                if let Some(latest) = response.events.last() {
+                    after_cursor = Some(latest.projection_cursor.clone());
+                }
+                for envelope in response.events {
+                    match serde_json::to_string(&envelope) {
+                        Ok(text) => {
+                            if socket
+                                .send(axum::extract::ws::Message::Text(text.into()))
+                                .await
+                                .is_err()
+                            {
+                                // Peer hung up.
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                target = "ironclaw_webui_v2::ws",
+                                error = %error,
+                                "failed to serialize ProductOutboundEnvelope for WS",
+                            );
+                        }
+                    }
+                }
+                let sleep_for =
+                    SSE_POLL_INTERVAL.min(SSE_MAX_LIFETIME.saturating_sub(started_at.elapsed()));
+                if sleep_for.is_zero() {
+                    let _ = socket.close().await;
+                    return;
+                }
+                tokio::time::sleep(sleep_for).await;
+            }
+            Ok(Err(error)) => {
+                tracing::debug!(
+                    target = "ironclaw_webui_v2::ws",
+                    error = ?error,
+                    "facade rejected WS drain; closing stream",
+                );
+                let payload = SseErrorPayload {
+                    error: error.code,
+                    retryable: error.retryable,
+                };
+                if let Ok(text) = serde_json::to_string(&payload) {
+                    let _ = socket
+                        .send(axum::extract::ws::Message::Text(text.into()))
+                        .await;
+                }
+                let _ = socket.close().await;
+                return;
+            }
+        }
+    }
 }
