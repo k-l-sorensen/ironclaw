@@ -1075,6 +1075,102 @@ async fn prompt_and_model_ports_send_selected_skill_context_to_gateway() {
 }
 
 #[tokio::test]
+async fn prompt_and_model_ports_resolve_skill_refs_after_prompt_sorting() {
+    let fixture = ThreadFixture::new().await;
+    let source = Arc::new(StaticSkillContextSource::new(vec![
+        HostSkillContextCandidate::new(
+            skill_md("zeta", "safe zeta description", "Use zeta prompt content."),
+            Some(SkillTrust::Trusted),
+            Some(SkillVisibility::Visible),
+        )
+        .with_ordering_key("0000000000000000"),
+        HostSkillContextCandidate::new(
+            skill_md(
+                "alpha",
+                "safe alpha description",
+                "Use alpha prompt content.",
+            ),
+            Some(SkillTrust::Trusted),
+            Some(SkillVisibility::Visible),
+        )
+        .with_ordering_key("0000000000000001"),
+    ]));
+    let context_port = Arc::new(
+        ThreadBackedLoopContextPort::new(
+            Arc::clone(&fixture.thread_service),
+            fixture.thread_scope.clone(),
+            fixture.run_context.clone(),
+            16,
+        )
+        .with_skill_context_source(source.clone()),
+    );
+    let milestones = Arc::new(InMemoryLoopHostMilestoneSink::default());
+    let prompt_port =
+        HostManagedLoopPromptPort::new(fixture.run_context.clone(), context_port, milestones);
+    let prompt_bundle = prompt_port
+        .build_prompt_bundle(ironclaw_turns::run_profile::LoopPromptBundleRequest {
+            mode: ironclaw_turns::run_profile::PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: None,
+            inline_messages: Vec::new(),
+            capability_view: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(prompt_bundle.messages.len(), 3);
+    assert_eq!(prompt_bundle.messages[0].role, "system");
+    assert!(
+        prompt_bundle.messages[0]
+            .content_ref
+            .as_str()
+            .contains("skill.alpha")
+    );
+    assert_eq!(prompt_bundle.messages[1].role, "system");
+    assert!(
+        prompt_bundle.messages[1]
+            .content_ref
+            .as_str()
+            .contains("skill.zeta")
+    );
+
+    let gateway = Arc::new(RecordingGateway::reply("model says hi"));
+    let model_port = ThreadBackedLoopModelPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        gateway.clone(),
+        16,
+    )
+    .with_skill_context_source(source);
+
+    model_port
+        .stream_model(LoopModelRequest {
+            messages: prompt_bundle.messages,
+            surface_version: None,
+            model_preference: None,
+            capability_view: None,
+        })
+        .await
+        .unwrap();
+
+    let calls = gateway.calls.lock().unwrap();
+    assert!(
+        calls[0].messages[0]
+            .content
+            .contains("safe alpha description")
+    );
+    assert!(
+        calls[0].messages[1]
+            .content
+            .contains("safe zeta description")
+    );
+    assert_eq!(calls[0].messages[2].role, HostManagedModelMessageRole::User);
+}
+
+#[tokio::test]
 async fn prompt_and_model_ports_resolve_instruction_memory_and_identity_refs() {
     let fixture = ThreadFixture::new().await;
     let materialization_store = Arc::new(InMemoryInstructionMaterializationStore::default());

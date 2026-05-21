@@ -659,13 +659,18 @@ fn local_dev_filesystem_skill_context_source(
     local_runtime: &crate::factory::RebornLocalRuntimeServices,
 ) -> Result<Arc<dyn HostSkillContextSource>, RebornRuntimeError> {
     validate_default_skill_workspace_isolation(local_runtime)?;
-    let bundle_source = Arc::new(FilesystemSkillBundleSource::new(
-        Arc::clone(&local_runtime.skill_filesystem),
-        vec![
-            FilesystemSkillBundleRoot::system(scoped_skill_root("/system/skills")?),
-            FilesystemSkillBundleRoot::user(scoped_skill_root("/skills")?),
-        ],
-    ));
+    let bundle_source = Arc::new(
+        FilesystemSkillBundleSource::new(
+            Arc::clone(&local_runtime.skill_filesystem),
+            vec![
+                FilesystemSkillBundleRoot::system(scoped_skill_root("/system/skills")?),
+                FilesystemSkillBundleRoot::user(scoped_skill_root("/skills")?),
+            ],
+        )
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("local-dev filesystem skill context source: {error}"),
+        })?,
+    );
     Ok(Arc::new(SkillBundleContextSource::new(bundle_source)))
 }
 
@@ -1543,7 +1548,7 @@ mod tests {
         assert!(combined_skill_context.contains("system helper description"));
         assert!(combined_skill_context.contains("SYSTEM_HELPER_PROMPT_SENTINEL"));
         assert!(combined_skill_context.contains("local helper description"));
-        assert!(!combined_skill_context.contains("USER_HELPER_PROMPT_SENTINEL"));
+        assert!(combined_skill_context.contains("USER_HELPER_PROMPT_SENTINEL"));
         assert!(!combined_skill_context.contains("shared helper description"));
         assert!(!combined_skill_context.contains("TENANT_SHARED_HELPER_PROMPT_SENTINEL"));
 
@@ -1693,7 +1698,7 @@ mod tests {
         assert!(combined_skill_context.contains("system shared helper description"));
         assert!(combined_skill_context.contains("SYSTEM_SHARED_HELPER_PROMPT_SENTINEL"));
         assert!(combined_skill_context.contains("user shared helper description"));
-        assert!(!combined_skill_context.contains("USER_SHARED_HELPER_PROMPT_SENTINEL"));
+        assert!(combined_skill_context.contains("USER_SHARED_HELPER_PROMPT_SENTINEL"));
 
         runtime.shutdown().await.expect("runtime shutdown");
     }
@@ -1732,7 +1737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn local_dev_runtime_fails_closed_for_invalid_filesystem_skill_before_model_call() {
+    async fn local_dev_runtime_skips_invalid_filesystem_skill_before_model_call() {
         let root = tempfile::tempdir().expect("tempdir");
         let storage_root = root.path().join("local-dev");
         std::fs::create_dir_all(storage_root.join("skills/bad-helper")).expect("bad skill dir");
@@ -1776,13 +1781,27 @@ mod tests {
         .expect("runtime send should finish")
         .expect("runtime send should succeed");
 
-        assert_ne!(reply.status, TurnStatus::Completed);
-        assert!(
-            requests
+        assert_eq!(reply.status, TurnStatus::Completed);
+        assert_eq!(reply.text.as_deref(), Some("should not reach model"));
+        let skill_message_count = {
+            let requests = requests
                 .lock()
-                .expect("recording gateway requests lock poisoned")
-                .is_empty(),
-            "invalid filesystem skill should fail before model dispatch"
+                .expect("recording gateway requests lock poisoned");
+            requests[0]
+                .messages
+                .iter()
+                .filter(|message| {
+                    message.role == HostManagedModelMessageRole::System
+                        && message
+                            .content_ref
+                            .as_str()
+                            .starts_with("msg:snippet.skill.")
+                })
+                .count()
+        };
+        assert_eq!(
+            skill_message_count, 0,
+            "invalid filesystem skill should be skipped before model dispatch"
         );
 
         runtime.shutdown().await.expect("runtime shutdown");

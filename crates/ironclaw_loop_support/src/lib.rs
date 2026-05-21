@@ -82,11 +82,12 @@ use ironclaw_turns::{
         CapabilityDeniedReasonKind, CapabilityInvocation, CapabilityOutcome,
         CapabilitySurfaceVersion, FinalizeAssistantMessage, InstructionMaterializationStore,
         LoopCapabilityPort, LoopContextBundle, LoopContextMessage, LoopContextPort,
-        LoopContextRequest, LoopDriverNoteKind, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
-        LoopInputCursor, LoopModelMessage, LoopModelPort, LoopModelRequest, LoopModelResponse,
-        LoopPromptBundleAuthority, LoopRunContext, LoopRunInfoPort, LoopSafeSummary,
-        LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput, PromptMode, UpdateAssistantDraft,
-        VisibleCapabilityRequest, VisibleCapabilitySurface, sanitize_model_visible_text,
+        LoopContextRequest, LoopContextSnippet, LoopDriverNoteKind, LoopHostMilestoneEmitter,
+        LoopHostMilestoneSink, LoopInputCursor, LoopModelMessage, LoopModelPort, LoopModelRequest,
+        LoopModelResponse, LoopPromptBundleAuthority, LoopRunContext, LoopRunInfoPort,
+        LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput, PromptMode,
+        UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        sanitize_model_visible_text,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -1146,8 +1147,9 @@ where
         let Some(source) = self.skill_context_source.as_deref() else {
             return Ok(HashMap::new());
         };
-        let snippets =
+        let mut snippets =
             skill_context::build_skill_instruction_snippets(source, &self.run_context).await?;
+        snippets.sort_by(compare_skill_instruction_snippets);
         let mut messages = HashMap::with_capacity(snippets.len());
         for (ordinal, snippet) in snippets.into_iter().enumerate() {
             let content_ref = skill_context::snippet_model_message_ref(
@@ -1167,6 +1169,15 @@ where
         }
         Ok(messages)
     }
+}
+
+fn compare_skill_instruction_snippets(
+    a: &LoopContextSnippet,
+    b: &LoopContextSnippet,
+) -> std::cmp::Ordering {
+    a.snippet_ref
+        .cmp(&b.snippet_ref)
+        .then_with(|| a.safe_summary.cmp(&b.safe_summary))
 }
 
 /// Host-managed text-only model gateway. Implementations own provider selection,
