@@ -23,11 +23,13 @@ use ironclaw_product_adapters::{
 };
 use ironclaw_product_workflow::{
     RebornCancelRunResponse, RebornCreateThreadResponse, RebornGetRunStateRequest,
-    RebornGetRunStateResponse, RebornResolveGateResponse, RebornResumeGateResponse,
-    RebornServicesApi, RebornServicesError, RebornServicesErrorCode, RebornStreamEventsRequest,
+    RebornGetRunStateResponse, RebornListThreadsResponse, RebornResolveGateResponse,
+    RebornResumeGateResponse, RebornServicesApi, RebornServicesError, RebornServicesErrorCode,
+    RebornSetupExtensionResponse, RebornSetupExtensionStatus, RebornStreamEventsRequest,
     RebornStreamEventsResponse, RebornSubmitTurnResponse, RebornTimelineRequest,
     RebornTimelineResponse, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
-    WebUiCreateThreadRequest, WebUiResolveGateRequest, WebUiSendMessageRequest,
+    WebUiCreateThreadRequest, WebUiListThreadsRequest, WebUiResolveGateRequest,
+    WebUiSendMessageRequest, WebUiSetupExtensionRequest,
 };
 use ironclaw_threads::SessionThreadRecord;
 use ironclaw_turns::{
@@ -256,6 +258,29 @@ impl RebornServicesApi for StubServices {
                 event_cursor: EventCursor(3),
             },
         ))
+    }
+
+    async fn list_threads(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _request: WebUiListThreadsRequest,
+    ) -> Result<RebornListThreadsResponse, RebornServicesError> {
+        Ok(RebornListThreadsResponse {
+            threads: Vec::new(),
+            next_cursor: None,
+        })
+    }
+
+    async fn setup_extension(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: WebUiSetupExtensionRequest,
+    ) -> Result<RebornSetupExtensionResponse, RebornServicesError> {
+        Ok(RebornSetupExtensionResponse {
+            extension_name: request.extension_name,
+            status: RebornSetupExtensionStatus::NotImplemented,
+            payload: None,
+        })
     }
 }
 
@@ -702,6 +727,20 @@ async fn stream_events_releases_slot_when_facade_drain_stalls_past_max_lifetime(
             _caller: WebUiAuthenticatedCaller,
             _request: RebornGetRunStateRequest,
         ) -> Result<RebornGetRunStateResponse, RebornServicesError> {
+            unreachable!("not exercised by this test")
+        }
+        async fn list_threads(
+            &self,
+            _caller: WebUiAuthenticatedCaller,
+            _request: WebUiListThreadsRequest,
+        ) -> Result<RebornListThreadsResponse, RebornServicesError> {
+            unreachable!("not exercised by this test")
+        }
+        async fn setup_extension(
+            &self,
+            _caller: WebUiAuthenticatedCaller,
+            _request: WebUiSetupExtensionRequest,
+        ) -> Result<RebornSetupExtensionResponse, RebornServicesError> {
             unreachable!("not exercised by this test")
         }
     }

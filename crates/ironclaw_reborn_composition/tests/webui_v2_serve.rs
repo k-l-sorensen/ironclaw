@@ -21,11 +21,13 @@ use http_body_util::BodyExt;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_product_workflow::{
     RebornCancelRunResponse, RebornCreateThreadResponse, RebornGetRunStateRequest,
-    RebornGetRunStateResponse, RebornResolveGateResponse, RebornServicesApi, RebornServicesError,
-    RebornServicesErrorCode, RebornStreamEventsRequest, RebornStreamEventsResponse,
+    RebornGetRunStateResponse, RebornListThreadsResponse, RebornResolveGateResponse,
+    RebornServicesApi, RebornServicesError, RebornServicesErrorCode, RebornSetupExtensionResponse,
+    RebornSetupExtensionStatus, RebornStreamEventsRequest, RebornStreamEventsResponse,
     RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse,
     WebUiAuthenticatedCaller, WebUiCancelRunRequest, WebUiCreateThreadRequest,
-    WebUiResolveGateRequest, WebUiSendMessageRequest,
+    WebUiListThreadsRequest, WebUiResolveGateRequest, WebUiSendMessageRequest,
+    WebUiSetupExtensionRequest,
 };
 use ironclaw_reborn_composition::{
     RebornReadiness, RebornWebuiBundle, WebuiAuthenticator, WebuiServeConfig, webui_v2_app,
@@ -176,6 +178,29 @@ impl RebornServicesApi for StubServices {
             retryable: false,
             field: None,
             validation_code: None,
+        })
+    }
+
+    async fn list_threads(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _request: WebUiListThreadsRequest,
+    ) -> Result<RebornListThreadsResponse, RebornServicesError> {
+        Ok(RebornListThreadsResponse {
+            threads: Vec::new(),
+            next_cursor: None,
+        })
+    }
+
+    async fn setup_extension(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: WebUiSetupExtensionRequest,
+    ) -> Result<RebornSetupExtensionResponse, RebornServicesError> {
+        Ok(RebornSetupExtensionResponse {
+            extension_name: request.extension_name,
+            status: RebornSetupExtensionStatus::NotImplemented,
+            payload: None,
         })
     }
 }

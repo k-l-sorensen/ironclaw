@@ -63,14 +63,16 @@ pub use ledger::{IdempotencyDecision, IdempotencyLedger};
 pub use ironclaw_product_adapters::{ProductOutboundEnvelope, ProjectionCursor};
 pub use reborn_services::{
     RebornCancelRunResponse, RebornCreateThreadResponse, RebornGetRunStateRequest,
-    RebornGetRunStateResponse, RebornResolveGateResponse, RebornResumeGateResponse, RebornServices,
-    RebornServicesApi, RebornServicesError, RebornServicesErrorCode, RebornStreamEventsRequest,
-    RebornStreamEventsResponse, RebornSubmitTurnResponse, RebornTimelineRequest,
-    RebornTimelineResponse,
+    RebornGetRunStateResponse, RebornListThreadsResponse, RebornResolveGateResponse,
+    RebornResumeGateResponse, RebornServices, RebornServicesApi, RebornServicesError,
+    RebornServicesErrorCode, RebornSetupExtensionResponse, RebornSetupExtensionStatus,
+    RebornStreamEventsRequest, RebornStreamEventsResponse, RebornSubmitTurnResponse,
+    RebornTimelineRequest, RebornTimelineResponse,
 };
 pub use webui_inbound::{
     WebUiAuthenticatedCaller, WebUiCancelReason, WebUiCancelRunRequest, WebUiCreateThreadRequest,
     WebUiGateResolution, WebUiInboundCommand, WebUiInboundValidationCode,
-    WebUiInboundValidationError, WebUiResolveGateRequest, WebUiSendMessageRequest,
+    WebUiInboundValidationError, WebUiListThreadsRequest, WebUiResolveGateRequest,
+    WebUiSendMessageRequest, WebUiSetupExtensionRequest,
 };
 pub use workflow::DefaultProductWorkflow;

@@ -27,7 +27,8 @@ use uuid::Uuid;
 use crate::{
     WebUiAuthenticatedCaller, WebUiCancelRunRequest, WebUiCreateThreadRequest, WebUiGateResolution,
     WebUiInboundCommand, WebUiInboundValidationCode, WebUiInboundValidationError,
-    WebUiResolveGateRequest, WebUiSendMessageRequest,
+    WebUiListThreadsRequest, WebUiResolveGateRequest, WebUiSendMessageRequest,
+    WebUiSetupExtensionRequest,
 };
 
 mod error;
@@ -36,7 +37,8 @@ mod types;
 pub use error::{RebornServicesError, RebornServicesErrorCode};
 pub use types::{
     RebornCancelRunResponse, RebornCreateThreadResponse, RebornGetRunStateRequest,
-    RebornGetRunStateResponse, RebornResolveGateResponse, RebornResumeGateResponse,
+    RebornGetRunStateResponse, RebornListThreadsResponse, RebornResolveGateResponse,
+    RebornResumeGateResponse, RebornSetupExtensionResponse, RebornSetupExtensionStatus,
     RebornStreamEventsRequest, RebornStreamEventsResponse, RebornSubmitTurnResponse,
     RebornTimelineRequest, RebornTimelineResponse,
 };
@@ -85,6 +87,31 @@ pub trait RebornServicesApi: Send + Sync {
         caller: WebUiAuthenticatedCaller,
         request: RebornGetRunStateRequest,
     ) -> Result<RebornGetRunStateResponse, RebornServicesError>;
+
+    /// List the caller-scoped threads. Pagination is opaque: callers
+    /// echo back the `next_cursor` from a prior response to retrieve
+    /// the next page; the cursor encoding is implementation-defined.
+    ///
+    /// Returns an empty list + `next_cursor: None` when no threads
+    /// exist for the caller's scope.
+    async fn list_threads(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: WebUiListThreadsRequest,
+    ) -> Result<RebornListThreadsResponse, RebornServicesError>;
+
+    /// Run a step in a v2-native extension onboarding flow. Today the
+    /// facade returns
+    /// [`RebornSetupExtensionStatus::NotImplemented`](types::RebornSetupExtensionStatus::NotImplemented)
+    /// because the underlying extension lifecycle is still v1-only.
+    /// The route exists so the WebUI v2 entrypoint inventory is
+    /// complete and so future onboarding port work has a fixed surface
+    /// to fill in.
+    async fn setup_extension(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: WebUiSetupExtensionRequest,
+    ) -> Result<RebornSetupExtensionResponse, RebornServicesError>;
 }
 
 /// Default facade implementation composed at the WebUI boundary.
@@ -519,6 +546,60 @@ impl RebornServicesApi for RebornServices {
             .await
             .map_err(map_turn_error)?;
         Ok(state.into())
+    }
+
+    async fn list_threads(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: WebUiListThreadsRequest,
+    ) -> Result<RebornListThreadsResponse, RebornServicesError> {
+        // Reuse the same scope-construction shape the other v2 facade
+        // methods use: fail-closed when the caller has no agent
+        // binding, owner-scope to the caller's user_id so the listing
+        // is per-caller.
+        let Some(agent_id) = caller.agent_id.clone() else {
+            return Err(RebornServicesError::from_status(
+                RebornServicesErrorCode::InvalidRequest,
+                400,
+                false,
+            ));
+        };
+        let scope = ThreadScope {
+            tenant_id: caller.tenant_id.clone(),
+            agent_id,
+            project_id: caller.project_id.clone(),
+            owner_user_id: Some(caller.user_id.clone()),
+            mission_id: None,
+        };
+        let response = self
+            .thread_service
+            .list_threads_for_scope(ironclaw_threads::ListThreadsForScopeRequest {
+                scope,
+                limit: request.limit,
+                cursor: request.cursor,
+            })
+            .await
+            .map_err(map_thread_error)?;
+        Ok(RebornListThreadsResponse {
+            threads: response.threads,
+            next_cursor: response.next_cursor,
+        })
+    }
+
+    async fn setup_extension(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: WebUiSetupExtensionRequest,
+    ) -> Result<RebornSetupExtensionResponse, RebornServicesError> {
+        // Skeleton: v2 native onboarding lifecycle is intentionally
+        // not wired to v1's onboarding controller. Returns a clear
+        // status so v2 callers know the route exists but the
+        // underlying flow is not yet ported.
+        Ok(RebornSetupExtensionResponse {
+            extension_name: request.extension_name,
+            status: RebornSetupExtensionStatus::NotImplemented,
+            payload: None,
+        })
     }
 }
 
