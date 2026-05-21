@@ -42,7 +42,8 @@ use async_trait::async_trait;
 use ironclaw_host_api::{
     CapabilityId, NetworkMethod, NetworkPolicy, NetworkTargetPattern, ResourceScope,
     RuntimeCredentialInjection, RuntimeCredentialSource, RuntimeCredentialTarget,
-    RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressRequest, RuntimeKind, SecretHandle,
+    RuntimeHttpEgress, RuntimeHttpEgressError, RuntimeHttpEgressReasonCode,
+    RuntimeHttpEgressRequest, RuntimeKind, SecretHandle,
 };
 use ironclaw_product_adapters::{
     DeclaredEgressTarget, EgressRequest, EgressResponse, ProtocolHttpEgress,
@@ -236,21 +237,35 @@ where
 
 /// Map a [`RuntimeHttpEgressError`] to the adapter-visible
 /// [`ProtocolHttpEgressError`]. The host has already redacted credential
-/// material from the rendered reason; this translation only re-labels the
-/// shape so the adapter can branch on retryable/permanent.
+/// material from the rendered reason; this translation re-labels the
+/// shape so the adapter retry classifier (`is_retryable` in
+/// `ironclaw_product_adapters::error`) sees the right verdict.
+///
+/// Retry contract:
+/// - `Network` → retryable (transport-layer failure, may succeed on retry).
+/// - everything else → permanent `PolicyDenied`. Credential/Request/Response
+///   failures (including leak-detector matches and response-body-limit
+///   exceeded) are not made transient by retrying.
+///
+/// We deliberately surface only the runtime's `stable_runtime_reason()` —
+/// a short, allow-listed string — into the adapter-visible reason, instead
+/// of forwarding the raw `reason` text. This keeps host-internal diagnostic
+/// strings out of audit logs and out of fields like `UnknownCredentialHandle.handle`
+/// where they previously misled downstream consumers that treated the field
+/// as a credential identity.
 fn map_runtime_error(err: RuntimeHttpEgressError) -> ProtocolHttpEgressError {
-    match err {
-        RuntimeHttpEgressError::Credential { reason } => {
-            ProtocolHttpEgressError::UnknownCredentialHandle { handle: reason }
+    let stable = err.stable_runtime_reason();
+    match err.reason_code() {
+        RuntimeHttpEgressReasonCode::NetworkError => {
+            ProtocolHttpEgressError::Network(RedactedString::new(stable.to_string()))
         }
-        RuntimeHttpEgressError::Request { reason, .. } => ProtocolHttpEgressError::PolicyDenied {
-            reason: RedactedString::new(reason),
-        },
-        RuntimeHttpEgressError::Network { reason, .. } => {
-            ProtocolHttpEgressError::Network(RedactedString::new(reason))
-        }
-        RuntimeHttpEgressError::Response { reason, .. } => {
-            ProtocolHttpEgressError::Network(RedactedString::new(reason))
+        RuntimeHttpEgressReasonCode::CredentialUnavailable
+        | RuntimeHttpEgressReasonCode::RequestDenied
+        | RuntimeHttpEgressReasonCode::ResponseError
+        | RuntimeHttpEgressReasonCode::ResponseBodyLimitExceeded => {
+            ProtocolHttpEgressError::PolicyDenied {
+                reason: RedactedString::new(stable.to_string()),
+            }
         }
     }
 }

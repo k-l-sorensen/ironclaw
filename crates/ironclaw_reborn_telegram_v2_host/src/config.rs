@@ -250,6 +250,27 @@ fn resolve_storage(env_lookup: EnvLookup) -> Result<StorageBackend, HostError> {
     }
     #[cfg(feature = "libsql")]
     if let Some(path) = env_lookup("LIBSQL_PATH") {
+        // Explicit `LIBSQL_PATH=:memory:` (or `:memory:?cache=...`) is the
+        // same hazard as the implicit fallback below — every restart loses
+        // the ledger and breaks the idempotency contract. Operators must
+        // opt in via `IRONCLAW_REBORN_ALLOW_EPHEMERAL=1` so a typo or a
+        // copy-from-test-config can't silently destroy production durability.
+        if is_libsql_in_memory_path(&path) {
+            if env_flag_set(env_lookup, ALLOW_EPHEMERAL_ENV)? {
+                tracing::warn!(
+                    "Reborn host: using ephemeral in-memory libSQL storage because \
+                     LIBSQL_PATH={path} and {ALLOW_EPHEMERAL_ENV} is set. Ledger \
+                     and bindings will be lost on restart; not safe for production."
+                );
+                return Ok(StorageBackend::LibSql { path });
+            }
+            return Err(HostError::Config(format!(
+                "LIBSQL_PATH={path} is an in-memory libSQL path which loses all \
+                 ledger + binding state on restart. Set {ALLOW_EPHEMERAL_ENV}=1 \
+                 to opt into this for tests/dev, or set LIBSQL_PATH to a real \
+                 file path."
+            )));
+        }
         return Ok(StorageBackend::LibSql { path });
     }
     // Fail-closed default. The Reborn host's entire purpose is durable
@@ -273,6 +294,14 @@ fn resolve_storage(env_lookup: EnvLookup) -> Result<StorageBackend, HostError> {
          LIBSQL_PATH (libsql). For tests/dev, set {ALLOW_EPHEMERAL_ENV}=1 to \
          opt into in-memory storage."
     )))
+}
+
+/// libSQL's in-memory mode accepts `:memory:` and `:memory:?<params>`
+/// (e.g. `?cache=shared`). Match both so the fail-closed guard cannot
+/// be bypassed via a URI-style suffix.
+#[cfg(feature = "libsql")]
+fn is_libsql_in_memory_path(path: &str) -> bool {
+    path == ":memory:" || path.starts_with(":memory:?")
 }
 
 #[cfg(test)]
@@ -511,6 +540,84 @@ mod tests {
             }
             other => panic!("expected Config error, got {other:?}"),
         }
+    }
+
+    /// Regression: explicit `LIBSQL_PATH=:memory:` must hit the same
+    /// fail-closed guard as the implicit fallback. The original PR shipped
+    /// the guard only on the fallback path, so an operator who typed
+    /// `:memory:` (or copied test config) could lose the ledger silently.
+    #[cfg(feature = "libsql")]
+    #[test]
+    fn resolve_storage_rejects_explicit_memory_path_without_opt_in() {
+        let env = fake_env(&[("LIBSQL_PATH", ":memory:")]);
+        let lookup = lookup(&env);
+        let err = resolve_storage(&lookup).expect_err("explicit :memory: must fail closed");
+        match err {
+            HostError::Config(msg) => {
+                assert!(
+                    msg.contains("in-memory") && msg.contains("ALLOW_EPHEMERAL"),
+                    "error must explain the opt-in path: {msg}"
+                );
+            }
+            other => panic!("expected Config error, got {other:?}"),
+        }
+    }
+
+    /// The `:memory:?<params>` URI form (e.g. `?cache=shared`) is libSQL's
+    /// shared in-memory mode — same durability hazard, so the guard must
+    /// match it too.
+    #[cfg(feature = "libsql")]
+    #[test]
+    fn resolve_storage_rejects_explicit_memory_uri_form_without_opt_in() {
+        let env = fake_env(&[("LIBSQL_PATH", ":memory:?cache=shared")]);
+        let lookup = lookup(&env);
+        let err = resolve_storage(&lookup).expect_err(":memory:?cache=shared must fail closed");
+        assert!(matches!(err, HostError::Config(_)));
+    }
+
+    /// With the explicit opt-in, the in-memory path is allowed and surfaced
+    /// verbatim so callers can preserve any `?cache=shared` suffix.
+    #[cfg(feature = "libsql")]
+    #[test]
+    fn resolve_storage_accepts_explicit_memory_path_with_opt_in() {
+        let env = fake_env(&[
+            ("LIBSQL_PATH", ":memory:"),
+            ("IRONCLAW_REBORN_ALLOW_EPHEMERAL", "1"),
+        ]);
+        let lookup = lookup(&env);
+        match resolve_storage(&lookup).expect("opt-in must allow in-memory") {
+            StorageBackend::LibSql { path } => assert_eq!(path, ":memory:"),
+            #[cfg(feature = "postgres")]
+            other => panic!("expected LibSql variant, got {other:?}"),
+        }
+    }
+
+    /// Non-`:memory:` paths must bypass the new guard entirely — production
+    /// file-backed deployments do not need the opt-in flag.
+    #[cfg(feature = "libsql")]
+    #[test]
+    fn resolve_storage_accepts_file_path_without_opt_in() {
+        let env = fake_env(&[("LIBSQL_PATH", "/var/lib/ironclaw/reborn.db")]);
+        let lookup = lookup(&env);
+        match resolve_storage(&lookup).expect("file path must not require opt-in") {
+            StorageBackend::LibSql { path } => assert_eq!(path, "/var/lib/ironclaw/reborn.db"),
+            #[cfg(feature = "postgres")]
+            other => panic!("expected LibSql variant, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "libsql")]
+    #[test]
+    fn is_libsql_in_memory_path_classifies_canonical_forms() {
+        assert!(is_libsql_in_memory_path(":memory:"));
+        assert!(is_libsql_in_memory_path(":memory:?cache=shared"));
+        assert!(!is_libsql_in_memory_path("/tmp/real.db"));
+        assert!(!is_libsql_in_memory_path("memory"));
+        assert!(!is_libsql_in_memory_path(""));
+        // Defense-in-depth: a path that happens to *contain* :memory: as a
+        // substring but doesn't *start with* it is a real file path on a
+        // dev box and must stay outside the guard.
+        assert!(!is_libsql_in_memory_path("/tmp/:memory:.db"));
     }
 
     #[test]

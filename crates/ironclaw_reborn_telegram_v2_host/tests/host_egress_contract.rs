@@ -47,6 +47,18 @@ impl RecordingRuntimeEgress {
         }
     }
 
+    /// Construct a fake that returns the given runtime error on every
+    /// `execute()`. Used to pin the `map_runtime_error` matrix from the
+    /// caller side — verifying the adapter-visible variant each runtime
+    /// error class translates into, since the retry classifier in
+    /// `ironclaw_product_adapters::error` branches on the variant.
+    fn with_error(error: RuntimeHttpEgressError) -> Self {
+        Self {
+            response: Mutex::new(Err(error)),
+            requests: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
     fn requests(&self) -> Vec<RuntimeHttpEgressRequest> {
         self.requests.lock().unwrap().clone()
     }
@@ -340,5 +352,133 @@ fn host_egress_construction_rejects_empty_declared_list() {
     assert!(
         rendered.contains("open network policy") || rendered.contains("declared egress"),
         "construction error should explain the open-policy refusal, got: {rendered}",
+    );
+}
+
+// ----------------------------------------------------------------------------
+// map_runtime_error retry-classification matrix
+//
+// The shim translates `RuntimeHttpEgressError` into `ProtocolHttpEgressError`,
+// and the adapter's `is_retryable` classifier branches on the variant. Pre-fix
+// the mapping made permanent runtime failures (leak detector, credential
+// store) look retryable, or stuffed free-text reason strings into typed-id
+// fields. These tests lock the contract: Network → retryable Network,
+// everything else → permanent PolicyDenied (with a stable, short reason).
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn host_egress_maps_runtime_credential_error_to_policy_denied() {
+    let runtime = Arc::new(RecordingRuntimeEgress::with_error(
+        RuntimeHttpEgressError::Credential {
+            reason: "credential store unavailable".to_string(),
+        },
+    ));
+    let shim = build_shim(Arc::clone(&runtime), telegram_target_with_default_handle());
+
+    let error = shim
+        .send(telegram_send_message_request())
+        .await
+        .expect_err("runtime credential failure should not be swallowed");
+
+    // Must be PolicyDenied (permanent), NOT UnknownCredentialHandle —
+    // stuffing the host's free-text reason into a `handle` slot was the
+    // previous bug, and UnknownCredentialHandle being permanent meant a
+    // transient `StoreUnavailable` was dropped instead of retried.
+    match &error {
+        ProtocolHttpEgressError::PolicyDenied { reason } => {
+            let rendered = reason.to_string();
+            // RedactedString renders as `<redacted>`; we lock in the variant
+            // (which drives `is_retryable`), not the reason text.
+            assert_eq!(rendered, "<redacted>");
+        }
+        other => panic!("expected PolicyDenied, got {other:?}"),
+    }
+    // The adapter retry classifier must agree this is non-retryable.
+    let adapter_error: ironclaw_product_adapters::ProductAdapterError = error.into();
+    assert!(
+        !adapter_error.is_retryable(),
+        "credential failures must surface as permanent so duplicate webhooks don't keep retrying"
+    );
+}
+
+#[tokio::test]
+async fn host_egress_maps_runtime_request_error_to_policy_denied() {
+    let runtime = Arc::new(RecordingRuntimeEgress::with_error(
+        RuntimeHttpEgressError::Request {
+            reason: "sensitive_header_denied:authorization".to_string(),
+            request_bytes: 0,
+            response_bytes: 0,
+        },
+    ));
+    let shim = build_shim(Arc::clone(&runtime), telegram_target_with_default_handle());
+
+    let error = shim
+        .send(telegram_send_message_request())
+        .await
+        .expect_err("request validation failures must surface");
+
+    match &error {
+        ProtocolHttpEgressError::PolicyDenied { .. } => {}
+        other => panic!("expected PolicyDenied, got {other:?}"),
+    }
+    let adapter_error: ironclaw_product_adapters::ProductAdapterError = error.into();
+    assert!(!adapter_error.is_retryable());
+}
+
+#[tokio::test]
+async fn host_egress_maps_runtime_network_error_to_retryable_network() {
+    let runtime = Arc::new(RecordingRuntimeEgress::with_error(
+        RuntimeHttpEgressError::Network {
+            reason: "connect timeout".to_string(),
+            request_bytes: 32,
+            response_bytes: 0,
+        },
+    ));
+    let shim = build_shim(Arc::clone(&runtime), telegram_target_with_default_handle());
+
+    let error = shim
+        .send(telegram_send_message_request())
+        .await
+        .expect_err("network failures must surface");
+
+    match &error {
+        ProtocolHttpEgressError::Network(_) => {}
+        other => panic!("expected Network, got {other:?}"),
+    }
+    let adapter_error: ironclaw_product_adapters::ProductAdapterError = error.into();
+    assert!(
+        adapter_error.is_retryable(),
+        "transport-layer failures must surface as retryable so transient connectivity issues recover"
+    );
+}
+
+#[tokio::test]
+async fn host_egress_maps_runtime_response_error_to_permanent_policy_denied() {
+    // The pre-fix bug: Response → Network → retryable. The host emits
+    // Response for leak-detector matches and decode errors — permanent
+    // conditions that retry would never resolve. Mapping to PolicyDenied
+    // makes the workflow surface the failure once instead of looping.
+    let runtime = Arc::new(RecordingRuntimeEgress::with_error(
+        RuntimeHttpEgressError::Response {
+            reason: "response_leak_blocked".to_string(),
+            request_bytes: 32,
+            response_bytes: 0,
+        },
+    ));
+    let shim = build_shim(Arc::clone(&runtime), telegram_target_with_default_handle());
+
+    let error = shim
+        .send(telegram_send_message_request())
+        .await
+        .expect_err("response leak should not be swallowed");
+
+    match &error {
+        ProtocolHttpEgressError::PolicyDenied { .. } => {}
+        other => panic!("expected PolicyDenied for response-side failures, got {other:?}"),
+    }
+    let adapter_error: ironclaw_product_adapters::ProductAdapterError = error.into();
+    assert!(
+        !adapter_error.is_retryable(),
+        "leak-detector matches and response-decode errors are permanent; retrying never helps"
     );
 }

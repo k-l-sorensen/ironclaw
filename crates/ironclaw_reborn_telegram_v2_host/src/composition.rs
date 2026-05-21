@@ -58,7 +58,15 @@ pub struct RebornProductRuntimeConfig {
     /// installation resolver key.
     pub adapter_id: ProductAdapterId,
     pub installation_id: AdapterInstallationId,
-    pub telegram_bot_token: String,
+    /// Telegram Bot API token. Held as [`SecretString`] end-to-end through
+    /// composition so the zeroize-on-drop and redacted-Debug guarantees of
+    /// the env-side [`HostConfig::telegram_bot_token`][hc] are not lost
+    /// while the value transits between modules. Only exposed once at the
+    /// `secret_store.put(...)` call site below, where it is consumed into
+    /// the host's secret store and the original `SecretString` is dropped.
+    ///
+    /// [hc]: crate::config::HostConfig::telegram_bot_token
+    pub telegram_bot_token: secrecy::SecretString,
     pub telegram_credential_handle: EgressCredentialHandle,
     pub telegram_declared_hosts: Vec<ironclaw_product_adapters::DeclaredEgressHost>,
     /// Trusted external-user → Reborn-user pairings to install before the
@@ -146,12 +154,13 @@ pub async fn build_reborn_product_runtime(
         .map_err(|e| HostError::Startup(format!("invalid secret handle: {e}")))?;
     {
         use ironclaw_secrets::SecretStore;
+        // `SecretMaterial` is a re-export of `secrecy::SecretString`, so the
+        // bot token moves into the store without ever taking a plain `String`
+        // intermediary on the heap. The original `SecretString` is consumed
+        // by `put()` and the redacted-Debug + zeroize-on-drop discipline is
+        // preserved end-to-end.
         secret_store
-            .put(
-                scope.clone(),
-                secret_handle,
-                ironclaw_secrets::SecretMaterial::from(telegram_bot_token),
-            )
+            .put(scope.clone(), secret_handle, telegram_bot_token)
             .await
             .map_err(|e| HostError::Startup(format!("seed telegram secret: {e}")))?;
     }

@@ -33,6 +33,18 @@ use crate::inbound_turn::StubInboundTurnService;
 use crate::router::{TelegramV2RouterState, telegram_v2_routes};
 
 pub const TELEGRAM_V2_CHANNEL_NAME: &str = "telegram_v2";
+
+/// Bounded queue depth for the native adapter runner.
+///
+/// Compile-time validated to avoid a runtime `.expect()` in production —
+/// CLAUDE.md forbids `unwrap`/`expect` on the boot path. `match` is `const`,
+/// so an unreachable `None` arm is a compile error rather than a panic on
+/// startup. If you ever want to tune this, change the literal and the
+/// validation runs again at build time.
+const RUNNER_CAPACITY: NonZeroUsize = match NonZeroUsize::new(64) {
+    Some(capacity) => capacity,
+    None => unreachable!(),
+};
 /// Credential handle name — kept in lockstep with v1's `telegram_bot_token`
 /// secret naming so the bot config carries over if operators migrate.
 const TELEGRAM_BOT_TOKEN_HANDLE: &str = "telegram_bot_token";
@@ -62,9 +74,9 @@ pub async fn boot(
     let default_agent_id = AgentId::new(&config.agent_id)
         .map_err(|e| HostError::Startup(format!("invalid agent id: {e}")))?;
 
-    // Expose at the boundary into the storage crate — the resolver still
-    // holds a plain `String`, so the residual exposure documented on
-    // `HostConfig::telegram_bot_token` applies here too.
+    // Pass the bot token through composition as `SecretString` — composition
+    // consumes it into the host's secret store at the put-site, so the
+    // value never lives on the heap as a plain `String` between modules.
     let runtime = build_reborn_product_runtime(
         handles,
         RebornProductRuntimeConfig {
@@ -72,7 +84,7 @@ pub async fn boot(
             default_agent_id: default_agent_id.clone(),
             adapter_id: adapter_id.clone(),
             installation_id: installation_id.clone(),
-            telegram_bot_token: config.telegram_bot_token.expose_secret().to_string(),
+            telegram_bot_token: config.telegram_bot_token.clone(),
             telegram_credential_handle: credential_handle.clone(),
             telegram_declared_hosts: telegram_declared_egress_hosts(),
             pairings: config.pairings.clone(),
@@ -134,10 +146,8 @@ pub async fn boot(
         expected_secret: config.telegram_webhook_secret.expose_secret().to_string(),
         subject: format!("telegram_v2:{}", config.installation_id),
     });
-    let runner_config = NativeProductAdapterRunnerConfig::new(
-        Duration::from_secs(15),
-        NonZeroUsize::new(64).expect("64 > 0"), // safety: literal 64 is provably non-zero
-    );
+    let runner_config =
+        NativeProductAdapterRunnerConfig::new(Duration::from_secs(15), RUNNER_CAPACITY);
     let runner = NativeProductAdapterRunner::with_config(
         adapter_arc,
         Arc::new(workflow),
