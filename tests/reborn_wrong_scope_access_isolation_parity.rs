@@ -14,12 +14,13 @@ use reborn_support::{
 
 #[tokio::test]
 async fn reborn_wrong_scope_access_isolation_parity() {
+    let room = format!("{}-room", module_path!());
     let model_gateway = RebornTraceReplayModelGateway::with_responses([
         trace_tool_call_response(),
         HostManagedModelResponse::assistant_reply("wrong scope must not resume this reply"),
     ]);
     let mut harness = RebornBinaryE2EHarness::with_harness_blocked_evidence(
-        "room-wrong-scope-access",
+        &room,
         model_gateway,
         RecordingTestCapabilityPort::approval_then_echo(),
     )
@@ -27,8 +28,9 @@ async fn reborn_wrong_scope_access_isolation_parity() {
     .expect("harness");
     harness.start();
 
+    let event = format!("{}-event", module_path!());
     let submitted = harness
-        .submit_text("event-wrong-scope-access", "needs approval")
+        .submit_text(&event, "needs approval")
         .await
         .expect("submit approval turn");
     let blocked = harness

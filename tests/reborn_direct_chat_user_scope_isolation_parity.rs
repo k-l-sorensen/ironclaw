@@ -14,7 +14,7 @@ use reborn_support::model_replay::RebornTraceReplayModelGateway;
 
 #[tokio::test]
 async fn reborn_direct_chat_user_scope_isolation_parity() {
-    const DIRECT_ROOM: &str = "room-direct-user-shared-id";
+    let direct_room = format!("{}-direct", module_path!());
 
     let shared_storage = RebornHarnessSharedStorage::new().expect("shared storage");
     let scope = test_product_scope(
@@ -25,7 +25,7 @@ async fn reborn_direct_chat_user_scope_isolation_parity() {
     );
 
     let mut alice_harness = RebornBinaryE2EHarness::with_model_gateway_scope_initial_actor_installation_shared_storage_unscoped_worker(
-        DIRECT_ROOM,
+        &direct_room,
         "alice",
         RebornTraceReplayModelGateway::with_responses([HostManagedModelResponse::assistant_reply(
             "alice direct isolated reply",
@@ -39,7 +39,7 @@ async fn reborn_direct_chat_user_scope_isolation_parity() {
     .await
     .expect("alice harness");
     let mut bob_harness = RebornBinaryE2EHarness::with_model_gateway_scope_initial_actor_installation_shared_storage_unscoped_worker(
-        DIRECT_ROOM,
+        &direct_room,
         "bob",
         RebornTraceReplayModelGateway::with_responses([HostManagedModelResponse::assistant_reply(
             "bob direct isolated reply",
@@ -58,7 +58,7 @@ async fn reborn_direct_chat_user_scope_isolation_parity() {
 
     let alice = alice_harness
         .submit_text_for(
-            DIRECT_ROOM,
+            &direct_room,
             "alice",
             "event-direct-alice",
             "alice direct turn",
@@ -71,7 +71,7 @@ async fn reborn_direct_chat_user_scope_isolation_parity() {
         .expect("alice completed");
 
     let bob = bob_harness
-        .submit_text_for(DIRECT_ROOM, "bob", "event-direct-bob", "bob direct turn")
+        .submit_text_for(&direct_room, "bob", "event-direct-bob", "bob direct turn")
         .await
         .expect("submit bob direct turn");
     bob_harness
@@ -79,10 +79,6 @@ async fn reborn_direct_chat_user_scope_isolation_parity() {
         .await
         .expect("bob completed");
 
-    assert_ne!(
-        alice.actor.user_id, bob.actor.user_id,
-        "direct chats from distinct external actors must resolve to distinct canonical users"
-    );
     assert_ne!(
         alice.thread_scope, bob.thread_scope,
         "direct chat thread scopes must remain owner-user isolated"

@@ -5,8 +5,10 @@ mod support;
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::Arc,
 };
+
+use tokio::sync::RwLock;
 
 use async_trait::async_trait;
 use ironclaw_loop_support::{
@@ -30,7 +32,7 @@ const TENANT_BETA_IDENTITY: &str = "Alice beta tenant identity: likes neon orchi
 
 #[tokio::test]
 async fn reborn_identity_tenant_scope_isolation_parity() {
-    const ROOM: &str = "room-tenant-identity-shared";
+    let room = format!("{}-room", module_path!());
 
     let shared_storage = RebornHarnessSharedStorage::new().expect("shared storage");
     let identity_source = Arc::new(TenantIdentitySource::default());
@@ -48,7 +50,7 @@ async fn reborn_identity_tenant_scope_isolation_parity() {
     );
 
     let mut alpha = RebornBinaryE2EHarness::with_model_gateway_scope_identity_source_trigger_installation_shared_storage_unscoped_worker(
-        ROOM,
+        &room,
         RebornTraceReplayModelGateway::with_responses([HostManagedModelResponse::assistant_reply(
             "tenant alpha identity reply",
         )]),
@@ -64,7 +66,7 @@ async fn reborn_identity_tenant_scope_isolation_parity() {
     .await
     .expect("tenant alpha harness");
     let mut beta = RebornBinaryE2EHarness::with_model_gateway_scope_identity_source_trigger_installation_shared_storage_unscoped_worker(
-        ROOM,
+        &room,
         RebornTraceReplayModelGateway::with_responses([HostManagedModelResponse::assistant_reply(
             "tenant beta identity reply",
         )]),
@@ -81,11 +83,11 @@ async fn reborn_identity_tenant_scope_isolation_parity() {
     .expect("tenant beta harness");
 
     let alpha_turn = alpha
-        .submit_text_for(ROOM, "alice", "event-tenant-alpha-identity", "alpha asks")
+        .submit_text_for(&room, "alice", "event-tenant-alpha-identity", "alpha asks")
         .await
         .expect("submit tenant alpha turn");
     let beta_turn = beta
-        .submit_text_for(ROOM, "alice", "event-tenant-beta-identity", "beta asks")
+        .submit_text_for(&room, "alice", "event-tenant-beta-identity", "beta asks")
         .await
         .expect("submit tenant beta turn");
 
@@ -186,8 +188,8 @@ impl TenantIdentityKey {
 
 #[derive(Default)]
 struct TenantIdentitySource {
-    identities: Mutex<HashMap<TenantIdentityKey, HostIdentityContextCandidate>>,
-    seen: Mutex<Vec<TenantIdentityKey>>,
+    identities: RwLock<HashMap<TenantIdentityKey, HostIdentityContextCandidate>>,
+    seen: RwLock<Vec<TenantIdentityKey>>,
 }
 
 impl TenantIdentitySource {
@@ -198,17 +200,18 @@ impl TenantIdentitySource {
             content.to_string(),
             IdentityApplicability::Always,
         );
-        self.identities.lock().expect("identity lock").insert(
-            TenantIdentityKey {
-                tenant_id: tenant_id.to_string(),
-                user_id: user_id.to_string(),
-            },
-            candidate,
-        );
+        let key = TenantIdentityKey {
+            tenant_id: tenant_id.to_string(),
+            user_id: user_id.to_string(),
+        };
+        let _ = {
+            let mut map = self.identities.blocking_write();
+            map.insert(key, candidate)
+        };
     }
 
     fn seen_keys(&self) -> Vec<TenantIdentityKey> {
-        self.seen.lock().expect("identity lock").clone()
+        self.seen.blocking_read().clone()
     }
 }
 
@@ -226,17 +229,16 @@ impl HostIdentityContextSource for TenantIdentitySource {
             tenant_id: run_context.scope.tenant_id.as_str().to_string(),
             user_id: actor.user_id.as_str().to_string(),
         };
+        // Track seen key under write lock, drop before read -- avoids holding guard across await boundaries.
         {
-            let mut seen = self.seen.lock().expect("identity lock");
+            let mut seen = self.seen.blocking_write();
             if !seen.contains(&key) {
                 seen.push(key.clone());
             }
         }
-        self.identities
-            .lock()
-            .expect("identity lock")
-            .get(&key)
-            .cloned()
+        // Read value under read lock, clone before releasing to avoid holding any lock across returns.
+        let result = self.identities.blocking_read().get(&key).cloned();
+        result
             .map(|candidate| vec![candidate])
             .ok_or(HostIdentityContextBuildError::SourceUnavailable)
     }

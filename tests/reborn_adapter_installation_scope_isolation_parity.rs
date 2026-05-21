@@ -14,8 +14,8 @@ use reborn_support::model_replay::RebornTraceReplayModelGateway;
 
 #[tokio::test]
 async fn reborn_adapter_installation_scope_isolation_parity() {
-    const ROOM: &str = "room-installation-shared";
-    const EVENT: &str = "event-installation-shared";
+    let room = format!("{}-room", module_path!());
+    let event = format!("{}-event", module_path!());
 
     let shared_storage = RebornHarnessSharedStorage::new().expect("shared storage");
     let scope = test_product_scope(
@@ -26,7 +26,7 @@ async fn reborn_adapter_installation_scope_isolation_parity() {
     );
 
     let mut install_a = RebornBinaryE2EHarness::with_model_gateway_scope_installation_shared_storage_unscoped_worker(
-        ROOM,
+        &room,
         RebornTraceReplayModelGateway::with_responses([HostManagedModelResponse::assistant_reply(
             "installation alpha isolated reply",
         )]),
@@ -39,7 +39,7 @@ async fn reborn_adapter_installation_scope_isolation_parity() {
     .await
     .expect("install A harness");
     let mut install_b = RebornBinaryE2EHarness::with_model_gateway_scope_installation_shared_storage_unscoped_worker(
-        ROOM,
+        &room,
         RebornTraceReplayModelGateway::with_responses([HostManagedModelResponse::assistant_reply(
             "installation beta isolated reply",
         )]),
@@ -56,7 +56,7 @@ async fn reborn_adapter_installation_scope_isolation_parity() {
     install_b.start();
 
     let alpha = install_a
-        .submit_text_for(ROOM, "alice", EVENT, "installation alpha turn")
+        .submit_text_for(&room, "alice", &event, "installation alpha turn")
         .await
         .expect("submit installation alpha turn");
     install_a
@@ -65,7 +65,7 @@ async fn reborn_adapter_installation_scope_isolation_parity() {
         .expect("install alpha completed");
 
     let beta = install_b
-        .submit_text_for(ROOM, "alice", EVENT, "installation beta turn")
+        .submit_text_for(&room, "alice", &event, "installation beta turn")
         .await
         .expect("submit installation beta turn with same external event id");
     install_b
