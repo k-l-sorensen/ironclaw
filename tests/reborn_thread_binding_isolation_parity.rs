@@ -6,7 +6,10 @@ mod support;
 use ironclaw_loop_support::HostManagedModelResponse;
 use ironclaw_threads::{MessageKind, MessageStatus, ThreadMessageRecord};
 use ironclaw_turns::TurnStatus;
-use reborn_support::harness::{RebornBinaryE2EHarness, RecordingTestCapabilityPort};
+use reborn_support::harness::{
+    assert_history_contains_assistant, assert_history_contains_user,
+    RebornBinaryE2EHarness, RecordingTestCapabilityPort,
+};
 use reborn_support::model_replay::RebornTraceReplayModelGateway;
 
 #[tokio::test]
@@ -86,27 +89,6 @@ async fn reborn_thread_binding_isolation_parity() {
     harness.shutdown().await;
 }
 
-fn assert_history_contains_user(history: &[ThreadMessageRecord], text: &str) {
-    assert!(
-        history
-            .iter()
-            .any(|message| message.kind == MessageKind::User
-                && message.status == MessageStatus::Submitted
-                && message.content.as_deref() == Some(text)),
-        "thread history should contain submitted user message {text:?}"
-    );
-}
-
-fn assert_history_contains_assistant(history: &[ThreadMessageRecord], text: &str) {
-    assert!(
-        history
-            .iter()
-            .any(|message| message.kind == MessageKind::Assistant
-                && message.status == MessageStatus::Finalized
-                && message.content.as_deref() == Some(text)),
-        "thread history should contain finalized assistant reply {text:?}"
-    );
-}
 
 fn assert_history_excludes(history: &[ThreadMessageRecord], text: &str) {
     assert!(

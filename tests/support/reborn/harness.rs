@@ -1986,3 +1986,27 @@ pub fn assert_milestone_order(
             .collect::<Vec<_>>()
     );
 }
+
+/// Assert that thread history contains a submitted user message with the given text.
+pub fn assert_history_contains_user(history: &[ThreadMessageRecord], text: &str) {
+    assert!(
+        history
+            .iter()
+            .any(|message| message.kind == MessageKind::User
+                && message.status == MessageStatus::Submitted
+                && message.content.as_deref() == Some(text)),
+        "thread history should contain submitted user message {text:?}"
+    );
+}
+
+/// Assert that thread history contains a finalized assistant reply with the given text.
+pub fn assert_history_contains_assistant(history: &[ThreadMessageRecord], text: &str) {
+    assert!(
+        history
+            .iter()
+            .any(|message| message.kind == MessageKind::Assistant
+                && message.status == MessageStatus::Finalized
+                && message.content.as_deref() == Some(text)),
+        "thread history should contain finalized assistant reply {text:?}"
+    );
+}

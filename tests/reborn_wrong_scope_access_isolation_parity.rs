@@ -113,6 +113,38 @@ async fn reborn_wrong_scope_access_isolation_parity() {
     harness.shutdown().await;
 }
 
+/// E2E test: verify that actor spoofing (auth evidence subject != payload user_id) is rejected
+/// at the inbound parse stage when going through the full harness.
+#[tokio::test]
+async fn reborn_adapter_rejects_spoofed_inbound_actor() {
+    let mut harness = RebornBinaryE2EHarness::with_harness_blocked_evidence(
+        "room-spoofed-actor",
+        RebornTraceReplayModelGateway::with_responses([]),
+        RecordingTestCapabilityPort::echo(),
+    )
+    .await
+    .expect("harness");
+    harness.start();
+
+    // Submit as 'bob' but the harness auth evidence is anchored to 'alice'
+    // This should be rejected because the payload user_id doesn't match the verified auth subject.
+    let result = harness
+        .submit_text_for(
+            "room-spoofed-actor",
+            "bob",  // payload claims to be bob
+            "event-spoof",
+            "hi from spoofed bob",
+        )
+        .await;
+
+    assert!(
+        result.is_err(),
+        "spoofed actor (payload user_id != verified auth subject) must be rejected at inbound parse"
+    );
+
+    harness.shutdown().await;
+}
+
 fn wrong_tenant_turn_scope(scope: &TurnScope) -> TurnScope {
     let mut wrong = scope.clone();
     wrong.tenant_id = TenantId::new("tenant-wrong-scope-e2e").expect("valid tenant id");
