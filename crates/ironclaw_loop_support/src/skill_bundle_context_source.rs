@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures::future::try_join_all;
 
 use crate::{
     HostSkillContextBuildError, HostSkillContextCandidate, HostSkillContextSource,
@@ -33,8 +32,8 @@ where
     }
 
     /// Returns the wrapped bundle source.
-    pub fn bundle_source(&self) -> &Arc<S> {
-        &self.bundle_source
+    pub fn bundle_source(&self) -> &S {
+        self.bundle_source.as_ref()
     }
 }
 
@@ -68,46 +67,15 @@ where
 
         validate_descriptor_policy_metadata(&descriptors)?;
 
-        let visible_candidates = try_join_all(
-            descriptors
-                .iter()
-                .enumerate()
-                .filter(|(_, descriptor)| {
-                    descriptor.visibility() == Some(&SkillVisibility::Visible)
-                })
-                .map(|(index, descriptor)| async move {
-                    let skill_md = self
-                        .bundle_source
-                        .read_skill_bundle_file(
-                            run_context,
-                            descriptor.id(),
-                            descriptor.skill_md_path(),
-                        )
-                        .await
-                        .map_err(skill_bundle_source_error_to_context_error)?;
-                    let skill_md = String::from_utf8(skill_md)
-                        .map_err(|_| HostSkillContextBuildError::ParseFailed)?;
-
-                    Ok::<_, HostSkillContextBuildError>((
-                        index,
-                        HostSkillContextCandidate::new(
-                            skill_md,
-                            descriptor.trust().cloned(),
-                            descriptor.visibility().copied(),
-                        )
-                        .with_ordering_key(descriptor_context_ordering_key(descriptor)),
-                    ))
-                }),
-        )
-        .await?;
-        let mut visible_candidates = visible_candidates.into_iter().peekable();
         let mut candidates = Vec::with_capacity(descriptors.len());
-        for (index, descriptor) in descriptors.iter().enumerate() {
+        for descriptor in &descriptors {
             let trust = descriptor.trust().cloned();
             let visibility = descriptor.visibility().copied();
             let ordering_key = descriptor_context_ordering_key(descriptor);
 
             if visibility != Some(SkillVisibility::Visible) {
+                // Preserve host policy metadata on unavailable candidates so downstream
+                // snapshot construction keeps one fail-closed validation path.
                 candidates.push(
                     HostSkillContextCandidate::unavailable(trust, visibility)
                         .with_ordering_key(ordering_key),
@@ -115,13 +83,18 @@ where
                 continue;
             }
 
-            let (read_index, candidate) = visible_candidates
-                .next()
-                .ok_or(HostSkillContextBuildError::Internal)?;
-            if read_index != index {
-                return Err(HostSkillContextBuildError::Internal);
-            }
-            candidates.push(candidate);
+            let skill_md = self
+                .bundle_source
+                .read_skill_bundle_file(run_context, descriptor.id(), descriptor.skill_md_path())
+                .await
+                .map_err(skill_bundle_source_error_to_context_error)?;
+            let skill_md =
+                String::from_utf8(skill_md).map_err(|_| HostSkillContextBuildError::ParseFailed)?;
+
+            candidates.push(
+                HostSkillContextCandidate::new(skill_md, trust, visibility)
+                    .with_ordering_key(ordering_key),
+            );
         }
 
         Ok(candidates)
@@ -131,6 +104,8 @@ where
 fn skill_bundle_source_error_to_context_error(
     error: SkillBundleSourceError,
 ) -> HostSkillContextBuildError {
+    // Collapse bundle-source internals into the public-safe context error taxonomy:
+    // unavailable, parse/policy failure, budget exhaustion, or internal bug.
     match error {
         SkillBundleSourceError::SourceUnavailable
         | SkillBundleSourceError::BundleNotFound
