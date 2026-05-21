@@ -163,6 +163,13 @@ pub struct OidcAuthenticator {
     cache_ttl: Duration,
     http: reqwest::Client,
     cache: Arc<RwLock<JwksCache>>,
+    /// Single-flight gate: when the JWKS cache expires, only one
+    /// concurrent caller actually hits the upstream JWKS endpoint;
+    /// other concurrent callers await the lock and pick up the
+    /// freshly-cached keys without re-fetching. Without this, a burst
+    /// of authenticated requests after cache TTL elapsed would
+    /// stampede the JWKS endpoint.
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
     claim_to_user_id: ClaimToUserIdFn,
 }
 
@@ -194,6 +201,7 @@ impl OidcAuthenticator {
             cache_ttl,
             http,
             cache: Arc::new(RwLock::new(JwksCache::default())),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             claim_to_user_id,
         })
     }
@@ -205,17 +213,31 @@ impl OidcAuthenticator {
         Arc::new(|claims: &IdTokenClaims| UserId::new(&claims.sub).ok())
     }
 
+    fn try_cached_keys(&self) -> Option<Vec<Jwk>> {
+        let guard = self.cache.read();
+        if let Some(fetched_at) = guard.fetched_at
+            && fetched_at.elapsed() < self.cache_ttl
+            && !guard.keys.is_empty()
+        {
+            return Some(guard.keys.clone());
+        }
+        None
+    }
+
     async fn jwks(&self) -> Result<Vec<Jwk>, OidcAuthenticatorError> {
         // Cheap fast-path: if the cache is fresh, return it under the
         // read lock.
-        {
-            let guard = self.cache.read();
-            if let Some(fetched_at) = guard.fetched_at
-                && fetched_at.elapsed() < self.cache_ttl
-                && !guard.keys.is_empty()
-            {
-                return Ok(guard.keys.clone());
-            }
+        if let Some(keys) = self.try_cached_keys() {
+            return Ok(keys);
+        }
+
+        // Single-flight: only one concurrent caller actually hits the
+        // upstream JWKS endpoint. Others await the lock and re-check
+        // the cache — a fresh fetch may have populated it while they
+        // were blocked.
+        let _guard = self.refresh_lock.lock().await;
+        if let Some(keys) = self.try_cached_keys() {
+            return Ok(keys);
         }
 
         // Slow-path: fetch + replace cache.

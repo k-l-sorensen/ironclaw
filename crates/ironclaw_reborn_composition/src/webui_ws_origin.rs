@@ -40,6 +40,12 @@ pub(crate) struct WebSocketOriginState {
     /// here too (a malformed entry could not pass through `CorsLayer`
     /// either).
     allowed_origins: Arc<Vec<String>>,
+    /// Optional canonical host (`WebuiServeConfig::canonical_host`).
+    /// When set, the `SameOriginRequired` policy compares `Origin`
+    /// against this value instead of trusting the client-supplied
+    /// `Host` header — protects against reverse-proxy
+    /// passthrough-Host misconfigurations.
+    canonical_host: Option<Arc<String>>,
 }
 
 impl std::fmt::Debug for WebSocketOriginState {
@@ -47,6 +53,7 @@ impl std::fmt::Debug for WebSocketOriginState {
         f.debug_struct("WebSocketOriginState")
             .field("ws_routes", &self.routes.len())
             .field("allowed_origins", &self.allowed_origins.len())
+            .field("canonical_host_set", &self.canonical_host.is_some())
             .finish()
     }
 }
@@ -57,6 +64,7 @@ impl std::fmt::Debug for WebSocketOriginState {
 pub(crate) fn build_websocket_origin_state(
     descriptors: &[IngressRouteDescriptor],
     allowed_origins: &[axum::http::HeaderValue],
+    canonical_host: Option<String>,
 ) -> WebSocketOriginState {
     let routes = descriptors
         .iter()
@@ -74,6 +82,7 @@ pub(crate) fn build_websocket_origin_state(
     WebSocketOriginState {
         routes: Arc::new(routes),
         allowed_origins: Arc::new(allowed_origins),
+        canonical_host: canonical_host.map(Arc::new),
     }
 }
 
@@ -95,14 +104,6 @@ fn origin_header_value(request: &Request) -> Option<String> {
         .map(str::to_string)
 }
 
-fn host_header_value(request: &Request) -> Option<String> {
-    request
-        .headers()
-        .get(header::HOST)
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_string)
-}
-
 fn origin_matches_host(origin: &str, host: &str) -> bool {
     // Same-origin: the Origin's `host:port` (after stripping `scheme://`)
     // matches the Host header. Browsers always send a fully-qualified
@@ -115,7 +116,12 @@ fn origin_matches_host(origin: &str, host: &str) -> bool {
 }
 
 fn forbidden_origin(detail: &'static str) -> Response {
-    tracing::debug!(
+    // Security event — log at info! so production deployments with
+    // `RUST_LOG=info` (the default) see WS-origin rejections in their
+    // request logs. info!/warn! is safe inside HTTP handlers; the
+    // CLAUDE.md REPL/TUI restriction is about background tasks and
+    // interactive CLI surfaces, not gateway request handling.
+    tracing::info!(
         target = "ironclaw::reborn::webui_ws_origin",
         detail,
         "rejecting WebSocket upgrade with disallowed Origin",
@@ -165,13 +171,33 @@ pub(crate) async fn enforce_websocket_origin(
             let Some(origin) = origin_header_value(&request) else {
                 return forbidden_origin("WebSocket upgrade requires Origin header");
             };
-            let Some(host) = host_header_value(&request) else {
-                return forbidden_origin("WebSocket upgrade requires Host header");
+            // Prefer the operator-configured canonical host over the
+            // client-supplied `Host` header. A reverse proxy that
+            // forwards an attacker-controlled Host would otherwise let
+            // the same-origin check pass for a forged Origin. Falls
+            // back to `Host` only when canonical_host is unset.
+            let host_for_compare: Option<&str> = state
+                .canonical_host
+                .as_deref()
+                .map(String::as_str)
+                .or_else(|| {
+                    // Host header is read from the request — wrap in
+                    // the let-else dance once here so the optional
+                    // logic stays compact.
+                    request
+                        .headers()
+                        .get(header::HOST)
+                        .and_then(|value| value.to_str().ok())
+                });
+            let Some(host) = host_for_compare else {
+                return forbidden_origin(
+                    "WebSocket upgrade requires Host header (or canonical_host config)",
+                );
             };
             // Host installations that front WS through a different
             // origin (reverse proxy / CDN) can still opt in via the
             // allowed_origins list.
-            let allowed = origin_matches_host(&origin, &host)
+            let allowed = origin_matches_host(&origin, host)
                 || state.allowed_origins.iter().any(|entry| entry == &origin);
             if allowed {
                 next.run(request).await
@@ -187,9 +213,26 @@ fn origin_is_localhost(origin: &str) -> bool {
         .strip_prefix("http://")
         .or_else(|| origin.strip_prefix("https://"))
         .unwrap_or(origin);
-    // Strip port suffix if present
-    let host = stripped.split(':').next().unwrap_or(stripped);
-    matches!(host, "localhost" | "127.0.0.1" | "[::1]" | "::1")
+    // Strip optional port suffix. IPv6 literals are bracketed
+    // (`[::1]:3000`), so the host portion is everything inside the
+    // brackets; for IPv4 / DNS names we split on the last `:`.
+    let host = if let Some(rest) = stripped.strip_prefix('[') {
+        // `[::1]:3000` → `::1`; `[::1]` → `::1`.
+        match rest.find(']') {
+            Some(end) => &rest[..end],
+            None => return false, // malformed
+        }
+    } else if let Some(idx) = stripped.rfind(':') {
+        // `127.0.0.1:3000` → `127.0.0.1`. Take a slice that excludes
+        // the port. The colon-only check below catches the no-port
+        // case for IPv6 literals already.
+        &stripped[..idx]
+    } else {
+        stripped
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+        || host.starts_with("127.")
+        || host == "::ffff:127.0.0.1"
 }
 
 #[cfg(test)]
@@ -214,13 +257,24 @@ mod tests {
         assert!(origin_is_localhost("http://localhost"));
         assert!(origin_is_localhost("http://127.0.0.1:3000"));
         assert!(origin_is_localhost("https://localhost:8443"));
+        // IPv6 literals must parse correctly with and without port.
+        // Browsers serialize IPv6 origins with brackets per RFC 6454.
+        assert!(origin_is_localhost("http://[::1]"));
+        assert!(origin_is_localhost("http://[::1]:3000"));
+        assert!(origin_is_localhost("http://[::ffff:127.0.0.1]"));
+        // Loopback /8 — `127.x.y.z` is the entire IPv4 loopback block.
+        assert!(origin_is_localhost("http://127.0.0.42"));
+        // Non-loopback rejections.
         assert!(!origin_is_localhost("http://attacker.test"));
+        assert!(!origin_is_localhost("http://192.168.1.1"));
+        // Malformed bracketed origin must NOT pass.
+        assert!(!origin_is_localhost("http://[no-close"));
     }
 
     #[test]
     fn build_state_collects_only_ws_descriptors() {
         let descriptors = ironclaw_webui_v2::webui_v2_routes();
-        let state = build_websocket_origin_state(&descriptors, &[]);
+        let state = build_websocket_origin_state(&descriptors, &[], None);
         assert!(
             !state.routes.is_empty(),
             "the v2 descriptor set must declare at least one WS route",

@@ -121,10 +121,12 @@ pub trait SessionThreadService: Send + Sync {
         request: CreateSummaryArtifactRequest,
     ) -> Result<SummaryArtifact, SessionThreadError>;
 
-    /// List threads scoped to the supplied `ThreadScope`. Default impl
-    /// returns an empty list + `None` cursor so existing stores that
-    /// don't yet implement enumeration stay buildable; production
-    /// backends override with their own pagination strategy.
+    /// List threads scoped to the supplied `ThreadScope`. The default
+    /// impl fails closed (`SessionThreadError::Backend`) so backends
+    /// that do not yet implement enumeration surface a clear
+    /// `503 Service Unavailable` at the gateway instead of pretending
+    /// the caller has zero threads. Production backends override this
+    /// method with their own pagination strategy.
     ///
     /// Implementations MUST scope the listing by `owner_user_id` (or
     /// equivalent caller-binding fields on the scope) — otherwise a
@@ -134,6 +136,10 @@ pub trait SessionThreadService: Send + Sync {
         &self,
         _request: ListThreadsForScopeRequest,
     ) -> Result<ListThreadsForScopeResponse, SessionThreadError> {
-        Ok(ListThreadsForScopeResponse::default())
+        Err(SessionThreadError::Backend(
+            "list_threads_for_scope is not implemented by this SessionThreadService backend; \
+             override this method before exposing the v2 list-threads route"
+                .to_string(),
+        ))
     }
 }

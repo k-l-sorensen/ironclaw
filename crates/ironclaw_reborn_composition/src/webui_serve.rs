@@ -113,6 +113,15 @@ pub struct WebuiServeConfig {
     /// Content-Security-Policy header value. Defaults to
     /// [`DEFAULT_WEBUI_CSP`] if `None`.
     pub csp_header: Option<HeaderValue>,
+    /// Canonical host the WebChat v2 listener is reachable on (e.g.
+    /// `"app.example.com"` or `"127.0.0.1:3000"`). When set, the
+    /// WebSocket same-origin middleware compares the request's
+    /// `Origin` header against this value instead of trusting the
+    /// client-supplied `Host` header. A misconfigured reverse proxy
+    /// that forwards an attacker-controlled Host would otherwise let
+    /// the same-origin check pass for a forged Origin. Defaults to
+    /// `None` (fall back to Host-header comparison + allowlist).
+    pub canonical_host: Option<String>,
 }
 
 impl WebuiServeConfig {
@@ -129,7 +138,16 @@ impl WebuiServeConfig {
             max_body_bytes: DEFAULT_WEBUI_MAX_BODY_BYTES,
             allowed_origins,
             csp_header: None,
+            canonical_host: None,
         }
+    }
+
+    /// Set the canonical host for WebSocket same-origin checks. See
+    /// [`Self::canonical_host`] for why this is more robust than
+    /// trusting the request's `Host` header.
+    pub fn with_canonical_host(mut self, host: impl Into<String>) -> Self {
+        self.canonical_host = Some(host.into());
+        self
     }
 
     /// Parse a list of allow-origin strings (typically read from
@@ -251,7 +269,11 @@ pub fn webui_v2_app(
     let descriptors = ironclaw_webui_v2::webui_v2_routes();
     let rate_limit_state = build_rate_limit_state(&descriptors)?;
     let body_limit_state = build_body_limit_state(&descriptors);
-    let ws_origin_state = build_websocket_origin_state(&descriptors, &config.allowed_origins);
+    let ws_origin_state = build_websocket_origin_state(
+        &descriptors,
+        &config.allowed_origins,
+        config.canonical_host.clone(),
+    );
 
     // Inner: the v2 route surface, retagged to `Router<()>` so it can
     // merge into the outer stateless router. `webui_v2_router` has
@@ -260,14 +282,16 @@ pub fn webui_v2_app(
         webui_v2_router(WebUiV2State::new(bundle.api.clone())).with_state(());
 
     // Layer order matters. `route_layer` stacks inside-out from the
-    // bottom of the chain up: enforce_rate_limit is closest to the
-    // handler, authenticate_request wraps it, enforce_body_limit wraps
-    // that. That gives the inbound flow:
-    //   per-route body limit → auth → rate-limit check → handler
-    // Body limit runs before auth so an oversized payload never spends
-    // a bearer-validation step. Auth runs before rate-limit so the
-    // limiter has a real caller to key on and an unauthenticated
-    // request never burns a rate-limit slot.
+    // bottom of the chain up — the LAST `.route_layer(...)` call is
+    // the outermost layer and runs FIRST on inbound. That gives:
+    //   ws-origin → per-route body limit → auth → rate-limit → handler
+    //
+    // WS-origin runs first so a forged-Origin WebSocket upgrade dies
+    // before the gateway spends an auth check on it. Body limit comes
+    // next so an oversized payload also short-circuits before bearer
+    // validation. Auth runs before rate-limit so the limiter has a
+    // real caller key and an unauthenticated request never burns a
+    // rate-limit slot.
     let app = Router::new()
         .merge(v2_inner)
         .route_layer(middleware::from_fn_with_state(

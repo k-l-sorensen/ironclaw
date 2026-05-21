@@ -134,6 +134,29 @@ impl ServeCommand {
             })
             .transpose()?;
 
+        // Loud warning when binding to a non-loopback interface. The
+        // env-bearer authenticator is fine for trusted operator-only
+        // deployments, but a public listener with a single env-token
+        // is a foot-gun. Operators can silence by setting
+        // `--host 0.0.0.0` explicitly (we don't have a "yes I mean
+        // it" flag yet — this is purely an attention nudge).
+        if !host.is_loopback() {
+            eprintln!(
+                "WARNING: WebChat v2 listener will bind to non-loopback address {host}. \
+                 The default env-bearer authenticator is intended for single-operator \
+                 deployments; review your auth config before exposing this to a network."
+            );
+        }
+        // Also emit a structured log so operators with log aggregation
+        // see the same signal.
+        if !host.is_loopback() {
+            tracing::warn!(
+                target = "ironclaw::reborn::cli::serve",
+                %host,
+                "binding WebChat v2 listener on a non-loopback interface",
+            );
+        }
+
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

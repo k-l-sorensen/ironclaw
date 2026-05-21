@@ -30,7 +30,6 @@ pub use oidc::{
 };
 pub use session::{
     InMemorySessionStore, SessionAuthenticator, SessionRecord, SessionStore, SessionStoreError,
-    SessionTokenSecret, unwrap_session_token, wrap_session_token,
 };
 
 use std::net::SocketAddr;

@@ -19,7 +19,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use ironclaw_host_api::{TenantId, UserId};
 use ironclaw_reborn_composition::WebuiAuthenticator;
 use parking_lot::RwLock;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use thiserror::Error;
@@ -101,6 +101,17 @@ impl InMemorySessionStore {
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
     }
+
+    /// Evict every session whose `expires_at` is at or before `now`.
+    /// Returns the number of records removed. Called automatically
+    /// from `create_session` and `lookup` so a long-running process
+    /// cannot leak memory through never-revoked expired sessions.
+    pub fn purge_expired(&self, now: DateTime<Utc>) -> usize {
+        let mut guard = self.inner.write();
+        let before = guard.len();
+        guard.retain(|_, record| !record.is_expired(now));
+        before - guard.len()
+    }
 }
 
 #[async_trait]
@@ -113,6 +124,10 @@ impl SessionStore for InMemorySessionStore {
     ) -> Result<SecretString, SessionStoreError> {
         let session_id = Uuid::new_v4().to_string();
         let now = Utc::now();
+        // Opportunistic GC: sweep expired records on every insert so
+        // the map size stays proportional to "active sessions", not
+        // "every session ever issued".
+        self.purge_expired(now);
         let record = SessionRecord {
             session_id: session_id.clone(),
             tenant_id,
@@ -127,6 +142,13 @@ impl SessionStore for InMemorySessionStore {
     }
 
     async fn lookup(&self, candidate: &str) -> Result<Option<SessionRecord>, SessionStoreError> {
+        // Opportunistic GC: same reasoning as create_session; bounded
+        // by the lock contention on the write path so we only invoke
+        // on the warm path when there is at least one entry present.
+        if !self.inner.read().is_empty() {
+            self.purge_expired(Utc::now());
+        }
+
         // Walk the map with constant-time comparison so that a hostile
         // caller cannot use timing to discover whether their guess
         // shares a prefix with a real session id. We accept the O(n)
@@ -145,6 +167,11 @@ impl SessionStore for InMemorySessionStore {
             }
         }
         Ok(hit)
+    }
+
+    async fn revoke(&self, candidate: &str) -> Result<(), SessionStoreError> {
+        self.inner.write().remove(candidate);
+        Ok(())
     }
 }
 
@@ -188,28 +215,10 @@ impl WebuiAuthenticator for SessionAuthenticator {
     }
 }
 
-/// Reborn-wide ergonomic alias so callers do not have to repeat the
-/// secret-string type when threading session material through their
-/// own helpers.
-pub type SessionTokenSecret = SecretString;
-
-/// Quick helper that lets host login code wrap a freshly created
-/// session token. Hides the secrecy dependency from binary call sites
-/// that only want to pass the token straight through to a Set-Cookie
-/// header (callers MUST expose the value through `.expose_secret()`
-/// only at the wire boundary).
-pub fn wrap_session_token(token: String) -> SessionTokenSecret {
-    SecretString::from(token)
-}
-
-/// Inspect a wrapped session token without leaking it into logs.
-pub fn unwrap_session_token(token: &SessionTokenSecret) -> &str {
-    token.expose_secret()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     fn tenant() -> TenantId {
         TenantId::new("tenant-a").expect("tenant")
