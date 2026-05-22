@@ -25,6 +25,7 @@ use crate::error::ProductWorkflowError;
 use crate::inbound_turn::{InboundTurnService, InboundUserMessageDispatch};
 use crate::ledger::{IdempotencyDecision, IdempotencyLedger};
 use crate::policy::{BeforeInboundPolicy, NoopBeforeInboundPolicy};
+use crate::resolution::{ApprovalResolutionHandler, AuthResolutionHandler};
 
 /// Host-side implementation of [`ProductWorkflow`] that dispatches inbound
 /// envelopes through the idempotency ledger and routes to the appropriate
@@ -34,6 +35,14 @@ pub struct DefaultProductWorkflow {
     idempotency_ledger: Arc<dyn IdempotencyLedger>,
     before_inbound_policy: Arc<dyn BeforeInboundPolicy>,
     binding_service: Arc<dyn ConversationBindingService>,
+    // Approval/auth resolution handlers are wired in via builders rather
+    // than required at construction so that pure user-message-routing
+    // tests do not have to stand up resolution machinery they will never
+    // exercise. Production composition wires both (see #3094 Slice 3).
+    // When unwired, the matching inbound payload returns
+    // `UnsupportedActionKind` to preserve the pre-cutover behavior.
+    approval_resolution_handler: Option<Arc<dyn ApprovalResolutionHandler>>,
+    auth_resolution_handler: Option<Arc<dyn AuthResolutionHandler>>,
 }
 
 impl DefaultProductWorkflow {
@@ -47,6 +56,8 @@ impl DefaultProductWorkflow {
             idempotency_ledger,
             before_inbound_policy: Arc::new(NoopBeforeInboundPolicy),
             binding_service,
+            approval_resolution_handler: None,
+            auth_resolution_handler: None,
         }
     }
 
@@ -55,6 +66,19 @@ impl DefaultProductWorkflow {
         before_inbound_policy: Arc<dyn BeforeInboundPolicy>,
     ) -> Self {
         self.before_inbound_policy = before_inbound_policy;
+        self
+    }
+
+    pub fn with_approval_resolution_handler(
+        mut self,
+        handler: Arc<dyn ApprovalResolutionHandler>,
+    ) -> Self {
+        self.approval_resolution_handler = Some(handler);
+        self
+    }
+
+    pub fn with_auth_resolution_handler(mut self, handler: Arc<dyn AuthResolutionHandler>) -> Self {
+        self.auth_resolution_handler = Some(handler);
         self
     }
 }
@@ -105,6 +129,8 @@ impl ProductWorkflow for DefaultProductWorkflow {
                     &envelope,
                     &*self.inbound_turn_service,
                     &*self.before_inbound_policy,
+                    self.approval_resolution_handler.as_deref(),
+                    self.auth_resolution_handler.as_deref(),
                 )
                 .await;
 
@@ -256,6 +282,8 @@ async fn dispatch_payload(
     envelope: &ProductInboundEnvelope,
     inbound_turn_service: &dyn InboundTurnService,
     before_inbound_policy: &dyn BeforeInboundPolicy,
+    approval_handler: Option<&dyn ApprovalResolutionHandler>,
+    auth_handler: Option<&dyn AuthResolutionHandler>,
 ) -> Result<DispatchedAction, ProductWorkflowError> {
     match envelope.payload() {
         ProductInboundPayload::UserMessage(_) => {
@@ -285,16 +313,26 @@ async fn dispatch_payload(
                 command: cmd.command.clone(),
             })
         }
-        ProductInboundPayload::ApprovalResolution(_) => {
-            Err(ProductWorkflowError::UnsupportedActionKind {
+        ProductInboundPayload::ApprovalResolution(_) => match approval_handler {
+            Some(handler) => {
+                let ack = handler.handle(envelope).await?;
+                let dispatch_kind = ActionDispatchKind::try_from_payload(envelope.payload())?;
+                Ok(DispatchedAction { ack, dispatch_kind })
+            }
+            None => Err(ProductWorkflowError::UnsupportedActionKind {
                 kind: "approval_resolution".into(),
-            })
-        }
-        ProductInboundPayload::AuthResolution(_) => {
-            Err(ProductWorkflowError::UnsupportedActionKind {
+            }),
+        },
+        ProductInboundPayload::AuthResolution(_) => match auth_handler {
+            Some(handler) => {
+                let ack = handler.handle(envelope).await?;
+                let dispatch_kind = ActionDispatchKind::try_from_payload(envelope.payload())?;
+                Ok(DispatchedAction { ack, dispatch_kind })
+            }
+            None => Err(ProductWorkflowError::UnsupportedActionKind {
                 kind: "auth_resolution".into(),
-            })
-        }
+            }),
+        },
         ProductInboundPayload::SubscriptionRequest(_) => {
             Err(ProductWorkflowError::UnsupportedActionKind {
                 kind: "subscription_request".into(),

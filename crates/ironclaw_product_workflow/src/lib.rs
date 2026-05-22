@@ -35,6 +35,7 @@ mod inbound_turn;
 mod ledger;
 mod policy;
 mod reborn_services;
+mod resolution;
 mod webui_inbound;
 mod workflow;
 
@@ -78,6 +79,7 @@ pub use reborn_services::{
     RebornStreamEventsRequest, RebornStreamEventsResponse, RebornSubmitTurnResponse,
     RebornTimelineRequest, RebornTimelineResponse,
 };
+pub use resolution::{ApprovalResolutionHandler, AuthResolutionHandler};
 pub use webui_inbound::{
     WebUiAuthenticatedCaller, WebUiCancelReason, WebUiCancelRunRequest, WebUiCreateThreadRequest,
     WebUiGateResolution, WebUiInboundCommand, WebUiInboundValidationCode,
