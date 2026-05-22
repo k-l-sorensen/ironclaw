@@ -215,8 +215,12 @@ fn action_dispatch_kind_retains_typed_payload_refs() {
 
     let gate_ref = LoopGateRef::new("gate:approval-1").expect("valid gate ref");
     let approval_payload = ProductInboundPayload::ApprovalResolution(
-        ApprovalResolutionPayload::new(gate_ref.as_str(), ApprovalDecision::ApproveOnce)
-            .expect("valid"),
+        ApprovalResolutionPayload::new(
+            ironclaw_turns::TurnRunId::new(),
+            gate_ref.as_str(),
+            ApprovalDecision::ApproveOnce,
+        )
+        .expect("valid"),
     );
     assert_eq!(
         ActionDispatchKind::try_from_payload(&approval_payload).expect("approval kind"),
@@ -224,7 +228,12 @@ fn action_dispatch_kind_retains_typed_payload_refs() {
     );
 
     let auth_payload = ProductInboundPayload::AuthResolution(
-        AuthResolutionPayload::new("auth-request-1", AuthResolutionResult::Denied).expect("valid"),
+        AuthResolutionPayload::new(
+            ironclaw_turns::TurnRunId::new(),
+            "auth-request-1",
+            AuthResolutionResult::Denied,
+        )
+        .expect("valid"),
     );
     assert_eq!(
         ActionDispatchKind::try_from_payload(&auth_payload).expect("auth kind"),
@@ -2332,6 +2341,7 @@ async fn unsupported_action_is_settled_as_terminal_rejection() {
         ExternalConversationRef::new(None, "conv1", None, None).expect("valid"),
         ProductInboundPayload::AuthResolution(
             ironclaw_product_adapters::AuthResolutionPayload::new(
+                ironclaw_turns::TurnRunId::new(),
                 "auth:1",
                 ironclaw_product_adapters::AuthResolutionResult::Denied,
             )

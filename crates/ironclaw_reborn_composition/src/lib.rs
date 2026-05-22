@@ -26,6 +26,7 @@ mod llm_catalog;
 mod product_live_adapters;
 mod profile;
 mod readiness;
+mod resolution_handlers;
 mod runtime;
 mod runtime_input;
 mod webui;
@@ -48,6 +49,7 @@ pub use product_live_adapters::{
 };
 pub use profile::{RebornCompositionProfile, RebornCompositionProfileParseError};
 pub use readiness::{RebornFacadeReadiness, RebornReadiness, RebornReadinessState};
+pub use resolution_handlers::{TurnCoordinatorApprovalHandler, TurnCoordinatorAuthHandler};
 pub use runtime::{
     AssistantReply, ConversationId, RebornRuntime, RebornRuntimeError, build_reborn_runtime,
 };

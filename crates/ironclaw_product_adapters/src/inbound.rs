@@ -174,25 +174,39 @@ pub enum ApprovalDecision {
     AlwaysAllow,
 }
 
+/// Inbound payload from a product surface resolving a pending approval
+/// gate.
+///
+/// `run_id` identifies the blocked run the gate is parked on. Required for
+/// production callers — the host needs it to address the resume/cancel via
+/// `TurnCoordinator`. The field is fail-closed on deserialization; payloads
+/// missing it are rejected at parse rather than silently defaulted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ApprovalResolutionPayload {
+    pub run_id: ironclaw_turns::TurnRunId,
     pub gate_ref: String,
     pub decision: ApprovalDecision,
 }
 
 impl ApprovalResolutionPayload {
     pub fn new(
+        run_id: ironclaw_turns::TurnRunId,
         gate_ref: impl Into<String>,
         decision: ApprovalDecision,
     ) -> Result<Self, ProductAdapterError> {
         let gate_ref = gate_ref.into();
         validate_token_string("gate ref", &gate_ref, INTERACTION_REF_MAX_BYTES)?;
-        Ok(Self { gate_ref, decision })
+        Ok(Self {
+            run_id,
+            gate_ref,
+            decision,
+        })
     }
 }
 
 #[derive(Deserialize)]
 struct ApprovalResolutionPayloadWire {
+    run_id: ironclaw_turns::TurnRunId,
     gate_ref: String,
     decision: ApprovalDecision,
 }
@@ -203,7 +217,7 @@ impl<'de> Deserialize<'de> for ApprovalResolutionPayload {
         D: Deserializer<'de>,
     {
         let wire = ApprovalResolutionPayloadWire::deserialize(deserializer)?;
-        Self::new(wire.gate_ref, wire.decision).map_err(serde::de::Error::custom)
+        Self::new(wire.run_id, wire.gate_ref, wire.decision).map_err(serde::de::Error::custom)
     }
 }
 
@@ -215,14 +229,21 @@ pub enum AuthResolutionResult {
     Denied,
 }
 
+/// Inbound payload from a product surface resolving a pending
+/// auth-required gate.
+///
+/// `run_id` identifies the blocked run the auth requirement is parked on.
+/// See [`ApprovalResolutionPayload::run_id`] for the same rationale.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AuthResolutionPayload {
+    pub run_id: ironclaw_turns::TurnRunId,
     pub auth_request_ref: String,
     pub result: AuthResolutionResult,
 }
 
 impl AuthResolutionPayload {
     pub fn new(
+        run_id: ironclaw_turns::TurnRunId,
         auth_request_ref: impl Into<String>,
         result: AuthResolutionResult,
     ) -> Result<Self, ProductAdapterError> {
@@ -234,6 +255,7 @@ impl AuthResolutionPayload {
         )?;
         validate_auth_resolution_result(&result)?;
         Ok(Self {
+            run_id,
             auth_request_ref,
             result,
         })
@@ -242,6 +264,7 @@ impl AuthResolutionPayload {
 
 #[derive(Deserialize)]
 struct AuthResolutionPayloadWire {
+    run_id: ironclaw_turns::TurnRunId,
     auth_request_ref: String,
     result: AuthResolutionResult,
 }
@@ -252,7 +275,7 @@ impl<'de> Deserialize<'de> for AuthResolutionPayload {
         D: Deserializer<'de>,
     {
         let wire = AuthResolutionPayloadWire::deserialize(deserializer)?;
-        Self::new(wire.auth_request_ref, wire.result).map_err(serde::de::Error::custom)
+        Self::new(wire.run_id, wire.auth_request_ref, wire.result).map_err(serde::de::Error::custom)
     }
 }
 

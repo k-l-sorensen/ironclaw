@@ -31,7 +31,12 @@ async fn approval_resolution_routes_through_handler_when_wired() {
         .with_approval_resolution_handler(approval_handler.clone());
 
     let payload = ProductInboundPayload::ApprovalResolution(
-        ApprovalResolutionPayload::new("gate:abc", ApprovalDecision::ApproveOnce).expect("valid"),
+        ApprovalResolutionPayload::new(
+            ironclaw_turns::TurnRunId::new(),
+            "gate:abc",
+            ApprovalDecision::ApproveOnce,
+        )
+        .expect("valid"),
     );
     let envelope = envelope_with_payload("evt:appr-1", payload);
     let ack = workflow.accept_inbound(envelope).await.expect("accepted");
@@ -59,7 +64,12 @@ async fn approval_resolution_returns_unsupported_when_handler_unwired() {
     let workflow = DefaultProductWorkflow::new(inbound, ledger, binding);
 
     let payload = ProductInboundPayload::ApprovalResolution(
-        ApprovalResolutionPayload::new("gate:abc", ApprovalDecision::ApproveOnce).expect("valid"),
+        ApprovalResolutionPayload::new(
+            ironclaw_turns::TurnRunId::new(),
+            "gate:abc",
+            ApprovalDecision::ApproveOnce,
+        )
+        .expect("valid"),
     );
     let envelope = envelope_with_payload("evt:appr-noh", payload);
     let err = workflow
@@ -83,7 +93,12 @@ async fn approval_resolution_propagates_handler_rejection_ack() {
         .with_approval_resolution_handler(approval_handler.clone());
 
     let payload = ProductInboundPayload::ApprovalResolution(
-        ApprovalResolutionPayload::new("gate:abc", ApprovalDecision::AlwaysAllow).expect("valid"),
+        ApprovalResolutionPayload::new(
+            ironclaw_turns::TurnRunId::new(),
+            "gate:abc",
+            ApprovalDecision::AlwaysAllow,
+        )
+        .expect("valid"),
     );
     let envelope = envelope_with_payload("evt:appr-reject", payload);
     let ack = workflow.accept_inbound(envelope).await.expect("ack");
@@ -105,6 +120,7 @@ async fn auth_resolution_routes_through_handler_when_wired() {
 
     let payload = ProductInboundPayload::AuthResolution(
         AuthResolutionPayload::new(
+            ironclaw_turns::TurnRunId::new(),
             "flow-xyz",
             AuthResolutionResult::CredentialProvided {
                 credential_ref: "cred-1".into(),
@@ -134,7 +150,12 @@ async fn auth_resolution_returns_unsupported_when_handler_unwired() {
     let workflow = DefaultProductWorkflow::new(inbound, ledger, binding);
 
     let payload = ProductInboundPayload::AuthResolution(
-        AuthResolutionPayload::new("flow-xyz", AuthResolutionResult::Denied).expect("valid"),
+        AuthResolutionPayload::new(
+            ironclaw_turns::TurnRunId::new(),
+            "flow-xyz",
+            AuthResolutionResult::Denied,
+        )
+        .expect("valid"),
     );
     let envelope = envelope_with_payload("evt:auth-noh", payload);
     let err = workflow
@@ -154,7 +175,12 @@ async fn handler_error_propagates_as_terminal_rejection() {
         .with_approval_resolution_handler(approval_handler);
 
     let payload = ProductInboundPayload::ApprovalResolution(
-        ApprovalResolutionPayload::new("gate:missing", ApprovalDecision::Deny).expect("valid"),
+        ApprovalResolutionPayload::new(
+            ironclaw_turns::TurnRunId::new(),
+            "gate:missing",
+            ApprovalDecision::Deny,
+        )
+        .expect("valid"),
     );
     let envelope = envelope_with_payload("evt:appr-err", payload);
     let err = workflow

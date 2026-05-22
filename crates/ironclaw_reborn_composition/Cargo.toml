@@ -75,6 +75,10 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+async-trait = "0.1"
+chrono = "0.4"
+ironclaw_product_adapters = { path = "../ironclaw_product_adapters", features = ["test-support"] }
+ironclaw_product_workflow = { path = "../ironclaw_product_workflow", features = ["test-support"] }
 ironclaw_skills = { path = "../ironclaw_skills" }
 ironclaw_threads = { path = "../ironclaw_threads" }
 tempfile = "3"
