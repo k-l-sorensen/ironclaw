@@ -95,7 +95,7 @@ jobs:
           # the SHA in the `bench` job's `uses:` below — bump in both
           # places together. Used here to validate the requested suite
           # exists at the same SHA we'd actually run against.
-          BENCH_PIN: 67effacd8c8a7f6f43b422e30a1810822b9d6d5f
+          BENCH_PIN: 773d4eccf924a706bc4a0c52344b54ac2d54ed75
         run: |
           set -euo pipefail
           # Grammar: /benchmark <suite> [--model <model-id>]
@@ -181,7 +181,7 @@ jobs:
     # Pinned to a reviewed commit on nearai/benchmarks main — mutable @main
     # + secrets: inherit was the supply-chain hole. Bump this SHA in a
     # deliberate PR when nearai/benchmarks ships a new reusable workflow.
-    uses: nearai/benchmarks/.github/workflows/bench-pr-reusable.yml@67effacd8c8a7f6f43b422e30a1810822b9d6d5f
+    uses: nearai/benchmarks/.github/workflows/bench-pr-reusable.yml@773d4eccf924a706bc4a0c52344b54ac2d54ed75
     with:
       ironclaw-rev: ${{ needs.parse.outputs.head_sha }}
       pr-repo: ${{ github.repository }}
