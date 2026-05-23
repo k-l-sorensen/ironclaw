@@ -24,7 +24,7 @@
 //! trust an absolute path again.
 
 use std::ffi::OsStr;
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 use rustix::fs::{Mode, OFlags};
 
@@ -173,7 +173,7 @@ fn open_beneath_walk(
     oflags: OFlags,
     mode: Mode,
 ) -> Result<OwnedFd, ResolveError> {
-    use std::os::fd::AsFd as _;
+    use std::os::fd::AsFd;
 
     let mut parent: Option<OwnedFd> = None;
     let last = tail.components.len() - 1;

@@ -708,3 +708,221 @@ fn scoped_project_fs(
         .unwrap(),
     )
 }
+
+// ─── TOCTOU-hardening: by-construction symlink-escape matrix ────────────────
+//
+// Every operation must reject a symlink that points outside the mount root,
+// driven through the `ScopedFilesystem` security boundary (per
+// `.claude/rules/testing.md`: test through the caller, not just the helper).
+// The fd-relative resolver closes the escape by construction on every platform,
+// so each op surfaces `SymlinkEscape` (mapped from `ELOOP`/`EXDEV`/`ENOTDIR`).
+
+#[cfg(unix)]
+fn full_perms() -> MountPermissions {
+    MountPermissions {
+        read: true,
+        write: true,
+        delete: true,
+        list: true,
+        execute: false,
+    }
+}
+
+/// Build a scoped fs over `storage/project1` with a symlink `escape.txt` inside
+/// it that points at `outside/secret.txt`, plus a symlinked directory
+/// `outside-dir` pointing at `outside`.
+#[cfg(unix)]
+fn scoped_with_escape_symlinks(
+    storage: &std::path::Path,
+    outside: &std::path::Path,
+) -> ScopedFilesystem<LocalFilesystem> {
+    use std::os::unix::fs::symlink;
+    std::fs::create_dir_all(storage.join("project1")).unwrap();
+    std::fs::write(outside.join("secret.txt"), b"secret").unwrap();
+    symlink(
+        outside.join("secret.txt"),
+        storage.join("project1/escape.txt"),
+    )
+    .unwrap();
+    symlink(outside, storage.join("project1/outside-dir")).unwrap();
+    scoped_project_fs(storage, full_perms())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn every_op_rejects_symlink_escape_by_construction() {
+    let storage = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    let scoped = scoped_with_escape_symlinks(storage.path(), outside.path());
+    let sys = ResourceScope::system();
+
+    macro_rules! assert_escape {
+        ($label:expr, $expr:expr) => {{
+            let err = $expr.await.unwrap_err();
+            assert!(
+                matches!(err, FilesystemError::SymlinkEscape { .. }),
+                "{} should be SymlinkEscape, got {err:?}",
+                $label
+            );
+        }};
+    }
+
+    // Leaf symlink pointing out of the mount.
+    let escape = ScopedPath::new("/workspace/escape.txt").unwrap();
+    assert_escape!("read_file", scoped.read_file(&sys, &escape));
+    assert_escape!(
+        "read_file_bounded",
+        scoped.read_bytes_bounded(&sys, &escape, 1024)
+    );
+    assert_escape!("write_file", scoped.write_file(&sys, &escape, b"x"));
+    assert_escape!("append_file", scoped.append_file(&sys, &escape, b"x"));
+    assert_escape!("stat", scoped.stat(&sys, &escape));
+
+    // Symlinked parent directory pointing out of the mount.
+    let via_dir = ScopedPath::new("/workspace/outside-dir/new.txt").unwrap();
+    assert_escape!(
+        "write through symlinked parent",
+        scoped.write_file(&sys, &via_dir, b"x")
+    );
+    assert_escape!(
+        "append through symlinked parent",
+        scoped.append_file(&sys, &via_dir, b"x")
+    );
+    assert_escape!(
+        "list symlinked dir",
+        scoped.list_dir(&sys, &ScopedPath::new("/workspace/outside-dir").unwrap())
+    );
+    assert_escape!(
+        "create_dir_all through symlinked parent",
+        scoped.create_dir_all(
+            &sys,
+            &ScopedPath::new("/workspace/outside-dir/sub").unwrap()
+        )
+    );
+
+    // The out-of-root targets are never touched.
+    assert_eq!(
+        std::fs::read(outside.path().join("secret.txt")).unwrap(),
+        b"secret"
+    );
+    assert!(!outside.path().join("new.txt").exists());
+    assert!(!outside.path().join("sub").exists());
+}
+
+/// Behavioral-parity note: deleting a leaf *symlink* that lives inside the
+/// mount root now removes the symlink itself (via `unlinkat` after a
+/// non-following `fstatat`) rather than refusing with `SymlinkEscape`. This is
+/// the safe outcome — the out-of-root target is never touched — and matches
+/// POSIX `unlink` semantics on a symlink. The previous canonicalize-based
+/// resolver followed the link and reported `SymlinkEscape`.
+#[cfg(unix)]
+#[tokio::test]
+async fn delete_leaf_symlink_removes_link_not_target() {
+    use std::os::unix::fs::symlink;
+
+    let storage = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    std::fs::create_dir_all(storage.path().join("project1")).unwrap();
+    std::fs::write(outside.path().join("secret.txt"), b"secret").unwrap();
+    symlink(
+        outside.path().join("secret.txt"),
+        storage.path().join("project1/escape.txt"),
+    )
+    .unwrap();
+
+    let scoped = scoped_project_fs(storage.path(), full_perms());
+    scoped
+        .delete(
+            &ResourceScope::system(),
+            &ScopedPath::new("/workspace/escape.txt").unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // The symlink is gone; the out-of-root target is intact.
+    assert!(!storage.path().join("project1/escape.txt").exists());
+    assert_eq!(
+        std::fs::read(outside.path().join("secret.txt")).unwrap(),
+        b"secret"
+    );
+}
+
+// ─── TOCTOU-hardening: concurrent ancestor-swap race loop ───────────────────
+//
+// A background task swaps an ancestor symlink between an in-root target and an
+// out-of-root target while the main task hammers read/write in a tight loop.
+// With fd-relative resolution the result is ALWAYS in-root content or a
+// SymlinkEscape/NotFound error — NEVER the out-of-root content. Linux-only
+// because it exercises the openat2(RESOLVE_BENEATH) kernel path; the by-
+// construction matrix above covers the portable walk.
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_ancestor_swap_never_escapes_root() {
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let storage = tempdir().unwrap();
+    let outside = tempdir().unwrap();
+    // In-root real directory the symlink may legitimately point at.
+    std::fs::create_dir_all(storage.path().join("project1/inside")).unwrap();
+    std::fs::write(storage.path().join("project1/inside/data.txt"), b"INROOT").unwrap();
+    // Out-of-root secret the attacker tries to expose via an ancestor swap.
+    std::fs::write(outside.path().join("data.txt"), b"SECRET").unwrap();
+
+    // `link` is the ancestor we swap; start it pointing inside the root.
+    let link = storage.path().join("project1/link");
+    symlink(storage.path().join("project1/inside"), &link).unwrap();
+
+    let scoped = std::sync::Arc::new(scoped_project_fs(storage.path(), full_perms()));
+    let target = ScopedPath::new("/workspace/link/data.txt").unwrap();
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+
+    // Attacker: flip the ancestor symlink in/out of the root.
+    let swapper = {
+        let stop = std::sync::Arc::clone(&stop);
+        let inside = storage.path().join("project1/inside");
+        let outside_dir = outside.path().to_path_buf();
+        let link = link.clone();
+        std::thread::spawn(move || {
+            let mut toggle = false;
+            while !stop.load(Ordering::Relaxed) {
+                let tmp = link.with_extension("tmp");
+                let _ = std::fs::remove_file(&tmp);
+                let dest = if toggle { &outside_dir } else { &inside };
+                if symlink(dest, &tmp).is_ok() {
+                    let _ = std::fs::rename(&tmp, &link);
+                }
+                toggle = !toggle;
+            }
+        })
+    };
+
+    let sys = ResourceScope::system();
+    for _ in 0..2000 {
+        // Read: must never return the out-of-root secret.
+        match scoped.read_file(&sys, &target).await {
+            Ok(bytes) => assert_eq!(
+                bytes, b"INROOT",
+                "read returned out-of-root content via swapped ancestor symlink"
+            ),
+            Err(FilesystemError::SymlinkEscape { .. }) | Err(FilesystemError::NotFound { .. }) => {}
+            Err(other) => panic!("unexpected read error: {other:?}"),
+        }
+        // Write: must never land outside the root.
+        match scoped.write_file(&sys, &target, b"INROOT").await {
+            Ok(()) => {}
+            Err(FilesystemError::SymlinkEscape { .. }) | Err(FilesystemError::NotFound { .. }) => {}
+            Err(other) => panic!("unexpected write error: {other:?}"),
+        }
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    swapper.join().unwrap();
+
+    // The out-of-root secret is never mutated by any write.
+    assert_eq!(
+        std::fs::read(outside.path().join("data.txt")).unwrap(),
+        b"SECRET"
+    );
+}
