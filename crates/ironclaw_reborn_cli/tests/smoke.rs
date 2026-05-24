@@ -1659,6 +1659,64 @@ fn serve_confirm_host_access_flag_gates_local_dev_yolo() {
     );
 }
 
+#[cfg(feature = "webui-v2-beta")]
+#[test]
+fn serve_confirmed_local_dev_yolo_rejects_non_loopback_cli_host() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let output = local_yolo_command(
+        &temp,
+        &["serve", "--confirm-host-access", "--host", "0.0.0.0"],
+    )
+    .env("IRONCLAW_REBORN_WEBUI_TOKEN", "test-token")
+    .env("IRONCLAW_REBORN_WEBUI_USER_ID", "test-user")
+    .output()
+    .expect("ironclaw-reborn serve should not crash");
+
+    assert!(
+        !output.status.success(),
+        "non-loopback confirmed yolo serve must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refuses non-loopback listener 0.0.0.0")
+            && stderr.contains("trusted-laptop host access"),
+        "stderr should reject non-loopback trusted-laptop access; got: {stderr}"
+    );
+}
+
+#[cfg(feature = "webui-v2-beta")]
+#[test]
+fn serve_confirmed_local_dev_yolo_rejects_non_loopback_config_host() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let reborn_home = temp.path().join("reborn-home");
+    std::fs::create_dir_all(&reborn_home).expect("reborn home");
+    std::fs::write(
+        reborn_home.join("config.toml"),
+        r#"
+[webui]
+listen_host = "0.0.0.0"
+"#,
+    )
+    .expect("write config");
+
+    let output = local_yolo_command(&temp, &["serve", "--confirm-host-access"])
+        .env("IRONCLAW_REBORN_WEBUI_TOKEN", "test-token")
+        .env("IRONCLAW_REBORN_WEBUI_USER_ID", "test-user")
+        .output()
+        .expect("ironclaw-reborn serve should not crash");
+
+    assert!(
+        !output.status.success(),
+        "non-loopback confirmed yolo serve from config must fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("refuses non-loopback listener 0.0.0.0")
+            && stderr.contains("trusted-laptop host access"),
+        "stderr should reject config-driven non-loopback trusted-laptop access; got: {stderr}"
+    );
+}
+
 #[test]
 fn run_honors_boot_profile_from_config_file() {
     let temp = tempfile::tempdir().expect("tempdir");

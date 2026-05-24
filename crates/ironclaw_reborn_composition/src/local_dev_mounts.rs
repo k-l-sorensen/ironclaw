@@ -20,14 +20,14 @@ pub(crate) fn workspace_mount_view(
     )?];
     if let Some(host_home_alias) = host_home_alias {
         mounts.push(grant(HOST_ALIAS, HOST_TARGET, permissions.clone())?);
-        if let Some(host_home_alias) = host_home_alias.to_str() {
-            if let Ok(raw_host_home_alias) = MountAlias::new(host_home_alias) {
-                mounts.push(MountGrant::new(
-                    raw_host_home_alias,
-                    VirtualPath::new(HOST_TARGET)?,
-                    permissions,
-                ));
-            }
+        if let Some(host_home_alias) = host_home_alias.to_str()
+            && let Ok(raw_host_home_alias) = MountAlias::new(host_home_alias)
+        {
+            mounts.push(MountGrant::new(
+                raw_host_home_alias,
+                VirtualPath::new(HOST_TARGET)?,
+                permissions,
+            ));
         }
     }
     MountView::new(mounts)

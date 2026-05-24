@@ -347,7 +347,7 @@ file:///etc/passwd
 Accepted only when the current local MountView contains a matching raw host alias:
 
 ```text
-/Users/alice/project
+<raw-confirmed-home>/project
 ```
 
 This exception is reserved for trusted local single-user host-home projections. Hosted

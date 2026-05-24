@@ -6,8 +6,8 @@ use std::sync::Arc;
 use anyhow::{Context, anyhow};
 use clap::Args;
 use ironclaw_reborn_composition::{
-    RebornReadiness, RebornRuntimeIdentity, RebornWebuiBundle, WebuiServeConfig,
-    build_reborn_runtime, build_webui_services, webui_v2_app,
+    RebornReadiness, RebornRuntimeIdentity, RebornRuntimeInput, RebornWebuiBundle,
+    WebuiServeConfig, build_reborn_runtime, build_webui_services, webui_v2_app,
 };
 use ironclaw_reborn_config::IdentitySection;
 use ironclaw_reborn_webui_ingress::{
@@ -168,6 +168,7 @@ impl ServeCommand {
             DEFAULT_SERVE_PORT
         };
         let listen_addr = SocketAddr::new(host, port);
+        reject_non_loopback_privileged_local_runtime(host, &runtime_input)?;
 
         // CORS allow-origin list. Empty = fail-closed on every
         // cross-origin preflight; operators MUST opt in to the
@@ -306,6 +307,36 @@ impl ServeCommand {
 
         Ok(())
     }
+}
+
+fn reject_non_loopback_privileged_local_runtime(
+    host: IpAddr,
+    runtime_input: &RebornRuntimeInput,
+) -> anyhow::Result<()> {
+    if host.is_loopback() || !runtime_exposes_trusted_laptop_access(runtime_input) {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "`ironclaw-reborn serve` refuses non-loopback listener {host} because the selected \
+         runtime policy grants trusted-laptop host access (host-home filesystem, local host \
+         process, direct network, inherited environment). Bind to a loopback host such as \
+         127.0.0.1 or ::1, or choose a less privileged profile."
+    );
+}
+
+fn runtime_exposes_trusted_laptop_access(runtime_input: &RebornRuntimeInput) -> bool {
+    let Some(policy) = runtime_input
+        .services
+        .as_ref()
+        .and_then(|services| services.runtime_policy())
+    else {
+        return false;
+    };
+
+    policy.filesystem_backend.as_str() == "host_workspace_and_home"
+        || policy.network_mode.as_str() == "direct"
+        || policy.secret_mode.as_str() == "inherited_env"
 }
 
 fn resolve_webui_default_agent(
