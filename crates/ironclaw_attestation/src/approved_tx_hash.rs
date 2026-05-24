@@ -6,12 +6,30 @@
 //! all six components is the anti-field-smuggling guarantee: changing any one
 //! changes the hash, so an approval of one view can never authorize signing of
 //! different bytes, a different account, chain, type, or schema.
+//!
+//! ## Safe vs low-level API
+//!
+//! Callers should use [`approved_tx_hash_for`], which derives BOTH the render
+//! and the canonical signing bytes from the *same* decoded transaction and the
+//! transaction's own chain/network/type — so the render input and the canonical
+//! input can never be mismatched by a caller. The low-level
+//! [`compute_approved_tx_hash`] (which takes already-derived components) is kept
+//! crate-private/test-only precisely so production callers cannot accidentally
+//! feed it a render of tx A with the canonical bytes of tx B.
+//!
+//! The signer/account is the ONE component that is NOT derived from the decoded
+//! transaction: it is the explicit, trusted account from the signing context
+//! (`SigningContext.key_or_account_id`), bound here so changing the bound signer
+//! changes the hash even when `to` / message contents stay fixed (threats #4/#5
+//! — the approved hash commits to *who* signs, not a heuristic recovered from
+//! the tx body).
 
 use ironclaw_signing_provider::ApprovedTxHash;
 use sha2::{Digest, Sha256};
 
-use crate::decoded_tx::RenderingSchemaVersion;
-use crate::rendered::RenderedTx;
+use crate::canonical::canonical_signing_bytes;
+use crate::decoded_tx::{DecodedTransaction, RenderingSchemaVersion};
+use crate::rendered::{RenderedTx, render};
 
 /// Domain separator for the approved-tx hash pre-image. Distinct from the
 /// canonical-bytes domain so the two digests can never share a pre-image.
@@ -48,11 +66,39 @@ fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(bytes);
 }
 
-/// Compute the binding [`ApprovedTxHash`].
+/// Compute the binding [`ApprovedTxHash`] for a decoded transaction and an
+/// explicit, trusted signer/account.
+///
+/// This is the **safe public API**: the render and canonical signing bytes are
+/// both derived here from the SAME `tx`, and chain/network/tx-type are read off
+/// `tx`, so a caller cannot mismatch a render of one transaction with the
+/// canonical bytes of another. `signer_account` is the explicit account the
+/// signing context binds (`SigningContext.key_or_account_id`) — it is NOT
+/// derived from the transaction body.
+pub fn approved_tx_hash_for(
+    tx: &DecodedTransaction,
+    signer_account: &str,
+    schema_version: RenderingSchemaVersion,
+) -> ApprovedTxHash {
+    let rendered = render(tx, schema_version);
+    let canonical = canonical_signing_bytes(tx, schema_version);
+    compute_approved_tx_hash_inner(
+        &rendered,
+        &canonical,
+        signer_account,
+        &tx.chain_network(),
+        &tx.tx_type_label(),
+        schema_version,
+    )
+}
+
+/// Compute the binding [`ApprovedTxHash`] from already-derived components.
 ///
 /// All six components are length-prefixed and folded under a single domain tag.
+/// **Crate-private**: production code must call [`approved_tx_hash_for`] so the
+/// render and canonical inputs are guaranteed to describe the same transaction.
 #[allow(clippy::too_many_arguments)]
-pub fn compute_approved_tx_hash(
+fn compute_approved_tx_hash_inner(
     rendered: &RenderedTx,
     canonical_bytes: &[u8],
     signer_account: &str,
@@ -70,4 +116,29 @@ pub fn compute_approved_tx_hash(
     update_lp(&mut hasher, &schema_version.get().to_be_bytes());
     let digest: [u8; 32] = hasher.finalize().into();
     ApprovedTxHash::from_bytes(digest)
+}
+
+/// Test-only escape hatch exposing the low-level component hasher so the
+/// binding suite can drive per-component tampering ("same render, different
+/// canonical bytes ⇒ different hash"). Gated behind the internal
+/// `test-internals` feature; never enabled by production dependents.
+#[cfg(feature = "test-internals")]
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn compute_approved_tx_hash(
+    rendered: &RenderedTx,
+    canonical_bytes: &[u8],
+    signer_account: &str,
+    chain_network: &str,
+    tx_type: &str,
+    schema_version: RenderingSchemaVersion,
+) -> ApprovedTxHash {
+    compute_approved_tx_hash_inner(
+        rendered,
+        canonical_bytes,
+        signer_account,
+        chain_network,
+        tx_type,
+        schema_version,
+    )
 }

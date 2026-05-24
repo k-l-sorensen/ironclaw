@@ -4143,6 +4143,7 @@ dependencies = [
 name = "ironclaw_attestation"
 version = "0.1.0"
 dependencies = [
+ "ironclaw_attestation",
  "ironclaw_signing_provider",
  "serde",
  "serde_json",
