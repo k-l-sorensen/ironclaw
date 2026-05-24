@@ -577,13 +577,15 @@ pub async fn start_server(
         ))
         .with_state(state.clone());
 
+    let sse = Arc::clone(&state.sse);
     let (shutdown_tx, shutdown_rx) = oneshot::channel();
     *state.shutdown_tx.write().await = Some(shutdown_tx);
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app)
-            .with_graceful_shutdown(async {
+            .with_graceful_shutdown(async move {
                 let _ = shutdown_rx.await;
+                sse.shutdown();
                 tracing::debug!("Web gateway shutting down");
             })
             .await
@@ -591,6 +593,46 @@ pub async fn start_server(
             tracing::error!("Web gateway server error: {}", e);
         }
     });
+    *state.shutdown_handle.write().await = Some(handle);
 
     Ok(bound_addr)
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::StatusCode;
+
+    use crate::channels::web::test_helpers::TestGatewayBuilder;
+
+    #[tokio::test]
+    async fn shutdown_drains_with_active_sse_connection() {
+        let (bound, state) = TestGatewayBuilder::new()
+            .start("test-token")
+            .await
+            .expect("start gateway");
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("http://{bound}/api/chat/events"))
+            .bearer_auth("test-token")
+            .send()
+            .await
+            .expect("open SSE stream");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let shutdown = async {
+            if let Some(tx) = state.shutdown_tx.write().await.take() {
+                let _ = tx.send(());
+            }
+            let handle = { state.shutdown_handle.write().await.take() };
+            if let Some(handle) = handle {
+                handle.await.expect("gateway task should finish");
+            }
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(2), shutdown)
+            .await
+            .expect("gateway shutdown should not hang on active SSE");
+
+        drop(response);
+    }
 }

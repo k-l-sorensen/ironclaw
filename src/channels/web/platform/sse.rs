@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::Stream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, watch};
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 use uuid::Uuid;
@@ -52,6 +52,7 @@ pub struct SseManager {
     boot_id: Arc<str>,
     next_event_id: Arc<AtomicU64>,
     max_connections: u64,
+    shutdown_tx: watch::Sender<bool>,
 }
 
 impl SseManager {
@@ -66,6 +67,7 @@ impl SseManager {
     /// validation; `tokio::broadcast::channel` panics on 0 capacity).
     pub fn with_max_connections_and_buffer(max_connections: u64, broadcast_buffer: usize) -> Self {
         let (tx, _) = broadcast::channel(broadcast_buffer);
+        let (shutdown_tx, _) = watch::channel(false);
         Self {
             tx,
             connection_count: Arc::new(AtomicU64::new(0)),
@@ -73,6 +75,7 @@ impl SseManager {
             boot_id: Arc::<str>::from(Uuid::new_v4().to_string()),
             next_event_id: Arc::new(AtomicU64::new(1)),
             max_connections,
+            shutdown_tx,
         }
     }
 
@@ -88,6 +91,7 @@ impl SseManager {
     /// established will break connection tracking, allow exceeding
     /// `max_connections`, and invalidate event-ID dedup for connected clients.
     pub(crate) fn from_sender(tx: broadcast::Sender<ScopedEvent>, max_connections: u64) -> Self {
+        let (shutdown_tx, _) = watch::channel(false);
         Self {
             tx,
             connection_count: Arc::new(AtomicU64::new(0)),
@@ -95,12 +99,24 @@ impl SseManager {
             boot_id: Arc::<str>::from(Uuid::new_v4().to_string()),
             next_event_id: Arc::new(AtomicU64::new(1)),
             max_connections,
+            shutdown_tx,
         }
     }
 
     /// Get a clone of the broadcast sender for use by other components.
     pub(crate) fn sender(&self) -> broadcast::Sender<ScopedEvent> {
         self.tx.clone()
+    }
+
+    /// Subscribe to the gateway shutdown signal.
+    pub(crate) fn shutdown_signal(&self) -> watch::Receiver<bool> {
+        self.shutdown_tx.subscribe()
+    }
+
+    /// Close long-lived SSE/WebSocket subscribers so Axum graceful shutdown
+    /// can drain instead of waiting forever on open browser connections.
+    pub(crate) fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 
     /// Get the configured connection limit.
@@ -200,9 +216,11 @@ impl SseManager {
             }
             Err(_) => None,
         });
+        let stream =
+            futures::StreamExt::take_until(stream, shutdown_signal_done(self.shutdown_signal()));
 
         Some(CountedStream {
-            inner: stream,
+            inner: Box::pin(stream),
             counter,
             verbose_counter,
         })
@@ -274,10 +292,12 @@ impl SseManager {
                     .event(event_type)
                     .data(data)))
             });
+        let stream =
+            futures::StreamExt::take_until(stream, shutdown_signal_done(self.shutdown_signal()));
 
         // Wrap in a stream that decrements both counters on drop.
         let counted_stream = CountedStream {
-            inner: stream,
+            inner: Box::pin(stream),
             counter,
             verbose_counter,
         };
@@ -325,19 +345,21 @@ impl Default for SseManager {
 /// total so that verbose-only events can be short-circuited at
 /// broadcast time when no debug client is connected.
 struct CountedStream<S> {
-    inner: S,
+    inner: std::pin::Pin<Box<S>>,
     counter: Arc<AtomicU64>,
     verbose_counter: Option<Arc<AtomicU64>>,
 }
 
-impl<S: Stream + Unpin> Stream for CountedStream<S> {
+impl<S> Unpin for CountedStream<S> {}
+
+impl<S: Stream> Stream for CountedStream<S> {
     type Item = S::Item;
 
     fn poll_next(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
-        std::pin::Pin::new(&mut self.inner).poll_next(cx)
+        self.inner.as_mut().poll_next(cx)
     }
 }
 
@@ -346,6 +368,17 @@ impl<S> Drop for CountedStream<S> {
         self.counter.fetch_sub(1, Ordering::Relaxed);
         if let Some(v) = &self.verbose_counter {
             v.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+async fn shutdown_signal_done(mut shutdown_rx: watch::Receiver<bool>) {
+    if *shutdown_rx.borrow() {
+        return;
+    }
+    while shutdown_rx.changed().await.is_ok() {
+        if *shutdown_rx.borrow() {
+            break;
         }
     }
 }
@@ -424,6 +457,27 @@ mod tests {
             assert_eq!(manager.connection_count(), 1);
         }
         // Stream dropped, counter should decrement
+        assert_eq!(manager.connection_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_shutdown_closes_subscribe_raw_stream() {
+        let manager = SseManager::new();
+        let mut stream = Box::pin(
+            manager
+                .subscribe_raw(None, false)
+                .expect("should subscribe"),
+        );
+        assert_eq!(manager.connection_count(), 1);
+
+        manager.shutdown();
+
+        let next = tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+            .await
+            .expect("stream should terminate after shutdown");
+        assert!(next.is_none(), "shutdown should end the stream");
+
+        drop(stream);
         assert_eq!(manager.connection_count(), 0);
     }
 

@@ -166,6 +166,7 @@ impl GatewayChannel {
             scheduler: None,
             owner_id,
             shutdown_tx: tokio::sync::RwLock::new(None),
+            shutdown_handle: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(ws::WsConnectionTracker::new())),
             llm_provider: None,
             llm_reload: None,
@@ -232,6 +233,7 @@ impl GatewayChannel {
             scheduler: self.state.scheduler.clone(),
             owner_id: self.state.owner_id.clone(),
             shutdown_tx: tokio::sync::RwLock::new(None),
+            shutdown_handle: tokio::sync::RwLock::new(None),
             ws_tracker: self.state.ws_tracker.clone(),
             llm_provider: self.state.llm_provider.clone(),
             llm_reload: self.state.llm_reload.clone(),
@@ -1055,8 +1057,27 @@ impl Channel for GatewayChannel {
     }
 
     async fn shutdown(&self) -> Result<(), ChannelError> {
+        self.state.sse.shutdown();
         if let Some(tx) = self.state.shutdown_tx.write().await.take() {
             let _ = tx.send(());
+        }
+        let handle = { self.state.shutdown_handle.write().await.take() };
+        if let Some(mut handle) = handle {
+            tokio::select! {
+                result = &mut handle => {
+                    if let Err(e) = result {
+                        return Err(ChannelError::Disconnected {
+                            name: "gateway".to_string(),
+                            reason: format!("server task failed during shutdown: {e}"),
+                        });
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    tracing::warn!("Timed out waiting for web gateway shutdown; aborting server task");
+                    handle.abort();
+                    let _ = handle.await;
+                }
+            }
         }
         *self.state.msg_tx.write().await = None;
         Ok(())

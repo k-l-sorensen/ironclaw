@@ -386,6 +386,8 @@ pub struct GatewayState {
     pub owner_id: String,
     /// Shutdown signal sender.
     pub shutdown_tx: tokio::sync::RwLock<Option<oneshot::Sender<()>>>,
+    /// Join handle for the Axum server task.
+    pub shutdown_handle: tokio::sync::RwLock<Option<tokio::task::JoinHandle<()>>>,
     /// WebSocket connection tracker.
     pub ws_tracker: Option<Arc<crate::channels::web::ws::WsConnectionTracker>>,
     /// LLM provider for OpenAI-compatible API proxy.

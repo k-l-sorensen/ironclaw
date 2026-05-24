@@ -1298,6 +1298,7 @@ mod tests {
             scheduler: None,
             owner_id: "test".to_string(),
             shutdown_tx: tokio::sync::RwLock::new(None),
+            shutdown_handle: tokio::sync::RwLock::new(None),
             ws_tracker: None,
             llm_provider: None,
             llm_reload: None,

@@ -86,6 +86,7 @@ pub async fn handle_ws_connection(
         return;
     };
     let mut event_stream = Box::pin(raw_stream);
+    let mut shutdown_rx = state.sse.shutdown_signal();
 
     // Channel for the sender task to receive messages from both
     // the broadcast stream and any direct sends (like Pong)
@@ -122,7 +123,19 @@ pub async fn handle_ws_connection(
 
     // Receiver task: read client frames and route to agent
     let user_id = user.user_id;
-    while let Some(Ok(frame)) = ws_stream.next().await {
+    loop {
+        let frame = tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    break;
+                }
+                continue;
+            }
+            frame = ws_stream.next() => frame,
+        };
+        let Some(Ok(frame)) = frame else {
+            break;
+        };
         match frame {
             Message::Text(text) => {
                 let parsed: Result<WsClientMessage, _> = serde_json::from_str(&text);
@@ -575,6 +588,7 @@ mod tests {
             scheduler: None,
             owner_id: "test".to_string(),
             shutdown_tx: tokio::sync::RwLock::new(None),
+            shutdown_handle: tokio::sync::RwLock::new(None),
             ws_tracker: Some(Arc::new(WsConnectionTracker::new())),
             llm_provider: None,
             llm_reload: None,
