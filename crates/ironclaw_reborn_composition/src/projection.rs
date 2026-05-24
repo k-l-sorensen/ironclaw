@@ -124,10 +124,7 @@ impl ProjectionStream for WebuiRunStatusProjectionStream {
             .map_err(map_event_stream_error)?;
 
         let resumes_runtime_item = origin_cursor.runtime_payloads_delivered > 0;
-        let mut batch = WebuiProjectionBatch::new(
-            origin_cursor,
-            EventProjectionCursor::origin_for_scope(projection_scope),
-        );
+        let mut batch = WebuiProjectionBatch::new(origin_cursor);
         if let Some(item) = subscription.next().await {
             if batch.push_runtime_item(item, &request.scope)? && !resumes_runtime_item {
                 for _ in 1..WEBUI_PROJECTION_PAGE_LIMIT {
@@ -190,16 +187,14 @@ impl ProjectionStream for WebuiRunStatusProjectionStream {
 
 struct WebuiProjectionBatch {
     cursor: WebuiProjectionCursor,
-    runtime_origin: EventProjectionCursor,
     runtime_payloads_pushed: usize,
     payloads: Vec<(WebuiProjectionCursor, ProductOutboundPayload)>,
 }
 
 impl WebuiProjectionBatch {
-    fn new(cursor: WebuiProjectionCursor, runtime_origin: EventProjectionCursor) -> Self {
+    fn new(cursor: WebuiProjectionCursor) -> Self {
         Self {
             cursor,
-            runtime_origin,
             runtime_payloads_pushed: 0,
             payloads: Vec::new(),
         }
@@ -227,12 +222,6 @@ impl WebuiProjectionBatch {
                 reason: "runtime delivery offset exceeds runtime item payload count".to_string(),
             });
         }
-        if already_delivered == total {
-            self.cursor.runtime = Some(max_projection_cursor(final_cursor, item_cursor));
-            self.cursor.runtime_item = None;
-            self.cursor.runtime_payloads_delivered = 0;
-            return Ok(true);
-        }
 
         let remaining_capacity =
             WEBUI_RUNTIME_ITEM_MAX_PAYLOADS.saturating_sub(self.runtime_payloads_pushed);
@@ -251,7 +240,6 @@ impl WebuiProjectionBatch {
                 self.cursor.runtime_item = None;
                 self.cursor.runtime_payloads_delivered = 0;
             } else {
-                self.cursor.runtime = self.cursor.runtime.clone();
                 self.cursor.runtime_item = Some(item_cursor.runtime);
                 self.cursor.runtime_payloads_delivered = delivered;
             }
@@ -268,16 +256,10 @@ impl WebuiProjectionBatch {
         let already_delivered = self.cursor.runtime_payloads_delivered;
         let remaining_capacity =
             WEBUI_RUNTIME_ITEM_MAX_PAYLOADS.saturating_sub(self.runtime_payloads_pushed);
-        let base_cursor = self
-            .cursor
-            .runtime
-            .clone()
-            .unwrap_or_else(|| self.runtime_origin.clone());
         if let Some((final_cursor, item_cursor, payloads, total, already_delivered)) =
             item_to_payloads(
                 item,
                 scope,
-                base_cursor,
                 self.cursor.runtime_item,
                 already_delivered,
                 remaining_capacity,
@@ -409,7 +391,6 @@ fn product_cursor_from_webui_cursor(
 fn item_to_payloads(
     item: ProjectionStreamItem,
     scope: &TurnScope,
-    base_cursor: EventProjectionCursor,
     expected_item: Option<EventCursor>,
     already_delivered: usize,
     capacity: usize,
@@ -430,7 +411,6 @@ fn item_to_payloads(
                 scope,
                 snapshot_from_envelope(envelope)?,
                 cursor,
-                base_cursor,
                 expected_item,
                 already_delivered,
                 capacity,
@@ -442,7 +422,6 @@ fn item_to_payloads(
                 scope,
                 replay_from_envelope(envelope.as_ref())?,
                 cursor,
-                base_cursor,
                 expected_item,
                 already_delivered,
                 capacity,
@@ -454,7 +433,6 @@ fn item_to_payloads(
                 scope,
                 snapshot_from_envelope(*snapshot)?,
                 cursor,
-                base_cursor,
                 expected_item,
                 already_delivered,
                 capacity,
@@ -474,7 +452,6 @@ fn snapshot_payloads(
     scope: &TurnScope,
     snapshot: ProjectionSnapshot,
     cursor: EventProjectionCursor,
-    _base_cursor: EventProjectionCursor,
     expected_item: Option<EventCursor>,
     already_delivered: usize,
     capacity: usize,
@@ -522,7 +499,6 @@ fn replay_payloads(
     scope: &TurnScope,
     replay: &ProjectionReplay,
     cursor: EventProjectionCursor,
-    _base_cursor: EventProjectionCursor,
     expected_item: Option<EventCursor>,
     already_delivered: usize,
     capacity: usize,
