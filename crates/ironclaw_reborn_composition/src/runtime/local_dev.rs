@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use ironclaw_host_api::{
     CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, EffectKind, ExecutionContext,
-    ExtensionId, GrantConstraints, MountAlias, MountGrant, MountPermissions, MountView,
-    NetworkPolicy, NetworkTargetPattern, Principal, RuntimeKind, TrustClass, UserId, VirtualPath,
+    ExtensionId, GrantConstraints, MountView, NetworkPolicy, NetworkTargetPattern, Principal,
+    RuntimeKind, TrustClass, UserId,
 };
 use ironclaw_host_runtime::{
     APPLY_PATCH_CAPABILITY_ID, CapabilitySurfacePolicy, ECHO_CAPABILITY_ID, GLOB_CAPABILITY_ID,
@@ -36,6 +36,7 @@ use ironclaw_turns::{
 };
 
 use crate::RebornServices;
+use crate::local_dev_mounts::skill_management_mount_view;
 
 pub(super) struct LocalDevCapabilityWiring {
     pub(super) capability_factory: Arc<dyn LoopCapabilityPortFactory>,
@@ -49,6 +50,10 @@ pub(super) fn capability_wiring(
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
 ) -> Option<LocalDevCapabilityWiring> {
     let runtime = services.host_runtime.clone()?;
+    let workspace_mounts = services
+        .local_runtime
+        .as_ref()
+        .map(|runtime| runtime.workspace_mounts.clone())?;
     let capability_io = Arc::new(LocalDevCapabilityIo::default());
     let capability_input_resolver: Arc<dyn LoopCapabilityInputResolver> = capability_io.clone();
     let capability_result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
@@ -56,6 +61,7 @@ pub(super) fn capability_wiring(
         Arc::new(LocalDevLoopCapabilityPortFactory::new(
             runtime,
             user_id,
+            workspace_mounts,
             capability_input_resolver,
             capability_result_writer,
             milestone_sink,
@@ -74,6 +80,7 @@ pub(super) fn capability_wiring(
 struct LocalDevLoopCapabilityPortFactory {
     runtime: Arc<dyn HostRuntime>,
     user_id: UserId,
+    workspace_mounts: MountView,
     input_resolver: Arc<dyn LoopCapabilityInputResolver>,
     result_writer: Arc<dyn LoopCapabilityResultWriter>,
     milestone_sink: Arc<dyn LoopHostMilestoneSink>,
@@ -83,6 +90,7 @@ impl LocalDevLoopCapabilityPortFactory {
     fn new(
         runtime: Arc<dyn HostRuntime>,
         user_id: UserId,
+        workspace_mounts: MountView,
         input_resolver: Arc<dyn LoopCapabilityInputResolver>,
         result_writer: Arc<dyn LoopCapabilityResultWriter>,
         milestone_sink: Arc<dyn LoopHostMilestoneSink>,
@@ -90,6 +98,7 @@ impl LocalDevLoopCapabilityPortFactory {
         Self {
             runtime,
             user_id,
+            workspace_mounts,
             input_resolver,
             result_writer,
             milestone_sink,
@@ -103,8 +112,8 @@ impl LoopCapabilityPortFactory for LocalDevLoopCapabilityPortFactory {
         &self,
         run_context: &LoopRunContext,
     ) -> Result<Arc<dyn LoopCapabilityPort>, AgentLoopHostError> {
-        let workspace_mounts = local_dev_workspace_mounts()?;
-        let skill_mounts = local_dev_skill_mounts()?;
+        let workspace_mounts = self.workspace_mounts.clone();
+        let skill_mounts = skill_management_mount_view().map_err(host_api_agent_loop_error)?;
         let visible_request = local_dev_visible_capability_request(
             run_context,
             self.user_id.clone(),
@@ -651,31 +660,6 @@ fn local_dev_shell_network_policy() -> NetworkPolicy {
     }
 }
 
-fn local_dev_workspace_mounts() -> Result<MountView, AgentLoopHostError> {
-    MountView::new(vec![MountGrant::new(
-        MountAlias::new("/workspace").map_err(host_api_agent_loop_error)?,
-        VirtualPath::new("/projects/workspace").map_err(host_api_agent_loop_error)?,
-        MountPermissions::read_write(),
-    )])
-    .map_err(host_api_agent_loop_error)
-}
-
-fn local_dev_skill_mounts() -> Result<MountView, AgentLoopHostError> {
-    MountView::new(vec![
-        MountGrant::new(
-            MountAlias::new("/skills").map_err(host_api_agent_loop_error)?,
-            VirtualPath::new("/projects/skills").map_err(host_api_agent_loop_error)?,
-            MountPermissions::read_write_list_delete(),
-        ),
-        MountGrant::new(
-            MountAlias::new("/system/skills").map_err(host_api_agent_loop_error)?,
-            VirtualPath::new("/projects/system/skills").map_err(host_api_agent_loop_error)?,
-            MountPermissions::read_only(),
-        ),
-    ])
-    .map_err(host_api_agent_loop_error)
-}
-
 fn ensure_local_dev_ref_scope(
     prefix: &str,
     reference: &str,
@@ -707,7 +691,7 @@ fn host_api_agent_loop_error(error: impl std::fmt::Display) -> AgentLoopHostErro
 mod tests {
     use super::*;
 
-    use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId};
+    use ironclaw_host_api::{AgentId, MountPermissions, ProjectId, TenantId, ThreadId};
     use ironclaw_turns::{
         RunProfileResolutionRequest, RunProfileResolver, TurnId, TurnRunId, TurnScope,
         run_profile::InMemoryRunProfileResolver,
@@ -850,8 +834,11 @@ mod tests {
             ]
         );
 
-        let workspace_mounts = local_dev_workspace_mounts().expect("workspace mounts build");
-        let skill_mounts = local_dev_skill_mounts().expect("skill mounts build");
+        let workspace_mounts =
+            crate::local_dev_mounts::workspace_mount_view(MountPermissions::read_write(), None)
+                .expect("workspace mounts build");
+        let skill_mounts =
+            crate::local_dev_mounts::skill_management_mount_view().expect("skill mounts build");
         assert!(workspace_mounts.mounts.iter().all(|mount| {
             mount.alias.as_str() != "/skills" && mount.alias.as_str() != "/system/skills"
         }));

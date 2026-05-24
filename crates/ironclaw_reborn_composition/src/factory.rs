@@ -12,9 +12,8 @@ use ironclaw_filesystem::RootFilesystem;
 use ironclaw_filesystem::{LocalFilesystem, ScopedFilesystem};
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy;
-use ironclaw_host_api::{
-    EffectKind, MountAlias, MountGrant, MountPermissions, MountView, PackageId, VirtualPath,
-};
+use ironclaw_host_api::runtime_policy::FilesystemBackendKind;
+use ironclaw_host_api::{EffectKind, MountPermissions, MountView, PackageId};
 use ironclaw_host_runtime::{
     CapabilitySurfaceVersion, FirstPartyCapabilityRegistry, HostRuntimeServices,
     builtin_first_party_handlers, builtin_first_party_package,
@@ -35,6 +34,7 @@ use ironclaw_turns::{
 };
 
 use crate::input::RebornStorageInput;
+use crate::local_dev_mounts::{skill_context_mount_view, workspace_mount_view};
 use crate::{
     RebornAuthContinuationDispatcher, RebornBuildError, RebornBuildInput, RebornCompositionProfile,
     RebornFacadeReadiness, RebornProductAuthServicePorts, RebornProductAuthServices,
@@ -56,6 +56,7 @@ pub(crate) struct RebornLocalRuntimeServices {
     pub(crate) thread_service: Arc<InMemorySessionThreadService>,
     pub(crate) skill_filesystem: Arc<ScopedFilesystem<LocalFilesystem>>,
     pub(crate) workspace_filesystem: Arc<ScopedFilesystem<LocalFilesystem>>,
+    pub(crate) workspace_mounts: MountView,
 }
 
 impl std::fmt::Debug for RebornServices {
@@ -142,6 +143,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     let RebornStorageInput::LocalDev {
         root,
         workspace_root,
+        host_home_root,
     } = storage
     else {
         return Err(RebornBuildError::InvalidConfig {
@@ -157,6 +159,29 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     })?;
     let root = canonicalize_local_dev_path(&root, "storage root")?;
     let workspace_root = canonicalize_local_dev_path(&workspace_root, "workspace root")?;
+    let include_host_home = runtime_policy.as_ref().is_some_and(|policy| {
+        policy.filesystem_backend == FilesystemBackendKind::HostWorkspaceAndHome
+    });
+    let host_home_root = match (include_host_home, host_home_root) {
+        (true, Some(path)) => Some(canonicalize_local_dev_existing_dir(
+            &path,
+            "host home root",
+        )?),
+        (true, None) => {
+            return Err(RebornBuildError::InvalidConfig {
+                reason: "local-dev-yolo host home access requires a confirmed host home root"
+                    .to_string(),
+            });
+        }
+        (false, Some(_)) => {
+            return Err(RebornBuildError::InvalidConfig {
+                reason:
+                    "confirmed host home root was supplied but the resolved runtime policy does not allow host home access"
+                        .to_string(),
+            });
+        }
+        (false, None) => None,
+    };
     validate_local_dev_workspace_skill_isolation(&root, &workspace_root)?;
     let mut filesystem = LocalFilesystem::new();
     let projects_root = ironclaw_host_api::VirtualPath::new("/projects").map_err(|error| {
@@ -168,6 +193,12 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         .map_err(|error| RebornBuildError::InvalidConfig {
             reason: error.to_string(),
         })?;
+    let host_virtual_root =
+        ironclaw_host_api::VirtualPath::new("/projects/host").map_err(|error| {
+            RebornBuildError::InvalidConfig {
+                reason: error.to_string(),
+            }
+        })?;
     filesystem.mount_local(
         projects_root,
         ironclaw_host_api::HostPath::from_path_buf(root),
@@ -176,15 +207,33 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         workspace_virtual_root,
         ironclaw_host_api::HostPath::from_path_buf(workspace_root),
     )?;
+    if let Some(host_home_root) = host_home_root.as_ref() {
+        filesystem.mount_local(
+            host_virtual_root,
+            ironclaw_host_api::HostPath::from_path_buf(host_home_root.clone()),
+        )?;
+    }
 
     let filesystem = Arc::new(filesystem);
+    let setup_workspace_mounts = workspace_mount_view(MountPermissions::read_only(), None)
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: error.to_string(),
+        })?;
+    let runtime_workspace_mounts =
+        workspace_mount_view(MountPermissions::read_write(), host_home_root.as_deref()).map_err(
+            |error| RebornBuildError::InvalidConfig {
+                reason: error.to_string(),
+            },
+        )?;
     let skill_filesystem = Arc::new(ScopedFilesystem::with_fixed_view(
         Arc::clone(&filesystem),
-        local_dev_skill_mount_view()?,
+        skill_context_mount_view().map_err(|error| RebornBuildError::InvalidConfig {
+            reason: error.to_string(),
+        })?,
     ));
     let workspace_filesystem = Arc::new(ScopedFilesystem::with_fixed_view(
         Arc::clone(&filesystem),
-        local_dev_workspace_mount_view()?,
+        setup_workspace_mounts,
     ));
 
     let run_state = Arc::new(InMemoryRunStateStore::new());
@@ -197,6 +246,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         thread_service: Arc::new(InMemorySessionThreadService::default()),
         skill_filesystem,
         workspace_filesystem,
+        workspace_mounts: runtime_workspace_mounts,
     });
 
     let mut services = HostRuntimeServices::new(
@@ -251,6 +301,20 @@ fn canonicalize_local_dev_path(path: &Path, label: &str) -> Result<PathBuf, Rebo
     })
 }
 
+fn canonicalize_local_dev_existing_dir(
+    path: &Path,
+    label: &str,
+) -> Result<PathBuf, RebornBuildError> {
+    let path = canonicalize_local_dev_path(path, label)?;
+    if path.is_dir() {
+        Ok(path)
+    } else {
+        Err(RebornBuildError::InvalidConfig {
+            reason: format!("local-dev {label} must be an existing directory"),
+        })
+    }
+}
+
 fn validate_local_dev_workspace_skill_isolation(
     storage_root: &Path,
     workspace_root: &Path,
@@ -276,45 +340,6 @@ fn validate_local_dev_workspace_skill_isolation(
 
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
-}
-
-fn local_dev_skill_mount_view() -> Result<MountView, RebornBuildError> {
-    let grant = |alias: &str, target: &str| -> Result<MountGrant, RebornBuildError> {
-        Ok(MountGrant::new(
-            MountAlias::new(alias).map_err(|error| RebornBuildError::InvalidConfig {
-                reason: error.to_string(),
-            })?,
-            VirtualPath::new(target).map_err(|error| RebornBuildError::InvalidConfig {
-                reason: error.to_string(),
-            })?,
-            MountPermissions::read_only(),
-        ))
-    };
-    MountView::new(vec![
-        grant("/skills", "/projects/skills")?,
-        grant("/tenant-shared/skills", "/projects/tenant-shared/skills")?,
-        grant("/system/skills", "/projects/system/skills")?,
-    ])
-    .map_err(|error| RebornBuildError::InvalidConfig {
-        reason: error.to_string(),
-    })
-}
-
-fn local_dev_workspace_mount_view() -> Result<MountView, RebornBuildError> {
-    MountView::new(vec![MountGrant::new(
-        MountAlias::new("/workspace").map_err(|error| RebornBuildError::InvalidConfig {
-            reason: error.to_string(),
-        })?,
-        VirtualPath::new("/projects/workspace").map_err(|error| {
-            RebornBuildError::InvalidConfig {
-                reason: error.to_string(),
-            }
-        })?,
-        MountPermissions::read_only(),
-    )])
-    .map_err(|error| RebornBuildError::InvalidConfig {
-        reason: error.to_string(),
-    })
 }
 
 fn builtin_extension_registry() -> Result<ExtensionRegistry, RebornBuildError> {
@@ -671,8 +696,9 @@ mod tests {
     use ironclaw_filesystem::FilesystemError;
     use ironclaw_host_api::{
         CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, EffectKind,
-        ExecutionContext, ExtensionId, GrantConstraints, InvocationId, NetworkPolicy, Principal,
-        ResourceEstimate, ResourceScope, RuntimeKind, ScopedPath, TrustClass, UserId,
+        ExecutionContext, ExtensionId, GrantConstraints, InvocationId, MountAlias, MountGrant,
+        NetworkPolicy, Principal, ResourceEstimate, ResourceScope, RuntimeKind, ScopedPath,
+        TrustClass, UserId, VirtualPath,
     };
     use ironclaw_host_runtime::{
         RuntimeCapabilityOutcome, RuntimeCapabilityRequest, RuntimeFailureKind,
@@ -1033,3 +1059,5 @@ mod tests {
 
 #[cfg(test)]
 mod auth_tests;
+#[cfg(test)]
+mod local_dev_host_tests;

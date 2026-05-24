@@ -37,15 +37,17 @@ fn resolve_path(
     path: &str,
     operation: FilesystemOperation,
 ) -> Result<ResolvedPath, CodingCapabilityError> {
-    let scoped_path = ScopedPath::new(scoped_path_input(path)).map_err(|_| input_error())?;
+    let mounts = request
+        .mounts
+        .ok_or_else(|| CodingCapabilityError::new(RuntimeDispatchErrorKind::FilesystemDenied))?;
+    let scoped_path = mounts
+        .scoped_path(scoped_path_input(path))
+        .map_err(|_| input_error())?;
     if is_sensitive_scoped_path(scoped_path.as_str()) {
         return Err(CodingCapabilityError::new(
             RuntimeDispatchErrorKind::FilesystemDenied,
         ));
     }
-    let mounts = request
-        .mounts
-        .ok_or_else(|| CodingCapabilityError::new(RuntimeDispatchErrorKind::FilesystemDenied))?;
     let (virtual_path, grant) = mounts
         .resolve_with_grant(&scoped_path)
         .map_err(|_| CodingCapabilityError::new(RuntimeDispatchErrorKind::FilesystemDenied))?;

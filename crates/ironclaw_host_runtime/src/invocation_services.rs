@@ -149,7 +149,7 @@ impl InvocationServicesResolver for LocalInvocationServicesResolver {
         if plan.requires_filesystem
             && !matches!(
                 plan.filesystem_backend,
-                FilesystemBackendKind::HostWorkspace
+                FilesystemBackendKind::HostWorkspace | FilesystemBackendKind::HostWorkspaceAndHome
             )
         {
             return Err(InvocationServicesError::UnsupportedFilesystemBackend {

@@ -198,7 +198,13 @@ impl VirtualPath {
 
 impl ScopedPath {
     pub fn new(value: impl Into<String>) -> Result<Self, HostApiError> {
-        let raw = value.into();
+        Self::new_with_allowed_raw_host_aliases(value.into(), &[])
+    }
+
+    pub(crate) fn new_with_allowed_raw_host_aliases(
+        raw: String,
+        raw_host_aliases: &[&str],
+    ) -> Result<Self, HostApiError> {
         if looks_like_url(&raw) {
             return Err(HostApiError::invalid_path(
                 REDACTED_PATH_VALUE,
@@ -214,6 +220,9 @@ impl ScopedPath {
         if RAW_HOST_PREFIXES
             .iter()
             .any(|prefix| raw.starts_with(prefix))
+            && !raw_host_aliases
+                .iter()
+                .any(|alias| path_matches_alias(alias, &raw))
         {
             return Err(HostApiError::invalid_path(
                 REDACTED_PATH_VALUE,
@@ -319,4 +328,8 @@ fn looks_like_url(value: &str) -> bool {
 fn looks_like_windows_path(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() >= 3 && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
+pub(crate) fn path_matches_alias(alias: &str, path: &str) -> bool {
+    path == alias || path.starts_with(&format!("{alias}/"))
 }

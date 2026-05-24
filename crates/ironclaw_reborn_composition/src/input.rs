@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy;
+use ironclaw_host_api::runtime_policy::{EffectiveRuntimePolicy, FilesystemBackendKind};
 use ironclaw_host_runtime::SchedulerTurnRunWakeNotifier;
 use ironclaw_trust::HostTrustPolicy;
 
@@ -25,6 +25,7 @@ pub(crate) enum RebornStorageInput {
     LocalDev {
         root: PathBuf,
         workspace_root: Option<PathBuf>,
+        host_home_root: Option<PathBuf>,
     },
     #[cfg(feature = "libsql")]
     Libsql {
@@ -80,6 +81,7 @@ impl RebornBuildInput {
             RebornStorageInput::LocalDev {
                 root,
                 workspace_root: None,
+                host_home_root: None,
             },
         )
     }
@@ -93,6 +95,23 @@ impl RebornBuildInput {
             *root = Some(workspace_root);
         }
         self
+    }
+
+    pub fn with_local_dev_confirmed_host_home_root(mut self, host_home_root: PathBuf) -> Self {
+        if let RebornStorageInput::LocalDev {
+            host_home_root: root,
+            ..
+        } = &mut self.storage
+        {
+            *root = Some(host_home_root);
+        }
+        self
+    }
+
+    pub fn requires_local_dev_confirmed_host_home_root(&self) -> bool {
+        self.runtime_policy.as_ref().is_some_and(|policy| {
+            policy.filesystem_backend == FilesystemBackendKind::HostWorkspaceAndHome
+        })
     }
 
     #[cfg(feature = "libsql")]

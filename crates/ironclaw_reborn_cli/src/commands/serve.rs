@@ -16,6 +16,7 @@ use ironclaw_reborn_webui_ingress::{
 use secrecy::SecretString;
 
 use crate::context::RebornCliContext;
+use crate::runtime::RuntimeInputOptions;
 
 const DEFAULT_SERVE_HOST: &str = "127.0.0.1";
 const DEFAULT_SERVE_PORT: u16 = 3000;
@@ -43,6 +44,10 @@ pub(crate) struct ServeCommand {
     /// (when neither is set) is 3000.
     #[arg(long)]
     port: Option<u16>,
+
+    /// Confirm trusted-laptop host filesystem access for local-dev-yolo.
+    #[arg(long = "confirm-host-access")]
+    confirm_host_access: bool,
 }
 
 impl ServeCommand {
@@ -50,9 +55,12 @@ impl ServeCommand {
         crate::runtime::init_tracing();
 
         // Build the runtime config from the operator's TOML.
-        let runtime_input = crate::runtime::build_runtime_input(
+        let runtime_input = crate::runtime::build_runtime_input_with_options(
             context.boot_config(),
             crate::runtime::RuntimeInputCaller::Serve,
+            RuntimeInputOptions {
+                confirm_host_access: self.confirm_host_access,
+            },
         )?;
         let boot_config = context.boot_config();
         let config_file =

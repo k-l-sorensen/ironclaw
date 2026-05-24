@@ -343,8 +343,9 @@ block by default: attempts to escape workspace or exfiltrate known secrets unles
 ### `local-yolo`
 
 ```text
-allow: workspace reads/writes, local shell, normal network
+allow: workspace reads/writes, confirmed host-home reads/writes through /host and the raw confirmed HOME path for local CLI, local shell, normal network
 ask: optional only for catastrophic/outside-root actions depending on user config
+block by default: known credential-bearing paths such as .ssh, .aws, .config/gh/hosts.yml, .env, and key material
 require: explicit startup confirmation and visible warning
 ```
 
