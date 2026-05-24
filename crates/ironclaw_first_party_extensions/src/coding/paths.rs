@@ -129,6 +129,26 @@ pub(super) async fn create_parent_dir(
         .map_err(filesystem_error)
 }
 
+pub(super) async fn deny_sensitive_parent_dir(
+    request: &CodingCapabilityRequest<'_>,
+    path: &VirtualPath,
+) -> Result<(), CodingCapabilityError> {
+    let Some(parent) = virtual_parent(path)? else {
+        return Ok(());
+    };
+    let stat = request
+        .filesystem
+        .stat(&parent)
+        .await
+        .map_err(filesystem_error)?;
+    if stat.sensitive {
+        return Err(CodingCapabilityError::new(
+            RuntimeDispatchErrorKind::FilesystemDenied,
+        ));
+    }
+    Ok(())
+}
+
 fn virtual_parent(path: &VirtualPath) -> Result<Option<VirtualPath>, CodingCapabilityError> {
     let raw = path.as_str().trim_end_matches('/');
     let Some((parent, _leaf)) = raw.rsplit_once('/') else {

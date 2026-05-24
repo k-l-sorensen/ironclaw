@@ -1577,6 +1577,89 @@ fn run_warns_when_falling_back_to_stub_gateway() {
 }
 
 #[test]
+fn run_confirm_host_access_flag_gates_local_dev_yolo() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing = local_yolo_command(&temp, &["run", "-m", "ping"])
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    assert!(!missing.status.success(), "missing confirmation must fail");
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        missing_stderr.contains("requires explicit disclosure acknowledgement"),
+        "stderr should require disclosure acknowledgement; got: {missing_stderr}"
+    );
+
+    let confirmed = local_yolo_command(&temp, &["run", "--confirm-host-access", "-m", "ping"])
+        .output()
+        .expect("ironclaw-reborn run should not crash");
+    let confirmed_stderr = String::from_utf8_lossy(&confirmed.stderr);
+    assert!(
+        !confirmed_stderr.contains("requires explicit disclosure acknowledgement")
+            && !confirmed_stderr.contains("requires --confirm-host-access"),
+        "confirmed run should pass the host-access gate; got: {confirmed_stderr}"
+    );
+}
+
+#[test]
+fn repl_confirm_host_access_flag_gates_local_dev_yolo() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing = local_yolo_command(&temp, &["repl"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("ironclaw-reborn repl should not crash");
+    assert!(!missing.status.success(), "missing confirmation must fail");
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        missing_stderr.contains("requires explicit disclosure acknowledgement"),
+        "stderr should require disclosure acknowledgement; got: {missing_stderr}"
+    );
+
+    let confirmed = local_yolo_command(&temp, &["repl", "--confirm-host-access"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("ironclaw-reborn repl should not crash");
+    let confirmed_stderr = String::from_utf8_lossy(&confirmed.stderr);
+    assert!(
+        !confirmed_stderr.contains("requires explicit disclosure acknowledgement")
+            && !confirmed_stderr.contains("requires --confirm-host-access"),
+        "confirmed repl should pass the host-access gate; got: {confirmed_stderr}"
+    );
+}
+
+#[cfg(feature = "webui-v2-beta")]
+#[test]
+fn serve_confirm_host_access_flag_gates_local_dev_yolo() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing = local_yolo_command(&temp, &["serve"])
+        .output()
+        .expect("ironclaw-reborn serve should not crash");
+    assert!(!missing.status.success(), "missing confirmation must fail");
+    let missing_stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        missing_stderr.contains("requires explicit disclosure acknowledgement"),
+        "stderr should require disclosure acknowledgement; got: {missing_stderr}"
+    );
+
+    let confirmed = local_yolo_command(&temp, &["serve", "--confirm-host-access"])
+        .output()
+        .expect("ironclaw-reborn serve should not crash");
+    assert!(
+        !confirmed.status.success(),
+        "serve still needs webui token config"
+    );
+    let confirmed_stderr = String::from_utf8_lossy(&confirmed.stderr);
+    assert!(
+        !confirmed_stderr.contains("requires explicit disclosure acknowledgement")
+            && !confirmed_stderr.contains("requires --confirm-host-access"),
+        "confirmed serve should pass the host-access gate; got: {confirmed_stderr}"
+    );
+    assert!(
+        confirmed_stderr.contains("IRONCLAW_REBORN_WEBUI_TOKEN"),
+        "confirmed serve should reach WebUI token resolution; got: {confirmed_stderr}"
+    );
+}
+
+#[test]
 fn run_honors_boot_profile_from_config_file() {
     let temp = tempfile::tempdir().expect("tempdir");
     let reborn_home = temp.path().join("reborn-home");
@@ -1913,4 +1996,19 @@ api_key_env = "REBORN_TEST_UNSET_BC8F4D_KEY"
         stderr.contains("REBORN_TEST_UNSET_BC8F4D_KEY"),
         "stderr should name the unset env var; got: {stderr}"
     );
+}
+
+fn local_yolo_command(temp: &tempfile::TempDir, args: &[&str]) -> Command {
+    let reborn_home = temp.path().join("reborn-home");
+    let home = temp.path().join("home");
+    std::fs::create_dir_all(&reborn_home).expect("reborn home");
+    std::fs::create_dir_all(&home).expect("home");
+    let mut command = Command::new(reborn_bin());
+    command
+        .args(args)
+        .env_clear()
+        .env("IRONCLAW_REBORN_HOME", reborn_home)
+        .env("IRONCLAW_REBORN_PROFILE", "local-dev-yolo")
+        .env("HOME", home);
+    command
 }

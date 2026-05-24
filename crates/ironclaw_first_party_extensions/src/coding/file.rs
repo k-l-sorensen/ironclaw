@@ -17,9 +17,9 @@ use super::{
     guest_error, input_error,
     inputs::{optional_usize, required_str},
     paths::{
-        create_parent_dir, filesystem_error, is_excluded_name, is_sensitive_scoped_path,
-        is_workspace_path, operation_allowed, resolve_optional_path, resolve_required_path,
-        scoped_child_path, stat_optional, virtual_to_relative,
+        create_parent_dir, deny_sensitive_parent_dir, filesystem_error, is_excluded_name,
+        is_sensitive_scoped_path, is_workspace_path, operation_allowed, resolve_optional_path,
+        resolve_required_path, scoped_child_path, stat_optional, virtual_to_relative,
     },
     state::{SharedCodingEditLocks, SharedCodingReadState, content_hash, read_scope_key},
     text::{count_matches, decode_text, encode_text, reject_binary_probe, replace_content},
@@ -117,6 +117,7 @@ pub(super) async fn write_file(
         ));
     }
     create_parent_dir(request, &resolved.virtual_path).await?;
+    deny_sensitive_parent_dir(request, &resolved.virtual_path).await?;
     request
         .filesystem
         .write_file(&resolved.virtual_path, content.as_bytes())

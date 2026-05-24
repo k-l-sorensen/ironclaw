@@ -21,7 +21,13 @@ pub(crate) fn workspace_mount_view(
     if let Some(host_home_alias) = host_home_alias {
         mounts.push(grant(HOST_ALIAS, HOST_TARGET, permissions.clone())?);
         if let Some(host_home_alias) = host_home_alias.to_str() {
-            mounts.push(grant(host_home_alias, HOST_TARGET, permissions)?);
+            if let Ok(raw_host_home_alias) = MountAlias::new(host_home_alias) {
+                mounts.push(MountGrant::new(
+                    raw_host_home_alias,
+                    VirtualPath::new(HOST_TARGET)?,
+                    permissions,
+                ));
+            }
         }
     }
     MountView::new(mounts)
@@ -68,4 +74,31 @@ fn grant(
         VirtualPath::new(target)?,
         permissions,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_mount_keeps_host_alias_when_raw_alias_is_not_mount_shaped() {
+        let mounts = workspace_mount_view(
+            MountPermissions::read_write(),
+            Some(Path::new(r"C:\Users\alice")),
+        )
+        .expect("mount view builds");
+
+        assert!(
+            mounts
+                .mounts
+                .iter()
+                .any(|mount| mount.alias.as_str() == "/host")
+        );
+        assert!(
+            mounts
+                .mounts
+                .iter()
+                .all(|mount| mount.alias.as_str() != r"C:\Users\alice")
+        );
+    }
 }

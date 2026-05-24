@@ -1425,6 +1425,24 @@ async fn builtin_coding_blocks_sensitive_host_paths_like_v1() {
         assert_eq!(error, RuntimeFailureKind::Authorization);
     }
 
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(temp.path().join(".ssh"), temp.path().join("dotssh")).unwrap();
+        let error = invoke_with_context(
+            &runtime,
+            WRITE_FILE_CAPABILITY_ID,
+            json!({"path": "/host/dotssh/config", "content": "created through symlink\n"}),
+            context.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error, RuntimeFailureKind::Authorization);
+        assert!(
+            !temp.path().join(".ssh/config").exists(),
+            "write must not create files under sensitive canonical parents"
+        );
+    }
+
     let read = invoke_with_context(
         &runtime,
         READ_FILE_CAPABILITY_ID,

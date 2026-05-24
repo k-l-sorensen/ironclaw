@@ -467,6 +467,30 @@ mod tests {
     }
 
     #[test]
+    fn local_resolver_accepts_host_workspace_and_home_when_filesystem_required() {
+        let resolver = resolver_without_http();
+        let mut plan = plan(
+            ProcessBackendKind::None,
+            false,
+            false,
+            NetworkMode::Deny,
+            false,
+        );
+        plan.requires_filesystem = true;
+        plan.filesystem_backend = FilesystemBackendKind::HostWorkspaceAndHome;
+
+        let services = resolver
+            .resolve(InvocationServicesResolutionRequest {
+                plan: &plan,
+                scope: &ResourceScope::system(),
+                mounts: None,
+            })
+            .expect("local-yolo filesystem backend should resolve");
+
+        assert!(services.runtime_http_egress.is_none());
+    }
+
+    #[test]
     fn local_resolver_ignores_unsupported_filesystem_backend_when_not_required() {
         let resolver = resolver_without_http();
         let mut plan = plan(
