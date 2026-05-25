@@ -6,13 +6,13 @@ use ironclaw_host_api::{InvocationId, MountView, ResourceScope, UserId};
 use ironclaw_product_workflow::{
     LifecyclePackageId, LifecyclePackageKind, LifecyclePackageRef, LifecyclePhase,
     LifecycleProductAction, LifecycleProductContext, LifecycleProductFacade,
-    LifecycleProductResponse, LifecycleReadinessBlocker, ProductWorkflowError,
+    LifecycleProductPayload, LifecycleProductResponse, LifecycleReadinessBlocker,
+    LifecycleSkillSource, LifecycleSkillSummary, ProductWorkflowError,
 };
 use ironclaw_skills::{
     SkillInstallRequest, SkillManagementContext, SkillManagementError, SkillManagementErrorKind,
     SkillRemoveRequest, SkillSearchRequest, install_skill, remove_skill, search_skills,
 };
-use serde_json::{Value, json};
 
 const SKILL_SEARCH_RESULT_LIMIT: usize = 50;
 
@@ -105,18 +105,21 @@ impl RebornLocalLifecycleFacade {
                     .skill_management
                     .search(&query, SKILL_SEARCH_RESULT_LIMIT)
                     .await?;
-                let matched_skills: Vec<Value> =
-                    result.skills.into_iter().map(skill_json).collect();
+                let matched_skills = result
+                    .skills
+                    .into_iter()
+                    .map(skill_summary)
+                    .collect::<Result<Vec<_>, _>>()?;
                 let count = matched_skills.len();
                 Ok(response_with_payload(
                     None,
                     LifecyclePhase::Discovered,
-                    json!({
-                        "skills": matched_skills,
-                        "count": count,
-                        "limit": SKILL_SEARCH_RESULT_LIMIT,
-                        "truncated": result.truncated,
-                    }),
+                    LifecycleProductPayload::SkillSearch {
+                        skills: matched_skills,
+                        count,
+                        limit: SKILL_SEARCH_RESULT_LIMIT,
+                        truncated: result.truncated,
+                    },
                 ))
             }
             LifecycleProductAction::SkillInstall { name, content } => {
@@ -127,10 +130,10 @@ impl RebornLocalLifecycleFacade {
                 Ok(response_with_payload(
                     Some(skill_package_ref(&installed.name)?),
                     LifecyclePhase::Installed,
-                    json!({
-                        "installed": true,
-                        "name": installed.name,
-                    }),
+                    LifecycleProductPayload::SkillInstall {
+                        installed: true,
+                        name: LifecyclePackageId::new(installed.name)?,
+                    },
                 ))
             }
             LifecycleProductAction::SkillRemove { package_ref } => {
@@ -142,10 +145,10 @@ impl RebornLocalLifecycleFacade {
                 Ok(response_with_payload(
                     Some(skill_package_ref(&removed.name)?),
                     LifecyclePhase::Removed,
-                    json!({
-                        "removed": true,
-                        "name": removed.name,
-                    }),
+                    LifecycleProductPayload::SkillRemove {
+                        removed: true,
+                        name: LifecyclePackageId::new(removed.name)?,
+                    },
                 ))
             }
             LifecycleProductAction::ExtensionSearch { .. } => unsupported_projection(None),
@@ -186,7 +189,7 @@ fn skill_package_ref(name: &str) -> Result<LifecyclePackageRef, ProductWorkflowE
 fn response_with_payload(
     package_ref: Option<LifecyclePackageRef>,
     phase: LifecyclePhase,
-    payload: Value,
+    payload: LifecycleProductPayload,
 ) -> LifecycleProductResponse {
     LifecycleProductResponse {
         package_ref,
@@ -197,15 +200,20 @@ fn response_with_payload(
     }
 }
 
-fn skill_json(skill: ironclaw_skills::SkillSummary) -> Value {
-    json!({
-        "name": skill.name,
-        "version": skill.version,
-        "description": skill.description,
-        "source": skill.source.as_str(),
-        "keywords": skill.keywords,
-        "tags": skill.tags,
-        "requires_skills": skill.requires_skills,
+fn skill_summary(
+    skill: ironclaw_skills::SkillSummary,
+) -> Result<LifecycleSkillSummary, ProductWorkflowError> {
+    Ok(LifecycleSkillSummary {
+        name: LifecyclePackageId::new(skill.name)?,
+        version: skill.version,
+        description: skill.description,
+        source: match skill.source {
+            ironclaw_skills::ManagedSkillSource::System => LifecycleSkillSource::System,
+            ironclaw_skills::ManagedSkillSource::User => LifecycleSkillSource::User,
+        },
+        keywords: skill.keywords,
+        tags: skill.tags,
+        requires_skills: skill.requires_skills,
     })
 }
 
@@ -275,13 +283,10 @@ mod tests {
             .await
             .expect("list skills");
         assert_eq!(list.phase, LifecyclePhase::Discovered);
-        assert_eq!(
-            list.payload
-                .as_ref()
-                .and_then(|payload| payload.get("count"))
-                .and_then(Value::as_u64),
-            Some(1)
-        );
+        let Some(LifecycleProductPayload::SkillSearch { count, .. }) = list.payload.as_ref() else {
+            panic!("expected skill search payload");
+        };
+        assert_eq!(*count, 1);
 
         for index in 0..55 {
             facade
@@ -304,20 +309,19 @@ mod tests {
             })
             .await
             .expect("list all skills");
-        let payload = all_skills.payload.as_ref().expect("skill search payload");
-        assert_eq!(payload.get("count").and_then(Value::as_u64), Some(50));
-        assert_eq!(payload.get("limit").and_then(Value::as_u64), Some(50));
-        assert_eq!(
-            payload.get("truncated").and_then(Value::as_bool),
-            Some(true)
-        );
-        assert_eq!(
-            payload
-                .get("skills")
-                .and_then(Value::as_array)
-                .map(Vec::len),
-            Some(50)
-        );
+        let Some(LifecycleProductPayload::SkillSearch {
+            skills,
+            count,
+            limit,
+            truncated,
+        }) = all_skills.payload.as_ref()
+        else {
+            panic!("expected skill search payload");
+        };
+        assert_eq!(*count, 50);
+        assert_eq!(*limit, 50);
+        assert!(*truncated);
+        assert_eq!(skills.len(), 50);
 
         let wrong_kind = facade
             .execute_action(LifecycleProductAction::SkillRemove {

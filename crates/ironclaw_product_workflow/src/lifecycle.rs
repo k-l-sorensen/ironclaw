@@ -198,19 +198,72 @@ pub enum LifecycleProductAction {
     },
 }
 
-impl LifecycleProductAction {
-    pub fn command_name(&self) -> &'static str {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleCommandKind {
+    ExtensionSearch,
+    ExtensionInstall,
+    ExtensionAuth,
+    ExtensionActivate,
+    ExtensionConfigure,
+    ExtensionRemove,
+    SkillSearch,
+    SkillInstall,
+    SkillRemove,
+}
+
+impl LifecycleCommandKind {
+    pub const ALL: [Self; 9] = [
+        Self::ExtensionSearch,
+        Self::ExtensionInstall,
+        Self::ExtensionAuth,
+        Self::ExtensionActivate,
+        Self::ExtensionConfigure,
+        Self::ExtensionRemove,
+        Self::SkillSearch,
+        Self::SkillInstall,
+        Self::SkillRemove,
+    ];
+
+    pub const fn command_name(self) -> &'static str {
         match self {
-            Self::ExtensionSearch { .. } => "extension_search",
-            Self::ExtensionInstall { .. } => "extension_install",
-            Self::ExtensionAuth { .. } => "extension_auth",
-            Self::ExtensionActivate { .. } => "extension_activate",
-            Self::ExtensionConfigure { .. } => "extension_configure",
-            Self::ExtensionRemove { .. } => "extension_remove",
-            Self::SkillSearch { .. } => "skill_search",
-            Self::SkillInstall { .. } => "skill_install",
-            Self::SkillRemove { .. } => "skill_remove",
+            Self::ExtensionSearch => "extension_search",
+            Self::ExtensionInstall => "extension_install",
+            Self::ExtensionAuth => "extension_auth",
+            Self::ExtensionActivate => "extension_activate",
+            Self::ExtensionConfigure => "extension_configure",
+            Self::ExtensionRemove => "extension_remove",
+            Self::SkillSearch => "skill_search",
+            Self::SkillInstall => "skill_install",
+            Self::SkillRemove => "skill_remove",
         }
+    }
+
+    pub fn from_command_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|kind| kind.command_name() == name)
+    }
+}
+
+impl LifecycleProductAction {
+    pub fn command_kind(&self) -> LifecycleCommandKind {
+        match self {
+            Self::ExtensionSearch { .. } => LifecycleCommandKind::ExtensionSearch,
+            Self::ExtensionInstall { .. } => LifecycleCommandKind::ExtensionInstall,
+            Self::ExtensionAuth { .. } => LifecycleCommandKind::ExtensionAuth,
+            Self::ExtensionActivate { .. } => LifecycleCommandKind::ExtensionActivate,
+            Self::ExtensionConfigure { .. } => LifecycleCommandKind::ExtensionConfigure,
+            Self::ExtensionRemove { .. } => LifecycleCommandKind::ExtensionRemove,
+            Self::SkillSearch { .. } => LifecycleCommandKind::SkillSearch,
+            Self::SkillInstall { .. } => LifecycleCommandKind::SkillInstall,
+            Self::SkillRemove { .. } => LifecycleCommandKind::SkillRemove,
+        }
+    }
+
+    pub fn command_name(&self) -> &'static str {
+        self.command_kind().command_name()
     }
 
     /// Returns the `LifecyclePackageRef` when this action targets a single
@@ -231,6 +284,43 @@ impl LifecycleProductAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LifecycleProductPayload {
+    SkillSearch {
+        skills: Vec<LifecycleSkillSummary>,
+        count: usize,
+        limit: usize,
+        truncated: bool,
+    },
+    SkillInstall {
+        installed: bool,
+        name: LifecyclePackageId,
+    },
+    SkillRemove {
+        removed: bool,
+        name: LifecyclePackageId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LifecycleSkillSummary {
+    pub name: LifecyclePackageId,
+    pub version: String,
+    pub description: String,
+    pub source: LifecycleSkillSource,
+    pub keywords: Vec<String>,
+    pub tags: Vec<String>,
+    pub requires_skills: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleSkillSource {
+    System,
+    User,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LifecycleProductResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_ref: Option<LifecyclePackageRef>,
@@ -240,7 +330,7 @@ pub struct LifecycleProductResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<Value>,
+    pub payload: Option<LifecycleProductPayload>,
 }
 
 impl LifecycleProductResponse {

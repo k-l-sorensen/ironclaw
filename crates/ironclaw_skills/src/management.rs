@@ -4,18 +4,16 @@ use std::{
 };
 
 use crate::{MAX_PROMPT_FILE_SIZE, normalize_line_endings, parse_skill_md, validate_skill_name};
-use async_trait::async_trait;
 use ironclaw_filesystem::{
-    BackendCapabilities, DirEntry, FileStat, FileType, FilesystemError, FilesystemOperation,
-    RootFilesystem, ScopedFilesystem,
+    DirEntry, FileType, FilesystemError, FilesystemOperation, RootFilesystem, ScopedFilesystem,
 };
-use ironclaw_host_api::{HostApiError, MountView, ResourceScope, ScopedPath, VirtualPath};
+use ironclaw_host_api::{HostApiError, MountView, ResourceScope, ScopedPath};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const USER_SKILLS_ROOT: &str = "/skills";
 const SYSTEM_SKILLS_ROOT: &str = "/system/skills";
 const SKILL_FILE_NAME: &str = "SKILL.md";
-const SKILL_SEARCH_SCAN_LIMIT: usize = 250;
+const SKILL_SEARCH_ENTRY_SCAN_LIMIT: usize = 250;
 static SKILL_WRITE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,7 +43,7 @@ impl SkillManagementError {
 
 #[derive(Clone)]
 pub struct SkillManagementContext {
-    filesystem: Arc<ScopedFilesystem<SkillManagementRootFilesystem>>,
+    filesystem: Arc<ScopedFilesystem<dyn RootFilesystem>>,
     scope: ResourceScope,
     write_lock_namespace: String,
 }
@@ -58,53 +56,10 @@ impl SkillManagementContext {
     ) -> Self {
         let write_lock_namespace = skill_write_lock_namespace(&mounts, &scope);
         Self {
-            filesystem: Arc::new(ScopedFilesystem::with_fixed_view(
-                Arc::new(SkillManagementRootFilesystem { inner: filesystem }),
-                mounts,
-            )),
+            filesystem: Arc::new(ScopedFilesystem::with_fixed_view(filesystem, mounts)),
             scope,
             write_lock_namespace,
         }
-    }
-}
-
-#[derive(Clone)]
-struct SkillManagementRootFilesystem {
-    inner: Arc<dyn RootFilesystem>,
-}
-
-#[async_trait]
-impl RootFilesystem for SkillManagementRootFilesystem {
-    fn capabilities(&self) -> BackendCapabilities {
-        self.inner.capabilities()
-    }
-
-    async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
-        self.inner.list_dir(path).await
-    }
-
-    async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
-        self.inner.stat(path).await
-    }
-
-    async fn read_file_bounded(
-        &self,
-        path: &VirtualPath,
-        max_bytes: usize,
-    ) -> Result<Option<Vec<u8>>, FilesystemError> {
-        self.inner.read_file_bounded(path, max_bytes).await
-    }
-
-    async fn write_file(&self, path: &VirtualPath, bytes: &[u8]) -> Result<(), FilesystemError> {
-        self.inner.write_file(path, bytes).await
-    }
-
-    async fn create_dir_all(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
-        self.inner.create_dir_all(path).await
-    }
-
-    async fn delete(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
-        self.inner.delete(path).await
     }
 }
 
@@ -190,14 +145,14 @@ pub async fn search_skills(
 ) -> Result<SkillSearchResult, SkillManagementError> {
     let normalized_query = request.query.trim().to_lowercase();
     let mut skills = Vec::new();
-    let mut remaining_scan = SKILL_SEARCH_SCAN_LIMIT;
+    let mut remaining_entries = SKILL_SEARCH_ENTRY_SCAN_LIMIT;
     let mut truncated = collect_matching_skill_root(
         context,
         SYSTEM_SKILLS_ROOT,
         SkillSource::System,
         &normalized_query,
         request.limit,
-        &mut remaining_scan,
+        &mut remaining_entries,
         &mut skills,
     )
     .await?;
@@ -208,7 +163,7 @@ pub async fn search_skills(
             SkillSource::User,
             &normalized_query,
             request.limit,
-            &mut remaining_scan,
+            &mut remaining_entries,
             &mut skills,
         )
         .await?;
@@ -439,12 +394,19 @@ async fn collect_matching_skill_root(
     source: SkillSource,
     normalized_query: &str,
     limit: usize,
-    remaining_scan: &mut usize,
+    remaining_entries: &mut usize,
     skills: &mut Vec<SkillSummary>,
 ) -> Result<bool, SkillManagementError> {
-    let entries = list_skill_root_entries(context, scoped_root).await?;
+    if skills.len() >= limit || *remaining_entries == 0 {
+        return Ok(true);
+    }
+    let fetch_limit = remaining_entries.saturating_add(1);
+    let mut entries = list_skill_root_entries_bounded(context, scoped_root, fetch_limit).await?;
+    let root_truncated = entries.len() > *remaining_entries;
+    entries.truncate(*remaining_entries);
 
     for entry in entries {
+        *remaining_entries -= 1;
         if entry.file_type != FileType::Directory {
             continue;
         }
@@ -452,10 +414,9 @@ async fn collect_matching_skill_root(
         if !validate_skill_name(name) {
             continue;
         }
-        if skills.len() >= limit || *remaining_scan == 0 {
+        if skills.len() >= limit {
             return Ok(true);
         }
-        *remaining_scan -= 1;
         let skill_path = skill_scoped_path(scoped_root, name, SKILL_FILE_NAME)?;
         let Some(skill) = read_skill_summary(context, &skill_path, source).await? else {
             continue;
@@ -465,16 +426,41 @@ async fn collect_matching_skill_root(
         }
         skills.push(skill);
     }
-    Ok(false)
+    Ok(root_truncated)
 }
 
 async fn list_skill_root_entries(
     context: &SkillManagementContext,
     scoped_root: &str,
 ) -> Result<Vec<DirEntry>, SkillManagementError> {
+    list_skill_root_entries_with(context, scoped_root, None).await
+}
+
+async fn list_skill_root_entries_bounded(
+    context: &SkillManagementContext,
+    scoped_root: &str,
+    max_entries: usize,
+) -> Result<Vec<DirEntry>, SkillManagementError> {
+    list_skill_root_entries_with(context, scoped_root, Some(max_entries)).await
+}
+
+async fn list_skill_root_entries_with(
+    context: &SkillManagementContext,
+    scoped_root: &str,
+    max_entries: Option<usize>,
+) -> Result<Vec<DirEntry>, SkillManagementError> {
     let root = ScopedPath::new(scoped_root)
         .map_err(|_| SkillManagementError::new(SkillManagementErrorKind::InvalidInput))?;
-    match context.filesystem.list_dir(&context.scope, &root).await {
+    let result = match max_entries {
+        Some(max_entries) => {
+            context
+                .filesystem
+                .list_dir_bounded(&context.scope, &root, max_entries)
+                .await
+        }
+        None => context.filesystem.list_dir(&context.scope, &root).await,
+    };
+    match result {
         Ok(entries) => Ok(entries),
         Err(FilesystemError::NotFound { .. }) => {
             tracing::debug!("skill management skill root not found");
@@ -656,7 +642,7 @@ fn filesystem_error(error: FilesystemError) -> SkillManagementError {
 mod tests {
     use super::*;
     use ironclaw_filesystem::InMemoryBackend;
-    use ironclaw_host_api::{MountAlias, MountGrant, MountPermissions};
+    use ironclaw_host_api::{MountAlias, MountGrant, MountPermissions, VirtualPath};
 
     #[tokio::test]
     async fn install_list_and_remove_user_skills_through_scoped_mounts() {
@@ -810,9 +796,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn search_skills_stops_after_scan_budget() {
+    async fn search_skills_stops_after_entry_scan_budget() {
         let filesystem = Arc::new(InMemoryBackend::default());
-        for index in 0..=SKILL_SEARCH_SCAN_LIMIT {
+        for index in 0..=SKILL_SEARCH_ENTRY_SCAN_LIMIT {
             write_file(
                 filesystem.as_ref(),
                 &format!("/projects/skills/local-{index:03}/SKILL.md"),

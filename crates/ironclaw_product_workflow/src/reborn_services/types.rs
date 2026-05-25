@@ -9,7 +9,9 @@ use ironclaw_turns::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::{LifecyclePackageRef, LifecyclePhase, LifecycleReadinessBlocker};
+use crate::{
+    LifecyclePackageRef, LifecyclePhase, LifecycleProductPayload, LifecycleReadinessBlocker,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebornCreateThreadResponse {
@@ -207,5 +209,5 @@ pub struct RebornSetupExtensionResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_ref: Option<LifecyclePackageRef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<serde_json::Value>,
+    pub payload: Option<LifecycleProductPayload>,
 }
