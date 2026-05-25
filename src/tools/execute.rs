@@ -194,17 +194,59 @@ pub async fn execute_tool_audited(
     let result = execute_tool_with_safety(tools, safety, tool_name, params, base_ctx).await;
     let elapsed = start.elapsed();
 
+    persist_tool_audit(
+        store,
+        safety,
+        &base_ctx.user_id,
+        tool_name,
+        redacted_input,
+        &result,
+        elapsed,
+        source,
+        existing_job_id,
+    )
+    .await;
+
+    result
+}
+
+/// Persist an `ActionRecord` for a tool call whose `Result<String, Error>` has
+/// **already been produced** — either by [`execute_tool_with_safety`] (the
+/// host execution path, via [`execute_tool_audited`]) or by an out-of-band
+/// executor such as the engine-v2 sandbox/mount backend, where the tool ran
+/// inside a container and the funnel never called `Tool::execute` locally.
+///
+/// Both call shapes converge here so host- and sandbox-dispatched calls
+/// produce the **same audit shape**: redacted input params + sanitized output
+/// (or the error string), correlated to either the caller's existing
+/// `agent_jobs` row (`existing_job_id = Some`) or a freshly-minted system job
+/// (`None`). Redaction is the caller's responsibility — `redacted_input` MUST
+/// already be redacted (via [`redact_params`]) so this helper never re-derives
+/// it and the two paths share one redaction implementation.
+///
+/// Store-optional / best-effort: persistence failures are logged at `debug!`
+/// (never `warn!`/`info!`, which corrupt the REPL/TUI — see CLAUDE.md) and
+/// swallowed; the tool result itself is owned by the caller and unaffected.
+#[allow(clippy::too_many_arguments)]
+pub async fn persist_tool_audit(
+    store: &Arc<dyn Database>,
+    safety: &SafetyLayer,
+    user_id: &str,
+    tool_name: &str,
+    redacted_input: serde_json::Value,
+    result: &Result<String, Error>,
+    elapsed: std::time::Duration,
+    source: DispatchSource,
+    existing_job_id: Option<Uuid>,
+) {
     // Resolve the audit FK job. When the caller already persisted a real
     // `agent_jobs` row (e.g. the scheduler), correlate the ActionRecord to it.
-    // Otherwise mint a fresh system job (chat/dispatcher behavior).
+    // Otherwise mint a fresh system job (chat/dispatcher/bridge behavior).
     let audit_job_id = match existing_job_id {
         Some(job_id) => Some(job_id),
         None => {
             let source_label = source.to_string();
-            match store
-                .create_system_job(&base_ctx.user_id, &source_label)
-                .await
-            {
+            match store.create_system_job(user_id, &source_label).await {
                 Ok(job_id) => Some(job_id),
                 Err(e) => {
                     tracing::debug!(
@@ -220,7 +262,7 @@ pub async fn execute_tool_audited(
 
     if let Some(job_id) = audit_job_id {
         let action = ActionRecord::new(0, tool_name, redacted_input);
-        let action = match &result {
+        let action = match result {
             Ok(output) => {
                 // `output` is already the pretty-printed tool result string.
                 // Sanitize it for the audit payload (mirrors dispatch).
@@ -242,8 +284,6 @@ pub async fn execute_tool_audited(
             );
         }
     }
-
-    result
 }
 
 /// Process a tool result into a `ChatMessage::tool_result` with safety sanitization.
