@@ -11,12 +11,13 @@ use super::{
     CapabilityId, DenyWasmHostHttp, DispatchError, ExtensionRuntime, FirstPartyCapabilityRegistry,
     FirstPartyCapabilityRequest, InvocationServicesResolutionRequest, InvocationServicesResolver,
     McpError, McpExecutionRequest, McpExecutor, McpInvocation, NetworkObligationPolicyStore,
-    PlannerError, PreparedWitTool, ResourceGovernor, ResourceReservationId, ResourceScope,
-    ResourceUsage, RootFilesystem, RuntimeAdapter, RuntimeAdapterRequest, RuntimeAdapterResult,
-    RuntimeDispatchErrorKind, RuntimeKind, ScriptError, ScriptExecutionRequest, ScriptExecutor,
-    ScriptInvocation, SharedRuntimeHttpEgress, WasmError, WasmRuntimeCredentialProvider,
-    WasmRuntimeHttpAdapter, WasmRuntimePolicyDiscarder, WitToolHost, WitToolRequest,
-    WitToolRuntime, WitToolRuntimeConfig, plan_capability, runtime_http_egress,
+    PlannerError, PreparedWitTool, ProcessBackendKind, ResourceCeiling, ResourceGovernor,
+    ResourceReservationId, ResourceScope, ResourceUsage, RootFilesystem, RuntimeAdapter,
+    RuntimeAdapterRequest, RuntimeAdapterResult, RuntimeDispatchErrorKind, RuntimeKind,
+    ScriptError, ScriptExecutionRequest, ScriptExecutor, ScriptInvocation, SharedRuntimeHttpEgress,
+    WasmError, WasmRuntimeCredentialProvider, WasmRuntimeHttpAdapter, WasmRuntimePolicyDiscarder,
+    WitToolHost, WitToolRequest, WitToolRuntime, WitToolRuntimeConfig, plan_capability,
+    runtime_http_egress,
 };
 
 pub(super) struct ServiceResolvedRuntimeAdapter<T> {
@@ -255,6 +256,14 @@ where
             secret_mode = ?plan.secret_mode,
             "first-party runtime adapter policy plan resolved"
         );
+        validate_first_party_resource_ceiling(request.resource_ceiling.as_ref(), &plan).map_err(
+            |kind| {
+                if let Some(reservation) = &request.resource_reservation {
+                    release_first_party_reservation(request.governor, reservation.id);
+                }
+                DispatchError::FirstParty { kind }
+            },
+        )?;
         let services = self
             .invocation_services
             .resolve(InvocationServicesResolutionRequest {
@@ -302,6 +311,7 @@ where
             scope: request.scope.clone(),
             estimate: request.estimate,
             mounts: request.mounts,
+            resource_ceiling: request.resource_ceiling,
             services,
             input: request.input,
         }))
@@ -631,6 +641,34 @@ fn wasm_invocation_context(capability_id: &CapabilityId) -> String {
         "capability_id": capability_id.as_str(),
     })
     .to_string()
+}
+
+fn validate_first_party_resource_ceiling(
+    ceiling: Option<&ResourceCeiling>,
+    plan: &crate::ExecutionPlan,
+) -> Result<(), RuntimeDispatchErrorKind> {
+    let Some(ceiling) = ceiling else {
+        return Ok(());
+    };
+    if ceiling.max_wall_clock_ms.is_some() && !plan.requires_process {
+        return Err(RuntimeDispatchErrorKind::Resource);
+    }
+    if let Some(sandbox) = &ceiling.sandbox {
+        if sandbox.memory_bytes.is_some() || sandbox.process_count.is_some() {
+            if !plan.requires_process
+                || !matches!(plan.process_backend, ProcessBackendKind::TenantSandbox)
+            {
+                return Err(RuntimeDispatchErrorKind::Resource);
+            }
+        }
+        if sandbox.cpu_time_ms.is_some()
+            || sandbox.disk_bytes.is_some()
+            || sandbox.network_egress_bytes.is_some()
+        {
+            return Err(RuntimeDispatchErrorKind::Resource);
+        }
+    }
+    Ok(())
 }
 
 fn account_or_release_failed_first_party_execution<G>(

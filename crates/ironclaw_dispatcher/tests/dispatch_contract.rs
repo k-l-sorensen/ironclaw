@@ -47,6 +47,7 @@ async fn dispatcher_routes_wasm_capability_through_registered_adapter() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "hello dispatcher"}),
         })
         .await
@@ -69,6 +70,63 @@ async fn dispatcher_routes_wasm_capability_through_registered_adapter() {
     );
     assert_eq!(requests[0].runtime, RuntimeKind::Wasm);
     assert_eq!(requests[0].input, json!({"message": "hello dispatcher"}));
+}
+
+#[tokio::test]
+async fn dispatcher_rejects_runtime_resource_ceiling_without_first_party_handoff() {
+    let fs = mounted_empty_extension_root();
+    let mut registry = ExtensionRegistry::new();
+    registry
+        .insert(package_from_manifest(WASM_MANIFEST))
+        .unwrap();
+    let adapter = RecordingAdapter::new(RuntimeKind::Wasm, json!({"message": "unused"}));
+    let governor = InMemoryResourceGovernor::new();
+    let scope = sample_scope();
+    governor
+        .set_limit(
+            ResourceAccount::tenant(scope.tenant_id.clone()),
+            ResourceLimits {
+                max_concurrency_slots: Some(1),
+                max_output_bytes: Some(10_000),
+                ..ResourceLimits::default()
+            },
+        )
+        .unwrap();
+
+    let dispatcher = RuntimeDispatcher::new(&registry, &fs, &governor)
+        .with_runtime_adapter(RuntimeKind::Wasm, &adapter);
+    let err = dispatcher
+        .dispatch_json(CapabilityDispatchRequest {
+            capability_id: CapabilityId::new("echo.say").unwrap(),
+            scope,
+            estimate: ResourceEstimate {
+                concurrency_slots: Some(1),
+                output_bytes: Some(10_000),
+                wall_clock_ms: Some(1_000),
+                ..ResourceEstimate::default()
+            },
+            mounts: None,
+            resource_reservation: None,
+            resource_ceiling: Some(ResourceCeiling {
+                max_usd: None,
+                max_input_tokens: None,
+                max_output_tokens: None,
+                max_wall_clock_ms: Some(1_000),
+                max_output_bytes: None,
+                sandbox: None,
+            }),
+            input: json!({"message": "hello dispatcher"}),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        err,
+        DispatchError::Wasm {
+            kind: RuntimeDispatchErrorKind::Resource
+        }
+    ));
+    assert!(adapter.requests().is_empty());
 }
 
 #[tokio::test]
@@ -113,6 +171,7 @@ async fn dispatcher_routes_script_capability_through_registered_adapter() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "hello script dispatcher"}),
         })
         .await
@@ -167,6 +226,7 @@ async fn dispatcher_redacts_runtime_adapter_failure_details() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "redact stderr"}),
         })
         .await
@@ -225,6 +285,7 @@ async fn dispatcher_routes_mcp_capability_through_registered_adapter() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"query": "ironclaw"}),
         })
         .await
@@ -263,6 +324,7 @@ async fn dispatcher_fails_unknown_capability_without_reserving_resources() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "nope"}),
         })
         .await
@@ -296,6 +358,7 @@ async fn dispatcher_releases_prepared_reservation_when_validation_fails_before_a
             estimate,
             mounts: None,
             resource_reservation: Some(reservation),
+            resource_ceiling: None,
             input: json!({"message": "release on validation failure"}),
         })
         .await
@@ -329,6 +392,7 @@ async fn dispatcher_requires_mcp_backend_before_reserving_resources() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"query": "blocked"}),
         })
         .await
@@ -367,6 +431,7 @@ async fn dispatcher_requires_script_backend_before_reserving_resources() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "blocked"}),
         })
         .await
@@ -404,6 +469,7 @@ async fn dispatcher_requires_wasm_backend_before_reserving_resources() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "blocked"}),
         })
         .await

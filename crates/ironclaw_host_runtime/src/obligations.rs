@@ -1284,9 +1284,11 @@ impl CapabilityObligationHandler for BuiltinObligationHandler {
             .await?;
         self.preflight_resource_ceiling(&request)?;
         let resource_reservation = self.reserve_resource_obligation(&request)?;
+        let resource_ceiling = resource_ceiling_obligation(request.obligations)?.cloned();
         let outcome = CapabilityObligationOutcome {
             mounts: scoped_mounts,
             resource_reservation,
+            resource_ceiling,
         };
 
         if let Err(error) = self
@@ -1581,9 +1583,6 @@ fn resource_ceiling_obligation(
 fn validate_supported_resource_ceiling(
     ceiling: &ResourceCeiling,
 ) -> Result<(), CapabilityObligationError> {
-    if ceiling.max_wall_clock_ms.is_some() {
-        return Err(resource_obligation_failed());
-    }
     if let Some(sandbox) = &ceiling.sandbox {
         validate_supported_sandbox_quota(sandbox)?;
     }
@@ -1594,10 +1593,8 @@ fn validate_supported_sandbox_quota(
     sandbox: &SandboxQuota,
 ) -> Result<(), CapabilityObligationError> {
     if sandbox.cpu_time_ms.is_some()
-        || sandbox.memory_bytes.is_some()
         || sandbox.disk_bytes.is_some()
         || sandbox.network_egress_bytes.is_some()
-        || sandbox.process_count.is_some()
     {
         return Err(resource_obligation_failed());
     }
@@ -1611,6 +1608,13 @@ fn validate_estimate_within_ceiling(
     check_optional_decimal_ceiling(estimate.usd, ceiling.max_usd)?;
     check_required_integer_ceiling(estimate.input_tokens, ceiling.max_input_tokens)?;
     check_required_integer_ceiling(estimate.output_tokens, ceiling.max_output_tokens)?;
+    check_required_integer_ceiling(estimate.wall_clock_ms, ceiling.max_wall_clock_ms)?;
+    if let Some(sandbox) = &ceiling.sandbox {
+        check_required_integer_ceiling(
+            estimate.process_count.map(u64::from),
+            sandbox.process_count.map(u64::from),
+        )?;
+    }
     Ok(())
 }
 
@@ -1622,6 +1626,13 @@ fn validate_usage_within_ceiling(
     check_decimal_ceiling(usage.usd, ceiling.max_usd)?;
     check_integer_ceiling(usage.input_tokens, ceiling.max_input_tokens)?;
     check_integer_ceiling(usage.output_tokens, ceiling.max_output_tokens)?;
+    check_integer_ceiling(usage.wall_clock_ms, ceiling.max_wall_clock_ms)?;
+    if let Some(sandbox) = &ceiling.sandbox {
+        check_integer_ceiling(
+            u64::from(usage.process_count),
+            sandbox.process_count.map(u64::from),
+        )?;
+    }
     check_output_bytes_ceiling(output_bytes, ceiling.max_output_bytes)?;
     Ok(())
 }

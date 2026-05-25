@@ -248,6 +248,17 @@ impl RebornScopedSandboxCommandTransport {
         );
         let env = validate_env(request.extra_env)?;
         let container_user = self.config.container_identity.container_user()?;
+        let memory_bytes = request
+            .limits
+            .sandbox
+            .memory_bytes
+            .unwrap_or(self.config.memory_bytes)
+            .min(self.config.memory_bytes);
+        let pids_limit = request.limits.sandbox.process_count.map(i64::from);
+        let output_limit = request
+            .limits
+            .output_limit()
+            .min(self.config.max_output_bytes);
         let binds = self
             .config
             .mount_sources
@@ -258,8 +269,9 @@ impl RebornScopedSandboxCommandTransport {
             .collect::<Vec<_>>();
         let host_config = HostConfig {
             binds: Some(binds),
-            memory: Some(self.config.memory_bytes as i64),
+            memory: Some(memory_bytes as i64),
             cpu_shares: Some(self.config.cpu_shares as i64),
+            pids_limit,
             auto_remove: Some(false),
             network_mode: self.config.disable_network.then(|| "none".to_string()),
             cap_drop: Some(vec!["ALL".to_string()]),
@@ -312,8 +324,7 @@ impl RebornScopedSandboxCommandTransport {
                     ))
                 })?;
             let exit_code = wait_for_container(&self.docker, &container_id).await?;
-            let output =
-                collect_logs(&self.docker, &container_id, self.config.max_output_bytes).await?;
+            let output = collect_logs(&self.docker, &container_id, output_limit).await?;
             Ok(CommandExecutionOutput {
                 output,
                 exit_code,
@@ -351,9 +362,8 @@ impl SandboxCommandTransport for RebornScopedSandboxCommandTransport {
         let workspace = self.prepare_workspace(&request.scope).await?;
         let workdir = Self::resolve_container_workdir(request.workdir.as_deref())?;
         let timeout = request
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(self.config.default_timeout);
+            .limits
+            .effective_timeout(request.timeout_secs, self.config.default_timeout);
         self.execute_in_container(request, &workspace, workdir, timeout)
             .await
     }
@@ -589,6 +599,7 @@ mod tests {
                 command: "true".to_string(),
                 workdir: None,
                 timeout_secs: Some(1),
+                limits: crate::CommandResourceLimits::default(),
                 extra_env: HashMap::new(),
             })
             .await

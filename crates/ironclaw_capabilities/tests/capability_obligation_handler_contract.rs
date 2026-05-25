@@ -414,6 +414,7 @@ impl CapabilityObligationHandler for EffectObligationHandler {
         Ok(CapabilityObligationOutcome {
             mounts: self.mounts.clone(),
             resource_reservation: self.reservation.clone(),
+            resource_ceiling: None,
         })
     }
 
@@ -447,6 +448,7 @@ impl CapabilityObligationHandler for FailingCompletionObligationHandler {
         Ok(CapabilityObligationOutcome {
             mounts: None,
             resource_reservation: Some(self.reservation.clone()),
+            resource_ceiling: None,
         })
     }
 

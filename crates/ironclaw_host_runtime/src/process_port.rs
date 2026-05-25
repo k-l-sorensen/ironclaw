@@ -66,7 +66,41 @@ pub struct CommandExecutionRequest {
     pub command: String,
     pub workdir: Option<String>,
     pub timeout_secs: Option<u64>,
+    pub limits: CommandResourceLimits,
     pub extra_env: HashMap<String, String>,
+}
+
+/// Command-level resource limits that a process port can enforce before or
+/// during execution.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandResourceLimits {
+    pub wall_clock_ms: Option<u64>,
+    pub output_bytes: Option<u64>,
+    pub sandbox: CommandSandboxLimits,
+}
+
+impl CommandResourceLimits {
+    pub(crate) fn effective_timeout(&self, requested: Option<u64>, default: Duration) -> Duration {
+        let requested = requested.map(Duration::from_secs).unwrap_or(default);
+        match self.wall_clock_ms.map(Duration::from_millis) {
+            Some(limit) => requested.min(limit),
+            None => requested,
+        }
+    }
+
+    pub(crate) fn output_limit(&self) -> usize {
+        self.output_bytes
+            .and_then(|limit| usize::try_from(limit).ok())
+            .unwrap_or(COMMAND_MAX_OUTPUT_SIZE)
+            .min(COMMAND_MAX_OUTPUT_SIZE)
+    }
+}
+
+/// Sandbox-only command limits.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandSandboxLimits {
+    pub memory_bytes: Option<u64>,
+    pub process_count: Option<u32>,
 }
 
 /// Process-port command result normalized for capability handlers.
@@ -141,13 +175,14 @@ impl RuntimeProcessPort for TenantSandboxProcessPort {
         request: CommandExecutionRequest,
     ) -> Result<CommandExecutionOutput, RuntimeProcessError> {
         let timeout = request
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_COMMAND_TIMEOUT);
+            .limits
+            .effective_timeout(request.timeout_secs, DEFAULT_COMMAND_TIMEOUT);
         let mut request = request;
-        request.timeout_secs = Some(timeout.as_secs());
+        request.timeout_secs = Some(duration_secs_ceil(timeout));
+        request.limits.wall_clock_ms = Some(duration_millis_u64(timeout));
+        let output_limit = request.limits.output_limit();
         let mut output = self.transport.run_command(request).await?;
-        output.output = truncate_output(&output.output);
+        output.output = truncate_output(&output.output, output_limit);
         output.sandboxed = true;
         Ok(output)
     }
@@ -201,10 +236,17 @@ impl RuntimeProcessPort for LocalHostProcessPort {
                     "cannot determine working directory: {e}"
                 ))
             })?;
+        if request.limits.sandbox.memory_bytes.is_some()
+            || request.limits.sandbox.process_count.is_some()
+        {
+            return Err(RuntimeProcessError::ExecutionFailed(
+                "sandbox resource limits require a sandbox process port".to_string(),
+            ));
+        }
         let timeout = request
-            .timeout_secs
-            .map(Duration::from_secs)
-            .unwrap_or(DEFAULT_COMMAND_TIMEOUT);
+            .limits
+            .effective_timeout(request.timeout_secs, DEFAULT_COMMAND_TIMEOUT);
+        let output_limit = request.limits.output_limit();
         if self.env_mode == LocalHostProcessEnvMode::Inherited {
             tracing::warn!(
                 host_access = "full-local",
@@ -216,6 +258,7 @@ impl RuntimeProcessPort for LocalHostProcessPort {
             &request.command,
             &cwd,
             timeout,
+            output_limit,
             &request.extra_env,
             self.env_mode,
         )
@@ -233,6 +276,7 @@ async fn execute_local_command(
     cmd: &str,
     workdir: &PathBuf,
     timeout: Duration,
+    output_limit: usize,
     extra_env: &HashMap<String, String>,
     env_mode: LocalHostProcessEnvMode,
 ) -> Result<(String, i32), RuntimeProcessError> {
@@ -279,7 +323,7 @@ async fn execute_local_command(
     let result = tokio::time::timeout(timeout, async {
         let stdout_fut = async {
             if let Some(out) = stdout_handle {
-                read_stream_limited(out).await
+                read_stream_limited(out, output_limit).await
             } else {
                 String::new()
             }
@@ -287,7 +331,7 @@ async fn execute_local_command(
 
         let stderr_fut = async {
             if let Some(err) = stderr_handle {
-                read_stream_limited(err).await
+                read_stream_limited(err, output_limit).await
             } else {
                 String::new()
             }
@@ -307,7 +351,7 @@ async fn execute_local_command(
     .await;
 
     match result {
-        Ok(Ok((output, code))) => Ok((truncate_output(&output), code)),
+        Ok(Ok((output, code))) => Ok((truncate_output(&output, output_limit), code)),
         Ok(Err(e)) => Err(RuntimeProcessError::ExecutionFailed(format!(
             "Command execution failed: {e}"
         ))),
@@ -331,13 +375,13 @@ async fn terminate_child_tree(child: &mut tokio::process::Child) {
     let _ = child.wait().await;
 }
 
-async fn read_stream_limited<R>(mut stream: R) -> String
+async fn read_stream_limited<R>(mut stream: R, limit: usize) -> String
 where
     R: tokio::io::AsyncRead + Unpin,
 {
     let mut buf = Vec::new();
     (&mut stream)
-        .take((COMMAND_MAX_OUTPUT_SIZE + 1) as u64)
+        .take((limit + 1) as u64)
         .read_to_end(&mut buf)
         .await
         .ok();
@@ -345,23 +389,32 @@ where
         .await
         .ok();
     let output = String::from_utf8_lossy(&buf).to_string();
-    truncate_output(&output)
+    truncate_output(&output, limit)
 }
 
-fn truncate_output(s: &str) -> String {
-    if s.len() <= COMMAND_MAX_OUTPUT_SIZE {
+fn truncate_output(s: &str, limit: usize) -> String {
+    if s.len() <= limit {
         s.to_string()
     } else {
-        let half = COMMAND_MAX_OUTPUT_SIZE / 2;
+        let half = limit / 2;
         let head_end = floor_char_boundary(s, half);
         let tail_start = floor_char_boundary(s, s.len() - half);
         format!(
             "{}\n\n... [truncated {} bytes] ...\n\n{}",
             &s[..head_end], // safety: head_end was clamped to a UTF-8 character boundary.
-            s.len() - COMMAND_MAX_OUTPUT_SIZE,
+            s.len() - limit,
             &s[tail_start..]
         )
     }
+}
+
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+fn duration_secs_ceil(duration: Duration) -> u64 {
+    let millis = duration_millis_u64(duration);
+    millis.saturating_add(999) / 1000
 }
 
 fn floor_char_boundary(s: &str, pos: usize) -> usize {
@@ -453,6 +506,7 @@ mod tests {
                 command: "echo sandbox".to_string(),
                 workdir: None,
                 timeout_secs: None,
+                limits: CommandResourceLimits::default(),
                 extra_env: HashMap::new(),
             })
             .await
@@ -473,6 +527,7 @@ mod tests {
             command: "echo sandbox".to_string(),
             workdir: None,
             timeout_secs: None,
+            limits: CommandResourceLimits::default(),
             extra_env: HashMap::new(),
         })
         .await
@@ -486,6 +541,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_sandbox_process_port_clamps_timeout_to_wall_clock_limit() {
+        let transport = std::sync::Arc::new(RecordingSandboxTransport::default());
+        let port = TenantSandboxProcessPort::new(transport.clone());
+
+        port.run_command(CommandExecutionRequest {
+            scope: ResourceScope::system(),
+            mounts: None,
+            command: "echo sandbox".to_string(),
+            workdir: None,
+            timeout_secs: Some(120),
+            limits: CommandResourceLimits {
+                wall_clock_ms: Some(2_000),
+                ..CommandResourceLimits::default()
+            },
+            extra_env: HashMap::new(),
+        })
+        .await
+        .unwrap();
+
+        let requests = transport.requests.lock().unwrap();
+        assert_eq!(requests[0].timeout_secs, Some(2));
+        assert_eq!(requests[0].limits.wall_clock_ms, Some(2_000));
+    }
+
+    #[tokio::test]
+    async fn local_process_port_rejects_sandbox_only_limits() {
+        let port = LocalHostProcessPort::new();
+
+        let error = port
+            .run_command(CommandExecutionRequest {
+                scope: ResourceScope::system(),
+                mounts: None,
+                command: "true".to_string(),
+                workdir: None,
+                timeout_secs: Some(1),
+                limits: CommandResourceLimits {
+                    sandbox: CommandSandboxLimits {
+                        memory_bytes: Some(1024),
+                        process_count: None,
+                    },
+                    ..CommandResourceLimits::default()
+                },
+                extra_env: HashMap::new(),
+            })
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error}").contains("sandbox resource limits"));
+    }
+
+    #[tokio::test]
     async fn tenant_sandbox_process_port_propagates_transport_error() {
         let port = TenantSandboxProcessPort::new(std::sync::Arc::new(FailingSandboxTransport));
 
@@ -496,6 +602,7 @@ mod tests {
                 command: "echo sandbox".to_string(),
                 workdir: None,
                 timeout_secs: None,
+                limits: CommandResourceLimits::default(),
                 extra_env: HashMap::new(),
             })
             .await
@@ -518,6 +625,7 @@ mod tests {
                 command: "echo sandbox".to_string(),
                 workdir: None,
                 timeout_secs: Some(1),
+                limits: CommandResourceLimits::default(),
                 extra_env: HashMap::new(),
             })
             .await
@@ -541,6 +649,7 @@ mod tests {
                 command: "echo sandbox".to_string(),
                 workdir: None,
                 timeout_secs: None,
+                limits: CommandResourceLimits::default(),
                 extra_env: HashMap::new(),
             })
             .await
@@ -553,7 +662,7 @@ mod tests {
     fn truncate_output_preserves_exact_limit() {
         let output = "x".repeat(COMMAND_MAX_OUTPUT_SIZE);
 
-        assert_eq!(truncate_output(&output), output);
+        assert_eq!(truncate_output(&output, COMMAND_MAX_OUTPUT_SIZE), output);
     }
 
     #[test]
@@ -565,7 +674,7 @@ mod tests {
             "b".repeat(COMMAND_MAX_OUTPUT_SIZE)
         );
 
-        let truncated = truncate_output(&output);
+        let truncated = truncate_output(&output, COMMAND_MAX_OUTPUT_SIZE);
 
         assert!(truncated.is_char_boundary(COMMAND_MAX_OUTPUT_SIZE / 2 - 1));
         assert!(truncated.contains("... [truncated "));
@@ -577,7 +686,7 @@ mod tests {
     async fn read_stream_limited_truncates_after_limit() {
         let input = "x".repeat(COMMAND_MAX_OUTPUT_SIZE + 1);
 
-        let output = read_stream_limited(input.as_bytes()).await;
+        let output = read_stream_limited(input.as_bytes(), COMMAND_MAX_OUTPUT_SIZE).await;
 
         assert!(output.len() > COMMAND_MAX_OUTPUT_SIZE);
         assert!(output.contains("... [truncated 1 bytes] ..."));
@@ -592,6 +701,7 @@ mod tests {
             "printf '%s' \"$HOME\"",
             &workdir.path().to_path_buf(),
             Duration::from_secs(5),
+            COMMAND_MAX_OUTPUT_SIZE,
             &HashMap::new(),
             LocalHostProcessEnvMode::Scrubbed,
         )
@@ -612,6 +722,7 @@ mod tests {
             "printf '%s\\n%s' \"$HOME\" \"$IRONCLAW_REBORN_SENTINEL\"",
             &workdir.path().to_path_buf(),
             Duration::from_secs(5),
+            COMMAND_MAX_OUTPUT_SIZE,
             &HashMap::from([(
                 "IRONCLAW_REBORN_SENTINEL".to_string(),
                 "inherited".to_string(),

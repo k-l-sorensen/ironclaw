@@ -39,6 +39,7 @@ async fn vertical_slice_discovers_and_dispatches_registered_runtime_adapters() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "hello wasm"}),
         })
         .await
@@ -67,6 +68,7 @@ async fn vertical_slice_discovers_and_dispatches_registered_runtime_adapters() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "hello script"}),
         })
         .await
@@ -97,6 +99,7 @@ async fn vertical_slice_discovers_and_dispatches_registered_runtime_adapters() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "hello mcp"}),
         })
         .await

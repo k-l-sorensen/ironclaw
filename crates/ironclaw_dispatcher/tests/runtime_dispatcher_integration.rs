@@ -69,6 +69,7 @@ async fn runtime_dispatcher_routes_already_authorized_request_through_public_tra
             },
             mounts: Some(mounts.clone()),
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "hello through public seam"}),
         })
         .await
@@ -131,6 +132,7 @@ async fn runtime_dispatcher_forwards_configured_runtime_policy_to_adapter() {
             estimate: ResourceEstimate::default(),
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "hello through configured policy"}),
         })
         .await
@@ -165,6 +167,7 @@ async fn runtime_dispatcher_fails_closed_for_missing_backend_before_reservation_
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "blocked"}),
         })
         .await

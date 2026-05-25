@@ -443,6 +443,7 @@ where
                 estimate: request.estimate.clone(),
                 mounts: obligation_outcome.mounts.clone(),
                 resource_reservation: obligation_outcome.resource_reservation.clone(),
+                resource_ceiling: obligation_outcome.resource_ceiling.clone(),
                 input: request.input,
             })
             .await
@@ -791,6 +792,7 @@ where
                 estimate: request.estimate.clone(),
                 mounts: obligation_outcome.mounts.clone(),
                 resource_reservation: obligation_outcome.resource_reservation.clone(),
+                resource_ceiling: obligation_outcome.resource_ceiling.clone(),
                 input: request.input,
             })
             .await

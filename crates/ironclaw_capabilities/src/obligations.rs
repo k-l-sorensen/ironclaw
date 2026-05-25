@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use ironclaw_host_api::{
     CapabilityDispatchResult, CapabilityId, ExecutionContext, MountView, Obligation,
-    ResourceEstimate, ResourceReservation,
+    ResourceCeiling, ResourceEstimate, ResourceReservation,
 };
 use thiserror::Error;
 
@@ -27,6 +27,7 @@ pub struct CapabilityObligationRequest<'a> {
 pub struct CapabilityObligationOutcome {
     pub mounts: Option<MountView>,
     pub resource_reservation: Option<ResourceReservation>,
+    pub resource_ceiling: Option<ResourceCeiling>,
 }
 
 /// Request passed to a configured obligation handler after successful dispatch.

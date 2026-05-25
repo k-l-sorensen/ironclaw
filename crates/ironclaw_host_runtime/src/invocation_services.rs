@@ -381,6 +381,7 @@ mod tests {
                 command: "echo hi".to_string(),
                 workdir: None,
                 timeout_secs: None,
+                limits: crate::CommandResourceLimits::default(),
                 extra_env: Default::default(),
             })
             .await

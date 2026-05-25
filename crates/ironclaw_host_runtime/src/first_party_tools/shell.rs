@@ -8,8 +8,8 @@ use ironclaw_host_api::{
 use serde_json::{Value, json};
 
 use crate::{
-    CommandExecutionRequest, FirstPartyCapabilityError, FirstPartyCapabilityRequest,
-    RuntimeProcessError,
+    CommandExecutionRequest, CommandResourceLimits, CommandSandboxLimits,
+    FirstPartyCapabilityError, FirstPartyCapabilityRequest, RuntimeProcessError,
 };
 
 use super::{FIRST_PARTY_MAX_OUTPUT_BYTES, first_party_capability_manifest};
@@ -73,6 +73,7 @@ pub(super) async fn dispatch(
         ));
     }
     shell_core::validate_command(&parsed.command, false).map_err(shell_error)?;
+    let limits = command_limits(request)?;
     let output = request
         .services
         .process
@@ -82,6 +83,7 @@ pub(super) async fn dispatch(
             command: parsed.command,
             workdir: parsed.workdir,
             timeout_secs: parsed.timeout_secs,
+            limits,
             extra_env: parsed.extra_env,
         })
         .await
@@ -94,6 +96,32 @@ pub(super) async fn dispatch(
         "sandboxed": output.sandboxed,
     });
     Ok((output_value, output.duration))
+}
+
+fn command_limits(
+    request: &FirstPartyCapabilityRequest,
+) -> Result<CommandResourceLimits, FirstPartyCapabilityError> {
+    let Some(ceiling) = &request.resource_ceiling else {
+        return Ok(CommandResourceLimits::default());
+    };
+    let mut limits = CommandResourceLimits {
+        wall_clock_ms: ceiling.max_wall_clock_ms,
+        output_bytes: ceiling.max_output_bytes,
+        sandbox: CommandSandboxLimits::default(),
+    };
+    if let Some(sandbox) = &ceiling.sandbox {
+        if sandbox.cpu_time_ms.is_some()
+            || sandbox.disk_bytes.is_some()
+            || sandbox.network_egress_bytes.is_some()
+        {
+            return Err(FirstPartyCapabilityError::new(
+                RuntimeDispatchErrorKind::Resource,
+            ));
+        }
+        limits.sandbox.memory_bytes = sandbox.memory_bytes;
+        limits.sandbox.process_count = sandbox.process_count;
+    }
+    Ok(limits)
 }
 
 fn reject_unbacked_scoped_workdir(

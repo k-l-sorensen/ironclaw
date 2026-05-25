@@ -12,8 +12,8 @@ use ironclaw_events::{EventSink, RuntimeEvent};
 use ironclaw_extensions::{ExtensionPackage, ExtensionRegistry};
 use ironclaw_filesystem::RootFilesystem;
 use ironclaw_host_api::{
-    CapabilityDescriptor, CapabilityId, ExtensionId, MountView, ResourceEstimate, ResourceReceipt,
-    ResourceReservation, ResourceScope, ResourceUsage, RuntimeKind,
+    CapabilityDescriptor, CapabilityId, ExtensionId, MountView, ResourceCeiling, ResourceEstimate,
+    ResourceReceipt, ResourceReservation, ResourceScope, ResourceUsage, RuntimeKind,
     runtime_policy::{
         ApprovalPolicy, AuditMode, DeploymentMode, EffectiveRuntimePolicy, FilesystemBackendKind,
         NetworkMode, ProcessBackendKind, RuntimeProfile, SecretMode,
@@ -68,6 +68,7 @@ where
     pub estimate: ResourceEstimate,
     pub mounts: Option<MountView>,
     pub resource_reservation: Option<ResourceReservation>,
+    pub resource_ceiling: Option<ResourceCeiling>,
     pub input: Value,
 }
 
@@ -284,6 +285,22 @@ where
         ))
         .await?;
 
+        if resource_ceiling_requires_runtime_handoff(request.resource_ceiling.as_ref())
+            && runtime != RuntimeKind::FirstParty
+        {
+            let error = dispatch_error_for_runtime(runtime, RuntimeDispatchErrorKind::Resource);
+            self.release_request_reservation(&request);
+            self.emit_dispatch_failure(
+                scope,
+                capability_id,
+                Some(descriptor.provider.clone()),
+                Some(runtime),
+                &error,
+            )
+            .await?;
+            return Err(error);
+        }
+
         let execution = match adapter
             .as_ref()
             .dispatch_json(RuntimeAdapterRequest {
@@ -297,6 +314,7 @@ where
                 estimate: request.estimate,
                 mounts: request.mounts,
                 resource_reservation: request.resource_reservation,
+                resource_ceiling: request.resource_ceiling,
                 input: request.input,
             })
             .await
@@ -378,6 +396,34 @@ where
             let _ = sink.as_ref().emit(event).await;
         }
         Ok(())
+    }
+}
+
+fn resource_ceiling_requires_runtime_handoff(ceiling: Option<&ResourceCeiling>) -> bool {
+    let Some(ceiling) = ceiling else {
+        return false;
+    };
+    if ceiling.max_wall_clock_ms.is_some() {
+        return true;
+    }
+    ceiling.sandbox.as_ref().is_some_and(|sandbox| {
+        sandbox.cpu_time_ms.is_some()
+            || sandbox.memory_bytes.is_some()
+            || sandbox.disk_bytes.is_some()
+            || sandbox.network_egress_bytes.is_some()
+            || sandbox.process_count.is_some()
+    })
+}
+
+fn dispatch_error_for_runtime(
+    runtime: RuntimeKind,
+    kind: RuntimeDispatchErrorKind,
+) -> DispatchError {
+    match runtime {
+        RuntimeKind::Wasm => DispatchError::Wasm { kind },
+        RuntimeKind::Mcp => DispatchError::Mcp { kind },
+        RuntimeKind::Script => DispatchError::Script { kind },
+        RuntimeKind::FirstParty | RuntimeKind::System => DispatchError::FirstParty { kind },
     }
 }
 

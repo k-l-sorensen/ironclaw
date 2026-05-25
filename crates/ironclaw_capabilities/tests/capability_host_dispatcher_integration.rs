@@ -58,6 +58,7 @@ async fn capability_host_invokes_through_runtime_dispatcher_and_completes_run() 
     assert_eq!(recorded.input, input);
     assert_eq!(recorded.mounts, None);
     assert_eq!(recorded.resource_reservation, None);
+    assert_eq!(recorded.resource_ceiling, None);
     assert_eq!(
         run_state
             .get(&recorded.scope, invocation_id)
@@ -361,6 +362,7 @@ struct RecordedRuntimeRequest {
     estimate: ResourceEstimate,
     mounts: Option<MountView>,
     resource_reservation: Option<ResourceReservation>,
+    resource_ceiling: Option<ResourceCeiling>,
     input: Value,
 }
 
@@ -398,6 +400,7 @@ impl RuntimeAdapter<LocalFilesystem, InMemoryResourceGovernor> for RecordingRunt
             estimate: request.estimate.clone(),
             mounts: request.mounts.clone(),
             resource_reservation: request.resource_reservation.clone(),
+            resource_ceiling: None,
             input: request.input.clone(),
         });
         let output = self.output.clone();

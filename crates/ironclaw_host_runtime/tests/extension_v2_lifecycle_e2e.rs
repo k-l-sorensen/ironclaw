@@ -107,6 +107,7 @@ async fn extension_v2_lifecycle_discovers_installs_publishes_and_dispatches_host
             estimate: estimate.clone(),
             mounts: None,
             resource_reservation: Some(reservation),
+            resource_ceiling: None,
             input: json!({"message":"hello"}),
         })
         .await

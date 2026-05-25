@@ -27,7 +27,7 @@ use ironclaw_filesystem::LibSqlRootFilesystem;
 use ironclaw_filesystem::PostgresRootFilesystem;
 use ironclaw_filesystem::{LocalFilesystem, RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{
-    CapabilityDispatchRequest, CapabilityDispatcher, CapabilityId, DispatchError,
+    CapabilityDispatchRequest, CapabilityDispatcher, CapabilityId, DispatchError, ResourceCeiling,
     ResourceReservationId, ResourceScope, ResourceUsage, RuntimeDispatchErrorKind,
     RuntimeHttpEgress, RuntimeKind,
     runtime_policy::{
@@ -589,6 +589,7 @@ impl ProcessExecutor for RuntimeDispatchProcessExecutor {
                 estimate: request.estimate,
                 mounts: Some(request.mounts),
                 resource_reservation: request.resource_reservation,
+                resource_ceiling: None,
                 input: request.input,
             })
             .await

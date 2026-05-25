@@ -282,6 +282,58 @@ async fn builtin_shell_delegates_command_execution_to_process_port() {
 }
 
 #[tokio::test]
+async fn builtin_shell_passes_resource_ceiling_to_process_port() {
+    let process_port = Arc::new(RecordingProcessPort::default());
+    let runtime = runtime_with_process_port(Arc::clone(&process_port));
+    let mut grant = dispatch_grant_with_mounts_and_network(
+        SHELL_CAPABILITY_ID,
+        MountView::default(),
+        shell_test_policy(),
+    );
+    grant.constraints.resource_ceiling = Some(ResourceCeiling {
+        max_usd: None,
+        max_input_tokens: None,
+        max_output_tokens: None,
+        max_wall_clock_ms: Some(10_000),
+        max_output_bytes: Some(4_096),
+        sandbox: None,
+    });
+    let context = ExecutionContext::local_default(
+        UserId::new("user").unwrap(),
+        ExtensionId::new("caller").unwrap(),
+        RuntimeKind::FirstParty,
+        TrustClass::FirstParty,
+        CapabilitySet {
+            grants: vec![grant],
+        },
+        MountView::default(),
+    )
+    .unwrap();
+
+    let outcome = runtime
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            context,
+            capability_id(SHELL_CAPABILITY_ID),
+            ResourceEstimate {
+                wall_clock_ms: Some(5_000),
+                output_bytes: Some(1_024),
+                ..ResourceEstimate::default()
+            },
+            json!({"command": "echo via port", "timeout": 15}),
+            trust_decision(),
+        ))
+        .await
+        .unwrap();
+
+    assert!(matches!(outcome, RuntimeCapabilityOutcome::Completed(_)));
+    let requests = process_port.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].timeout_secs, Some(15));
+    assert_eq!(requests[0].limits.wall_clock_ms, Some(10_000));
+    assert_eq!(requests[0].limits.output_bytes, Some(4_096));
+}
+
+#[tokio::test]
 async fn builtin_shell_returns_stderr_and_nonzero_exit_without_dispatch_failure() {
     let output = invoke_shell(json!({"command": "printf shell-error >&2; exit 7"}))
         .await

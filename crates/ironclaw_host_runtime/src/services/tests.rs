@@ -126,6 +126,7 @@ async fn inherited_env_runtime_policy_selects_inherited_local_process_port() {
             command: "printf '%s' \"$HOME\"".to_string(),
             workdir: Some(workdir.path().display().to_string()),
             timeout_secs: Some(5),
+            limits: crate::CommandResourceLimits::default(),
             extra_env: Default::default(),
         })
         .await
@@ -161,6 +162,7 @@ async fn scrubbed_runtime_policy_resets_managed_local_process_port_after_inherit
             command: "printf '%s' \"$HOME\"".to_string(),
             workdir: Some(workdir.path().display().to_string()),
             timeout_secs: Some(5),
+            limits: crate::CommandResourceLimits::default(),
             extra_env: Default::default(),
         })
         .await
@@ -216,6 +218,7 @@ async fn service_guard_releases_reservation_on_planner_denial() {
             estimate,
             mounts: None,
             resource_reservation: Some(reservation),
+            resource_ceiling: None,
             input: json!({}),
         })
         .await;
@@ -270,6 +273,7 @@ async fn service_guard_rejects_resolution_before_wasm_dispatch() {
             estimate,
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({}),
         })
         .await;
@@ -332,6 +336,7 @@ async fn service_guard_releases_reservation_on_invocation_service_resolution_den
             estimate,
             mounts: None,
             resource_reservation: Some(reservation),
+            resource_ceiling: None,
             input: json!({}),
         })
         .await;
@@ -386,6 +391,7 @@ async fn service_guard_rejects_required_secret_without_secret_store_before_dispa
             estimate,
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({}),
         })
         .await;
@@ -450,6 +456,7 @@ async fn first_party_adapter_releases_reservation_when_invocation_service_resolu
             estimate,
             mounts: None,
             resource_reservation: Some(reservation),
+            resource_ceiling: None,
             input: json!({}),
         })
         .await;
@@ -517,6 +524,7 @@ async fn first_party_adapter_releases_reservation_when_planner_denies() {
             estimate,
             mounts: None,
             resource_reservation: Some(reservation),
+            resource_ceiling: None,
             input: json!({}),
         })
         .await;

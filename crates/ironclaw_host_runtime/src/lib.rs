@@ -93,8 +93,9 @@ pub use obligations::{
 use obligations::{NetworkObligationPolicyStore, RuntimeSecretInjectionStore};
 pub use planner::{ExecutionPlan, PlannerError, plan_capability};
 pub use process_port::{
-    CommandExecutionOutput, CommandExecutionRequest, LocalHostProcessPort, RuntimeProcessError,
-    RuntimeProcessPort, SandboxCommandTransport, TenantSandboxProcessPort,
+    CommandExecutionOutput, CommandExecutionRequest, CommandResourceLimits, CommandSandboxLimits,
+    LocalHostProcessPort, RuntimeProcessError, RuntimeProcessPort, SandboxCommandTransport,
+    TenantSandboxProcessPort,
 };
 pub use production::DefaultHostRuntime;
 pub use sandbox_process::{

@@ -37,6 +37,7 @@ async fn dispatcher_emits_events_for_wasm_and_script_success() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "hello wasm"}),
         })
         .await
@@ -54,6 +55,7 @@ async fn dispatcher_emits_events_for_wasm_and_script_success() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "hello script"}),
         })
         .await
@@ -111,6 +113,7 @@ async fn dispatcher_ignores_event_sink_failures_on_success() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "event sink fails"}),
         })
         .await
@@ -138,6 +141,7 @@ async fn dispatcher_preserves_original_error_when_failure_event_sink_fails() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "missing backend"}),
         })
         .await
@@ -180,6 +184,7 @@ async fn dispatcher_logs_release_failure_without_masking_dispatch_error() {
             },
             mounts: None,
             resource_reservation: Some(reservation.clone()),
+            resource_ceiling: None,
             input: json!({"message": "missing backend"}),
         })
         .instrument(tracing::info_span!(
@@ -223,6 +228,7 @@ async fn dispatcher_emits_redacted_runtime_error_kind_for_adapter_failure() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "adapter fails"}),
         })
         .await
@@ -267,6 +273,7 @@ async fn dispatcher_emits_events_for_mcp_success() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"query": "ironclaw"}),
         })
         .await
@@ -306,6 +313,7 @@ async fn dispatcher_emits_failed_event_for_missing_backend_without_reserving() {
             },
             mounts: None,
             resource_reservation: None,
+            resource_ceiling: None,
             input: json!({"message": "blocked"}),
         })
         .await

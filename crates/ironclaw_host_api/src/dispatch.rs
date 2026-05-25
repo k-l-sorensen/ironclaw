@@ -9,8 +9,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    CapabilityId, ExtensionId, MountView, ResourceEstimate, ResourceReceipt, ResourceReservation,
-    ResourceScope, ResourceUsage, RuntimeKind,
+    CapabilityId, ExtensionId, MountView, ResourceCeiling, ResourceEstimate, ResourceReceipt,
+    ResourceReservation, ResourceScope, ResourceUsage, RuntimeKind,
 };
 
 /// Request for one already-authorized declared capability dispatch.
@@ -21,6 +21,7 @@ pub struct CapabilityDispatchRequest {
     pub estimate: ResourceEstimate,
     pub mounts: Option<MountView>,
     pub resource_reservation: Option<ResourceReservation>,
+    pub resource_ceiling: Option<ResourceCeiling>,
     pub input: Value,
 }
 

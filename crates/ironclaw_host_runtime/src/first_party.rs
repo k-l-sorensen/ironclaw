@@ -10,7 +10,7 @@ use std::{collections::HashMap, fmt, sync::Arc};
 
 use async_trait::async_trait;
 use ironclaw_host_api::{
-    CapabilityId, MountView, ResourceEstimate, ResourceScope, ResourceUsage,
+    CapabilityId, MountView, ResourceCeiling, ResourceEstimate, ResourceScope, ResourceUsage,
     RuntimeDispatchErrorKind,
 };
 use serde_json::Value;
@@ -29,6 +29,7 @@ pub struct FirstPartyCapabilityRequest {
     pub scope: ResourceScope,
     pub estimate: ResourceEstimate,
     pub mounts: Option<MountView>,
+    pub resource_ceiling: Option<ResourceCeiling>,
     pub services: InvocationServices,
     pub input: Value,
 }
@@ -41,6 +42,7 @@ impl fmt::Debug for FirstPartyCapabilityRequest {
             .field("scope", &self.scope)
             .field("estimate", &self.estimate)
             .field("mounts", &self.mounts)
+            .field("resource_ceiling", &self.resource_ceiling)
             .field("services", &self.services)
             .field("input", &self.input)
             .finish()
@@ -53,6 +55,7 @@ impl PartialEq for FirstPartyCapabilityRequest {
             && self.scope == other.scope
             && self.estimate == other.estimate
             && self.mounts == other.mounts
+            && self.resource_ceiling == other.resource_ceiling
             && self.input == other.input
     }
 }
