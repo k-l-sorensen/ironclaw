@@ -37,7 +37,7 @@ const APPROVED_TX_DOMAIN: &[u8] = b"ironclaw.attestation.approved_tx_hash.v1";
 
 /// Append `len(bytes) ∥ bytes` to the hasher.
 fn update_lp(hasher: &mut Sha256, bytes: &[u8]) {
-    hasher.update((bytes.len() as u32).to_be_bytes());
+    hasher.update((bytes.len() as u64).to_be_bytes());
     hasher.update(bytes);
 }
 
@@ -52,7 +52,7 @@ fn render_bytes(rendered: &RenderedTx) -> Vec<u8> {
     push_lp(&mut out, rendered.chain.as_bytes());
     push_lp(&mut out, rendered.chain_network.as_bytes());
     push_lp(&mut out, rendered.tx_type.as_bytes());
-    out.extend_from_slice(&(rendered.fields.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(rendered.fields.len() as u64).to_be_bytes());
     for field in &rendered.fields {
         push_lp(&mut out, field.label.as_bytes());
         push_lp(&mut out, field.value.as_bytes());
@@ -62,7 +62,7 @@ fn render_bytes(rendered: &RenderedTx) -> Vec<u8> {
 
 /// Append `len(bytes) ∥ bytes` to `out`.
 fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
     out.extend_from_slice(bytes);
 }
 

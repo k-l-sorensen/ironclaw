@@ -740,7 +740,7 @@ fn near_render_surfaces_every_signing_field() {
 #[test]
 fn render_field_count_matches_canonical_field_count() {
     // Both views derive from the same projection. The canonical bytes encode
-    // the field count as a u32 immediately after the domain tag and the four
+    // the field count as a u64 immediately after the domain tag and the four
     // length-prefixed headers (chain_tag, chain_network, tx_type, schema). We
     // parse it out and assert it EQUALS the rendered field count — guarding
     // against a field added to one path but not the other (fixes the previously
@@ -755,29 +755,29 @@ fn render_field_count_matches_canonical_field_count() {
         let count = parse_canonical_field_count(&bytes);
         assert_eq!(
             count,
-            rendered.fields.len() as u32,
+            rendered.fields.len() as u64,
             "canonical field count must equal rendered field count for {}",
             tx.chain_tag()
         );
     }
 }
 
-/// Parse the `u32` field count out of the canonical signing bytes.
+/// Parse the `u64` field count out of the canonical signing bytes.
 ///
 /// Layout: `DOMAIN ∥ lp(chain_tag) ∥ lp(chain_network) ∥ lp(tx_type) ∥
-/// lp(schema u16) ∥ u32_be(field_count) ∥ ...`, where `lp(x) = u32_be(len) ∥ x`.
-fn parse_canonical_field_count(bytes: &[u8]) -> u32 {
+/// lp(schema u16) ∥ u64_be(field_count) ∥ ...`, where `lp(x) = u64_be(len) ∥ x`.
+fn parse_canonical_field_count(bytes: &[u8]) -> u64 {
     const DOMAIN_LEN: usize = b"ironclaw.attestation.canonical.v1".len();
     let mut pos = DOMAIN_LEN;
     let skip_lp = |bytes: &[u8], pos: &mut usize| {
-        let len = u32::from_be_bytes(bytes[*pos..*pos + 4].try_into().expect("len")) as usize;
-        *pos += 4 + len;
+        let len = u64::from_be_bytes(bytes[*pos..*pos + 8].try_into().expect("len")) as usize;
+        *pos += 8 + len;
     };
     skip_lp(bytes, &mut pos); // chain_tag
     skip_lp(bytes, &mut pos); // chain_network
     skip_lp(bytes, &mut pos); // tx_type
     skip_lp(bytes, &mut pos); // schema version
-    u32::from_be_bytes(bytes[pos..pos + 4].try_into().expect("count"))
+    u64::from_be_bytes(bytes[pos..pos + 8].try_into().expect("count"))
 }
 
 // ---- Cross-chain domain separation --------------------------------------

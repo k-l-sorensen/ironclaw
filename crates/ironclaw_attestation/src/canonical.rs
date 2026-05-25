@@ -15,13 +15,13 @@
 //! lp(chain_network)
 //! lp(tx_type_label)
 //! lp(schema_version big-endian u16)
-//! u32_be(field_count)
+//! u64_be(field_count)
 //! for each field, in canonical order:
 //!     lp(field.tag)
 //!     lp(field.canonical_bytes)
 //! ```
 //!
-//! where `lp(x)` = `u32_be(x.len()) ∥ x`. Length-prefixing every component makes
+//! where `lp(x)` = `u64_be(x.len()) ∥ x` (lengths in bytes). Length-prefixing every component makes
 //! the encoding injective: no concatenation of two distinct field sets can
 //! collide, so a hidden / reordered / extra field always changes the bytes.
 
@@ -35,7 +35,7 @@ const CANONICAL_DOMAIN: &[u8] = b"ironclaw.attestation.canonical.v1";
 
 /// Append `len(bytes) ∥ bytes` to `out`.
 fn push_lp(out: &mut Vec<u8>, bytes: &[u8]) {
-    out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
     out.extend_from_slice(bytes);
 }
 
@@ -56,7 +56,7 @@ pub fn canonical_signing_bytes(
     push_lp(&mut out, tx.chain_network().as_bytes());
     push_lp(&mut out, tx.tx_type_label().as_bytes());
     push_lp(&mut out, &schema_version.get().to_be_bytes());
-    out.extend_from_slice(&(fields.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(fields.len() as u64).to_be_bytes());
     for field in &fields {
         push_lp(&mut out, field.tag.as_bytes());
         push_lp(&mut out, &field.canonical_bytes);
