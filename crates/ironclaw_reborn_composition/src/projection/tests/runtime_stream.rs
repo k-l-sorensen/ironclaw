@@ -207,6 +207,7 @@ async fn capability_display_preview_store_redacts_unsafe_paths_and_secrets() {
     let preview = store
         .preview(&CapabilityActivityProjection {
             invocation_id: InvocationId::from_uuid(run_id.as_uuid()),
+            run_id: Some(InvocationId::from_uuid(run_id.as_uuid())),
             capability_id: capability,
             thread_id: Some(ThreadId::new("webui-preview-thread").unwrap()),
             status: ironclaw_event_projections::CapabilityActivityStatus::Completed,
@@ -275,6 +276,7 @@ async fn capability_display_preview_store_keys_completed_results_by_invocation()
     let first_preview = store
         .preview(&CapabilityActivityProjection {
             invocation_id: first_invocation,
+            run_id: Some(InvocationId::from_uuid(run_id.as_uuid())),
             capability_id: first_capability,
             thread_id: Some(ThreadId::new("webui-preview-thread").unwrap()),
             status: ironclaw_event_projections::CapabilityActivityStatus::Completed,
@@ -292,6 +294,7 @@ async fn capability_display_preview_store_keys_completed_results_by_invocation()
     let second_preview = store
         .preview(&CapabilityActivityProjection {
             invocation_id: second_invocation,
+            run_id: Some(InvocationId::from_uuid(run_id.as_uuid())),
             capability_id: second_capability,
             thread_id: Some(ThreadId::new("webui-preview-thread").unwrap()),
             status: ironclaw_event_projections::CapabilityActivityStatus::Completed,
@@ -363,6 +366,7 @@ async fn capability_display_preview_store_pairs_inputs_by_ref_when_results_compl
     let first_preview = store
         .preview(&CapabilityActivityProjection {
             invocation_id: first_invocation,
+            run_id: Some(InvocationId::from_uuid(run_id.as_uuid())),
             capability_id: first_capability,
             thread_id: Some(ThreadId::new("webui-preview-thread").unwrap()),
             status: ironclaw_event_projections::CapabilityActivityStatus::Completed,
@@ -380,6 +384,7 @@ async fn capability_display_preview_store_pairs_inputs_by_ref_when_results_compl
     let second_preview = store
         .preview(&CapabilityActivityProjection {
             invocation_id: second_invocation,
+            run_id: Some(InvocationId::from_uuid(run_id.as_uuid())),
             capability_id: second_capability,
             thread_id: Some(ThreadId::new("webui-preview-thread").unwrap()),
             status: ironclaw_event_projections::CapabilityActivityStatus::Completed,
@@ -458,6 +463,7 @@ async fn capability_display_preview_marks_json_depth_truncation() {
     let preview = store
         .preview(&CapabilityActivityProjection {
             invocation_id,
+            run_id: Some(InvocationId::from_uuid(run_id.as_uuid())),
             capability_id: capability,
             thread_id: Some(ThreadId::new("webui-preview-thread").unwrap()),
             status: ironclaw_event_projections::CapabilityActivityStatus::Completed,
@@ -489,6 +495,7 @@ async fn capability_display_preview_falls_back_for_failed_tool_without_result() 
     let preview = store
         .preview(&CapabilityActivityProjection {
             invocation_id: InvocationId::new(),
+            run_id: None,
             capability_id: capability,
             thread_id: Some(ThreadId::new("webui-preview-thread").unwrap()),
             status: ironclaw_event_projections::CapabilityActivityStatus::Failed,
@@ -538,6 +545,7 @@ async fn capability_display_preview_store_truncates_long_output_by_lines() {
     let preview = store
         .preview(&CapabilityActivityProjection {
             invocation_id: InvocationId::from_uuid(run_id.as_uuid()),
+            run_id: Some(InvocationId::from_uuid(run_id.as_uuid())),
             capability_id: capability,
             thread_id: Some(ThreadId::new("webui-preview-thread").unwrap()),
             status: ironclaw_event_projections::CapabilityActivityStatus::Completed,
@@ -755,6 +763,7 @@ async fn webui_projection_snapshot_bounds_activity_fanout_before_payload_mapping
         capability_activities: (0..(WEBUI_PROJECTION_PAGE_LIMIT + 10))
             .map(|index| CapabilityActivityProjection {
                 invocation_id: InvocationId::new(),
+                run_id: None,
                 capability_id: capability.clone(),
                 thread_id: Some(thread_id.clone()),
                 status: ironclaw_event_projections::CapabilityActivityStatus::Running,
@@ -849,6 +858,7 @@ async fn webui_projection_snapshot_resumes_preview_payload() {
         }],
         capability_activities: vec![CapabilityActivityProjection {
             invocation_id,
+            run_id: Some(InvocationId::from_uuid(run_id.as_uuid())),
             capability_id: capability,
             thread_id: Some(thread_id),
             status: ironclaw_event_projections::CapabilityActivityStatus::Completed,
