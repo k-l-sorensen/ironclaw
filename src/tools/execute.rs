@@ -237,7 +237,30 @@ pub async fn execute_tool_audited(
     let result = execute_tool_with_safety(tools, safety, tool_name, params, base_ctx).await;
     let elapsed = start.elapsed();
 
-    let action = ActionRecord::new(0, &audit_name, redacted_input);
+    // Allocate a sequence number that won't collide with rows already on this
+    // job. A freshly minted system job (the `existing_job_id = None` branch
+    // above) has no actions, so sequence 0 is safe. An *existing* job (e.g. a
+    // scheduler parent running several tool subtasks) may already hold
+    // ActionRecords; reusing 0 would violate `UNIQUE(job_id, sequence_num)` on
+    // the second subtask and silently drop its audit row. Derive the next
+    // sequence from the persisted rows instead.
+    let sequence = if existing_job_id.is_some() {
+        store
+            .get_job_actions(job_id)
+            .await
+            .map(|actions| {
+                actions
+                    .iter()
+                    .map(|a| a.sequence)
+                    .max()
+                    .map_or(0, |m| m + 1)
+            })
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let action = ActionRecord::new(sequence, &audit_name, redacted_input);
     let action = match &result {
         Ok(output) => {
             // `output` is the pretty-printed tool result string. Sanitize it for
@@ -1128,6 +1151,57 @@ mod audited_integration_tests {
         assert!(
             seen.lock().unwrap().is_none(),
             "tool must not run when validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn audited_existing_job_allocates_unique_sequences_for_subtasks() {
+        // Regression (#4024 P1): multiple tool subtasks correlated to the SAME
+        // existing job (a scheduler parent) must each receive a distinct
+        // sequence number. Reusing 0 would violate UNIQUE(job_id, sequence_num)
+        // on the second subtask and silently drop its audit row.
+        let (db, _backend, _dir) = test_store().await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let registry = registry_with(Arc::new(ContextEchoTool {
+            seen_user: Arc::clone(&seen),
+        }))
+        .await;
+        let safety = safety();
+        let job_ctx = JobContext::with_user("chatter", "scheduler", "task");
+
+        // A real persisted parent job the subtasks correlate to.
+        let job_id = db
+            .create_system_job("chatter", "scheduler")
+            .await
+            .expect("create parent job");
+
+        for i in 0..2 {
+            execute_tool_audited(
+                &registry,
+                &safety,
+                Some(&db),
+                "ctx_echo",
+                serde_json::json!({ "message": format!("subtask-{i}") }),
+                &job_ctx,
+                DispatchSource::System,
+                Some(job_id),
+            )
+            .await
+            .expect("subtask should succeed");
+        }
+
+        let actions = db.get_job_actions(job_id).await.expect("get actions");
+        assert_eq!(
+            actions.len(),
+            2,
+            "both subtasks must persist an ActionRecord on the shared job"
+        );
+        let mut seqs: Vec<u32> = actions.iter().map(|a| a.sequence).collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            vec![0, 1],
+            "subtasks on the same job must get distinct sequence numbers"
         );
     }
 }
