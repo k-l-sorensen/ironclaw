@@ -1004,6 +1004,54 @@ async fn replay_projection_folds_dispatch_lifecycle_into_capability_activity() {
 }
 
 #[tokio::test]
+async fn replay_projection_folds_process_completed_into_completed_capability_activity() {
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let service = ReplayEventProjectionService::new(Arc::clone(&log));
+    let scope = scope_for_thread(ThreadId::new("thread-tool-activity-process").unwrap());
+    let capability = capability_id();
+    let provider = provider_id();
+    let process_id = ProcessId::new();
+
+    log.append(RuntimeEvent::process_started(
+        scope.clone(),
+        capability.clone(),
+        provider.clone(),
+        RuntimeKind::Script,
+        process_id,
+    ))
+    .await
+    .unwrap();
+    log.append(RuntimeEvent::process_completed(
+        scope.clone(),
+        capability,
+        provider,
+        RuntimeKind::Script,
+        process_id,
+    ))
+    .await
+    .unwrap();
+
+    let snapshot = service
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&scope),
+            after: None,
+            limit: 16,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.capability_activities.len(), 1);
+    assert_eq!(
+        snapshot.capability_activities[0].status,
+        CapabilityActivityStatus::Completed
+    );
+    assert_eq!(
+        snapshot.capability_activities[0].process_id,
+        Some(process_id)
+    );
+}
+
+#[tokio::test]
 async fn replay_projection_snapshot_bounds_capability_activity_window_to_request_limit() {
     let log = Arc::new(InMemoryDurableEventLog::new());
     let service = ReplayEventProjectionService::new(Arc::clone(&log));
@@ -1790,6 +1838,79 @@ async fn replay_projection_dispatch_succeeded_does_not_clobber_terminal_process_
     assert_eq!(
         snapshot.capability_activities[0].status,
         CapabilityActivityStatus::Failed
+    );
+    assert_eq!(
+        snapshot.capability_activities[0].error_kind.as_deref(),
+        Some("process_crashed")
+    );
+}
+
+#[tokio::test]
+async fn replay_projection_bounded_activity_window_preserves_terminal_process_state() {
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let service = ReplayEventProjectionService::new(Arc::clone(&log));
+    let scope = scope_for_thread(ThreadId::new("thread-bounded-process-state").unwrap());
+    let capability = capability_id();
+    let provider = provider_id();
+    let process_id = ProcessId::new();
+
+    log.append(RuntimeEvent::process_started(
+        scope.clone(),
+        capability.clone(),
+        provider.clone(),
+        RuntimeKind::Script,
+        process_id,
+    ))
+    .await
+    .unwrap();
+    log.append(RuntimeEvent::process_failed(
+        scope.clone(),
+        capability.clone(),
+        provider.clone(),
+        RuntimeKind::Script,
+        process_id,
+        "process_crashed",
+    ))
+    .await
+    .unwrap();
+
+    let mut other_scope = scope.clone();
+    other_scope.invocation_id = InvocationId::new();
+    log.append(RuntimeEvent::dispatch_requested(
+        other_scope,
+        capability.clone(),
+    ))
+    .await
+    .unwrap();
+
+    log.append(RuntimeEvent::dispatch_succeeded(
+        scope.clone(),
+        capability,
+        provider,
+        RuntimeKind::Script,
+        0,
+    ))
+    .await
+    .unwrap();
+
+    let snapshot = service
+        .snapshot(ProjectionRequest {
+            scope: ProjectionScope::from_resource_scope(&scope),
+            after: None,
+            limit: 1,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(snapshot.capability_activities.len(), 1);
+    assert_eq!(
+        snapshot.capability_activities[0].invocation_id,
+        scope.invocation_id
+    );
+    assert_eq!(
+        snapshot.capability_activities[0].status,
+        CapabilityActivityStatus::Failed,
+        "bounded output must not evict lifecycle state before a late dispatch ack is folded"
     );
     assert_eq!(
         snapshot.capability_activities[0].error_kind.as_deref(),

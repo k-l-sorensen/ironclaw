@@ -125,3 +125,53 @@ async fn webui_event_stream_rejects_runtime_delivery_offset_above_item_payload_c
         }
     ));
 }
+
+#[tokio::test]
+async fn webui_event_stream_rejects_legacy_partial_snapshot_offset_above_item_payload_count() {
+    let tenant_id = TenantId::new("webui-events-tenant").unwrap();
+    let user_id = UserId::new("webui-events-user").unwrap();
+    let agent_id = AgentId::new("webui-events-agent").unwrap();
+    let thread_id = ThreadId::new("webui-events-thread").unwrap();
+    let invocation_id = InvocationId::new();
+    let event_log = Arc::new(InMemoryDurableEventLog::new());
+    event_log
+        .append(RuntimeEvent::dispatch_requested(
+            resource_scope(&tenant_id, &user_id, &agent_id, &thread_id, invocation_id),
+            CapabilityId::new("script.echo").unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let event_log: Arc<dyn DurableEventLog> = event_log;
+    let actor = TurnActor::new(user_id);
+    let scope = TurnScope::new(tenant_id, Some(agent_id), None, thread_id);
+    let cursor = product_cursor_from_webui_cursor(&WebuiProjectionCursor {
+        runtime: None,
+        runtime_item: None,
+        turn: None,
+        runtime_payloads_delivered: 3,
+    })
+    .unwrap();
+    let services = build_reborn_projection_services(
+        event_log,
+        ReplyTargetBindingRef::new("webui-events-reply").unwrap(),
+    );
+
+    let error = services
+        .webui_event_stream()
+        .drain(ProjectionSubscriptionRequest {
+            actor,
+            scope,
+            after_cursor: Some(cursor),
+        })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ProductAdapterError::InvalidIdentifier {
+            kind: "projection_cursor",
+            ..
+        }
+    ));
+}

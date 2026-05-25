@@ -562,6 +562,24 @@ mod tests {
     }
 
     #[test]
+    fn capability_activity_view_rejects_error_kind_with_unsafe_character_after_safe_prefix() {
+        let json = serde_json::json!({
+            "invocation_id": InvocationId::new(),
+            "thread_id": "thread-tool-activity",
+            "capability_id": "script.echo",
+            "status": "failed",
+            "provider": "script",
+            "runtime": "script",
+            "process_id": null,
+            "output_bytes": null,
+            "error_kind": "safe/path",
+            "updated_at": Utc::now(),
+        });
+
+        assert!(serde_json::from_value::<CapabilityActivityView>(json).is_err());
+    }
+
+    #[test]
     fn capability_activity_view_rejects_oversized_and_malformed_error_kind_segments() {
         for error_kind in [
             "a".repeat(CAPABILITY_ACTIVITY_ERROR_KIND_MAX_BYTES + 1),

@@ -26,54 +26,32 @@ impl RuntimeProjectionState {
     pub(crate) fn apply(&mut self, entry: &EventLogEntry<RuntimeEvent>) {
         apply_run_event(&mut self.runs, entry);
         apply_capability_activity_event(&mut self.capability_activities, entry);
-        enforce_capability_activity_limit(
-            &mut self.capability_activities,
-            self.capability_activity_limit,
-        );
     }
 
     pub(crate) fn into_parts(
         self,
     ) -> (Vec<RunStatusProjection>, Vec<CapabilityActivityProjection>) {
-        (
-            self.runs.into_values().collect(),
-            self.capability_activities.into_values().collect(),
-        )
+        let mut capability_activities = self.capability_activities.into_values().collect();
+        enforce_capability_activity_limit(
+            &mut capability_activities,
+            self.capability_activity_limit,
+        );
+        (self.runs.into_values().collect(), capability_activities)
     }
 }
 
 fn enforce_capability_activity_limit(
-    activities: &mut HashMap<InvocationId, CapabilityActivityProjection>,
+    activities: &mut Vec<CapabilityActivityProjection>,
     limit: Option<usize>,
 ) {
     let Some(limit) = limit else {
         return;
     };
-    while activities.len() > limit {
-        let Some(invocation_id) = least_recent_capability_activity(activities) else {
-            return;
-        };
-        activities.remove(&invocation_id);
+    if activities.len() <= limit {
+        return;
     }
-}
-
-fn least_recent_capability_activity(
-    activities: &HashMap<InvocationId, CapabilityActivityProjection>,
-) -> Option<InvocationId> {
-    activities
-        .iter()
-        .min_by(|(_, left), (_, right)| {
-            left.updated_at
-                .cmp(&right.updated_at)
-                .then_with(|| left.last_cursor.cmp(&right.last_cursor))
-                .then_with(|| {
-                    right
-                        .invocation_id
-                        .as_uuid()
-                        .cmp(&left.invocation_id.as_uuid())
-                })
-        })
-        .map(|(invocation_id, _)| *invocation_id)
+    sort_capability_activities_for_projection(activities);
+    activities.truncate(limit);
 }
 
 pub(crate) fn sort_runs_for_projection(runs: &mut [RunStatusProjection]) {

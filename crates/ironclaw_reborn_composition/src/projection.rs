@@ -54,7 +54,7 @@ impl RebornProjectionServices {
     }
 
     pub(crate) fn webui_event_stream(&self) -> Arc<dyn ProjectionStream> {
-        Arc::new(WebuiRunStatusProjectionStream {
+        Arc::new(WebuiRuntimeProjectionStream {
             manager: Arc::clone(&self.event_stream_manager),
             turn_events: self.turn_events.clone(),
             reply_target_binding_ref: self.webui_reply_target_binding_ref.clone(),
@@ -85,17 +85,18 @@ pub(crate) fn build_reborn_projection_services(
 
 /// WebUI bridge over the shared EventStreamManager.
 ///
-/// This intentionally exposes the current run-status slice of the product
-/// thread projection. Timeline content stays behind the WebUI timeline facade
-/// until the browser event schema grows a first-class timeline-entry mapper.
-struct WebuiRunStatusProjectionStream {
+/// This exposes runtime projection payloads that WebChat v2 has first-class
+/// SSE frames for: run status and capability activity. Timeline content stays
+/// behind the WebUI timeline facade until the browser event schema grows a
+/// first-class timeline-entry mapper.
+struct WebuiRuntimeProjectionStream {
     manager: Arc<EventStreamManager>,
     turn_events: TurnEventBridge,
     reply_target_binding_ref: ReplyTargetBindingRef,
 }
 
 #[async_trait]
-impl ProjectionStream for WebuiRunStatusProjectionStream {
+impl ProjectionStream for WebuiRuntimeProjectionStream {
     async fn drain(
         &self,
         request: ProjectionSubscriptionRequest,
