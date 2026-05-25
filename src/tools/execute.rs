@@ -7,6 +7,8 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use uuid::Uuid;
+
 use crate::context::{ActionRecord, JobContext};
 use crate::db::Database;
 use crate::error::Error;
@@ -135,11 +137,16 @@ pub async fn execute_tool_with_safety(
 ///   direct `execute_tool_with_safety` call — this function delegates to it.
 /// * On top of that, an `ActionRecord` is built (redacted params + sanitized
 ///   output, mirroring [`crate::tools::dispatch::ToolDispatcher::dispatch`])
-///   and persisted under a freshly-minted system job for FK integrity. The
-///   caller's `base_ctx.job_id` is intentionally **not** used as the audit
-///   FK: interactive-chat job contexts are in-memory and have no backing
-///   `agent_jobs` row, so a dedicated system job is created (matching the
-///   dispatcher funnel).
+///   and persisted. The audit FK depends on `existing_job_id`:
+///   * `None` — the caller's `base_ctx.job_id` is in-memory only (no backing
+///     `agent_jobs` row), so a freshly-minted system job is created for FK
+///     integrity. This is the interactive-chat path (#4019 step 3) and the
+///     dispatcher-funnel behavior.
+///   * `Some(job_id)` — the caller already persisted a real `agent_jobs` row
+///     (e.g. the scheduler, which `save_job`s before dispatch, #4019 step 4).
+///     The `ActionRecord` is saved under that job so the audit correlates to
+///     the originating job rather than an orphan system job. No fresh system
+///     job is minted in this case.
 ///
 /// `source` carries the channel/actor seam that the per-channel tool-permit
 /// filter (#1378) will key on once it lands; this function is the path where
@@ -164,6 +171,7 @@ pub async fn execute_tool_audited(
     params: serde_json::Value,
     base_ctx: &JobContext,
     source: DispatchSource,
+    existing_job_id: Option<Uuid>,
 ) -> Result<String, Error> {
     // Without a store there is nothing to audit against — preserve the exact
     // historical chat behavior (no DB rows) by passing straight through.
@@ -198,21 +206,32 @@ pub async fn execute_tool_audited(
         }
     };
 
-    // Create the audit anchor *before* executing the tool, and fail the call if
-    // it cannot be created. A side-effecting chat tool must never run without a
+    // Resolve the audit anchor *before* executing the tool, and fail the call if
+    // it cannot be created. A side-effecting tool must never run without a
     // persisted `ActionRecord` — that reintroduces the unaudited-execution gap
     // this funnel exists to close. Mirrors `ToolDispatcher::dispatch`, which
     // creates the system job before execution and fails the call if that step
-    // fails. The base context's identity (user) drives ownership; its job_id is
-    // in-memory only.
-    let source_label = source.to_string();
-    let job_id = store
-        .create_system_job(&base_ctx.user_id, &source_label)
-        .await
-        .map_err(|e| crate::error::ToolError::ExecutionFailed {
-            name: tool_name.to_string(),
-            reason: format!("failed to create audit anchor: {e}"),
-        })?;
+    // fails.
+    //
+    // When the caller already persisted a real `agent_jobs` row (e.g. the
+    // scheduler running an accepted job), correlate the `ActionRecord` to that
+    // job via `existing_job_id` so the audit trail attaches to the real run
+    // rather than a synthetic system job. Otherwise mint a fresh system job
+    // (chat/dispatcher/routine behavior): the base context's identity (user)
+    // drives ownership; its in-memory job_id is not a DB row.
+    let job_id = match existing_job_id {
+        Some(job_id) => job_id,
+        None => {
+            let source_label = source.to_string();
+            store
+                .create_system_job(&base_ctx.user_id, &source_label)
+                .await
+                .map_err(|e| crate::error::ToolError::ExecutionFailed {
+                    name: tool_name.to_string(),
+                    reason: format!("failed to create audit anchor: {e}"),
+                })?
+        }
+    };
 
     let start = std::time::Instant::now();
     let result = execute_tool_with_safety(tools, safety, tool_name, params, base_ctx).await;
@@ -243,7 +262,7 @@ pub async fn execute_tool_audited(
             error = %e,
             tool = %tool_name,
             job_id = %job_id,
-            "failed to persist chat tool ActionRecord"
+            "failed to persist tool ActionRecord"
         );
     }
 
@@ -786,6 +805,7 @@ mod audited_integration_tests {
             serde_json::json!({ "message": "hi", "api_key": "secret-value" }),
             &job_ctx,
             DispatchSource::Channel("web".into()),
+            None,
         )
         .await
         .expect("audited execution should succeed");
@@ -848,6 +868,7 @@ mod audited_integration_tests {
             serde_json::json!({ "message": "hi" }),
             &job_ctx,
             DispatchSource::Channel("web".into()),
+            None,
         )
         .await
         .expect("audited execution should succeed for hyphenated alias");
@@ -891,6 +912,7 @@ mod audited_integration_tests {
             params.clone(),
             &job_ctx,
             DispatchSource::Channel("web".into()),
+            None,
         )
         .await
         .expect("audited ok");
@@ -903,6 +925,7 @@ mod audited_integration_tests {
             params.clone(),
             &job_ctx,
             DispatchSource::Channel("web".into()),
+            None,
         )
         .await
         .expect("audited (no store) ok");
@@ -939,6 +962,7 @@ mod audited_integration_tests {
             serde_json::json!({}),
             &job_ctx,
             DispatchSource::Channel("web".into()),
+            None,
         )
         .await;
 
@@ -981,6 +1005,7 @@ mod audited_integration_tests {
             serde_json::json!({ "api_key": "secret-value", "prompt": "do x" }),
             &job_ctx,
             DispatchSource::Channel("web".into()),
+            None,
         )
         .await;
 
@@ -1005,6 +1030,104 @@ mod audited_integration_tests {
             action.input.get("prompt").and_then(|v| v.as_str()),
             Some("[REDACTED]"),
             "every field of an unresolved tool call must be redacted"
+        );
+    }
+
+    // ── Routine-engine funnel (#4019 step 4) ──────────────────────────────
+    // The routine engine previously called `tool.execute()` raw — no audit, no
+    // param validation/redaction. It now routes through `execute_tool_audited`
+    // with `DispatchSource::Routine` and `existing_job_id = None` (routine run
+    // ids are in-memory, so a fresh system job backs the audit FK).
+
+    #[tokio::test]
+    async fn audited_routine_tool_call_persists_action_record() {
+        let (db, backend, _dir) = test_store().await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let registry = registry_with(Arc::new(ContextEchoTool {
+            seen_user: Arc::clone(&seen),
+        }))
+        .await;
+        let safety = safety();
+        let routine_id = Uuid::new_v4();
+        // A routine job context carries the routine owner; its job_id is the
+        // in-memory run id (no agent_jobs row), mirroring production routines.
+        let job_ctx = JobContext::with_user("chatter", "routine", "lightweight");
+
+        let out = execute_tool_audited(
+            &registry,
+            &safety,
+            Some(&db),
+            "ctx_echo",
+            serde_json::json!({ "message": "routine-run", "api_key": "secret-value" }),
+            &job_ctx,
+            DispatchSource::Routine { routine_id },
+            None,
+        )
+        .await
+        .expect("audited routine execution should succeed");
+
+        assert_eq!(
+            seen.lock().unwrap().clone().as_deref(),
+            Some("chatter"),
+            "tool must run under the routine's JobContext"
+        );
+        assert!(out.contains("routine-run"));
+
+        let actions = fetch_system_actions(&backend, &db, "chatter").await;
+        let action = actions
+            .iter()
+            .find(|a| a.tool_name == "ctx_echo")
+            .expect("an ActionRecord for the routine tool call");
+        assert!(action.success);
+        // Routine path now redacts sensitive params (it did not before step 4).
+        assert_eq!(
+            action.input.get("api_key").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "routine audit row must redact sensitive params"
+        );
+        assert!(!action.input.to_string().contains("secret-value"));
+    }
+
+    #[tokio::test]
+    async fn audited_routine_tool_call_runs_through_validation() {
+        // The routine path now runs the same param validator chat/dispatch use.
+        // A null byte (rejected by the default validator) must surface as an
+        // InvalidParameters error rather than reaching the tool.
+        let (db, _backend, _dir) = test_store().await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let registry = registry_with(Arc::new(ContextEchoTool {
+            seen_user: Arc::clone(&seen),
+        }))
+        .await;
+        let safety = safety();
+        let job_ctx = JobContext::with_user("chatter", "routine", "lightweight");
+
+        let result = execute_tool_audited(
+            &registry,
+            &safety,
+            Some(&db),
+            "ctx_echo",
+            serde_json::json!({ "message": "bad\u{0000}value" }),
+            &job_ctx,
+            DispatchSource::Routine {
+                routine_id: Uuid::new_v4(),
+            },
+            None,
+        )
+        .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(crate::error::Error::Tool(
+                    crate::error::ToolError::InvalidParameters { .. }
+                ))
+            ),
+            "routine path must reject invalid params via the shared validator: {result:?}"
+        );
+        assert!(
+            seen.lock().unwrap().is_none(),
+            "tool must not run when validation fails"
         );
     }
 }
