@@ -30,6 +30,11 @@ pub(super) fn extract_skill_bundle(
     let reader = std::io::Cursor::new(data);
     let mut archive = zip::ZipArchive::new(reader)
         .map_err(|_| FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OperationFailed))?;
+    if archive.len() > MAX_ZIP_FILE_ENTRIES {
+        return Err(FirstPartyCapabilityError::new(
+            RuntimeDispatchErrorKind::OutputTooLarge,
+        ));
+    }
 
     let mut raw_paths = Vec::new();
     for index in 0..archive.len() {

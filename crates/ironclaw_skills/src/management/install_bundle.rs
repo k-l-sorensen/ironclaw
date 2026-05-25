@@ -82,7 +82,7 @@ pub(super) async fn publish_skill_install(
     .await;
 
     if let Err(error) = result {
-        cleanup_partial_install(context, skill_name, &skill_dir).await;
+        cleanup_partial_install(context, skill_name, &skill_dir).await?;
         return Err(error);
     }
     Ok(())
@@ -146,15 +146,22 @@ pub(super) async fn read_install_metadata_bytes(
         .await
     {
         Ok(Some(bytes)) => Ok(Some(bytes)),
-        Ok(None) | Err(FilesystemError::NotFound { .. }) => Ok(None),
+        Ok(None) => Ok(Some(Vec::new())),
+        Err(FilesystemError::NotFound { .. }) => Ok(None),
         Err(error) => Err(filesystem_error(error)),
     }
 }
 
 fn install_metadata_bytes(source_url: Option<&str>) -> Result<Vec<u8>, SkillManagementError> {
-    InstalledSkillMetadata::installed_url(source_url)
+    let bytes = InstalledSkillMetadata::installed_url(source_url)
         .to_pretty_json()
-        .map_err(|_| SkillManagementError::new(SkillManagementErrorKind::InvalidInput))
+        .map_err(|_| SkillManagementError::new(SkillManagementErrorKind::InvalidInput))?;
+    if bytes.len() > MAX_INSTALL_METADATA_BYTES {
+        return Err(SkillManagementError::new(
+            SkillManagementErrorKind::Resource,
+        ));
+    }
+    Ok(bytes)
 }
 
 fn skill_bundle_file_scoped_path(
@@ -257,7 +264,7 @@ async fn cleanup_partial_install(
     context: &SkillManagementContext,
     skill_name: &str,
     skill_dir: &ScopedPath,
-) {
+) -> Result<(), SkillManagementError> {
     log_skill_filesystem_phase("cleanup_partial_install", skill_name, skill_dir);
     if let Err(error) = context.filesystem.delete(&context.scope, skill_dir).await {
         tracing::debug!(
@@ -266,5 +273,7 @@ async fn cleanup_partial_install(
             error = ?error,
             "skill install failed to clean up partial bundle"
         );
+        return Err(filesystem_error(error));
     }
+    Ok(())
 }

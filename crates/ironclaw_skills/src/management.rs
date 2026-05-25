@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{Arc, LazyLock, Mutex, Weak},
+};
 
 use crate::{MAX_PROMPT_FILE_SIZE, normalize_line_endings, parse_skill_md, validate_skill_name};
 use async_trait::async_trait;
@@ -22,6 +25,10 @@ use install_bundle::{
 pub(super) const USER_SKILLS_ROOT: &str = "/skills";
 const SYSTEM_SKILLS_ROOT: &str = "/system/skills";
 pub(super) const SKILL_FILE_NAME: &str = "SKILL.md";
+type SkillMutationLock = Arc<tokio::sync::Mutex<()>>;
+
+static SKILL_MUTATION_LOCKS: LazyLock<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillManagementErrorKind {
@@ -224,6 +231,8 @@ pub async fn install_skill(
     validate_install_bundle_files(request.files)?;
 
     let skill_name = parsed.manifest.name;
+    let mutation_lock = skill_mutation_lock(&skill_name);
+    let _mutation_guard = mutation_lock.lock().await;
     let skill_dir = skill_root_scoped_path(USER_SKILLS_ROOT, &skill_name)?;
     let skill_path = skill_scoped_path(USER_SKILLS_ROOT, &skill_name, SKILL_FILE_NAME)?;
 
@@ -290,6 +299,8 @@ pub async fn remove_skill(
             SkillManagementErrorKind::InvalidInput,
         ));
     }
+    let mutation_lock = skill_mutation_lock(request.name);
+    let _mutation_guard = mutation_lock.lock().await;
     let skill_dir = skill_root_scoped_path(USER_SKILLS_ROOT, request.name)?;
     let skill_path = skill_scoped_path(USER_SKILLS_ROOT, request.name, SKILL_FILE_NAME)?;
     log_skill_filesystem_phase("stat_existing", request.name, &skill_path);
@@ -315,6 +326,20 @@ pub async fn remove_skill(
     Ok(SkillRemoveResult {
         name: request.name.to_string(),
     })
+}
+
+fn skill_mutation_lock(skill_name: &str) -> SkillMutationLock {
+    let mut guard = SKILL_MUTATION_LOCKS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(existing) = guard.get(skill_name).and_then(Weak::upgrade) {
+        return existing;
+    }
+
+    let lock = Arc::new(tokio::sync::Mutex::new(()));
+    guard.insert(skill_name.to_string(), Arc::downgrade(&lock));
+    lock
 }
 
 #[tracing::instrument(

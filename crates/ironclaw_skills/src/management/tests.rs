@@ -6,7 +6,7 @@ use ironclaw_filesystem::{
     RootFilesystem,
 };
 use ironclaw_host_api::{
-    MountAlias, MountGrant, MountPermissions, MountView, ResourceScope, VirtualPath,
+    MountAlias, MountGrant, MountPermissions, MountView, ResourceScope, ScopedPath, VirtualPath,
 };
 
 use super::install_bundle::MAX_INSTALL_BUNDLE_FILE_BYTES;
@@ -196,6 +196,7 @@ async fn install_bundle_failure_cleans_up_partial_directory() {
     let filesystem = Arc::new(FailingBundleWriteFilesystem {
         inner: inner.clone(),
         fail_suffix: "/scripts/run.py",
+        fail_delete: false,
     });
     let context = skill_management_context_with_root(filesystem, skill_mounts());
 
@@ -274,11 +275,61 @@ async fn install_rejects_preexisting_skill_directory_without_deleting_contents()
 }
 
 #[tokio::test]
+async fn install_serializes_concurrent_same_name_requests() {
+    let filesystem = Arc::new(InMemoryBackend::default());
+    let context = skill_management_context(filesystem.clone(), skill_mounts());
+    let content = skill_md("shared-helper", "description", "PROMPT");
+
+    let first = install_skill(
+        &context,
+        SkillInstallRequest {
+            name: None,
+            content: &content,
+            files: &[],
+            source: SkillInstallSource::User,
+            source_url: None,
+        },
+    );
+    let second = install_skill(
+        &context,
+        SkillInstallRequest {
+            name: None,
+            content: &content,
+            files: &[],
+            source: SkillInstallSource::User,
+            source_url: None,
+        },
+    );
+    let (first, second) = tokio::join!(first, second);
+
+    let results = [first, second];
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| {
+                result
+                    .as_ref()
+                    .is_err_and(|error| error.kind() == SkillManagementErrorKind::Conflict)
+            })
+            .count(),
+        1
+    );
+    assert_file_contents(
+        &filesystem,
+        "/projects/skills/shared-helper/SKILL.md",
+        content.as_bytes(),
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn install_metadata_write_failure_cleans_up_partial_directory() {
     let inner = Arc::new(InMemoryBackend::default());
     let filesystem = Arc::new(FailingBundleWriteFilesystem {
         inner: inner.clone(),
         fail_suffix: "/.ironclaw-install.json",
+        fail_delete: false,
     });
     let context = skill_management_context_with_root(filesystem, skill_mounts());
 
@@ -308,6 +359,47 @@ async fn install_metadata_write_failure_cleans_up_partial_directory() {
 }
 
 #[tokio::test]
+async fn install_cleanup_failure_is_reported() {
+    let inner = Arc::new(InMemoryBackend::default());
+    let filesystem = Arc::new(FailingBundleWriteFilesystem {
+        inner: inner.clone(),
+        fail_suffix: "/scripts/run.py",
+        fail_delete: true,
+    });
+    let context = skill_management_context_with_root(filesystem, skill_mounts());
+
+    let error = install_skill(
+        &context,
+        SkillInstallRequest {
+            name: None,
+            content: &skill_md("cleanup-helper", "description", "PROMPT"),
+            files: &[
+                SkillInstallFile {
+                    relative_path: "references/guide.md",
+                    contents: b"# Guide\n",
+                },
+                SkillInstallFile {
+                    relative_path: "scripts/run.py",
+                    contents: b"print('nope')\n",
+                },
+            ],
+            source: SkillInstallSource::User,
+            source_url: None,
+        },
+    )
+    .await
+    .unwrap_err();
+
+    assert_eq!(error.kind(), SkillManagementErrorKind::FilesystemDenied);
+    assert_file_contents(
+        &inner,
+        "/projects/skills/cleanup-helper/references/guide.md",
+        b"# Guide\n",
+    )
+    .await;
+}
+
+#[tokio::test]
 async fn list_treats_malformed_install_metadata_as_installed() {
     let filesystem = Arc::new(InMemoryBackend::default());
     write_file(
@@ -320,6 +412,31 @@ async fn list_treats_malformed_install_metadata_as_installed() {
         .write_file(
             &VirtualPath::new("/projects/skills/metadata-helper/.ironclaw-install.json").unwrap(),
             b"not json",
+        )
+        .await
+        .unwrap();
+    let context = skill_management_context(filesystem, skill_mounts());
+
+    let listed = list_skills(&context).await.unwrap();
+
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].name, "metadata-helper");
+    assert_eq!(listed[0].source, SkillSource::Installed);
+}
+
+#[tokio::test]
+async fn list_treats_oversized_install_metadata_as_installed() {
+    let filesystem = Arc::new(InMemoryBackend::default());
+    write_file(
+        filesystem.as_ref(),
+        "/projects/skills/metadata-helper/SKILL.md",
+        skill_md("metadata-helper", "local skill description", "PROMPT"),
+    )
+    .await;
+    filesystem
+        .write_file(
+            &VirtualPath::new("/projects/skills/metadata-helper/.ironclaw-install.json").unwrap(),
+            &vec![b'x'; crate::MAX_INSTALL_METADATA_BYTES + 1],
         )
         .await
         .unwrap();
@@ -403,6 +520,7 @@ async fn assert_file_contents(root: &InMemoryBackend, path: &str, expected: &[u8
 struct FailingBundleWriteFilesystem {
     inner: Arc<InMemoryBackend>,
     fail_suffix: &'static str,
+    fail_delete: bool,
 }
 
 #[async_trait]
@@ -443,6 +561,12 @@ impl RootFilesystem for FailingBundleWriteFilesystem {
     }
 
     async fn delete(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+        if self.fail_delete {
+            return Err(FilesystemError::PermissionDenied {
+                path: ScopedPath::new(path.as_str().to_string()).unwrap(),
+                operation: FilesystemOperation::Delete,
+            });
+        }
         self.inner.delete(path).await
     }
 }

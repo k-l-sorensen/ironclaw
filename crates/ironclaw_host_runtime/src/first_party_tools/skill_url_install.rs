@@ -16,7 +16,8 @@ const SKILL_URL_FETCH_TIMEOUT_MS: u32 = 10_000;
 const MAX_ZIP_ENTRY_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_TOTAL_UNZIPPED_BYTES: u64 = 20 * 1024 * 1024;
 const MAX_GITHUB_PATH_SEGMENTS: usize = 8;
-const MAX_GITHUB_CONTENT_DIRS: usize = ironclaw_skills::MAX_INSTALL_BUNDLE_FILES * 4;
+const MAX_GITHUB_CONTENT_API_REQUESTS: usize = 64;
+const MAX_GITHUB_CONTENT_API_RESPONSE_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_ZIP_FILE_ENTRIES: usize = ironclaw_skills::MAX_INSTALL_BUNDLE_FILES * 4;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,9 +33,9 @@ pub(super) struct SkillUrlPayloadFile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FetchedBytes {
-    status: u16,
-    body: Vec<u8>,
+pub(super) struct FetchedBytes {
+    pub(super) status: u16,
+    pub(super) body: Vec<u8>,
 }
 
 pub(super) async fn fetch_skill_url_payload(
@@ -89,7 +90,7 @@ async fn fetch_url_bytes_with_headers(
     Ok(response.body)
 }
 
-async fn fetch_url_response(
+pub(super) async fn fetch_url_response(
     request: &FirstPartyCapabilityRequest,
     url: &url::Url,
     usage: &mut ResourceUsage,

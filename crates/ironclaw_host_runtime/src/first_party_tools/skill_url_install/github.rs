@@ -9,9 +9,10 @@ use serde::Deserialize;
 use crate::{FirstPartyCapabilityError, FirstPartyCapabilityRequest};
 
 use super::{
-    MAX_GITHUB_CONTENT_DIRS, MAX_GITHUB_PATH_SEGMENTS, SkillUrlPayload, bundle::BundleCollector,
+    MAX_GITHUB_CONTENT_API_REQUESTS, MAX_GITHUB_CONTENT_API_RESPONSE_BYTES,
+    MAX_GITHUB_PATH_SEGMENTS, SkillUrlPayload, bundle::BundleCollector,
     bundle::normalize_archive_path, fetch_url_bytes, fetch_url_bytes_with_headers,
-    validate_derived_fetch_url, zip_bundle::extract_skill_bundle_blocking,
+    fetch_url_response, validate_derived_fetch_url, zip_bundle::extract_skill_bundle_blocking,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -199,6 +200,31 @@ fn build_github_contents_url(
     Ok(url)
 }
 
+fn build_github_raw_url(
+    owner: &str,
+    repo: &str,
+    git_ref: &str,
+    path: &Path,
+) -> Result<url::Url, FirstPartyCapabilityError> {
+    validate_github_repo_components(owner, repo)?;
+    let mut url = validate_derived_fetch_url("https://raw.githubusercontent.com")?;
+    {
+        let mut segments = url.path_segments_mut().map_err(|_| {
+            FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OperationFailed)
+        })?;
+        segments.push(owner);
+        segments.push(repo);
+        segments.push(git_ref);
+        for segment in path.iter() {
+            let segment = segment.to_str().ok_or_else(|| {
+                FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::InputEncode)
+            })?;
+            segments.push(segment);
+        }
+    }
+    Ok(url)
+}
+
 fn build_github_matching_refs_url(
     owner: &str,
     repo: &str,
@@ -246,6 +272,26 @@ async fn fetch_github_api_json<T: for<'de> Deserialize<'de>>(
         FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OperationFailed)
             .with_usage(usage.clone())
     })
+}
+
+async fn fetch_github_api_json_with_body_len<T: for<'de> Deserialize<'de>>(
+    request: &FirstPartyCapabilityRequest,
+    url: &url::Url,
+    usage: &mut ResourceUsage,
+) -> Result<(T, u64), FirstPartyCapabilityError> {
+    let response = fetch_url_response(request, url, usage, github_api_headers()).await?;
+    if !(200..300).contains(&response.status) {
+        return Err(
+            FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OperationFailed)
+                .with_usage(usage.clone()),
+        );
+    }
+    let body_len = response.body.len() as u64;
+    let value = serde_json::from_slice(&response.body).map_err(|_| {
+        FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OperationFailed)
+            .with_usage(usage.clone())
+    })?;
+    Ok((value, body_len))
 }
 
 async fn resolve_github_default_branch(
@@ -426,12 +472,13 @@ async fn fetch_github_repo_payload(
     usage: &mut ResourceUsage,
 ) -> Result<SkillUrlPayload, FirstPartyCapabilityError> {
     let repo = resolve_github_tree_request(request, repo_request, usage).await?;
-    if repo.subdir.is_some() {
-        return fetch_github_contents_bundle_payload(request, source_url, repo, usage).await;
-    }
     let commit_sha =
         resolve_github_ref_commit_sha(request, &repo.owner, &repo.repo, &repo.branch, usage)
             .await?;
+    if repo.subdir.is_some() {
+        return fetch_github_contents_bundle_payload(request, source_url, repo, &commit_sha, usage)
+            .await;
+    }
     let archive_url = validate_derived_fetch_url(&format!(
         "https://codeload.github.com/{}/{}/legacy.zip/{}",
         repo.owner, repo.repo, commit_sha
@@ -454,6 +501,7 @@ async fn fetch_github_contents_bundle_payload(
     request: &FirstPartyCapabilityRequest,
     source_url: &str,
     repo: GitHubRepoRef,
+    commit_sha: &str,
     usage: &mut ResourceUsage,
 ) -> Result<SkillUrlPayload, FirstPartyCapabilityError> {
     let root_subdir = repo
@@ -464,25 +512,32 @@ async fn fetch_github_contents_bundle_payload(
     let root_dir = normalized_archive_path_to_string(&root_path)?;
     let mut directories = VecDeque::from([root_path.clone()]);
     let mut visited_directories = 0usize;
+    let mut contents_response_bytes = 0u64;
     let mut seen_files = HashSet::<PathBuf>::new();
     let mut collector = BundleCollector::new(root_path);
 
     while let Some(directory) = directories.pop_front() {
         visited_directories += 1;
-        if visited_directories > MAX_GITHUB_CONTENT_DIRS {
+        if visited_directories > MAX_GITHUB_CONTENT_API_REQUESTS {
             return Err(FirstPartyCapabilityError::new(
                 RuntimeDispatchErrorKind::OutputTooLarge,
             ));
         }
         let directory_path = normalized_archive_path_to_string(&directory)?;
-        let contents_url = build_github_contents_url(
-            &repo.owner,
-            &repo.repo,
-            Some(&directory_path),
-            &repo.branch,
-        )?;
-        let entries: Vec<GitHubContentFile> =
-            fetch_github_api_json(request, &contents_url, usage).await?;
+        let contents_url =
+            build_github_contents_url(&repo.owner, &repo.repo, Some(&directory_path), commit_sha)?;
+        let (entries, response_bytes): (Vec<GitHubContentFile>, u64) =
+            fetch_github_api_json_with_body_len(request, &contents_url, usage).await?;
+        contents_response_bytes = contents_response_bytes
+            .checked_add(response_bytes)
+            .ok_or_else(|| {
+                FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OutputTooLarge)
+            })?;
+        if contents_response_bytes > MAX_GITHUB_CONTENT_API_RESPONSE_BYTES {
+            return Err(FirstPartyCapabilityError::new(
+                RuntimeDispatchErrorKind::OutputTooLarge,
+            ));
+        }
         for entry in entries {
             let entry_path = entry.path.ok_or_else(|| {
                 FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OperationFailed)
@@ -503,10 +558,8 @@ async fn fetch_github_contents_bundle_payload(
                             RuntimeDispatchErrorKind::InputEncode,
                         ));
                     }
-                    let download_url = entry.download_url.ok_or_else(|| {
-                        FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OperationFailed)
-                    })?;
-                    let download_url = validate_derived_fetch_url(&download_url)?;
+                    let download_url =
+                        build_github_raw_url(&repo.owner, &repo.repo, commit_sha, &path)?;
                     let bytes = fetch_url_bytes(request, &download_url, usage).await?;
                     collector.push_file(path, bytes)?;
                 }
