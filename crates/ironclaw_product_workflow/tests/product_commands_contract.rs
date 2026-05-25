@@ -2,8 +2,8 @@
 
 use ironclaw_product_adapters::{InboundCommandPayload, ProductTriggerReason};
 use ironclaw_product_workflow::{
-    LifecyclePackageKind, LifecyclePackageRef, LifecycleProductAction, ProductCommand,
-    ProductModelCommand, product_command_descriptors,
+    LifecyclePackageId, LifecyclePackageKind, LifecyclePackageRef, LifecycleProductAction,
+    ProductCommand, ProductModelCommand, product_command_descriptors,
 };
 
 #[test]
@@ -45,7 +45,7 @@ fn command_payload_maps_all_declared_commands_and_unknown_fallback() {
             r#"{"name":"review-helper","content":"---\nname: review-helper\n---\nUse review helper."}"#,
             ProductCommand::Lifecycle {
                 action: LifecycleProductAction::SkillInstall {
-                    name: Some("review-helper".to_string()),
+                    name: Some(LifecyclePackageId::new("review-helper").unwrap()),
                     content: "---\nname: review-helper\n---\nUse review helper.".to_string(),
                 },
             },
@@ -248,6 +248,21 @@ fn lifecycle_refs_validate_during_deserialization() {
             "invalid lifecycle ref should reject: {json}"
         );
     }
+}
+
+#[test]
+fn lifecycle_command_parser_rejects_invalid_skill_install_name() {
+    let payload = InboundCommandPayload {
+        command: "skill_install".to_string(),
+        arguments: r#"{"name":"bad\nname","content":"---\nname: bad-name\n---\nUse bad name."}"#
+            .to_string(),
+        trigger: ProductTriggerReason::BotCommand,
+    };
+
+    assert!(matches!(
+        ProductCommand::from_payload(&payload),
+        ProductCommand::Unknown { .. }
+    ));
 }
 
 #[test]

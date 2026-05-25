@@ -16,9 +16,8 @@ use serde_json::Value;
 use crate::{
     ProductCommandContext, ProductCommandService, ProductWorkflowError,
     lifecycle::{
-        LIFECYCLE_ID_MAX_BYTES, LifecyclePackageKind, LifecyclePackageRef, LifecycleProductAction,
-        LifecycleProductContext, LifecycleProductFacade, validate_lifecycle_string,
-        validate_lifecycle_text,
+        LifecyclePackageId, LifecyclePackageKind, LifecyclePackageRef, LifecycleProductAction,
+        LifecycleProductContext, LifecycleProductFacade, validate_lifecycle_text,
     },
 };
 
@@ -289,13 +288,10 @@ fn parse_skill_install_command(payload: &InboundCommandPayload) -> ProductComman
         Err(_) => return unknown_lifecycle_command(payload),
     };
     let name = match json.get("name").and_then(Value::as_str) {
-        Some(name) => {
-            match validate_lifecycle_string(name.to_string(), "skill name", LIFECYCLE_ID_MAX_BYTES)
-            {
-                Ok(name) => Some(name),
-                Err(_) => return unknown_lifecycle_command(payload),
-            }
-        }
+        Some(name) => match LifecyclePackageId::new(name) {
+            Ok(name) => Some(name),
+            Err(_) => return unknown_lifecycle_command(payload),
+        },
         None => None,
     };
     ProductCommand::Lifecycle {

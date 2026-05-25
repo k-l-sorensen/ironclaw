@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use ironclaw_filesystem::LocalFilesystem;
 use ironclaw_host_api::{InvocationId, MountView, ResourceScope, UserId};
 use ironclaw_product_workflow::{
-    LifecyclePackageKind, LifecyclePackageRef, LifecyclePhase, LifecycleProductAction,
-    LifecycleProductContext, LifecycleProductFacade, LifecycleProductResponse,
-    LifecycleReadinessBlocker, ProductWorkflowError,
+    LifecyclePackageId, LifecyclePackageKind, LifecyclePackageRef, LifecyclePhase,
+    LifecycleProductAction, LifecycleProductContext, LifecycleProductFacade,
+    LifecycleProductResponse, LifecycleReadinessBlocker, ProductWorkflowError,
 };
 use ironclaw_skills::{
     SkillInstallRequest, SkillManagementContext, SkillManagementError, SkillManagementErrorKind,
@@ -122,7 +122,7 @@ impl RebornLocalLifecycleFacade {
             LifecycleProductAction::SkillInstall { name, content } => {
                 let installed = self
                     .skill_management
-                    .install(name.as_deref(), &content)
+                    .install(name.as_ref().map(LifecyclePackageId::as_str), &content)
                     .await?;
                 Ok(response_with_payload(
                     Some(skill_package_ref(&installed.name)?),
@@ -286,7 +286,10 @@ mod tests {
         for index in 0..55 {
             facade
                 .execute_action(LifecycleProductAction::SkillInstall {
-                    name: Some(format!("bulk-skill-{index:02}")),
+                    name: Some(
+                        LifecyclePackageId::new(format!("bulk-skill-{index:02}"))
+                            .expect("valid skill id"),
+                    ),
                     content: format!(
                         "---\nname: bulk-skill-{index:02}\ndescription: bulk test\n---\nUse bulk.\n"
                     ),
@@ -361,11 +364,11 @@ mod tests {
         let facade_a = facade.clone();
         let facade_b = facade.clone();
         let install_a = facade_a.execute_action(LifecycleProductAction::SkillInstall {
-            name: Some("concurrent-a".to_string()),
+            name: Some(LifecyclePackageId::new("concurrent-a").expect("valid skill id")),
             content: skill_content("concurrent-a"),
         });
         let install_b = facade_b.execute_action(LifecycleProductAction::SkillInstall {
-            name: Some("concurrent-b".to_string()),
+            name: Some(LifecyclePackageId::new("concurrent-b").expect("valid skill id")),
             content: skill_content("concurrent-b"),
         });
         let (installed_a, installed_b) = tokio::join!(install_a, install_b);
@@ -395,7 +398,7 @@ mod tests {
 
         let invalid_install = facade
             .execute_action(LifecycleProductAction::SkillInstall {
-                name: Some("broken-skill".to_string()),
+                name: Some(LifecyclePackageId::new("broken-skill").expect("valid skill id")),
                 content: "not a skill manifest".to_string(),
             })
             .await

@@ -184,7 +184,7 @@ pub enum LifecycleProductAction {
     },
     SkillInstall {
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
+        name: Option<LifecyclePackageId>,
         content: String,
     },
     SkillRemove {

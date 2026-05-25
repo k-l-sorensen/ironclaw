@@ -1,4 +1,7 @@
-use std::sync::{Arc, OnceLock};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+};
 
 use crate::{MAX_PROMPT_FILE_SIZE, normalize_line_endings, parse_skill_md, validate_skill_name};
 use async_trait::async_trait;
@@ -7,12 +10,13 @@ use ironclaw_filesystem::{
     RootFilesystem, ScopedFilesystem,
 };
 use ironclaw_host_api::{HostApiError, MountView, ResourceScope, ScopedPath, VirtualPath};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 
 const USER_SKILLS_ROOT: &str = "/skills";
 const SYSTEM_SKILLS_ROOT: &str = "/system/skills";
 const SKILL_FILE_NAME: &str = "SKILL.md";
-static SKILL_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+const SKILL_SEARCH_SCAN_LIMIT: usize = 250;
+static SKILL_WRITE_LOCKS: OnceLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SkillManagementErrorKind {
@@ -43,6 +47,7 @@ impl SkillManagementError {
 pub struct SkillManagementContext {
     filesystem: Arc<ScopedFilesystem<SkillManagementRootFilesystem>>,
     scope: ResourceScope,
+    write_lock_namespace: String,
 }
 
 impl SkillManagementContext {
@@ -51,12 +56,14 @@ impl SkillManagementContext {
         mounts: MountView,
         scope: ResourceScope,
     ) -> Self {
+        let write_lock_namespace = skill_write_lock_namespace(&mounts, &scope);
         Self {
             filesystem: Arc::new(ScopedFilesystem::with_fixed_view(
                 Arc::new(SkillManagementRootFilesystem { inner: filesystem }),
                 mounts,
             )),
             scope,
+            write_lock_namespace,
         }
     }
 }
@@ -175,7 +182,7 @@ pub async fn list_skills(
 #[tracing::instrument(
     level = "debug",
     skip(context, request),
-    fields(query = request.query, limit = request.limit)
+    fields(query_bytes = request.query.len(), limit = request.limit)
 )]
 pub async fn search_skills(
     context: &SkillManagementContext,
@@ -183,12 +190,14 @@ pub async fn search_skills(
 ) -> Result<SkillSearchResult, SkillManagementError> {
     let normalized_query = request.query.trim().to_lowercase();
     let mut skills = Vec::new();
+    let mut remaining_scan = SKILL_SEARCH_SCAN_LIMIT;
     let mut truncated = collect_matching_skill_root(
         context,
         SYSTEM_SKILLS_ROOT,
         SkillSource::System,
         &normalized_query,
         request.limit,
+        &mut remaining_scan,
         &mut skills,
     )
     .await?;
@@ -199,6 +208,7 @@ pub async fn search_skills(
             SkillSource::User,
             &normalized_query,
             request.limit,
+            &mut remaining_scan,
             &mut skills,
         )
         .await?;
@@ -255,7 +265,7 @@ pub async fn install_skill(
     let skill_name = parsed.manifest.name;
     let skill_dir = skill_root_scoped_path(USER_SKILLS_ROOT, &skill_name)?;
     let skill_path = skill_scoped_path(USER_SKILLS_ROOT, &skill_name, SKILL_FILE_NAME)?;
-    let _guard = skill_write_lock().lock().await;
+    let _guard = skill_write_lock(context, &skill_path).await;
 
     log_skill_filesystem_phase("stat_existing", &skill_name, &skill_path);
     if stat_optional(context, &skill_path).await?.is_some() {
@@ -327,7 +337,7 @@ pub async fn remove_skill(
     }
     let skill_dir = skill_root_scoped_path(USER_SKILLS_ROOT, request.name)?;
     let skill_path = skill_scoped_path(USER_SKILLS_ROOT, request.name, SKILL_FILE_NAME)?;
-    let _guard = skill_write_lock().lock().await;
+    let _guard = skill_write_lock(context, &skill_path).await;
     log_skill_filesystem_phase("stat_existing", request.name, &skill_path);
     if stat_optional(context, &skill_path).await?.is_none() {
         tracing::debug!(
@@ -353,8 +363,40 @@ pub async fn remove_skill(
     })
 }
 
-fn skill_write_lock() -> &'static Mutex<()> {
-    SKILL_WRITE_LOCK.get_or_init(|| Mutex::new(()))
+async fn skill_write_lock(
+    context: &SkillManagementContext,
+    skill_path: &ScopedPath,
+) -> OwnedMutexGuard<()> {
+    let key = format!("{}:{}", context.write_lock_namespace, skill_path);
+    let lock = {
+        let registry = SKILL_WRITE_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut locks = registry.lock().await;
+        locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    lock.lock_owned().await
+}
+
+fn skill_write_lock_namespace(mounts: &MountView, scope: &ResourceScope) -> String {
+    let user_root = ScopedPath::new(USER_SKILLS_ROOT)
+        .ok()
+        .and_then(|path| mounts.resolve(&path).ok())
+        .map(|path| path.as_str().to_string())
+        .unwrap_or_else(|| USER_SKILLS_ROOT.to_string());
+    format!(
+        "tenant={};user={};agent={};project={};root={}",
+        scope.tenant_id.as_str(),
+        scope.user_id.as_str(),
+        scope.agent_id.as_ref().map(|id| id.as_str()).unwrap_or(""),
+        scope
+            .project_id
+            .as_ref()
+            .map(|id| id.as_str())
+            .unwrap_or(""),
+        user_root,
+    )
 }
 
 #[tracing::instrument(
@@ -368,24 +410,7 @@ async fn list_skill_root(
     source: SkillSource,
 ) -> Result<Vec<SkillSummary>, SkillManagementError> {
     tracing::debug!("skill management listing skill root");
-    let root = ScopedPath::new(scoped_root)
-        .map_err(|_| SkillManagementError::new(SkillManagementErrorKind::InvalidInput))?;
-    let entries = match context.filesystem.list_dir(&context.scope, &root).await {
-        Ok(entries) => entries,
-        Err(FilesystemError::NotFound { .. }) => {
-            tracing::debug!("skill management skill root not found");
-            return Ok(Vec::new());
-        }
-        Err(FilesystemError::PermissionDenied { .. }) => {
-            tracing::debug!("skill management skill root permission denied");
-            return Ok(Vec::new());
-        }
-        Err(error) if is_unmounted_scoped_root(&error) => {
-            tracing::debug!("skill management skill root is not mounted");
-            return Ok(Vec::new());
-        }
-        Err(error) => return Err(filesystem_error(error)),
-    };
+    let entries = list_skill_root_entries(context, scoped_root).await?;
 
     let mut skills = Vec::new();
     for entry in entries {
@@ -414,17 +439,10 @@ async fn collect_matching_skill_root(
     source: SkillSource,
     normalized_query: &str,
     limit: usize,
+    remaining_scan: &mut usize,
     skills: &mut Vec<SkillSummary>,
 ) -> Result<bool, SkillManagementError> {
-    let root = ScopedPath::new(scoped_root)
-        .map_err(|_| SkillManagementError::new(SkillManagementErrorKind::InvalidInput))?;
-    let entries = match context.filesystem.list_dir(&context.scope, &root).await {
-        Ok(entries) => entries,
-        Err(FilesystemError::NotFound { .. }) => return Ok(false),
-        Err(FilesystemError::PermissionDenied { .. }) => return Ok(false),
-        Err(error) if is_unmounted_scoped_root(&error) => return Ok(false),
-        Err(error) => return Err(filesystem_error(error)),
-    };
+    let entries = list_skill_root_entries(context, scoped_root).await?;
 
     for entry in entries {
         if entry.file_type != FileType::Directory {
@@ -434,6 +452,10 @@ async fn collect_matching_skill_root(
         if !validate_skill_name(name) {
             continue;
         }
+        if skills.len() >= limit || *remaining_scan == 0 {
+            return Ok(true);
+        }
+        *remaining_scan -= 1;
         let skill_path = skill_scoped_path(scoped_root, name, SKILL_FILE_NAME)?;
         let Some(skill) = read_skill_summary(context, &skill_path, source).await? else {
             continue;
@@ -441,12 +463,33 @@ async fn collect_matching_skill_root(
         if !skill_matches_query(&skill, normalized_query) {
             continue;
         }
-        if skills.len() == limit {
-            return Ok(true);
-        }
         skills.push(skill);
     }
     Ok(false)
+}
+
+async fn list_skill_root_entries(
+    context: &SkillManagementContext,
+    scoped_root: &str,
+) -> Result<Vec<DirEntry>, SkillManagementError> {
+    let root = ScopedPath::new(scoped_root)
+        .map_err(|_| SkillManagementError::new(SkillManagementErrorKind::InvalidInput))?;
+    match context.filesystem.list_dir(&context.scope, &root).await {
+        Ok(entries) => Ok(entries),
+        Err(FilesystemError::NotFound { .. }) => {
+            tracing::debug!("skill management skill root not found");
+            Ok(Vec::new())
+        }
+        Err(FilesystemError::PermissionDenied { .. }) => {
+            tracing::debug!("skill management skill root permission denied");
+            Ok(Vec::new())
+        }
+        Err(error) if is_unmounted_scoped_root(&error) => {
+            tracing::debug!("skill management skill root is not mounted");
+            Ok(Vec::new())
+        }
+        Err(error) => Err(filesystem_error(error)),
+    }
 }
 
 fn skill_matches_query(skill: &SkillSummary, normalized_query: &str) -> bool {
@@ -738,6 +781,62 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.skills.len(), 2);
+        assert!(result.truncated);
+    }
+
+    #[tokio::test]
+    async fn search_skills_zero_limit_returns_empty_truncated_result() {
+        let filesystem = Arc::new(InMemoryBackend::default());
+        write_file(
+            filesystem.as_ref(),
+            "/projects/skills/local-helper/SKILL.md",
+            skill_md("local-helper", "shared search description", "PROMPT"),
+        )
+        .await;
+        let context = skill_management_context(filesystem, skill_mounts());
+
+        let result = search_skills(
+            &context,
+            SkillSearchRequest {
+                query: "",
+                limit: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.skills.is_empty());
+        assert!(result.truncated);
+    }
+
+    #[tokio::test]
+    async fn search_skills_stops_after_scan_budget() {
+        let filesystem = Arc::new(InMemoryBackend::default());
+        for index in 0..=SKILL_SEARCH_SCAN_LIMIT {
+            write_file(
+                filesystem.as_ref(),
+                &format!("/projects/skills/local-{index:03}/SKILL.md"),
+                skill_md(
+                    &format!("local-{index:03}"),
+                    "non matching description",
+                    "PROMPT",
+                ),
+            )
+            .await;
+        }
+        let context = skill_management_context(filesystem, skill_mounts());
+
+        let result = search_skills(
+            &context,
+            SkillSearchRequest {
+                query: "absent-query",
+                limit: 50,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(result.skills.is_empty());
         assert!(result.truncated);
     }
 
