@@ -65,6 +65,26 @@ impl SecretsCrypto {
         salt
     }
 
+    /// Mint a fresh, cryptographically-random in-process master key.
+    ///
+    /// Intended for ephemeral / in-memory keystores (local-dev, tests) where no
+    /// secret must be persisted in source and no stable key is needed across
+    /// restarts. The key is a hex-encoded 32-byte `OsRng` draw, which always
+    /// satisfies the length + distinct-byte validation in [`Self::new`].
+    /// Durable deployments must still source the master key from the OS
+    /// keychain / KMS, never from this generator.
+    pub fn generate() -> Self {
+        let mut key = [0u8; KEY_SIZE];
+        rand::RngCore::fill_bytes(&mut OsRng, &mut key);
+        let mut hex = String::with_capacity(KEY_SIZE * 2);
+        for b in key {
+            use std::fmt::Write as _;
+            // Infallible: writing to a String never errors.
+            let _ = write!(hex, "{b:02x}");
+        }
+        Self::from_valid_master_key(hex)
+    }
+
     /// Encrypt `plaintext` and authenticate it against `aad`.
     ///
     /// The `aad` (additional authenticated data) is *not* encrypted but is
