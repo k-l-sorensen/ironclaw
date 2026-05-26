@@ -116,7 +116,7 @@ fn snapshot(scope: &ProjectionScope, cursor: u64) -> ProjectionSnapshot {
 
 fn snapshot_for_thread(scope: &ProjectionScope, cursor: u64, thread: &str) -> ProjectionSnapshot {
     let mut snapshot = snapshot(scope, cursor);
-    let thread_id = Some(ThreadId::new(thread).unwrap());
+    let thread_id = Some(ThreadId::new(thread).expect("valid test thread id"));
     for entry in &mut snapshot.timeline.entries {
         entry.thread_id = thread_id.clone();
     }
@@ -149,6 +149,7 @@ fn replay(scope: &ProjectionScope, cursor: u64, next: u64) -> ProjectionReplay {
             cursor,
             TimelineEntryKind::DispatchSucceeded,
         )],
+        capability_activity_transitions: Vec::new(),
         runs: vec![run_status(scope, next)],
         capability_activities: vec![capability_activity(scope, next)],
         next_cursor: ProjectionCursor::for_scope(scope.clone(), EventCursor::new(next)),
@@ -209,6 +210,20 @@ fn replay_with_activity_thread(
     replay
 }
 
+fn replay_with_activity_transition_thread(
+    scope: &ProjectionScope,
+    cursor: u64,
+    next: u64,
+    thread: &str,
+) -> ProjectionReplay {
+    let mut replay = replay(scope, cursor, next);
+    let mut transition = capability_activity(scope, next);
+    transition.thread_id = Some(ThreadId::new(thread).expect("valid test thread id"));
+    transition.status = CapabilityActivityStatus::Started;
+    replay.capability_activity_transitions = vec![transition];
+    replay
+}
+
 fn timeline_entry(scope: &ProjectionScope, cursor: u64, kind: TimelineEntryKind) -> TimelineEntry {
     TimelineEntry {
         cursor: EventCursor::new(cursor),
@@ -250,6 +265,7 @@ fn run_status(scope: &ProjectionScope, cursor: u64) -> RunStatusProjection {
 fn capability_activity(scope: &ProjectionScope, cursor: u64) -> CapabilityActivityProjection {
     CapabilityActivityProjection {
         invocation_id: InvocationId::new(),
+        run_id: None,
         capability_id: CapabilityId::new("script.echo").unwrap(),
         thread_id: scope.read_scope.thread_id.clone(),
         status: CapabilityActivityStatus::Completed,

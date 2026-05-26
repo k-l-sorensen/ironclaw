@@ -1,17 +1,20 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::{StreamExt, stream};
+#[cfg(test)]
+use ironclaw_event_projections::CapabilityActivityProjection;
 use ironclaw_event_projections::{
-    CapabilityActivityProjection, CapabilityActivityStatus, EventProjectionService,
-    ProjectionCursor as EventProjectionCursor, ProjectionReplay,
-    ProjectionScope as EventProjectionScope, ProjectionSnapshot, ReplayEventProjectionService,
-    RunProjectionStatus, RunStatusProjection,
+    CapabilityActivityStatus, EventProjectionService, ProjectionCursor as EventProjectionCursor,
+    ProjectionReplay, ProjectionScope as EventProjectionScope, ProjectionSnapshot,
+    ReplayEventProjectionService, RunProjectionStatus, RunStatusProjection,
 };
 use ironclaw_event_streams::{
     AllowAllProjectionAccessPolicy, EventStreamManager, InMemoryProjectionStreamAdmissionPolicy,
     InMemoryProjectionUpdateSource, NoExposureProjectionRedactionValidator,
     ProjectionStreamError as EventProjectionStreamError, ProjectionStreamItem,
-    ProjectionSubscribeRequest, ProjectionTarget, ProjectionViewClass, SubscriberCapabilities,
+    ProjectionSubscribeRequest, ProjectionSubscription as EventProjectionSubscription,
+    ProjectionTarget, ProjectionViewClass, SubscriberCapabilities,
 };
 use ironclaw_events::{DurableEventLog, EventCursor, EventStreamKey, ReadScope};
 use ironclaw_outbound::InMemoryOutboundStateStore;
@@ -28,8 +31,18 @@ use ironclaw_turns::{
     TurnEventProjectionSource, TurnRunId, TurnScope,
 };
 
+mod display_preview;
+mod runtime_replay;
 mod turn_events;
+use display_preview::{CapabilityDisplayPreviewSource, NoopCapabilityDisplayPreviewSource};
+use runtime_replay::{
+    RuntimePayloadCandidate, replay_payload_candidates, snapshot_payload_candidates,
+};
 use turn_events::{TurnEventBridge, TurnEventPayload};
+
+pub(crate) use display_preview::{CapabilityDisplayPreviewResult, CapabilityDisplayPreviewStore};
+#[cfg(test)]
+pub(crate) use display_preview::{SANITIZE_JSON_MAX_DEPTH, sanitize_json_value, sanitize_text};
 
 const WEBUI_PROJECTION_PAGE_LIMIT: usize = 256;
 const WEBUI_RUNTIME_ITEM_MAX_PAYLOADS: usize = WEBUI_PROJECTION_PAGE_LIMIT + 1;
@@ -40,6 +53,7 @@ const WEBUI_PROJECTION_INSTALLATION_ID: &str = "webui_v2.local";
 pub(crate) struct RebornProjectionServices {
     event_stream_manager: Arc<EventStreamManager>,
     turn_events: TurnEventBridge,
+    display_previews: Arc<dyn CapabilityDisplayPreviewSource>,
     webui_reply_target_binding_ref: ReplyTargetBindingRef,
 }
 
@@ -53,10 +67,19 @@ impl RebornProjectionServices {
         self
     }
 
+    pub(crate) fn with_display_previews(
+        mut self,
+        display_previews: Arc<CapabilityDisplayPreviewStore>,
+    ) -> Self {
+        self.display_previews = display_previews;
+        self
+    }
+
     pub(crate) fn webui_event_stream(&self) -> Arc<dyn ProjectionStream> {
         Arc::new(WebuiRuntimeProjectionStream {
             manager: Arc::clone(&self.event_stream_manager),
             turn_events: self.turn_events.clone(),
+            display_previews: Arc::clone(&self.display_previews),
             reply_target_binding_ref: self.webui_reply_target_binding_ref.clone(),
         })
     }
@@ -79,6 +102,7 @@ pub(crate) fn build_reborn_projection_services(
     RebornProjectionServices {
         event_stream_manager,
         turn_events: TurnEventBridge::default(),
+        display_previews: Arc::new(NoopCapabilityDisplayPreviewSource),
         webui_reply_target_binding_ref,
     }
 }
@@ -92,6 +116,7 @@ pub(crate) fn build_reborn_projection_services(
 struct WebuiRuntimeProjectionStream {
     manager: Arc<EventStreamManager>,
     turn_events: TurnEventBridge,
+    display_previews: Arc<dyn CapabilityDisplayPreviewSource>,
     reply_target_binding_ref: ReplyTargetBindingRef,
 }
 
@@ -124,41 +149,38 @@ impl ProjectionStream for WebuiRuntimeProjectionStream {
             .await
             .map_err(map_event_stream_error)?;
 
-        let resumes_runtime_item = origin_cursor.runtime_payloads_delivered > 0;
+        let is_resuming_runtime_payloads = origin_cursor.runtime_payloads_delivered > 0;
         let mut batch = WebuiProjectionBatch::new(origin_cursor);
         if let Some(item) = subscription.next().await
-            && batch.push_runtime_item(item, &request.scope)?
-            && !resumes_runtime_item
+            && batch
+                .push_runtime_item(item, &request.scope, self.display_previews.as_ref())
+                .await?
+            && !is_resuming_runtime_payloads
         {
-            for _ in 1..WEBUI_PROJECTION_PAGE_LIMIT {
-                if !batch.has_runtime_payload_capacity() {
-                    break;
-                }
-                let Some(item) = subscription.try_next_buffered() else {
-                    break;
-                };
-                if !batch.push_runtime_item(item, &request.scope)? {
-                    break;
-                }
-            }
+            consume_buffered_runtime_items(
+                &mut subscription,
+                &mut batch,
+                &request.scope,
+                self.display_previews.as_ref(),
+            )
+            .await?;
         }
 
-        if batch.runtime_payloads_pushed == 0 && !resumes_runtime_item {
-            for _ in 0..WEBUI_PROJECTION_PAGE_LIMIT {
-                if !batch.has_runtime_payload_capacity() {
-                    break;
-                }
-                let Some(item) = subscription.try_next_buffered() else {
-                    break;
-                };
-                if !batch.push_runtime_item(item, &request.scope)? {
-                    break;
-                }
-            }
+        if batch.runtime_payloads_pushed == 0 && !is_resuming_runtime_payloads {
+            consume_buffered_runtime_items(
+                &mut subscription,
+                &mut batch,
+                &request.scope,
+                self.display_previews.as_ref(),
+            )
+            .await?;
         }
 
         let turn_after = batch.cursor().turn.clone();
-        let turn_drain = self.turn_events.drain(&request.scope, turn_after).await?;
+        let turn_drain = self
+            .turn_events
+            .drain(&request.actor.user_id, &request.scope, turn_after)
+            .await?;
         for TurnEventPayload {
             cursor: turn_cursor,
             payload,
@@ -185,6 +207,29 @@ impl ProjectionStream for WebuiRuntimeProjectionStream {
             })
             .collect()
     }
+}
+
+async fn consume_buffered_runtime_items(
+    subscription: &mut EventProjectionSubscription,
+    batch: &mut WebuiProjectionBatch,
+    scope: &TurnScope,
+    display_previews: &dyn CapabilityDisplayPreviewSource,
+) -> Result<(), ProductAdapterError> {
+    for _ in 0..WEBUI_PROJECTION_PAGE_LIMIT {
+        if !batch.has_runtime_payload_capacity() {
+            break;
+        }
+        let Some(item) = subscription.try_next_buffered() else {
+            break;
+        };
+        if !batch
+            .push_runtime_item(item, scope, display_previews)
+            .await?
+        {
+            break;
+        }
+    }
+    Ok(())
 }
 
 struct WebuiProjectionBatch {
@@ -250,10 +295,11 @@ impl WebuiProjectionBatch {
         Ok(self.cursor.runtime_payloads_delivered == 0)
     }
 
-    fn push_runtime_item(
+    async fn push_runtime_item(
         &mut self,
         item: ProjectionStreamItem,
         scope: &TurnScope,
+        display_previews: &dyn CapabilityDisplayPreviewSource,
     ) -> Result<bool, ProductAdapterError> {
         let already_delivered = self.cursor.runtime_payloads_delivered;
         let remaining_capacity =
@@ -261,10 +307,13 @@ impl WebuiProjectionBatch {
         if let Some(runtime_item) = item_to_payloads(
             item,
             scope,
+            display_previews,
             self.cursor.runtime_item,
             already_delivered,
             remaining_capacity,
-        )? {
+        )
+        .await?
+        {
             return self.push_runtime_payloads(
                 runtime_item.final_cursor,
                 runtime_item.item_cursor,
@@ -388,9 +437,10 @@ fn product_cursor_from_webui_cursor(
     )
 }
 
-fn item_to_payloads(
+async fn item_to_payloads(
     item: ProjectionStreamItem,
     scope: &TurnScope,
+    display_previews: &dyn CapabilityDisplayPreviewSource,
     expected_item: Option<EventCursor>,
     already_delivered: usize,
     capacity: usize,
@@ -400,34 +450,40 @@ fn item_to_payloads(
             let cursor = envelope.cursor();
             snapshot_payloads(
                 scope,
+                display_previews,
                 snapshot_from_envelope(envelope)?,
                 cursor,
                 expected_item,
                 already_delivered,
                 capacity,
             )
+            .await
         }
         ProjectionStreamItem::Update(envelope) => {
             let cursor = envelope.cursor();
             replay_payloads(
                 scope,
+                display_previews,
                 replay_from_envelope(envelope.as_ref())?,
                 cursor,
                 expected_item,
                 already_delivered,
                 capacity,
             )
+            .await
         }
         ProjectionStreamItem::RebaseRequired { snapshot, .. } => {
             let cursor = snapshot.cursor();
             snapshot_payloads(
                 scope,
+                display_previews,
                 snapshot_from_envelope(*snapshot)?,
                 cursor,
                 expected_item,
                 already_delivered,
                 capacity,
             )
+            .await
         }
         ProjectionStreamItem::Lagged { .. } => Err(ProductAdapterError::WorkflowRejected {
             kind: ProductWorkflowRejectionKind::Unavailable,
@@ -439,8 +495,9 @@ fn item_to_payloads(
     }
 }
 
-fn snapshot_payloads(
+async fn snapshot_payloads(
     scope: &TurnScope,
+    display_previews: &dyn CapabilityDisplayPreviewSource,
     snapshot: ProjectionSnapshot,
     cursor: EventProjectionCursor,
     expected_item: Option<EventCursor>,
@@ -449,10 +506,17 @@ fn snapshot_payloads(
 ) -> RuntimePayloadItemResult {
     let item_cursor = snapshot_item_cursor(&snapshot, &cursor);
     let candidates = snapshot_payload_candidates(snapshot);
-    if candidates.is_empty() {
+    let all_payloads = runtime_payloads_from_candidates(
+        scope,
+        display_previews,
+        candidates,
+        StatePayloadKind::Snapshot,
+    )
+    .await?;
+    if all_payloads.is_empty() {
         return Ok(None);
     }
-    let total = candidates.len();
+    let total = all_payloads.len();
     let already_delivered =
         effective_runtime_payload_offset(already_delivered, expected_item, item_cursor.runtime);
     if already_delivered > 0 && already_delivered >= total {
@@ -461,13 +525,11 @@ fn snapshot_payloads(
             reason: "runtime delivery offset exceeds runtime item payload count".to_string(),
         });
     }
-    let payloads = runtime_payloads_from_candidates(
-        scope,
-        candidates,
-        StatePayloadKind::Snapshot,
-        already_delivered,
-        capacity,
-    )?;
+    let payloads = all_payloads
+        .into_iter()
+        .skip(already_delivered)
+        .take(capacity)
+        .collect();
     Ok(Some(RuntimePayloadItem {
         final_cursor: cursor,
         item_cursor,
@@ -477,8 +539,9 @@ fn snapshot_payloads(
     }))
 }
 
-fn replay_payloads(
+async fn replay_payloads(
     scope: &TurnScope,
+    display_previews: &dyn CapabilityDisplayPreviewSource,
     replay: &ProjectionReplay,
     cursor: EventProjectionCursor,
     expected_item: Option<EventCursor>,
@@ -487,10 +550,17 @@ fn replay_payloads(
 ) -> RuntimePayloadItemResult {
     let item_cursor = replay_item_cursor(replay, &cursor);
     let candidates = replay_payload_candidates(replay);
-    if candidates.is_empty() {
+    let all_payloads = runtime_payloads_from_candidates(
+        scope,
+        display_previews,
+        candidates,
+        StatePayloadKind::Update,
+    )
+    .await?;
+    if all_payloads.is_empty() {
         return Ok(None);
     }
-    let total = candidates.len();
+    let total = all_payloads.len();
     let already_delivered =
         effective_runtime_payload_offset(already_delivered, expected_item, item_cursor.runtime);
     if already_delivered > 0 && already_delivered >= total {
@@ -499,13 +569,11 @@ fn replay_payloads(
             reason: "runtime delivery offset exceeds runtime item payload count".to_string(),
         });
     }
-    let payloads = runtime_payloads_from_candidates(
-        scope,
-        candidates,
-        StatePayloadKind::Update,
-        already_delivered,
-        capacity,
-    )?;
+    let payloads = all_payloads
+        .into_iter()
+        .skip(already_delivered)
+        .take(capacity)
+        .collect();
     Ok(Some(RuntimePayloadItem {
         final_cursor: cursor,
         item_cursor,
@@ -526,9 +594,12 @@ struct RuntimePayloadItem {
 
 type RuntimePayloadItemResult = Result<Option<RuntimePayloadItem>, ProductAdapterError>;
 
-enum RuntimePayloadCandidate {
-    State { runs: Vec<RunStatusProjection> },
-    CapabilityActivity(CapabilityActivityProjection),
+#[cfg(test)]
+struct RuntimePayloadItemInput {
+    runs: Vec<RunStatusProjection>,
+    capability_activities: Vec<CapabilityActivityProjection>,
+    cursor: EventProjectionCursor,
+    state_kind: StatePayloadKind,
 }
 
 #[derive(Clone, Copy)]
@@ -537,64 +608,84 @@ enum StatePayloadKind {
     Update,
 }
 
-fn snapshot_payload_candidates(snapshot: ProjectionSnapshot) -> Vec<RuntimePayloadCandidate> {
-    runtime_payload_candidates(
-        snapshot.runs,
-        snapshot.capability_activities,
-        WEBUI_RUNTIME_ITEM_MAX_PAYLOADS,
-    )
-}
-
-fn replay_payload_candidates(replay: &ProjectionReplay) -> Vec<RuntimePayloadCandidate> {
-    runtime_payload_candidates(
-        replay.runs.clone(),
-        replay.capability_activities.clone(),
-        WEBUI_RUNTIME_ITEM_MAX_PAYLOADS,
-    )
-}
-
-fn runtime_payload_candidates(
-    runs: Vec<RunStatusProjection>,
-    capability_activities: Vec<CapabilityActivityProjection>,
-    max_payloads: usize,
-) -> Vec<RuntimePayloadCandidate> {
-    let state_payloads = usize::from(!runs.is_empty());
-    let activity_payloads = max_payloads.saturating_sub(state_payloads);
-    let mut candidates = Vec::with_capacity(
-        state_payloads.saturating_add(activity_payloads.min(capability_activities.len())),
-    );
-    if !runs.is_empty() {
-        candidates.push(RuntimePayloadCandidate::State { runs });
-    }
-    candidates.extend(
-        capability_activities
-            .into_iter()
-            .take(activity_payloads)
-            .map(RuntimePayloadCandidate::CapabilityActivity),
-    );
-    candidates
-}
-
-fn runtime_payloads_from_candidates(
+#[cfg(test)]
+async fn runtime_payloads_for_item(
     scope: &TurnScope,
-    candidates: Vec<RuntimePayloadCandidate>,
-    state_kind: StatePayloadKind,
+    display_previews: &dyn CapabilityDisplayPreviewSource,
+    input: RuntimePayloadItemInput,
+    expected_item: Option<EventCursor>,
     already_delivered: usize,
     capacity: usize,
-) -> Result<Vec<ProductOutboundPayload>, ProductAdapterError> {
-    candidates
+) -> RuntimePayloadItemResult {
+    let RuntimePayloadItemInput {
+        runs,
+        capability_activities,
+        cursor,
+        state_kind,
+    } = input;
+    let snapshot = ProjectionSnapshot {
+        timeline: ironclaw_event_projections::ThreadTimeline {
+            entries: Vec::new(),
+        },
+        runs,
+        capability_activities,
+        next_cursor: cursor.clone(),
+        truncated: false,
+    };
+    let item_cursor = snapshot_item_cursor(&snapshot, &cursor);
+    let candidates = snapshot_payload_candidates(snapshot);
+    let all_payloads =
+        runtime_payloads_from_candidates(scope, display_previews, candidates, state_kind).await?;
+    if all_payloads.is_empty() {
+        return Ok(None);
+    }
+    let total = all_payloads.len();
+    let already_delivered =
+        effective_runtime_payload_offset(already_delivered, expected_item, item_cursor.runtime);
+    if already_delivered > 0 && already_delivered >= total {
+        return Err(ProductAdapterError::InvalidIdentifier {
+            kind: "projection_cursor",
+            reason: "runtime delivery offset exceeds runtime item payload count".to_string(),
+        });
+    }
+    let payloads = all_payloads
         .into_iter()
         .skip(already_delivered)
         .take(capacity)
-        .map(|candidate| runtime_payload_from_candidate(scope, candidate, state_kind))
+        .collect();
+    Ok(Some(RuntimePayloadItem {
+        final_cursor: cursor,
+        item_cursor,
+        payloads,
+        total,
+        already_delivered,
+    }))
+}
+
+async fn runtime_payloads_from_candidates(
+    scope: &TurnScope,
+    display_previews: &dyn CapabilityDisplayPreviewSource,
+    candidates: Vec<RuntimePayloadCandidate>,
+    state_kind: StatePayloadKind,
+) -> Result<Vec<ProductOutboundPayload>, ProductAdapterError> {
+    stream::iter(candidates)
+        .map(|candidate| {
+            runtime_payload_from_candidate(scope, display_previews, candidate, state_kind)
+        })
+        .buffered(16)
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .filter_map(Result::transpose)
         .collect()
 }
 
-fn runtime_payload_from_candidate(
+async fn runtime_payload_from_candidate(
     scope: &TurnScope,
+    display_previews: &dyn CapabilityDisplayPreviewSource,
     candidate: RuntimePayloadCandidate,
     state_kind: StatePayloadKind,
-) -> Result<ProductOutboundPayload, ProductAdapterError> {
+) -> Result<Option<ProductOutboundPayload>, ProductAdapterError> {
     match candidate {
         RuntimePayloadCandidate::State { runs, .. } => {
             let state = run_status_projection_state(scope, runs)?
@@ -603,7 +694,7 @@ fn runtime_payload_from_candidate(
                 StatePayloadKind::Snapshot => ProductOutboundPayload::ProjectionSnapshot { state },
                 StatePayloadKind::Update => ProductOutboundPayload::ProjectionUpdate { state },
             };
-            Ok(payload)
+            Ok(Some(payload))
         }
         RuntimePayloadCandidate::CapabilityActivity(activity) => {
             CapabilityActivityView::new(CapabilityActivityViewInput {
@@ -619,7 +710,12 @@ fn runtime_payload_from_candidate(
                 updated_at: activity.updated_at,
             })
             .map(ProductOutboundPayload::CapabilityActivity)
+            .map(Some)
         }
+        RuntimePayloadCandidate::CapabilityDisplayPreview(activity) => display_previews
+            .preview(&activity)
+            .await
+            .map(|preview| preview.map(ProductOutboundPayload::CapabilityDisplayPreview)),
     }
 }
 
@@ -676,6 +772,12 @@ fn replay_item_cursor(
         .chain(
             replay
                 .capability_activities
+                .iter()
+                .map(|activity| activity.last_cursor),
+        )
+        .chain(
+            replay
+                .capability_activity_transitions
                 .iter()
                 .map(|activity| activity.last_cursor),
         )

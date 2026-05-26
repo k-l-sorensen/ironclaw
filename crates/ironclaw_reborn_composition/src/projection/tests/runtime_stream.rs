@@ -97,6 +97,108 @@ async fn webui_event_stream_drains_capability_activity_from_projection() {
 }
 
 #[tokio::test]
+async fn webui_event_stream_replays_capability_started_before_folded_completion() {
+    let tenant_id = TenantId::new("webui-activity-replay-tenant").unwrap();
+    let user_id = UserId::new("webui-activity-replay-user").unwrap();
+    let agent_id = AgentId::new("webui-activity-replay-agent").unwrap();
+    let thread_id = ThreadId::new("webui-activity-replay-thread").unwrap();
+    let run_id = InvocationId::new();
+    let capability_invocation = InvocationId::new();
+    let capability = CapabilityId::new("script.echo").unwrap();
+    let provider = ExtensionId::new("script").unwrap();
+    let event_log = Arc::new(InMemoryDurableEventLog::new());
+    event_log
+        .append(RuntimeEvent::model_started(
+            resource_scope(&tenant_id, &user_id, &agent_id, &thread_id, run_id),
+            CapabilityId::new("loop.model").unwrap(),
+        ))
+        .await
+        .unwrap();
+
+    let event_log_dyn: Arc<dyn DurableEventLog> = event_log.clone();
+    let actor = TurnActor::new(user_id.clone());
+    let scope = TurnScope::new(
+        tenant_id.clone(),
+        Some(agent_id.clone()),
+        None,
+        thread_id.clone(),
+    );
+    let services = build_reborn_projection_services(
+        event_log_dyn,
+        ReplyTargetBindingRef::new("webui-activity-replay-reply").unwrap(),
+    );
+    let initial = services
+        .webui_event_stream()
+        .drain(ProjectionSubscriptionRequest {
+            actor: actor.clone(),
+            scope: scope.clone(),
+            after_cursor: None,
+        })
+        .await
+        .unwrap();
+
+    event_log
+        .append(RuntimeEvent::dispatch_requested(
+            resource_scope(
+                &tenant_id,
+                &user_id,
+                &agent_id,
+                &thread_id,
+                capability_invocation,
+            ),
+            capability.clone(),
+        ))
+        .await
+        .unwrap();
+    event_log
+        .append(RuntimeEvent::dispatch_succeeded(
+            resource_scope(
+                &tenant_id,
+                &user_id,
+                &agent_id,
+                &thread_id,
+                capability_invocation,
+            ),
+            capability.clone(),
+            provider,
+            RuntimeKind::Script,
+            42,
+        ))
+        .await
+        .unwrap();
+
+    let replayed = services
+        .webui_event_stream()
+        .drain(ProjectionSubscriptionRequest {
+            actor,
+            scope,
+            after_cursor: Some(initial[0].projection_cursor().clone()),
+        })
+        .await
+        .unwrap();
+
+    let statuses = replayed
+        .iter()
+        .filter_map(|event| match event.payload() {
+            ProductOutboundPayload::CapabilityActivity(activity)
+                if activity.invocation_id == capability_invocation
+                    && activity.capability_id == capability =>
+            {
+                Some(activity.status)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        statuses,
+        vec![
+            CapabilityActivityStatusView::Started,
+            CapabilityActivityStatusView::Completed,
+        ]
+    );
+}
+
+#[tokio::test]
 async fn webui_event_stream_preserves_sanitized_capability_activity_error_kind() {
     let tenant_id = TenantId::new("webui-activity-redacted-tenant").unwrap();
     let user_id = UserId::new("webui-activity-redacted-user").unwrap();
@@ -261,8 +363,8 @@ async fn webui_event_stream_accepts_legacy_partial_origin_cursor() {
     ));
 }
 
-#[test]
-fn webui_projection_snapshot_bounds_activity_fanout_before_payload_mapping() {
+#[tokio::test]
+async fn webui_projection_snapshot_bounds_activity_fanout_before_payload_mapping() {
     let tenant_id = TenantId::new("webui-activity-cap-tenant").unwrap();
     let user_id = UserId::new("webui-activity-cap-user").unwrap();
     let agent_id = AgentId::new("webui-activity-cap-agent").unwrap();
@@ -292,6 +394,7 @@ fn webui_projection_snapshot_bounds_activity_fanout_before_payload_mapping() {
         capability_activities: (0..(WEBUI_PROJECTION_PAGE_LIMIT + 10))
             .map(|index| CapabilityActivityProjection {
                 invocation_id: InvocationId::new(),
+                run_id: None,
                 capability_id: capability.clone(),
                 thread_id: Some(thread_id.clone()),
                 status: ironclaw_event_projections::CapabilityActivityStatus::Running,
@@ -308,14 +411,21 @@ fn webui_projection_snapshot_bounds_activity_fanout_before_payload_mapping() {
         truncated: false,
     };
 
-    let item = snapshot_payloads(
+    let display_previews = NoopCapabilityDisplayPreviewSource;
+    let item = runtime_payloads_for_item(
         &scope,
-        snapshot,
-        cursor.clone(),
+        &display_previews,
+        RuntimePayloadItemInput {
+            runs: snapshot.runs,
+            capability_activities: snapshot.capability_activities,
+            cursor: cursor.clone(),
+            state_kind: StatePayloadKind::Snapshot,
+        },
         None,
         0,
         WEBUI_PROJECTION_PAGE_LIMIT + 11,
     )
+    .await
     .unwrap()
     .unwrap();
 

@@ -12,6 +12,7 @@ mod schemas;
 mod shell;
 mod skill_management;
 mod skill_url_install;
+mod spawn_subagent;
 mod time;
 
 use std::{sync::Arc, time::Instant};
@@ -45,6 +46,7 @@ pub use skill_management::{
     SKILL_INSTALL_CAPABILITY_ID, SKILL_INSTALL_URL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID,
     SKILL_REMOVE_CAPABILITY_ID,
 };
+pub use spawn_subagent::SPAWN_SUBAGENT_CAPABILITY_ID;
 pub use time::TIME_CAPABILITY_ID;
 
 pub const BUILTIN_FIRST_PARTY_PROVIDER: &str = "builtin";
@@ -143,6 +145,7 @@ pub fn builtin_first_party_package() -> Result<ExtensionPackage, ExtensionError>
                     json::manifest()?,
                     http::manifest()?,
                     shell::manifest()?,
+                    spawn_subagent::manifest()?,
                 ];
                 capabilities.extend(coding_manifests()?);
                 capabilities.extend(skill_management::manifests()?);
@@ -180,6 +183,10 @@ pub fn builtin_first_party_handlers() -> Result<FirstPartyCapabilityRegistry, Ho
     for metadata in CODING_CAPABILITIES {
         registry.insert_handler(CapabilityId::new(metadata.id)?, handler.clone());
     }
+    registry.insert_handler(
+        CapabilityId::new(SPAWN_SUBAGENT_CAPABILITY_ID)?,
+        handler.clone(),
+    );
     skill_management::insert_handlers(&mut registry)?;
     Ok(registry)
 }
@@ -258,6 +265,7 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
                     },
                 ));
             }
+            SPAWN_SUBAGENT_CAPABILITY_ID => spawn_subagent::dispatch(),
             capability_id => {
                 let Some(metadata) = coding_capability_metadata(capability_id) else {
                     return Err(FirstPartyCapabilityError::new(
