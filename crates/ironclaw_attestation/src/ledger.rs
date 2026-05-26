@@ -307,6 +307,40 @@ pub mod contract {
         ledger.advance(&g, Finalized).await.expect("finalize");
     }
 
+    /// Cross-tenant / two-gate isolation: two distinct gates — standing in for
+    /// two tenants' independent signing flows — advance with no state bleed
+    /// between them. The ledger is keyed purely by `gate_ref` (it carries no
+    /// tenant component), so tenant isolation here is inherited from the fact
+    /// that two tenants' flows always carry distinct `gate_ref`s. This case
+    /// locks that independence: advancing gate A to a terminal must not move,
+    /// create, or otherwise perturb gate B, and creating/advancing B must not
+    /// touch A.
+    pub async fn distinct_gates_advance_independently<L: SigningLedger>(ledger: L) {
+        use SigningLedgerState::*;
+        // Two gate_refs as two different tenants' flows would carry.
+        let gate_a = GateRef::new("gate:tenant-a:ledger");
+        let gate_b = GateRef::new("gate:tenant-b:ledger");
+
+        ledger.create(&gate_a).await.expect("create A");
+        // B does not exist yet just because A does.
+        assert_eq!(ledger.state(&gate_b).await, Err(LedgerError::NotFound));
+
+        // Drive A all the way to a terminal.
+        ledger.create(&gate_b).await.expect("create B");
+        for to in [Signing, Signed, BroadcastSubmitted, Finalized] {
+            ledger.advance(&gate_a, to).await.expect("advance A");
+        }
+        // B stayed exactly where it was created (Approved) — A's progression
+        // never bled across the tenant/gate boundary.
+        assert_eq!(ledger.state(&gate_b).await.expect("state B"), Approved);
+        assert_eq!(ledger.state(&gate_a).await.expect("state A"), Finalized);
+
+        // Now advance B independently; A (terminal) is unaffected.
+        ledger.advance(&gate_b, Signing).await.expect("advance B");
+        assert_eq!(ledger.state(&gate_a).await.expect("state A"), Finalized);
+        assert_eq!(ledger.state(&gate_b).await.expect("state B"), Signing);
+    }
+
     /// Every terminal state (`Finalized`, `Unknown`, `ManualReview`) rejects
     /// every possible subsequent transition. Each terminal is driven on its own
     /// `gate_ref` row so we exercise the real persisted terminal value, not a
@@ -543,6 +577,11 @@ pub mod contract {
                 #[tokio::test]
                 async fn broadcast_idempotency_guard() {
                     $crate::ledger::contract::broadcast_idempotency_guard($factory()).await;
+                }
+                #[tokio::test]
+                async fn distinct_gates_advance_independently() {
+                    $crate::ledger::contract::distinct_gates_advance_independently($factory())
+                        .await;
                 }
                 #[tokio::test]
                 async fn terminal_states_never_advance() {

@@ -83,6 +83,21 @@ fn signing_context(account_hex_no_prefix: &str) -> SigningContext {
     }
 }
 
+/// A signing context for a *different tenant* but otherwise the same flow shape
+/// as [`signing_context`].
+fn other_tenant_signing_context(account_hex_no_prefix: &str) -> SigningContext {
+    SigningContext {
+        tenant: SigningTenantId::new("tenant-b"),
+        user: SigningUserId::new("alice"),
+        scope: ScopeId::new("scope-x"),
+        actor: ActorId::new("actor-7"),
+        run_id: RunId::new("run-42"),
+        gate_ref: SigningGateRef::new(GATE),
+        chain_id: ChainId::new(DEV_TESTNET_CHAIN),
+        key_or_account_id: KeyOrAccountId::new(account_hex_no_prefix),
+    }
+}
+
 /// Build a sample EIP-1559 transaction + its decoded form + the binding hash.
 ///
 /// The approved hash is computed with the GATE-BOUND signer (`signer`) folded
@@ -850,6 +865,64 @@ async fn confirmed_submission_reaches_broadcast_submitted() {
     assert_eq!(
         ledger.state(&gate).await.unwrap(),
         SigningLedgerState::BroadcastSubmitted
+    );
+}
+
+// ── Cross-tenant isolation: a foreign-tenant grant never satisfies the gate ─
+
+/// Drive the REAL custodial continuation for a gate bound to tenant A, with the
+/// ONLY sealed grant belonging to tenant B (identical run/gate/hash/key/chain).
+/// The custodial signer claims `GrantKey::from_context(&binding.context, hash)`
+/// — tenant A's key — which is NOT sealed, so the one-shot claim fails closed
+/// with `GrantError::NotFound`, surfaced as `ContinuationError::ChainSigning`.
+/// No broadcast happens and tenant B's grant stays unclaimed: a grant authorized
+/// for one tenant can never be redeemed inside another tenant's signing flow.
+#[tokio::test]
+async fn gate_resolve_is_tenant_isolated_cross_tenant_grant_fails_closed() {
+    let priv_bytes = [0x21u8; 32];
+    let (keystore, account) = keystore_with_evm_key(&priv_bytes).await;
+    // The gate is bound to tenant A ("default", via `signing_context`).
+    let ctx_a = signing_context(&account);
+    // The attacker holds a grant sealed for tenant B, same in every other
+    // component.
+    let ctx_b = other_tenant_signing_context(&account);
+    assert_ne!(ctx_a.tenant, ctx_b.tenant);
+    let (_tx, decoded, hash) = sample_evm(&account);
+
+    let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
+    let (driver, grants, ledger) = custodial_driver(Arc::clone(&keystore), Arc::clone(&bindings));
+
+    // Seal ONLY tenant B's grant; persist the authoritative tenant-A binding.
+    seal_grant(&grants, &ctx_b, hash).await;
+    put_binding(&bindings, &ctx_a, decoded, hash).await;
+
+    let gate = SigningGateRef::new(GATE);
+    let err = driver
+        .continue_after_resolved(&gate, &SigningProof::WebAuthnAssertionProof(vec![]))
+        .await
+        .expect_err("a foreign-tenant grant must not satisfy tenant-A's gate");
+    assert!(
+        matches!(
+            err,
+            ContinuationError::ChainSigning(ChainSigningError::Grant(
+                ironclaw_attestation::GrantError::NotFound
+            ))
+        ),
+        "expected tenant-A grant NotFound, got {err:?}"
+    );
+
+    // Tenant B's grant was never claimed — it is still sealed and claimable.
+    let b_key = GrantKey::from_context(&ctx_b, hash);
+    grants
+        .claim(&b_key)
+        .await
+        .expect("tenant-B grant must remain unclaimed by the failed cross-tenant resolve");
+
+    // The ledger never reached a broadcast for this gate.
+    assert_ne!(
+        ledger.state(&gate).await.unwrap(),
+        SigningLedgerState::BroadcastSubmitted,
+        "no broadcast may occur on a cross-tenant grant mismatch"
     );
 }
 

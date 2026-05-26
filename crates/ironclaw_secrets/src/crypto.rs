@@ -481,6 +481,49 @@ mod tests {
     }
 
     #[test]
+    fn chain_key_aad_differs_per_tenant() {
+        // The tenant is the first AAD component (multi-tenant isolation key).
+        // Two scopes identical in user/agent/project but in different tenants
+        // must produce different chain-key AAD, so a chain-A key sealed for
+        // tenant A cannot be addressed under tenant B's AAD.
+        let chain = "eip155:1";
+        assert_ne!(
+            chain_key_aad(&scope("tenant-a", "user-a", Some("proj")), chain),
+            chain_key_aad(&scope("tenant-b", "user-a", Some("proj")), chain),
+            "different tenants must produce different chain-key AAD"
+        );
+    }
+
+    #[test]
+    fn chain_key_ciphertext_fails_under_wrong_tenant_aad() {
+        // Cross-tenant isolation, crypto half: a custodial key sealed for
+        // tenant A's owner scope cannot be decrypted under tenant B's AAD even
+        // when user/project/chain are otherwise identical. This proves a tenant
+        // cannot recover another tenant's custodial key bytes even with full
+        // ciphertext access (e.g. raw DB read), because the AES-GCM tag is
+        // bound to the tenant via the AAD. Locks the tenant-isolation invariant
+        // at the custodial-key AAD surface against silent regression.
+        let crypto = crypto();
+        let tenant_a = scope("tenant-a", "user-a", Some("proj"));
+        let key_material = [7u8; 32];
+        let (ct, salt) = crypto
+            .encrypt(&key_material, &chain_key_aad(&tenant_a, "eip155:1"))
+            .expect("encrypt under tenant-a AAD");
+
+        // Tenant A decrypts.
+        let ok = crypto.decrypt(&ct, &salt, &chain_key_aad(&tenant_a, "eip155:1"));
+        assert!(ok.is_ok(), "owning tenant must decrypt its own key");
+
+        // Tenant B — same user/project/chain — fails closed.
+        let tenant_b = scope("tenant-b", "user-a", Some("proj"));
+        let wrong_tenant = crypto.decrypt(&ct, &salt, &chain_key_aad(&tenant_b, "eip155:1"));
+        assert!(
+            matches!(wrong_tenant, Err(SecretError::DecryptionFailed(_))),
+            "cross-tenant AAD must fail decryption, got {wrong_tenant:?}"
+        );
+    }
+
+    #[test]
     fn chain_key_aad_domain_is_distinct_from_other_aads() {
         // A chain-key ciphertext must not decrypt under any other AAD domain
         // even with an identical scope: the domain separator prevents

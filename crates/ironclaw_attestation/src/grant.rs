@@ -371,6 +371,40 @@ pub mod contract {
             .expect("the sealed grant itself must still be claimable");
     }
 
+    /// Cross-tenant isolation: a grant sealed for tenant A cannot be claimed by
+    /// a [`GrantKey`] identical in every component except `tenant = B`. The
+    /// mismatched-tenant claim is `NotFound` (the tenant is part of the composite
+    /// identity and of `grant_key_hash` in the durable backends), and the
+    /// original tenant-A grant remains claimable afterwards — proving the failed
+    /// cross-tenant claim mutated nothing. This locks the
+    /// `TenantId`-is-the-first-`GrantKey`-field isolation invariant against
+    /// silent regression at the sealed-grant surface, across every backend the
+    /// contract macro runs for.
+    pub async fn cross_tenant_claim_is_not_found<S: SealedGrantStore>(store: S) {
+        let tenant_a = key(8); // tenant = "tenant-a" (see `key`)
+        store
+            .seal(AttestedSigningGrant::seal(tenant_a.clone(), 0, None))
+            .await
+            .expect("seal tenant-a grant");
+
+        // Same run/user/gate/hash/key/chain, different tenant.
+        let mut tenant_b = tenant_a.clone();
+        tenant_b.tenant = TenantId::new("tenant-b");
+        assert_ne!(tenant_b.tenant, tenant_a.tenant);
+        assert_eq!(
+            store.claim(&tenant_b).await,
+            Err(GrantError::NotFound),
+            "a claim carrying a different tenant must not match tenant-a's grant"
+        );
+
+        // Tenant A's grant is untouched and still wins its one-shot claim.
+        let claimed = store
+            .claim(&tenant_a)
+            .await
+            .expect("original tenant-a grant must still be claimable");
+        assert_eq!(claimed.key.tenant, tenant_a.tenant);
+    }
+
     pub async fn double_seal_is_already_sealed<S: SealedGrantStore>(store: S) {
         let k = key(5);
         store
@@ -442,6 +476,10 @@ pub mod contract {
                         $factory(),
                     )
                     .await;
+                }
+                #[tokio::test]
+                async fn cross_tenant_claim_is_not_found() {
+                    $crate::grant::contract::cross_tenant_claim_is_not_found($factory()).await;
                 }
                 #[tokio::test]
                 async fn double_seal_is_already_sealed() {

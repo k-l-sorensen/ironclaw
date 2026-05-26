@@ -339,8 +339,12 @@ mod tests {
     use secrecy::SecretString;
 
     fn scope(user: &str) -> ResourceScope {
+        scope_t("default", user)
+    }
+
+    fn scope_t(tenant: &str, user: &str) -> ResourceScope {
         ResourceScope {
-            tenant_id: TenantId::new("default").unwrap(),
+            tenant_id: TenantId::new(tenant).unwrap(),
             user_id: UserId::new(user).unwrap(),
             agent_id: None,
             project_id: Some(ProjectId::new("bootstrap").unwrap()),
@@ -447,6 +451,101 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, KeyStoreError::NotFound));
+    }
+
+    #[tokio::test]
+    async fn consume_under_other_tenant_is_tenant_isolated() {
+        // Cross-tenant isolation at the keystore lookup: a key bound for tenant
+        // A's scope is addressed by a map key that includes the tenant, so a
+        // tenant-B scope (same user/project/chain) finds no key and fails closed
+        // with NotFound — the keystore never even reaches decryption for another
+        // tenant's row.
+        let store = SecretsKeyStore::new(crypto());
+        let tenant_a = scope_t("tenant-a", "alice");
+        store
+            .bind(&tenant_a, binding("eip155:1", "abc"), vec![3u8; 32])
+            .await
+            .unwrap();
+
+        let tenant_b = scope_t("tenant-b", "alice");
+        let err = store
+            .consume(
+                &tenant_b,
+                &ChainKeyId::new("eip155:1").unwrap(),
+                ChainFamily::Evm,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KeyStoreError::NotFound),
+            "tenant-B lookup must not find tenant-A's key, got {err:?}"
+        );
+
+        // Tenant A still consumes its own key intact.
+        let consumed = store
+            .consume(
+                &tenant_a,
+                &ChainKeyId::new("eip155:1").unwrap(),
+                ChainFamily::Evm,
+            )
+            .await
+            .unwrap();
+        assert_eq!(consumed.expose_private_key(), &[3u8; 32]);
+    }
+
+    #[tokio::test]
+    async fn cross_tenant_ciphertext_injection_fails_closed() {
+        // The strongest cross-tenant property: even an attacker (or buggy
+        // backend) with full storage access who *moves* tenant A's stored
+        // ciphertext into the slot a tenant-B consume would read cannot recover
+        // the key. We simulate that DB-level swap by reaching into the private
+        // key map, copying tenant A's `StoredKey` (ciphertext + salt + binding)
+        // verbatim under tenant B's map key, then driving the real `consume`
+        // path for tenant B. Decryption fails closed on the AES-GCM tag because
+        // the ciphertext was sealed under tenant A's chain-key AAD, and no key
+        // bytes are ever returned.
+        let store = SecretsKeyStore::new(crypto());
+        let tenant_a = scope_t("tenant-a", "alice");
+        let chain = ChainKeyId::new("eip155:1").unwrap();
+        store
+            .bind(&tenant_a, binding("eip155:1", "abc"), vec![5u8; 32])
+            .await
+            .unwrap();
+
+        let tenant_b = scope_t("tenant-b", "alice");
+        // Copy tenant A's stored ciphertext verbatim into tenant B's slot,
+        // modelling an attacker with raw store access.
+        {
+            let mut keys = store.keys.lock().unwrap();
+            let a_key = KeyStoreKey::new(&tenant_a, &chain);
+            let stored = keys.get(&a_key).expect("tenant-A key present");
+            let smuggled = StoredKey {
+                binding: stored.binding.clone(),
+                encrypted: stored.encrypted.clone(),
+                salt: stored.salt.clone(),
+            };
+            let b_key = KeyStoreKey::new(&tenant_b, &chain);
+            keys.insert(b_key, smuggled);
+        }
+
+        // Tenant B now "finds" a row, but consume decrypts under tenant B's AAD
+        // and the tag check fails — fail-closed, no key material leaked.
+        let err = store
+            .consume(&tenant_b, &chain, ChainFamily::Evm)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, KeyStoreError::Decryption { .. }),
+            "smuggled cross-tenant ciphertext must fail the AAD tag check, got {err:?}"
+        );
+
+        // Tenant A's own consume still succeeds — the smuggle did not corrupt
+        // the legitimate row.
+        let consumed = store
+            .consume(&tenant_a, &chain, ChainFamily::Evm)
+            .await
+            .unwrap();
+        assert_eq!(consumed.expose_private_key(), &[5u8; 32]);
     }
 
     #[test]
