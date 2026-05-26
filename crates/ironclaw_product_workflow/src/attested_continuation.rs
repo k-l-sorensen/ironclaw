@@ -116,6 +116,12 @@ pub enum AttestedContinuationRejection {
     MalformedProof,
     /// The continuation port is not wired on this deployment.
     Unavailable,
+    /// The caller-supplied turn scope / run / gate_ref did not match the
+    /// authoritative binding context recorded when the gate was raised
+    /// (tenant or gate-ref divergence). Defense-in-depth against driving a
+    /// binding raised for one tenant/gate with a continuation request bearing
+    /// another's identity. Fail closed.
+    ContextMismatch,
 }
 
 impl AttestedContinuationRejection {
@@ -128,6 +134,7 @@ impl AttestedContinuationRejection {
             Self::LedgerGuard => "attested_ledger_guard",
             Self::MalformedProof => "attested_malformed_proof",
             Self::Unavailable => "attested_unavailable",
+            Self::ContextMismatch => "attested_context_mismatch",
         }
     }
 }

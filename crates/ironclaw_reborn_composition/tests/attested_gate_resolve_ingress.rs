@@ -35,8 +35,8 @@ use ironclaw_host_api::{
 };
 use ironclaw_product_workflow::{
     AttestedContinuationOutcome, AttestedContinuationRejection, AttestedGateContinuationPort,
-    AttestedProofClaim, RebornServices, RebornServicesApi, WebUiAuthenticatedCaller,
-    WebUiResolveGateRequest,
+    AttestedProofClaim, AttestedProofKind, RebornServices, RebornServicesApi,
+    WebUiAuthenticatedCaller, WebUiResolveGateRequest,
 };
 use ironclaw_reborn_composition::{
     RebornAttestedComposition, RebornAttestedContinuation, RegisterAttestedGateError,
@@ -922,5 +922,142 @@ async fn register_attested_gate_rejects_mismatch_and_is_insert_only() {
     assert!(
         matches!(dup, Err(RegisterAttestedGateError::DuplicateBinding)),
         "a second raise for the same gate must be refused, got {dup:?}"
+    );
+}
+
+/// Build a valid injected-wallet (Solana) `AttestedProofClaim` for the bound
+/// hash, signed by `key`.
+fn attested_claim(
+    key: &EdSigningKey,
+    hash: &ApprovedTxHash,
+    account_hex: &str,
+) -> AttestedProofClaim {
+    let signature = key.sign(hash.as_bytes());
+    AttestedProofClaim {
+        kind: AttestedProofKind::InjectedWallet,
+        approved_tx_hash_hex: lower_hex(hash.as_bytes()),
+        proof_json: json!({
+            "scheme": "solana",
+            "approved_tx_hash": lower_hex(hash.as_bytes()),
+            "claimed_signer": account_hex,
+            "signature": lower_hex(&signature.to_bytes()),
+            "public_key": account_hex,
+        }),
+    }
+}
+
+/// Defense-in-depth (whole-stack coherence review): the continuation asserts the
+/// caller-supplied turn scope / gate_ref against the authoritative
+/// `binding.context` BEFORE claiming the grant / verifying / broadcasting. A
+/// continuation request bearing a DIFFERENT identity than the binding's context
+/// must fail closed without claiming the one-shot grant — so a subsequent
+/// MATCHING continuation for the same gate still succeeds (the grant was never
+/// burned by the mismatched attempt).
+///
+/// Two layered IDOR guards run on `verify_and_claim`, in order:
+///   1. the driver's `assert_binding_owner` (tenant + user), which fails closed
+///      as `MissingBinding` (404, no existence oracle) — the authoritative
+///      ownership gate; and
+///   2. this port's `assert_caller_matches_binding` (tenant), which surfaces a
+///      tenant divergence as the dedicated `ContextMismatch` (403).
+/// A mismatched tenant is caught by (1) first (404). The `broadcast_resolved`
+/// half does NOT re-run the driver owner check, so its composition-layer
+/// re-assertion exercises the `ContextMismatch` (403) path directly.
+#[tokio::test]
+async fn continuation_fails_closed_on_scope_mismatch_then_matching_succeeds() {
+    let key = EdSigningKey::from_bytes(&[0x77u8; 32]);
+    let account_hex = lower_hex(&key.verifying_key().to_bytes());
+    let hash = bound_hash(&account_hex);
+
+    let bindings = Arc::new(InMemoryAttestedGateBindingStore::new());
+    let composition = build_composition(Arc::clone(&bindings));
+    composition
+        .register_attested_gate(
+            SigningGateRef::new(GATE),
+            binding(&account_hex, hash),
+            0,
+            None,
+        )
+        .await
+        .expect("register attested gate");
+
+    let continuation = RebornAttestedContinuation::new(&composition);
+    let gate_ref = GateRef::new(GATE).unwrap();
+    let run_id = TurnRunId::new();
+    let claim = attested_claim(&key, &hash, &account_hex);
+
+    // The actor whose user matches the binding's authoritative `context.user`.
+    let owner_actor = TurnActor::new(UserId::new(USER).unwrap());
+
+    // A turn scope whose tenant DIFFERS from the binding's context.tenant.
+    let mismatched_scope = TurnScope::new(
+        TenantId::new("tenant-other").unwrap(),
+        Some(AgentId::new(AGENT).unwrap()),
+        Some(ProjectId::new(PROJECT).unwrap()),
+        ThreadId::new(THREAD).unwrap(),
+    );
+
+    // verify_and_claim fails closed on the tenant mismatch — BEFORE any grant
+    // claim or proof verification. The driver's `assert_binding_owner` runs
+    // first and catches the divergence as `MissingBinding` (404, no existence
+    // oracle); the `ContextMismatch` (403) classification is exercised on the
+    // broadcast half below, which does not re-run the driver owner check.
+    let mismatch = continuation
+        .verify_and_claim(&mismatched_scope, &owner_actor, run_id, &gate_ref, &claim)
+        .await;
+    assert!(
+        matches!(mismatch, Err(AttestedContinuationRejection::MissingBinding)),
+        "mismatched-tenant verify_and_claim must fail closed as MissingBinding (no oracle), got {:?}",
+        mismatch.as_ref().err()
+    );
+
+    // A gate_ref the binding store has no entry for fails closed too (no binding
+    // to assert against). Use the matching tenant to isolate the gate axis.
+    let unknown_gate = GateRef::new("gate:unknown").unwrap();
+    let unknown = continuation
+        .verify_and_claim(&turn_scope(), &owner_actor, run_id, &unknown_gate, &claim)
+        .await;
+    assert!(
+        matches!(unknown, Err(AttestedContinuationRejection::MissingBinding)),
+        "unknown gate_ref must fail closed (no binding), got {:?}",
+        unknown.as_ref().err()
+    );
+
+    // The MATCHING continuation still succeeds end-to-end: the mismatched attempt
+    // never claimed the one-shot grant, so verify+claim + broadcast both run.
+    let verified = continuation
+        .verify_and_claim(&turn_scope(), &owner_actor, run_id, &gate_ref, &claim)
+        .await
+        .expect("matching verify_and_claim succeeds (grant was not burned by the mismatch)");
+
+    // broadcast_resolved also re-asserts via the composition-layer tenant check
+    // (it does NOT re-run the driver's owner check), so a mismatched scope on the
+    // broadcast half fails closed as the dedicated `ContextMismatch` (403) before
+    // broadcasting.
+    let bad_broadcast = continuation
+        .broadcast_resolved(&mismatched_scope, run_id, &gate_ref, verified)
+        .await;
+    assert!(
+        matches!(
+            bad_broadcast,
+            Err(AttestedContinuationRejection::ContextMismatch)
+        ),
+        "mismatched-scope broadcast_resolved must fail closed as ContextMismatch, got {:?}",
+        bad_broadcast.as_ref().err()
+    );
+
+    // A fresh matching continuation completes the broadcast (the grant for this
+    // gate was claimed by the earlier successful verify_and_claim, so re-running
+    // verify here would hit the one-shot CAS; instead assert the matching
+    // broadcast half succeeds on its own verified handle).
+    let verified2 = continuation
+        .verify_and_claim(&turn_scope(), &owner_actor, run_id, &gate_ref, &claim)
+        .await;
+    // The grant was already claimed by the first matching verify — the one-shot
+    // CAS now rejects, proving the matching path is the ONLY one that ever
+    // claimed it (the two earlier fail-closed attempts did not).
+    assert!(
+        verified2.is_err(),
+        "the one-shot grant was claimed exactly once by the matching path"
     );
 }

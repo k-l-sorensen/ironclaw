@@ -1350,6 +1350,17 @@ fn map_attested_continuation_rejection(
             RebornServicesErrorKind::Validation,
             400,
         ),
+        // A context mismatch is an ownership/tenant divergence (the caller's
+        // turn scope / run / gate_ref did not match the authoritative binding
+        // recorded at raise), not a malformed request. Surface it as 403
+        // Forbidden so the classification matches how this crate already maps an
+        // unauthorized turn (`TurnErrorCategory::Unauthorized`), rather than
+        // collapsing it into the generic proof-validation 400.
+        AttestedContinuationRejection::ContextMismatch => (
+            RebornServicesErrorCode::Forbidden,
+            RebornServicesErrorKind::ParticipantDenied,
+            403,
+        ),
         AttestedContinuationRejection::LedgerGuard => (
             RebornServicesErrorCode::Conflict,
             RebornServicesErrorKind::Conflict,
@@ -1587,5 +1598,57 @@ fn generated_thread_id(
             // Fallback remains valid under ThreadId validation rules.
             ThreadId::new("generated-thread-fallback").unwrap_or_else(|_| unreachable!())
         }
+    }
+}
+
+#[cfg(test)]
+mod attested_rejection_mapping_tests {
+    use super::*;
+
+    #[test]
+    fn context_mismatch_maps_to_forbidden_not_validation() {
+        // A context mismatch is an ownership/tenant divergence — it must surface
+        // as 403 Forbidden (ParticipantDenied), not be collapsed into the
+        // generic 400 proof-validation bucket.
+        let err =
+            map_attested_continuation_rejection(AttestedContinuationRejection::ContextMismatch);
+        assert_eq!(err.code, RebornServicesErrorCode::Forbidden);
+        assert_eq!(err.kind, RebornServicesErrorKind::ParticipantDenied);
+        assert_eq!(err.status_code, 403);
+        assert!(!err.retryable);
+    }
+
+    #[test]
+    fn proof_rejections_stay_validation_400() {
+        for rejection in [
+            AttestedContinuationRejection::ProviderMismatch,
+            AttestedContinuationRejection::ProofRejected,
+            AttestedContinuationRejection::MalformedProof,
+        ] {
+            let err = map_attested_continuation_rejection(rejection.clone());
+            assert_eq!(
+                err.code,
+                RebornServicesErrorCode::InvalidRequest,
+                "{rejection:?} should remain a 400 validation error"
+            );
+            assert_eq!(err.status_code, 400);
+        }
+    }
+
+    #[test]
+    fn missing_binding_and_guards_keep_their_codes() {
+        let missing =
+            map_attested_continuation_rejection(AttestedContinuationRejection::MissingBinding);
+        assert_eq!(missing.code, RebornServicesErrorCode::NotFound);
+        assert_eq!(missing.status_code, 404);
+
+        let guard = map_attested_continuation_rejection(AttestedContinuationRejection::LedgerGuard);
+        assert_eq!(guard.code, RebornServicesErrorCode::Conflict);
+        assert_eq!(guard.status_code, 409);
+
+        let unavailable =
+            map_attested_continuation_rejection(AttestedContinuationRejection::Unavailable);
+        assert_eq!(unavailable.code, RebornServicesErrorCode::Unavailable);
+        assert_eq!(unavailable.status_code, 503);
     }
 }
