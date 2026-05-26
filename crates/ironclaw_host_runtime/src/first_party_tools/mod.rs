@@ -5,6 +5,7 @@
 //! through `CapabilityHost`, trust policy, grants, resource accounting, and
 //! runtime dispatch before any handler runs.
 
+mod check_background_subagent;
 mod echo;
 mod http;
 mod json;
@@ -38,6 +39,7 @@ use crate::{
 
 pub(crate) use self::schemas::resolve_builtin_input_schema_ref;
 
+pub use check_background_subagent::CHECK_BACKGROUND_SUBAGENT_CAPABILITY_ID;
 pub use echo::ECHO_CAPABILITY_ID;
 pub use http::HTTP_CAPABILITY_ID;
 pub use json::JSON_CAPABILITY_ID;
@@ -146,6 +148,7 @@ pub fn builtin_first_party_package() -> Result<ExtensionPackage, ExtensionError>
                     http::manifest()?,
                     shell::manifest()?,
                     spawn_subagent::manifest()?,
+                    check_background_subagent::manifest()?,
                 ];
                 capabilities.extend(coding_manifests()?);
                 capabilities.extend(skill_management::manifests()?);
@@ -185,6 +188,10 @@ pub fn builtin_first_party_handlers() -> Result<FirstPartyCapabilityRegistry, Ho
     }
     registry.insert_handler(
         CapabilityId::new(SPAWN_SUBAGENT_CAPABILITY_ID)?,
+        handler.clone(),
+    );
+    registry.insert_handler(
+        CapabilityId::new(CHECK_BACKGROUND_SUBAGENT_CAPABILITY_ID)?,
         handler.clone(),
     );
     skill_management::insert_handlers(&mut registry)?;
@@ -266,6 +273,9 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
                 ));
             }
             SPAWN_SUBAGENT_CAPABILITY_ID => spawn_subagent::dispatch(),
+            CHECK_BACKGROUND_SUBAGENT_CAPABILITY_ID => {
+                check_background_subagent::dispatch(&request.input)?
+            }
             capability_id => {
                 let Some(metadata) = coding_capability_metadata(capability_id) else {
                     return Err(FirstPartyCapabilityError::new(

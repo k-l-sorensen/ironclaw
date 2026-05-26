@@ -21,10 +21,10 @@ use ironclaw_host_api::runtime_policy::{
 };
 use ironclaw_host_api::*;
 use ironclaw_host_runtime::{
-    APPLY_PATCH_CAPABILITY_ID, CapabilitySurfacePolicy, CapabilitySurfaceVersion,
-    CommandExecutionOutput, CommandExecutionRequest, ECHO_CAPABILITY_ID, GLOB_CAPABILITY_ID,
-    GREP_CAPABILITY_ID, HTTP_CAPABILITY_ID, HostRuntime, HostRuntimeServices, JSON_CAPABILITY_ID,
-    LIST_DIR_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, RuntimeCapabilityOutcome,
+    APPLY_PATCH_CAPABILITY_ID, CHECK_BACKGROUND_SUBAGENT_CAPABILITY_ID, CapabilitySurfacePolicy,
+    CapabilitySurfaceVersion, CommandExecutionOutput, CommandExecutionRequest, ECHO_CAPABILITY_ID,
+    GLOB_CAPABILITY_ID, GREP_CAPABILITY_ID, HTTP_CAPABILITY_ID, HostRuntime, HostRuntimeServices,
+    JSON_CAPABILITY_ID, LIST_DIR_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, RuntimeCapabilityOutcome,
     RuntimeCapabilityRequest, RuntimeFailureKind, RuntimeProcessError, RuntimeProcessPort,
     SHELL_CAPABILITY_ID, SKILL_INSTALL_CAPABILITY_ID, SKILL_INSTALL_URL_CAPABILITY_ID,
     SKILL_LIST_CAPABILITY_ID, SKILL_REMOVE_CAPABILITY_ID, SPAWN_SUBAGENT_CAPABILITY_ID,
@@ -251,6 +251,31 @@ async fn builtin_spawn_subagent_authorization_invokes_through_host_runtime() {
         .await
         .unwrap();
     assert_eq!(output, json!({"authorized": true}));
+}
+
+#[tokio::test]
+async fn builtin_check_background_subagent_polls_through_host_runtime() {
+    // Gap 2 (issue #4084): the poll capability is reachable through the full
+    // first-party dispatch pipeline and returns a structured response keyed on
+    // the requested child run.
+    let output = invoke(
+        CHECK_BACKGROUND_SUBAGENT_CAPABILITY_ID,
+        json!({ "child_run_id": "run-123" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(output["child_run_id"], json!("run-123"));
+    assert_eq!(output["output_available"], json!(false));
+    assert_eq!(output["status"], json!("poll_not_supported"));
+    assert_eq!(output["delivery"], json!("inbound_notification"));
+}
+
+#[tokio::test]
+async fn builtin_check_background_subagent_rejects_missing_child_run_id() {
+    let failure = invoke(CHECK_BACKGROUND_SUBAGENT_CAPABILITY_ID, json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(failure, RuntimeFailureKind::InvalidInput);
 }
 
 #[tokio::test]
@@ -3809,7 +3834,7 @@ fn provider_id() -> ExtensionId {
     ExtensionId::new("builtin").unwrap()
 }
 
-fn all_builtin_capability_ids() -> [&'static str; 16] {
+fn all_builtin_capability_ids() -> [&'static str; 17] {
     [
         ECHO_CAPABILITY_ID,
         TIME_CAPABILITY_ID,
@@ -3817,6 +3842,7 @@ fn all_builtin_capability_ids() -> [&'static str; 16] {
         HTTP_CAPABILITY_ID,
         SHELL_CAPABILITY_ID,
         SPAWN_SUBAGENT_CAPABILITY_ID,
+        CHECK_BACKGROUND_SUBAGENT_CAPABILITY_ID,
         READ_FILE_CAPABILITY_ID,
         WRITE_FILE_CAPABILITY_ID,
         LIST_DIR_CAPABILITY_ID,

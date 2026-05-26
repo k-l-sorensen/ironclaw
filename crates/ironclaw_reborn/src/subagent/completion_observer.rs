@@ -11,8 +11,9 @@ use ironclaw_loop_support::{
     SubagentThreadMetadata,
 };
 use ironclaw_threads::{
-    LatestThreadMessageRequest, MessageKind, MessageStatus, SessionThreadService,
-    ThreadHistoryRequest, ThreadScope, ToolResultSafeSummary, UpdateToolResultReferenceRequest,
+    AcceptInboundMessageRequest, LatestThreadMessageRequest, MessageContent, MessageKind,
+    MessageStatus, SessionThreadError, SessionThreadService, ThreadHistoryRequest, ThreadScope,
+    ToolResultSafeSummary, UpdateToolResultReferenceRequest,
 };
 use ironclaw_turns::{
     GateRef, IdempotencyKey, ResumeTurnPrecondition, ResumeTurnRequest, TurnActor,
@@ -20,6 +21,7 @@ use ironclaw_turns::{
     TurnRunRecord, TurnRunState, TurnSpawnTreeStateStore, TurnStatus,
     run_profile::{AgentLoopHostError, LoopRunContext, sanitize_model_visible_text},
 };
+use tracing::debug;
 
 use crate::subagent::gate_resolution::{
     AwaitedChildTerminalEvent, BoundedSubagentGateResolutionStore,
@@ -137,15 +139,30 @@ where
             })?;
             match state.record.mode {
                 SpawnSubagentMode::Blocking => {
-                    self.write_terminal_result(&state.record, &terminal_event)
+                    let _ = self
+                        .write_terminal_result(&state.record, &terminal_event)
                         .await?;
                     if parent_resume_gates.insert(state.record.gate_ref.clone()) {
                         parent_resumes.push((state.record.clone(), terminal_event.clone()));
                     }
                 }
                 SpawnSubagentMode::Background => {
-                    self.write_terminal_result(&state.record, &terminal_event)
+                    let summary = self
+                        .write_terminal_result(&state.record, &terminal_event)
                         .await?;
+                    // Gap 1 (issue #4084): a blocking child resumes the parent
+                    // turn directly, but a background child only writes its
+                    // result into the parent's `LoopResultRef`. Nothing wakes
+                    // an idle parent, so the result is stranded until the
+                    // parent happens to start another turn. Deliver an inbound
+                    // message to the parent thread — the same mechanism routine
+                    // notifications use to wake idle agents.
+                    self.notify_parent_of_background_completion(
+                        &state.record,
+                        &terminal_event,
+                        &summary,
+                    )
+                    .await?;
                 }
             }
             self.release_descendant_reservation(&state.record).await?;
@@ -338,7 +355,7 @@ where
         &self,
         record: &ironclaw_loop_support::AwaitedChildSetRecord,
         event: &AwaitedChildTerminalEvent,
-    ) -> Result<(), TurnError> {
+    ) -> Result<ToolResultSafeSummary, TurnError> {
         let result_ref = &record.result_ref;
         let child_output = self.child_terminal_output(record, event).await?;
         let safe_summary = parent_result_summary(event, &child_output)?;
@@ -351,9 +368,76 @@ where
             Ok(()) => {}
             Err(error) => return Err(map_host_error(error)),
         }
-        self.update_parent_result_reference(record, event, result_ref, safe_summary)
+        self.update_parent_result_reference(record, event, result_ref, safe_summary.clone())
             .await?;
-        Ok(())
+        Ok(safe_summary)
+    }
+
+    /// Wake an idle parent after a background subagent terminates.
+    ///
+    /// Blocking children resume the parent turn directly; background
+    /// children only populate the parent's `LoopResultRef`. Without an
+    /// explicit wake the populated result sits in the store with no
+    /// trigger to deliver it (issue #4084). Delivering an inbound message
+    /// mirrors how routine notifications nudge idle agents back into a
+    /// turn.
+    ///
+    /// Idempotency / races: `accept_inbound_message` dedupes on
+    /// `(scope, source_binding_id, external_event_id)`. Both are set to
+    /// stable, child-run-scoped values, so re-delivery after a retry or a
+    /// duplicate terminal event collapses onto the existing message
+    /// instead of double-notifying the parent. If the parent thread no
+    /// longer exists (e.g. it was deleted between completion and
+    /// delivery), the notification is a no-op rather than an error — the
+    /// result is still durably written to the `LoopResultRef`.
+    async fn notify_parent_of_background_completion(
+        &self,
+        record: &ironclaw_loop_support::AwaitedChildSetRecord,
+        event: &AwaitedChildTerminalEvent,
+        summary: &ToolResultSafeSummary,
+    ) -> Result<(), TurnError> {
+        let Some(agent_id) = record.parent_run_context.scope.agent_id.clone() else {
+            return Err(TurnError::InvalidRequest {
+                reason: "parent scope missing agent id for subagent notification".to_string(),
+            });
+        };
+        let thread_scope = ThreadScope {
+            tenant_id: record.parent_run_context.scope.tenant_id.clone(),
+            agent_id,
+            project_id: record.parent_run_context.scope.project_id.clone(),
+            owner_user_id: event.owner_user_id.clone(),
+            mission_id: None,
+        };
+        // Stable idempotency coordinates keyed on the terminating child run:
+        // a duplicate terminal event or observer retry collapses onto the
+        // same inbound message instead of waking the parent twice.
+        let external_event_id = format!("subagent-bg-complete:{}", record.child_run_id);
+        let request = AcceptInboundMessageRequest {
+            scope: thread_scope,
+            thread_id: record.parent_run_context.scope.thread_id.clone(),
+            actor_id: "subagent-completion-observer".to_string(),
+            source_binding_id: Some("subagent-background-completion".to_string()),
+            reply_target_binding_id: None,
+            external_event_id: Some(external_event_id),
+            content: MessageContent::text(summary.as_str().to_string()),
+        };
+        match self.thread_service.accept_inbound_message(request).await {
+            Ok(_) => Ok(()),
+            // Parent thread gone between completion and delivery: fail closed
+            // (no-op). The result remains in the `LoopResultRef`; nothing is
+            // lost, and there is no parent left to wake.
+            Err(SessionThreadError::UnknownThread { thread_id }) => {
+                debug!(
+                    parent_thread_id = %thread_id,
+                    child_run_id = %record.child_run_id,
+                    "skipping background subagent notification: parent thread no longer exists"
+                );
+                Ok(())
+            }
+            Err(error) => Err(TurnError::Unavailable {
+                reason: format!("subagent background completion notification failed: {error}"),
+            }),
+        }
     }
 
     async fn child_terminal_output(
@@ -1338,14 +1422,212 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(history.messages.len(), 1);
+        // Two messages now: the updated tool-result reference (the spawn's
+        // `LoopResultRef`) plus the inbound wake delivered by Gap 1.
+        assert_eq!(history.messages.len(), 2);
+        let tool_result = history
+            .messages
+            .iter()
+            .find(|message| message.kind == MessageKind::ToolResultReference)
+            .expect("tool result reference message");
         assert!(
-            history.messages[0]
+            tool_result
                 .content
                 .as_ref()
                 .unwrap()
                 .contains("final child answer")
         );
+        // Gap 1: an inbound (User-kind) message must wake the parent thread.
+        let inbound = history
+            .messages
+            .iter()
+            .find(|message| message.kind == MessageKind::User)
+            .expect("inbound wake message delivered to parent thread");
+        assert!(
+            inbound
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("final child answer"),
+            "inbound wake should carry the subagent result summary"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_completion_notification_is_idempotent_under_duplicate_delivery() {
+        // Re-delivering the same child completion (duplicate terminal event,
+        // observer retry) must not wake the parent twice. The inbound
+        // notification dedupes on the child-run-scoped idempotency key.
+        let tenant = TenantId::new("tenant").unwrap();
+        let agent = AgentId::new("agent").unwrap();
+        let owner = UserId::new("owner").unwrap();
+        let parent_scope = TurnScope::new(
+            tenant.clone(),
+            Some(agent.clone()),
+            None,
+            ThreadId::new("parent-thread-idem").unwrap(),
+        );
+        let parent_thread_scope = ThreadScope {
+            tenant_id: tenant.clone(),
+            agent_id: agent.clone(),
+            project_id: None,
+            owner_user_id: Some(owner.clone()),
+            mission_id: None,
+        };
+        let child_scope = TurnScope::new(
+            tenant.clone(),
+            Some(agent.clone()),
+            None,
+            ThreadId::new("child-thread-idem").unwrap(),
+        );
+        let child_run_id = TurnRunId::new();
+        let parent_run_id = TurnRunId::new();
+        let result_ref = LoopResultRef::new("result:subagent.idem").unwrap();
+
+        let thread_service = Arc::new(InMemorySessionThreadService::default());
+        thread_service
+            .ensure_thread(EnsureThreadRequest {
+                scope: parent_thread_scope.clone(),
+                thread_id: Some(parent_scope.thread_id.clone()),
+                created_by_actor_id: "test".to_string(),
+                title: None,
+                metadata_json: None,
+            })
+            .await
+            .unwrap();
+
+        let mut parent_run_context =
+            ironclaw_agent_loop::test_support::test_run_context("completion-observer-idem");
+        parent_run_context.scope = parent_scope.clone();
+        parent_run_context.thread_id = parent_scope.thread_id.clone();
+        parent_run_context.run_id = parent_run_id;
+
+        let record = AwaitedChildSetRecord {
+            gate_ref: GateRef::new("gate:subagent-bg-idem").unwrap(),
+            parent_run_context,
+            tree_root_run_id: parent_run_id,
+            child_scope,
+            child_run_id,
+            child_thread_id: ThreadId::new("child-thread-idem").unwrap(),
+            source_binding_ref: SourceBindingRef::new("subagent-source:idem").unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new("subagent-reply:idem").unwrap(),
+            subagent_kind: SubagentKindId::new("general").unwrap(),
+            spawn_capability_id: CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
+            result_ref,
+            mode: SpawnSubagentMode::Background,
+        };
+        let event = AwaitedChildTerminalEvent {
+            status: TurnStatus::Completed,
+            kind: TurnEventKind::Completed,
+            cursor: EventCursor(3),
+            sanitized_reason: None,
+            owner_user_id: Some(owner),
+        };
+        let summary = ToolResultSafeSummary::new("Subagent completed").unwrap();
+
+        let observer = SubagentCompletionObserver::new_unbound(
+            Arc::new(BoundedSubagentGateResolutionStore::new()),
+            Arc::new(InMemoryBoundedSubagentGoalStore::new()),
+            Arc::new(RecordingTurnStateStore::default()),
+            Arc::new(RecordingResultWriter::new(
+                LoopResultRef::new("result:test").unwrap(),
+            )),
+            thread_service.clone(),
+        );
+
+        observer
+            .notify_parent_of_background_completion(&record, &event, &summary)
+            .await
+            .unwrap();
+        observer
+            .notify_parent_of_background_completion(&record, &event, &summary)
+            .await
+            .unwrap();
+
+        let history = thread_service
+            .list_thread_history(ThreadHistoryRequest {
+                scope: parent_thread_scope,
+                thread_id: parent_scope.thread_id,
+            })
+            .await
+            .unwrap();
+        let inbound = history
+            .messages
+            .iter()
+            .filter(|message| message.kind == MessageKind::User)
+            .count();
+        assert_eq!(inbound, 1, "duplicate delivery must not wake parent twice");
+    }
+
+    #[tokio::test]
+    async fn background_completion_notification_no_ops_when_parent_thread_missing() {
+        // Parent thread deleted between completion and delivery: the wake is a
+        // graceful no-op (the result remains in the LoopResultRef), not an error.
+        let tenant = TenantId::new("tenant").unwrap();
+        let agent = AgentId::new("agent").unwrap();
+        let owner = UserId::new("owner").unwrap();
+        let parent_scope = TurnScope::new(
+            tenant.clone(),
+            Some(agent.clone()),
+            None,
+            ThreadId::new("parent-thread-missing").unwrap(),
+        );
+        let child_scope = TurnScope::new(
+            tenant,
+            Some(agent),
+            None,
+            ThreadId::new("child-thread-missing").unwrap(),
+        );
+        let child_run_id = TurnRunId::new();
+        let parent_run_id = TurnRunId::new();
+
+        // Note: no `ensure_thread` for the parent — it does not exist.
+        let thread_service = Arc::new(InMemorySessionThreadService::default());
+
+        let mut parent_run_context =
+            ironclaw_agent_loop::test_support::test_run_context("completion-observer-missing");
+        parent_run_context.scope = parent_scope.clone();
+        parent_run_context.thread_id = parent_scope.thread_id.clone();
+        parent_run_context.run_id = parent_run_id;
+
+        let record = AwaitedChildSetRecord {
+            gate_ref: GateRef::new("gate:subagent-bg-missing").unwrap(),
+            parent_run_context,
+            tree_root_run_id: parent_run_id,
+            child_scope,
+            child_run_id,
+            child_thread_id: ThreadId::new("child-thread-missing").unwrap(),
+            source_binding_ref: SourceBindingRef::new("subagent-source:missing").unwrap(),
+            reply_target_binding_ref: ReplyTargetBindingRef::new("subagent-reply:missing").unwrap(),
+            subagent_kind: SubagentKindId::new("general").unwrap(),
+            spawn_capability_id: CapabilityId::new(DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID).unwrap(),
+            result_ref: LoopResultRef::new("result:subagent.missing").unwrap(),
+            mode: SpawnSubagentMode::Background,
+        };
+        let event = AwaitedChildTerminalEvent {
+            status: TurnStatus::Completed,
+            kind: TurnEventKind::Completed,
+            cursor: EventCursor(4),
+            sanitized_reason: None,
+            owner_user_id: Some(owner),
+        };
+        let summary = ToolResultSafeSummary::new("Subagent completed").unwrap();
+
+        let observer = SubagentCompletionObserver::new_unbound(
+            Arc::new(BoundedSubagentGateResolutionStore::new()),
+            Arc::new(InMemoryBoundedSubagentGoalStore::new()),
+            Arc::new(RecordingTurnStateStore::default()),
+            Arc::new(RecordingResultWriter::new(
+                LoopResultRef::new("result:test").unwrap(),
+            )),
+            thread_service,
+        );
+
+        // Must not error even though the parent thread is gone.
+        observer
+            .notify_parent_of_background_completion(&record, &event, &summary)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -1478,9 +1760,27 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(history.messages.len(), 1);
+        // Updated tool-result reference + inbound wake (Gap 1).
+        assert_eq!(history.messages.len(), 2);
+        let tool_result = history
+            .messages
+            .iter()
+            .find(|message| message.kind == MessageKind::ToolResultReference)
+            .expect("tool result reference message");
         assert!(
-            history.messages[0]
+            tool_result
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("Subagent finished with status completed")
+        );
+        let inbound = history
+            .messages
+            .iter()
+            .find(|message| message.kind == MessageKind::User)
+            .expect("inbound wake message");
+        assert!(
+            inbound
                 .content
                 .as_ref()
                 .unwrap()
@@ -1839,9 +2139,27 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(history.messages.len(), 1);
+        // Updated tool-result reference + inbound wake (Gap 1).
+        assert_eq!(history.messages.len(), 2);
+        let tool_result = history
+            .messages
+            .iter()
+            .find(|message| message.kind == MessageKind::ToolResultReference)
+            .expect("tool result reference message");
         assert!(
-            history.messages[0]
+            tool_result
+                .content
+                .as_ref()
+                .unwrap()
+                .contains("recovery_required")
+        );
+        let inbound = history
+            .messages
+            .iter()
+            .find(|message| message.kind == MessageKind::User)
+            .expect("inbound wake message");
+        assert!(
+            inbound
                 .content
                 .as_ref()
                 .unwrap()

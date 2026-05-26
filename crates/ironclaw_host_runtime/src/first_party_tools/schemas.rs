@@ -112,6 +112,17 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
             "required": ["flavor_id", "task"],
             "additionalProperties": false
         }),
+        "schemas/builtin/check_background_subagent.input.v1.json" => json!({
+            "type": "object",
+            "properties": {
+                "child_run_id": {
+                    "type": "string",
+                    "description": "Run id of the background subagent to poll"
+                }
+            },
+            "required": ["child_run_id"],
+            "additionalProperties": false
+        }),
         "schemas/builtin/read_file.input.v1.json" => json!({
             "type": "object",
             "properties": {
