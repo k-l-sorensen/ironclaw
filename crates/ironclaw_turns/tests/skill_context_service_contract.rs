@@ -143,6 +143,22 @@ async fn trusted_skill_includes_prompt_content() {
 }
 
 #[tokio::test]
+async fn trusted_skill_uses_description_when_prompt_context_exceeds_budget() {
+    let snapshot = SkillRunSnapshot::from_entries(vec![visible_trusted(
+        "github",
+        "github skill description",
+        &"x".repeat(5 * 1024),
+    )]);
+    let service = SkillContextService::new(snapshot.clone());
+
+    let snippets = service.skill_snippets(&snapshot).await.unwrap();
+
+    assert_eq!(snippets.len(), 1);
+    assert_eq!(snippets[0].snippet_ref, "skill:github");
+    assert_eq!(snippets[0].safe_summary, "github skill description");
+}
+
+#[tokio::test]
 async fn installed_skill_excludes_prompt_content() {
     let snapshot =
         SkillRunSnapshot::from_entries(vec![visible_installed("alpha", "the description")]);
@@ -258,7 +274,7 @@ async fn tampered_snapshot_version_fails_closed() {
 #[tokio::test]
 async fn oversized_single_snippet_fails_budget() {
     let snapshot =
-        SkillRunSnapshot::from_entries(vec![visible_trusted("alpha", "desc", &"x".repeat(128))]);
+        SkillRunSnapshot::from_entries(vec![visible_installed("alpha", &"x".repeat(128))]);
     let service =
         SkillContextService::with_budget(snapshot.clone(), SkillContextBudget::new(64, 512));
 
