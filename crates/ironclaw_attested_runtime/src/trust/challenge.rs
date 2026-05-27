@@ -77,6 +77,13 @@ impl TrustChallenge {
             hasher.update((field.len() as u64).to_be_bytes());
             hasher.update(field.as_bytes());
         }
+        // `expires_at_unix_ms` is appended as a fixed-width 8-byte big-endian
+        // integer with no length prefix. This is safe *because* it is
+        // fixed-width: a constant 8-byte field cannot be confused with any
+        // variable-length string field above (all of which are length-prefixed),
+        // so no two distinct field tuples can collide. IMPORTANT: any field
+        // added here that is NOT fixed-width MUST be length-prefixed like the
+        // string fields above, or it reopens a concatenation-collision hole.
         hasher.update(self.expires_at_unix_ms.to_be_bytes());
         hasher.finalize().into()
     }

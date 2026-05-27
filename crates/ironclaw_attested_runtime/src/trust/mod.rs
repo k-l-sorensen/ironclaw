@@ -25,8 +25,9 @@
 //!    re-initiating an in-flight ceremony returns the same challenge.
 //! 2. [`TrustRegistrar::complete_registration`] → verifies control of the
 //!    claimed account (EVM ecrecover / Solana ed25519 / NEAR access-key
-//!    ed25519, reusing `ironclaw_wallet_external` crypto) → `Verified` →
-//!    persists an `Active` [`TrustedSignerBinding`].
+//!    ed25519, reusing `ironclaw_wallet_external` crypto) → atomically moves
+//!    the enrollment `Challenged → Active` and persists an `Active`
+//!    [`TrustedSignerBinding`] (no intermediate `Verified` row).
 //! 3. [`TrustRegistrar::revoke_binding`] → `Revoked`; expiry → not resolvable.
 //!
 //! ## Invariants
@@ -43,6 +44,7 @@ mod enrollment;
 mod store;
 mod verifier;
 
+use sha3::{Digest, Keccak256};
 use subtle::ConstantTimeEq;
 
 use ironclaw_signing_provider::{ActorId, ChainId, SigningProviderError, TenantId, UserId};
@@ -50,16 +52,52 @@ use ironclaw_signing_provider::{ActorId, ChainId, SigningProviderError, TenantId
 pub use challenge::TrustChallenge;
 pub use enrollment::{EnrollmentState, TrustEnrollment, TrustKind};
 pub use store::{BindingKey, BindingStatus, InMemoryTrustStore, TrustStore, TrustedSignerBinding};
-pub use verifier::{AlwaysTrustNearAccessKeyVerifier, NearAccessKeyVerifier, VerifiedControl};
+#[cfg(any(test, feature = "unsafe-always-trust-near"))]
+pub use verifier::AlwaysTrustNearAccessKeyVerifier;
+pub use verifier::{NearAccessKeyVerifier, VerifiedControl};
 
 /// A source of per-challenge random nonces.
 ///
 /// Injected so the ceremony has no opinion on the entropy source and tests are
-/// deterministic. Production wiring supplies a CSPRNG-backed source.
+/// deterministic. Production wiring supplies a CSPRNG-backed source — use
+/// [`CsprngNonceSource`], the shipped OS-entropy implementation.
 pub trait NonceSource: Send + Sync {
     /// Return a fresh nonce as lowercase hex. Must be unpredictable in
     /// production (replay/forgery defense).
     fn next_nonce_hex(&self) -> String;
+}
+
+/// Production [`NonceSource`] backed by the operating system CSPRNG.
+///
+/// Each call draws 32 fresh bytes from the OS entropy source (`getrandom`,
+/// i.e. `getrandom(2)` / `/dev/urandom` / `BCryptGenRandom`) and returns them
+/// as lowercase hex. This is the canonical implementation production callers
+/// MUST use: a predictable nonce would let a race attacker who observes one
+/// challenge pre-compute the digest of the next, eroding the replay/forgery
+/// resistance the nonce exists to provide. The deterministic sequential source
+/// used by the tests is `#[cfg(test)]`-only and never compiled into a release
+/// build.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct CsprngNonceSource;
+
+impl CsprngNonceSource {
+    /// Construct an OS-CSPRNG-backed nonce source.
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl NonceSource for CsprngNonceSource {
+    fn next_nonce_hex(&self) -> String {
+        let mut bytes = [0u8; 32];
+        // `getrandom` only errors if the OS entropy source is unavailable — a
+        // catastrophic platform failure, not a normal runtime condition. We
+        // cannot mint an unpredictable challenge without it, so fail loudly
+        // rather than silently emitting a weak/zero nonce.
+        getrandom::getrandom(&mut bytes)
+            .expect("OS CSPRNG (getrandom) unavailable; cannot mint a secure challenge nonce");
+        hex_encode(&bytes)
+    }
 }
 
 /// Errors from the trust-registration ceremony.
@@ -155,6 +193,18 @@ impl<S: TrustStore, N: NearAccessKeyVerifier> TrustRegistrar<S, N> {
         actor: ActorId,
         now_unix_ms: u64,
     ) -> Result<(TrustEnrollment, TrustChallenge), TrustError> {
+        // Normalize the claimed account to its canonical per-chain form *at the
+        // API boundary*, before it feeds the idempotency key, the stored
+        // enrollment, and the challenge digest. Without this, the same physical
+        // account submitted in two surface forms (EIP-55 mixed-case vs lowercase
+        // EVM; base58 vs hex Solana; mixed-case NEAR id) would hash to two
+        // distinct idempotency keys — minting parallel enrollment slots that
+        // both collapse onto the single account-less `BindingKey`, leaving the
+        // binding's `account_or_key` non-deterministic. Canonicalizing here makes
+        // one physical account map to exactly one ceremony and one binding.
+        let family = chain_family(&chain_id)
+            .ok_or_else(|| TrustError::UnsupportedChain(chain_id.to_string()))?;
+        let claimed_account = normalize_claimed_account(family, &claimed_account)?;
         let idempotency_key =
             idempotency_key(&tenant_id, &user_id, &chain_id, &network, &claimed_account);
 
@@ -327,8 +377,7 @@ impl<S: TrustStore, N: NearAccessKeyVerifier> TrustRegistrar<S, N> {
         // the enrollment `Challenged -> Active` is the winner and goes on to
         // persist the binding. A second (replayed/concurrent) completion finds
         // the state already moved and fails closed with `NotChallengeable`.
-        enrollment.mark_verified(evidence_hash.clone(), now_unix_ms);
-        enrollment.mark_active(now_unix_ms);
+        enrollment.mark_active(evidence_hash.clone(), now_unix_ms);
         let won = self
             .store
             .compare_and_swap_enrollment_state(
@@ -514,6 +563,31 @@ fn chain_family(chain_id: &ChainId) -> Option<TrustChainFamily> {
     }
 }
 
+/// Canonicalize a `claimed_account` to the per-chain form the rest of the
+/// ceremony (idempotency key, stored enrollment, challenge digest, signer
+/// match) keys on. Applied once at the API boundary so a single physical
+/// account always maps to a single ceremony and a single binding.
+///
+/// * **EVM** — lowercase, `0x`-prefixed hex address.
+/// * **Solana** — lowercase hex of the 32-byte ed25519 pubkey. Real wallets
+///   present base58 (Phantom/Solflare `signMessage`), so a base58-decodable
+///   32-byte input is accepted and converted; a 64-char hex input is accepted
+///   as-is. Anything else fails closed with a clear error.
+/// * **NEAR** — lowercase `account_id` (NEAR named/implicit accounts are
+///   case-insensitive and conventionally lowercase).
+fn normalize_claimed_account(
+    family: TrustChainFamily,
+    claimed_account: &str,
+) -> Result<String, TrustError> {
+    match family {
+        TrustChainFamily::Evm => Ok(verifier::normalize_evm(claimed_account)),
+        TrustChainFamily::Solana => {
+            verifier::normalize_solana_pubkey(claimed_account).map_err(TrustError::from)
+        }
+        TrustChainFamily::Near => Ok(claimed_account.to_ascii_lowercase()),
+    }
+}
+
 /// Stable idempotency key for a `(tenant, user, chain, network, account)` tuple.
 fn idempotency_key(
     tenant: &TenantId,
@@ -522,7 +596,6 @@ fn idempotency_key(
     network: &str,
     account: &str,
 ) -> String {
-    use sha3::{Digest, Keccak256};
     let mut hasher = Keccak256::new();
     for field in [
         tenant.as_str(),
@@ -540,7 +613,6 @@ fn idempotency_key(
 
 /// Server-issued enrollment id, stable per idempotency key + creation time.
 fn new_enrollment_id(idempotency_key: &str, created_at_unix_ms: u64) -> String {
-    use sha3::{Digest, Keccak256};
     let mut hasher = Keccak256::new();
     hasher.update(b"ironclaw/trust/enrollment-id/v1");
     hasher.update(idempotency_key.as_bytes());

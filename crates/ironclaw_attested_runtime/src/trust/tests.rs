@@ -656,7 +656,7 @@ async fn cas_enrollment_state_enforces_expected_state() {
     store.put_enrollment(e.clone()).await;
 
     let mut active = e.clone();
-    active.mark_active(T0 + 1);
+    active.mark_active("evidence".into(), T0 + 1);
     // First CAS (Challenged -> Active) wins.
     assert!(
         store
@@ -714,4 +714,177 @@ async fn second_completion_is_not_challengeable_single_binding() {
         .await
         .expect_err("second completion must fail closed");
     assert!(matches!(err, TrustError::NotChallengeable { .. }));
+}
+
+// ---- Normalization & idempotency (henrypark133 review: #1, #2) ----
+
+/// EVM addresses differing only in case are the SAME physical account: they
+/// must resume one ceremony (same idempotency key, same enrollment id, same
+/// challenge digest) and produce one binding with a deterministic lowercase
+/// `account_or_key` — not two parallel enrollment slots.
+#[tokio::test]
+async fn evm_address_case_is_normalized_to_one_ceremony_and_binding() {
+    let reg = registrar();
+    let (sk, addr) = evm_keypair(); // lowercase 0x form
+    let upper = format!("0x{}", addr.trim_start_matches("0x").to_ascii_uppercase());
+    assert_ne!(addr, upper, "test precondition: forms differ by case");
+
+    let (enr1, chal1) = reg
+        .initiate_registration(
+            TenantId::new("t1"),
+            UserId::new("u1"),
+            ChainId::new("eip155:1"),
+            "mainnet".into(),
+            upper.clone(),
+            ActorId::new("a1"),
+            T0,
+        )
+        .await
+        .expect("initiate upper");
+    // The stored claim and challenge are canonicalized to lowercase.
+    assert_eq!(enr1.claimed_account, addr);
+    assert_eq!(chal1.claimed_account, addr);
+
+    let (enr2, chal2) = reg
+        .initiate_registration(
+            TenantId::new("t1"),
+            UserId::new("u1"),
+            ChainId::new("eip155:1"),
+            "mainnet".into(),
+            addr.clone(),
+            ActorId::new("a1"),
+            T0 + 5,
+        )
+        .await
+        .expect("initiate lower");
+    // Same physical account → same ceremony resumed, byte-identical challenge.
+    assert_eq!(enr1.enrollment_id, enr2.enrollment_id);
+    assert_eq!(chal1.digest(), chal2.digest());
+
+    let sig = evm_sign(&sk, &chal2);
+    let binding = reg
+        .complete_registration(
+            &enr2.enrollment_id,
+            SignedChallenge {
+                challenge: chal2,
+                signature: sig,
+                public_key_hex: None,
+            },
+            T0 + 6,
+        )
+        .await
+        .expect("complete");
+    assert_eq!(
+        binding.account_or_key, addr,
+        "binding is canonical lowercase"
+    );
+}
+
+/// A real Solana wallet presents its pubkey as base58. Registration must accept
+/// it (normalizing to canonical lowercase hex) and verify against the same key.
+#[tokio::test]
+async fn solana_base58_account_is_accepted_and_normalized() {
+    let reg = registrar();
+    let (sk, pk_hex) = ed_keypair(11);
+    // What a Phantom/Solflare-style wallet would submit: base58 of the 32-byte key.
+    let pk_bytes = sk.verifying_key().to_bytes();
+    let base58 = bs58::encode(pk_bytes).into_string();
+    assert_ne!(base58, pk_hex, "base58 and hex forms differ");
+
+    let (enr, chal) = reg
+        .initiate_registration(
+            TenantId::new("t1"),
+            UserId::new("u1"),
+            ChainId::new("solana:mainnet"),
+            "mainnet".into(),
+            base58.clone(),
+            ActorId::new("a1"),
+            T0,
+        )
+        .await
+        .expect("initiate base58");
+    // Canonicalized to lowercase hex for storage / challenge / signer match.
+    assert_eq!(enr.claimed_account, pk_hex);
+    assert_eq!(chal.claimed_account, pk_hex);
+
+    let sig = ed_sign(&sk, &chal);
+    let binding = reg
+        .complete_registration(
+            &enr.enrollment_id,
+            SignedChallenge {
+                challenge: chal,
+                signature: sig,
+                public_key_hex: Some(pk_hex.clone()),
+            },
+            T0 + 1,
+        )
+        .await
+        .expect("complete base58 solana");
+    assert_eq!(binding.account_or_key, pk_hex);
+}
+
+/// base58 and hex submissions of the same Solana key resume one ceremony.
+#[tokio::test]
+async fn solana_base58_and_hex_share_one_idempotency_slot() {
+    let reg = registrar();
+    let (sk, pk_hex) = ed_keypair(12);
+    let base58 = bs58::encode(sk.verifying_key().to_bytes()).into_string();
+
+    let (enr_b58, chal_b58) = reg
+        .initiate_registration(
+            TenantId::new("t1"),
+            UserId::new("u1"),
+            ChainId::new("solana:mainnet"),
+            "mainnet".into(),
+            base58,
+            ActorId::new("a1"),
+            T0,
+        )
+        .await
+        .unwrap();
+    let (enr_hex, chal_hex) = reg
+        .initiate_registration(
+            TenantId::new("t1"),
+            UserId::new("u1"),
+            ChainId::new("solana:mainnet"),
+            "mainnet".into(),
+            pk_hex,
+            ActorId::new("a1"),
+            T0 + 5,
+        )
+        .await
+        .unwrap();
+    assert_eq!(enr_b58.enrollment_id, enr_hex.enrollment_id);
+    assert_eq!(chal_b58.digest(), chal_hex.digest());
+}
+
+/// Garbage Solana accounts (neither 32-byte hex nor 32-byte base58) fail closed.
+#[tokio::test]
+async fn solana_invalid_account_fails_closed() {
+    let reg = registrar();
+    let err = reg
+        .initiate_registration(
+            TenantId::new("t1"),
+            UserId::new("u1"),
+            ChainId::new("solana:mainnet"),
+            "mainnet".into(),
+            "not-a-key".into(),
+            ActorId::new("a1"),
+            T0,
+        )
+        .await
+        .expect_err("must reject garbage account");
+    assert!(matches!(err, TrustError::Verification(_)));
+}
+
+/// The production CSPRNG nonce source yields fresh, well-formed (64-hex)
+/// nonces; two draws differ with overwhelming probability.
+#[test]
+fn csprng_nonce_source_is_fresh_and_well_formed() {
+    let src = CsprngNonceSource::new();
+    let a = src.next_nonce_hex();
+    let b = src.next_nonce_hex();
+    assert_eq!(a.len(), 64, "32 bytes → 64 hex chars");
+    assert!(a.bytes().all(|c| c.is_ascii_hexdigit()));
+    assert_ne!(a, b, "distinct draws");
 }

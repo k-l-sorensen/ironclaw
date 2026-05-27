@@ -145,26 +145,86 @@ pub trait NearAccessKeyVerifier: Send + Sync {
 /// Stub [`NearAccessKeyVerifier`] that accepts any key.
 ///
 /// For tests and single-user-trusted deployments where the on-chain access-key
-/// lookup (gap-D) is not yet wired. Production multi-tenant deployments MUST
-/// replace this with an RPC-backed verifier so a forged `(account, key)` claim
-/// cannot mint a trusted binding.
+/// lookup (gap-D) is not yet wired. An ed25519 signature only proves
+/// *possession* of a key, not that it is a registered access key for the
+/// account, so this stub is a silent privilege-escalation vector if wired into
+/// a multi-tenant production binary: a user could register an arbitrary key as
+/// trusted for an account they do not control.
+///
+/// It is therefore compiled **only** under `cfg(test)` or behind the explicit
+/// opt-in `unsafe-always-trust-near` feature — a production build cannot wire it
+/// by accident — and it emits a `warn!` on every use so any deployment that
+/// does opt in is unmistakable in the logs. Production multi-tenant deployments
+/// MUST replace it with an RPC-backed verifier.
+#[cfg(any(test, feature = "unsafe-always-trust-near"))]
 #[derive(Debug, Default, Clone, Copy)]
 pub struct AlwaysTrustNearAccessKeyVerifier;
 
+#[cfg(any(test, feature = "unsafe-always-trust-near"))]
 impl NearAccessKeyVerifier for AlwaysTrustNearAccessKeyVerifier {
     fn verify_access_key(
         &self,
-        _account_id: &str,
-        _public_key_hex: &str,
+        account_id: &str,
+        public_key_hex: &str,
     ) -> Result<(), SigningProviderError> {
+        tracing::warn!(
+            account_id,
+            public_key_hex,
+            "AlwaysTrustNearAccessKeyVerifier in use: on-chain NEAR access-key check BYPASSED — \
+             any ed25519 key signs as trusted for this account. Never use in multi-tenant production."
+        );
         Ok(())
     }
 }
 
 /// Lowercase + `0x`-normalize an EVM address for canonical binding storage.
-fn normalize_evm(addr: &str) -> String {
+pub(super) fn normalize_evm(addr: &str) -> String {
     let stripped = addr.strip_prefix("0x").unwrap_or(addr);
     format!("0x{}", stripped.to_ascii_lowercase())
+}
+
+/// Canonicalize a Solana account to lowercase hex of its 32-byte ed25519
+/// pubkey.
+///
+/// Real Solana wallets (Phantom, Solflare, the wallet-adapter standard) present
+/// their public key as **base58** (~44 chars), while the verification kernel
+/// ([`verify_ed25519_signer_over_digest`]) and the rest of this ceremony key on
+/// lowercase hex. Accept either surface form so a real wallet's registration
+/// does not silently no-op, and converge both to the canonical hex form:
+///
+/// * 64-char hex (optionally `0x`-prefixed) → lowercased.
+/// * Otherwise → base58-decoded; valid only if it yields exactly 32 bytes.
+///
+/// Fails closed with a clear error on anything that is neither a 32-byte hex nor
+/// a 32-byte base58 key.
+pub(super) fn normalize_solana_pubkey(account: &str) -> Result<String, SigningProviderError> {
+    let stripped = account.strip_prefix("0x").unwrap_or(account);
+    // Hex form: 64 lowercase/uppercase hex chars over the 32-byte key.
+    if stripped.len() == 64 && stripped.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Ok(stripped.to_ascii_lowercase());
+    }
+    // Base58 form (the common real-wallet case): must decode to 32 bytes.
+    let decoded =
+        bs58::decode(account)
+            .into_vec()
+            .map_err(|e| SigningProviderError::ProofInvalid {
+                reason: format!("solana account is neither 32-byte hex nor valid base58: {e}"),
+            })?;
+    let bytes: [u8; 32] =
+        decoded
+            .as_slice()
+            .try_into()
+            .map_err(|_| SigningProviderError::ProofInvalid {
+                reason: format!(
+                    "solana account base58 must decode to 32 bytes, got {}",
+                    decoded.len()
+                ),
+            })?;
+    let mut hex = String::with_capacity(64);
+    for b in bytes {
+        hex.push_str(&format!("{b:02x}"));
+    }
+    Ok(hex)
 }
 
 /// Decode a 32-byte ed25519 public key from (optionally `0x`-prefixed) hex.

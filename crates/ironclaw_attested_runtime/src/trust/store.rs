@@ -202,8 +202,18 @@ impl InMemoryTrustStore {
 #[async_trait]
 impl TrustStore for InMemoryTrustStore {
     async fn put_enrollment(&self, enrollment: TrustEnrollment) {
-        if let Ok(mut map) = self.enrollments.lock() {
-            map.insert(enrollment.idempotency_key.clone(), enrollment);
+        match self.enrollments.lock() {
+            Ok(mut map) => {
+                map.insert(enrollment.idempotency_key.clone(), enrollment);
+            }
+            // A poisoned mutex means another task panicked mid-write. Silently
+            // dropping the enrollment would let the ceremony proceed as if it
+            // were persisted; surface it loudly instead (a system-failure
+            // signal, per the repo logging rules).
+            Err(_) => tracing::error!(
+                enrollment_id = %enrollment.enrollment_id,
+                "trust store enrollments mutex poisoned; enrollment write dropped"
+            ),
         }
     }
 
@@ -266,8 +276,17 @@ impl TrustStore for InMemoryTrustStore {
     }
 
     async fn put_binding(&self, binding: TrustedSignerBinding) {
-        if let Ok(mut map) = self.bindings.lock() {
-            map.insert(binding.key(), binding);
+        match self.bindings.lock() {
+            Ok(mut map) => {
+                map.insert(binding.key(), binding);
+            }
+            // See `put_enrollment`: never silently drop a binding write on a
+            // poisoned mutex — a lost binding would fail-close every later
+            // raise-side lookup with no trace of why.
+            Err(_) => tracing::error!(
+                tenant_id = %binding.tenant_id.as_str(),
+                "trust store bindings mutex poisoned; binding write dropped"
+            ),
         }
     }
 

@@ -13,6 +13,13 @@ publish = false
 [package.metadata.dist]
 dist = false
 
+[features]
+# Opt-in escape hatch for the `AlwaysTrustNearAccessKeyVerifier` stub, which
+# bypasses the on-chain NEAR access-key check. Compiled out of production builds
+# by default so the privilege-escalation stub cannot be wired by accident; only
+# single-user-trusted deployments that knowingly accept the risk enable it.
+unsafe-always-trust-near = []
+
 [dependencies]
 async-trait = "0.1"
 # Structured diagnostics for the broadcast-failure recovery path (a non-benign
@@ -45,6 +52,16 @@ alloy-eips = "1"
 thiserror = "2"
 sha3 = "0.10"
 subtle = "2"
+# Base58 decode for Solana account pubkeys: real wallets (Phantom/Solflare,
+# wallet-adapter standard) present their key as base58, which the ceremony
+# normalizes to canonical lowercase hex at the API boundary. Version matches the
+# root crate's pin; already in-tree via the Solana toolchain, so no new
+# transitive deps are introduced.
+bs58 = "0.5"
+# OS CSPRNG for the production NonceSource (challenge nonce entropy). getrandom
+# is already in the dependency closure (ed25519-dalek / k256 via rand_core);
+# pinning it directly only surfaces the OS-entropy call we need.
+getrandom = "0.2"
 
 [dev-dependencies]
 async-trait = "0.1"

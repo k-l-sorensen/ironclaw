@@ -6,10 +6,16 @@
 //! additional [`TrustKind`] variants with their own verifiers — the state
 //! machine here is kind-agnostic.
 //!
-//! States advance `Pending → Challenged → Verified → Active`, with terminal
+//! States advance `Pending → Challenged → Active`, with terminal
 //! `Revoked` / `Expired` / `Failed`. Kind-specific control-of-account
 //! verification ([`super::verifier`]) is kept strictly separate from the
-//! transition bookkeeping below.
+//! transition bookkeeping below. There is no durable `Verified` state: a
+//! single atomic compare-and-swap moves `Challenged → Active` once the
+//! signature has verified (recording the evidence hash in the same step), so
+//! no intermediate row is ever persisted. Splitting it into a separately
+//! stored `Verified` state would create a second CAS — and a window in which a
+//! verified-but-not-active enrollment could be observed or raced — for no
+//! benefit, since the binding is only created on the `Active` transition.
 //!
 //! Idempotency: an enrollment is keyed by a stable `idempotency_key`
 //! `(tenant, user, chain, network, claimed_account)`; re-initiating resumes the
@@ -39,10 +45,11 @@ pub enum EnrollmentState {
     Pending,
     /// A single-use challenge has been issued; awaiting a signed response.
     Challenged,
-    /// The signed challenge verified control of the claimed account.
-    Verified,
-    /// An active [`super::TrustedSignerBinding`] was persisted from this
-    /// ceremony.
+    /// The signed challenge verified control of the claimed account *and* an
+    /// active [`super::TrustedSignerBinding`] was persisted from this ceremony.
+    /// The `Challenged → Active` transition is a single atomic CAS that also
+    /// records the evidence hash — there is no separately persisted `Verified`
+    /// state.
     Active,
     /// Explicitly revoked.
     Revoked,
@@ -85,8 +92,9 @@ pub struct TrustEnrollment {
     /// challenge (same digest) rather than minting a new one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub challenge_nonce_hex: Option<String>,
-    /// Hex of the verified evidence digest (`None` until `Verified`). Equals the
-    /// challenge digest that was actually signed.
+    /// Hex of the verified evidence digest (`None` until `Active`). Equals the
+    /// challenge digest that was actually signed; recorded atomically with the
+    /// `Challenged → Active` transition.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evidence_hash: Option<String>,
     /// The acting principal that initiated the ceremony.
@@ -151,15 +159,15 @@ impl TrustEnrollment {
         self.updated_at_unix_ms = now_unix_ms;
     }
 
-    /// Record verified evidence and advance to `Verified`.
-    pub(super) fn mark_verified(&mut self, evidence_hash: String, now_unix_ms: u64) {
+    /// Record the verified evidence hash and advance straight to `Active`.
+    ///
+    /// This is the single durable post-challenge transition: the signature has
+    /// verified, so we record the evidence and mark the ceremony active in one
+    /// step. The caller persists this via a `Challenged → Active` CAS, so the
+    /// evidence hash and the active state are committed atomically — there is no
+    /// intermediate `Verified` row.
+    pub(super) fn mark_active(&mut self, evidence_hash: String, now_unix_ms: u64) {
         self.evidence_hash = Some(evidence_hash);
-        self.state = EnrollmentState::Verified;
-        self.updated_at_unix_ms = now_unix_ms;
-    }
-
-    /// Advance to `Active` once a binding has been persisted.
-    pub(super) fn mark_active(&mut self, now_unix_ms: u64) {
         self.state = EnrollmentState::Active;
         self.updated_at_unix_ms = now_unix_ms;
     }
