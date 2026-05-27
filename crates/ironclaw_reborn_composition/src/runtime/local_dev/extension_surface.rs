@@ -7,18 +7,16 @@ use ironclaw_host_api::{
 };
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 
-use crate::extension_lifecycle::{ActiveExtensionCapability, RebornLocalExtensionManagementPort};
+use crate::extension_lifecycle::{ActiveExtensionCapability, RebornExtensionManagementPort};
 use ironclaw_product_workflow::ProductWorkflowError;
 
 #[derive(Clone, Default)]
 pub(super) struct LocalDevExtensionSurfaceSource {
-    extension_management: Option<Arc<RebornLocalExtensionManagementPort>>,
+    extension_management: Option<Arc<RebornExtensionManagementPort>>,
 }
 
 impl LocalDevExtensionSurfaceSource {
-    pub(super) fn new(
-        extension_management: Option<Arc<RebornLocalExtensionManagementPort>>,
-    ) -> Self {
+    pub(super) fn new(extension_management: Option<Arc<RebornExtensionManagementPort>>) -> Self {
         Self {
             extension_management,
         }
@@ -39,7 +37,7 @@ pub(super) struct LocalDevExtensionSurface {
 
 impl LocalDevExtensionSurface {
     pub(super) async fn from_extension_management(
-        extension_management: &RebornLocalExtensionManagementPort,
+        extension_management: &RebornExtensionManagementPort,
     ) -> Result<Self, ProductWorkflowError> {
         Ok(Self {
             active_capabilities: extension_management
