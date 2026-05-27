@@ -960,7 +960,12 @@ async fn subscription_request_via_accept_inbound_rejects_without_ledger_row() {
 
     assert!(matches!(
         err,
-        ProductAdapterError::MalformedInboundPayload { .. }
+        ProductAdapterError::WorkflowRejected {
+            kind: ProductWorkflowRejectionKind::InvalidRequest,
+            status_code: 400,
+            retryable: false,
+            ..
+        }
     ));
     assert_eq!(inbound.accepted_count(), 0);
     assert_eq!(ledger.settled_count(), 0);

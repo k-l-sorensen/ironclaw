@@ -49,7 +49,7 @@ fn slash_parser_rejects_invalid_command_names() {
 }
 
 #[test]
-fn slash_parser_rejects_oversized_command_and_arguments_before_payload_build() {
+fn slash_parser_rejects_oversized_command_and_arguments() {
     let oversized_command = format!("/{}", "h".repeat(257));
     let err = parse_product_slash_command(&oversized_command, ProductTriggerReason::BotCommand)
         .expect_err("oversized command must fail");

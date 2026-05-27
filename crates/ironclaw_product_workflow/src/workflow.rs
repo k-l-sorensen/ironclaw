@@ -96,7 +96,10 @@ impl ProductWorkflow for DefaultProductWorkflow {
             envelope.payload(),
             ProductInboundPayload::SubscriptionRequest(_)
         ) {
-            return Err(ProductAdapterError::MalformedInboundPayload {
+            return Err(ProductAdapterError::WorkflowRejected {
+                kind: ProductWorkflowRejectionKind::InvalidRequest,
+                status_code: 400,
+                retryable: false,
                 reason: RedactedString::new(
                     "subscription_request must be resolved through resolve_projection_subscription",
                 ),

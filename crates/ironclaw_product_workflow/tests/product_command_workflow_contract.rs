@@ -325,33 +325,65 @@ async fn default_command_service_rejects_when_admission_is_supplied() {
 }
 
 #[tokio::test]
-async fn command_service_turn_ack_is_rejected_before_turn_dispatch_kind_is_recorded() {
-    let inbound = Arc::new(FakeInboundTurnService::new());
-    let ledger = Arc::new(FakeIdempotencyLedger::new());
-    let binding = Arc::new(FakeConversationBindingService::new());
-    let admission_service = Arc::new(RecordingProductCommandAdmissionService::allowing());
-    let command_service = Arc::new(RecordingProductCommandService::with_ack(
-        ProductInboundAck::Accepted {
-            accepted_message_ref: AcceptedMessageRef::new("msg:command").expect("valid ref"),
-            submitted_run_id: TurnRunId::new(),
-        },
-    ));
-    let workflow = DefaultProductWorkflow::new(inbound.clone(), ledger.clone(), binding)
-        .with_product_command_admission_service(admission_service)
-        .with_product_command_service(command_service);
-    let envelope = sample_command_envelope("command-turn-ack", "status", "");
+async fn command_service_non_command_acks_are_rejected_before_dispatch_kind_is_recorded() {
+    let cases = [
+        (
+            "accepted",
+            ProductInboundAck::Accepted {
+                accepted_message_ref: AcceptedMessageRef::new("msg:command-accepted")
+                    .expect("valid ref"),
+                submitted_run_id: TurnRunId::new(),
+            },
+        ),
+        (
+            "deferred_busy",
+            ProductInboundAck::DeferredBusy {
+                accepted_message_ref: AcceptedMessageRef::new("msg:command-deferred")
+                    .expect("valid ref"),
+                active_run_id: TurnRunId::new(),
+            },
+        ),
+        (
+            "duplicate",
+            ProductInboundAck::Duplicate {
+                prior: Box::new(ProductInboundAck::NoOp),
+            },
+        ),
+        ("noop", ProductInboundAck::NoOp),
+    ];
 
-    workflow
-        .accept_inbound(envelope)
-        .await
-        .expect_err("turn-shaped command ack must fail");
+    for (case, ack) in cases {
+        let inbound = Arc::new(FakeInboundTurnService::new());
+        let ledger = Arc::new(FakeIdempotencyLedger::new());
+        let binding = Arc::new(FakeConversationBindingService::new());
+        let admission_service = Arc::new(RecordingProductCommandAdmissionService::allowing());
+        let command_service = Arc::new(RecordingProductCommandService::with_ack(ack));
+        let workflow = DefaultProductWorkflow::new(inbound.clone(), ledger.clone(), binding)
+            .with_product_command_admission_service(admission_service)
+            .with_product_command_service(command_service.clone());
+        let envelope = sample_command_envelope(case, "status", "");
 
-    assert_eq!(inbound.accepted_count(), 0);
-    assert_eq!(ledger.released_count(), 0);
-    let settled = ledger.settled_actions();
-    assert_eq!(settled.len(), 1);
-    assert!(matches!(
-        settled[0].dispatch_kind,
-        Some(ActionDispatchKind::Rejected { .. })
-    ));
+        let err = workflow
+            .accept_inbound(envelope)
+            .await
+            .expect_err("non-command command ack must fail");
+
+        assert!(!err.is_retryable(), "{case}");
+        assert_eq!(
+            command_service.commands(),
+            vec![ProductCommand::Status],
+            "{case}"
+        );
+        assert_eq!(inbound.accepted_count(), 0, "{case}");
+        assert_eq!(ledger.released_count(), 0, "{case}");
+        let settled = ledger.settled_actions();
+        assert_eq!(settled.len(), 1, "{case}");
+        assert!(
+            matches!(
+                &settled[0].dispatch_kind,
+                Some(ActionDispatchKind::Rejected { .. })
+            ),
+            "{case}"
+        );
+    }
 }

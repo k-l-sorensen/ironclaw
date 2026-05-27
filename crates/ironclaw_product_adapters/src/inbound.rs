@@ -144,7 +144,7 @@ pub struct InboundCommandPayload {
     pub trigger: ProductTriggerReason,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct RoutedCommandName(String);
 
 impl RoutedCommandName {
@@ -222,14 +222,6 @@ pub fn parse_product_slash_command(
         .unwrap_or(without_slash.len());
     let command_slice = &without_slash[..command_end];
     let arguments_slice = without_slash[command_end..].trim_start();
-    validate_command_name(command_slice)
-        .map_err(|error| ProductSlashCommandParseError::InvalidPayload(error.to_string()))?;
-    validate_payload_string(
-        "command arguments",
-        arguments_slice,
-        COMMAND_ARGUMENTS_MAX_BYTES,
-    )
-    .map_err(|error| ProductSlashCommandParseError::InvalidPayload(error.to_string()))?;
 
     let command = command_slice.to_ascii_lowercase();
     let arguments = arguments_slice.to_string();
@@ -762,6 +754,16 @@ mod tests {
             "trigger": "direct_chat"
         });
         assert!(serde_json::from_value::<UserMessagePayload>(forged).is_err());
+    }
+
+    #[test]
+    fn routed_command_name_rejects_invalid_inputs() {
+        for input in ["", "bad name", "bad\\name", "bad\nname"] {
+            assert!(
+                RoutedCommandName::new(input).is_err(),
+                "expected {input:?} to be rejected"
+            );
+        }
     }
 
     #[test]
