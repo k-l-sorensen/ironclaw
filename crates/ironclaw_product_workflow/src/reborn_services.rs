@@ -1332,16 +1332,23 @@ fn attested_invalid_field(field: &str) -> RebornServicesError {
 }
 
 /// Map a sanitized attested-continuation rejection to the WebUI error surface.
-/// The continuation runs after the resume guard already consumed the one-shot,
-/// so every category here is non-retryable from the client's perspective.
+///
+/// Most categories are terminal: the one-shot resume guard / sealed grant was
+/// already consumed (or the request was rejected before it could be), so the
+/// client cannot retry the same proof. The lone exception is `Unavailable`,
+/// which is a POST-verification broadcast-tail failure (RPC timeout, etc.): the
+/// grant IS already claimed and the broadcast is idempotency-guarded by the
+/// ledger row, so the client may safely retry only the broadcast tail. The
+/// per-arm `retryable` flag reflects that distinction.
 fn map_attested_continuation_rejection(
     rejection: AttestedContinuationRejection,
 ) -> RebornServicesError {
-    let (code, kind, status) = match rejection {
+    let (code, kind, status, retryable) = match rejection {
         AttestedContinuationRejection::MissingBinding => (
             RebornServicesErrorCode::NotFound,
             RebornServicesErrorKind::NotFound,
             404,
+            false,
         ),
         AttestedContinuationRejection::ProviderMismatch
         | AttestedContinuationRejection::ProofRejected
@@ -1349,6 +1356,7 @@ fn map_attested_continuation_rejection(
             RebornServicesErrorCode::InvalidRequest,
             RebornServicesErrorKind::Validation,
             400,
+            false,
         ),
         // A context mismatch is an ownership/tenant divergence (the caller's
         // turn scope / run / gate_ref did not match the authoritative binding
@@ -1360,19 +1368,26 @@ fn map_attested_continuation_rejection(
             RebornServicesErrorCode::Forbidden,
             RebornServicesErrorKind::ParticipantDenied,
             403,
+            false,
         ),
         AttestedContinuationRejection::LedgerGuard => (
             RebornServicesErrorCode::Conflict,
             RebornServicesErrorKind::Conflict,
             409,
+            false,
         ),
+        // Broadcast-tail failure after the grant was already claimed: the
+        // ledger row makes the broadcast idempotent, so the client may retry
+        // the broadcast tail. Retryable, matching how `Unavailable` is treated
+        // by the other mappers in this file.
         AttestedContinuationRejection::Unavailable => (
             RebornServicesErrorCode::Unavailable,
             RebornServicesErrorKind::ServiceUnavailable,
             503,
+            true,
         ),
     };
-    RebornServicesError::from_status_kind(code, kind, status, false)
+    RebornServicesError::from_status_kind(code, kind, status, retryable)
 }
 
 fn segment(name: &str, value: &str) -> String {
@@ -1645,10 +1660,18 @@ mod attested_rejection_mapping_tests {
         let guard = map_attested_continuation_rejection(AttestedContinuationRejection::LedgerGuard);
         assert_eq!(guard.code, RebornServicesErrorCode::Conflict);
         assert_eq!(guard.status_code, 409);
+        // The grant was already consumed — replaying the same proof is terminal.
+        assert!(!guard.retryable);
 
         let unavailable =
             map_attested_continuation_rejection(AttestedContinuationRejection::Unavailable);
         assert_eq!(unavailable.code, RebornServicesErrorCode::Unavailable);
         assert_eq!(unavailable.status_code, 503);
+        // Broadcast-tail failure after a claimed grant: the ledger row makes the
+        // broadcast idempotent, so the client may retry the broadcast tail.
+        assert!(
+            unavailable.retryable,
+            "a post-verification broadcast-tail Unavailable must be retryable"
+        );
     }
 }

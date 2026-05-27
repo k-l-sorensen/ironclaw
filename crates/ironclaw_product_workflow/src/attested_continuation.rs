@@ -114,7 +114,11 @@ pub enum AttestedContinuationRejection {
     LedgerGuard,
     /// The proof payload was malformed and could not be decoded.
     MalformedProof,
-    /// The continuation port is not wired on this deployment.
+    /// A post-verification, server-side (recoverable) failure: the proof was
+    /// already verified and the one-shot grant claimed, but the broadcast tail
+    /// failed (e.g. RPC timeout). The broadcast is ledger-idempotent, so this is
+    /// retryable for the broadcast tail only — it must NOT be surfaced as a
+    /// proof-validation error.
     Unavailable,
     /// The caller-supplied turn scope / run / gate_ref did not match the
     /// authoritative binding context recorded when the gate was raised

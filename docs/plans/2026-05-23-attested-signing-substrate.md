@@ -190,6 +190,13 @@ cannot complete.
   because a review of the *un-rebased* assembled tip still shows the pre-fix
   code; the rebased PR2 is authoritative.
 
+  Traceability note: `signer_account()` is the *pre-rebase* symbol — it is not
+  defined anywhere in the current assembled head, so this assertion cannot be
+  verified against this tree alone. To confirm the removal, diff against the
+  pre-rebase PR2 tip (the commit that last defined `signer_account()`); after
+  the bottom-up rebase cascade lands, the authoritative form is
+  `approved_tx_hash_for` taking the explicit `SigningContext` signer.
+
 **Integration caveat (important).** The *fixed* whole stack does not exist as a
 single artifact yet. The per-PR review-fixes and the multi-tenant / trust / KMS
 additions live on separate branches; the integrated tree materializes only
