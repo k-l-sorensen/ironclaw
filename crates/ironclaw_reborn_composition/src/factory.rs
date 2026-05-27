@@ -33,7 +33,6 @@ use ironclaw_turns::{
     AttestedResumePort, DefaultTurnCoordinator, InMemoryCheckpointStateStore,
     InMemoryLoopCheckpointStore, InMemoryTurnStateStore,
 };
-use secrecy::SecretString;
 
 use crate::input::RebornStorageInput;
 use crate::{
@@ -385,15 +384,13 @@ fn build_local_dev_attested_composition(
 ) -> Result<crate::attested::LocalDevAttestedComposition, RebornBuildError> {
     use ironclaw_attestation::SealedGrantStore;
 
-    // Local-dev master key for the custodial keystore AAD. Production wires a
-    // real master key (OS keychain / KMS); this dev key never signs mainnet
-    // because the ship-gate refuses it without secure custody.
-    let crypto = SecretsCrypto::new(SecretString::from(
-        "0123456789abcdef0123456789ABCDEF".to_string(),
-    ))
-    .map_err(|error| RebornBuildError::InvalidConfig {
-        reason: format!("local-dev custodial master key invalid: {error}"),
-    })?;
+    // Local-dev master key for the custodial keystore AAD. Generated per-process
+    // from `OsRng` (no stable key ever lives in source control) — the in-memory
+    // keystore is rebuilt every start anyway, so no stable key is needed across
+    // restarts. Production wires a real master key (OS keychain / KMS); this dev
+    // key never signs mainnet because the ship-gate refuses it without secure
+    // custody.
+    let crypto = SecretsCrypto::generate();
     let keystore = Arc::new(SecretsKeyStore::new(crypto));
 
     // No KMS backend in local-dev: mainnet custodial signing stays refused.
