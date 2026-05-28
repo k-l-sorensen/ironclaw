@@ -3249,10 +3249,9 @@ async fn builtin_coding_apply_patch_serializes_concurrent_edits_on_same_path() {
     let result_b = task_b.await.unwrap();
 
     // Serialization guarantee: the second patch reads the post-write file and
-    // its cached hash (taken before either write) no longer matches, so
-    // exactly one apply_patch must succeed. Without the per-path edit lock,
-    // both calls can pass `check_before_edit` concurrently and silently lose
-    // an update.
+    // no longer finds `old_string`, so exactly one apply_patch must succeed.
+    // Without the per-path edit lock, both calls can read the original file
+    // concurrently and silently lose an update.
     let outcomes = [result_a.is_ok(), result_b.is_ok()];
     assert_eq!(
         outcomes.iter().filter(|ok| **ok).count(),
@@ -3720,22 +3719,13 @@ async fn builtin_coding_read_rejects_non_file_paths() {
 }
 
 #[tokio::test]
-async fn builtin_apply_patch_matches_v1_exact_unique_and_replace_all_behavior() {
+async fn builtin_apply_patch_matches_exact_unique_and_replace_all_behavior() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("code.rs"), "old\nold\nunique\n").unwrap();
 
     let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
     let runtime = runtime_with_filesystem(filesystem);
     let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
-
-    invoke_with_context(
-        &runtime,
-        READ_FILE_CAPABILITY_ID,
-        json!({"path": "/workspace/code.rs"}),
-        context.clone(),
-    )
-    .await
-    .unwrap();
 
     let duplicate = invoke_with_context(
         &runtime,
@@ -3779,7 +3769,7 @@ async fn builtin_apply_patch_matches_v1_exact_unique_and_replace_all_behavior() 
 }
 
 #[tokio::test]
-async fn builtin_apply_patch_requires_full_fresh_read_like_v1() {
+async fn builtin_apply_patch_accepts_unique_match_without_prior_read() {
     let temp = tempfile::tempdir().unwrap();
     std::fs::write(temp.path().join("code.rs"), "old\n").unwrap();
 
@@ -3787,39 +3777,25 @@ async fn builtin_apply_patch_requires_full_fresh_read_like_v1() {
     let runtime = runtime_with_filesystem(filesystem);
     let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
 
-    let unread = invoke_with_context(
+    let patched = invoke_with_context(
         &runtime,
         APPLY_PATCH_CAPABILITY_ID,
         json!({"path": "/workspace/code.rs", "old_string": "old", "new_string": "new"}),
-        context.clone(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(unread, RuntimeFailureKind::OperationFailed);
-
-    invoke_with_context(
-        &runtime,
-        READ_FILE_CAPABILITY_ID,
-        json!({"path": "/workspace/code.rs", "limit": 1}),
-        context.clone(),
+        context,
     )
     .await
     .unwrap();
-    let partial = invoke_with_context(
-        &runtime,
-        APPLY_PATCH_CAPABILITY_ID,
-        json!({"path": "/workspace/code.rs", "old_string": "old", "new_string": "new"}),
-        context.clone(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(partial, RuntimeFailureKind::OperationFailed);
+
+    assert_eq!(patched["success"], json!(true));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("code.rs")).unwrap(),
+        "new\n"
+    );
 }
 
 #[tokio::test]
-async fn builtin_apply_patch_rejects_same_second_content_changes_after_read() {
+async fn builtin_apply_patch_accepts_file_content_written_by_same_scope() {
     let temp = tempfile::tempdir().unwrap();
-    std::fs::write(temp.path().join("code.rs"), "old\n").unwrap();
 
     let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
     let runtime = runtime_with_filesystem(filesystem);
@@ -3827,15 +3803,46 @@ async fn builtin_apply_patch_rejects_same_second_content_changes_after_read() {
 
     invoke_with_context(
         &runtime,
-        READ_FILE_CAPABILITY_ID,
-        json!({"path": "/workspace/code.rs"}),
+        WRITE_FILE_CAPABILITY_ID,
+        json!({"path": "/workspace/math_utils.py", "content": "def multiply(a, b):\n    return a + b\n"}),
         context.clone(),
     )
     .await
     .unwrap();
-    std::fs::write(temp.path().join("code.rs"), "old\nchanged\n").unwrap();
 
-    let stale = invoke_with_context(
+    let patched = invoke_with_context(
+        &runtime,
+        APPLY_PATCH_CAPABILITY_ID,
+        json!({
+            "path": "/workspace/math_utils.py",
+            "old_string": "    return a + b",
+            "new_string": "    return a * b"
+        }),
+        context,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(patched["success"], json!(true));
+    assert_eq!(patched["replacements"], json!(1));
+    assert_eq!(
+        std::fs::read_to_string(temp.path().join("math_utils.py")).unwrap(),
+        "def multiply(a, b):\n    return a * b\n"
+    );
+}
+
+#[tokio::test]
+async fn builtin_apply_patch_rejects_when_old_string_is_no_longer_present() {
+    let temp = tempfile::tempdir().unwrap();
+    std::fs::write(temp.path().join("code.rs"), "old\n").unwrap();
+
+    let (filesystem, mounts) = mounted_filesystem(temp.path(), MountPermissions::read_write());
+    let runtime = runtime_with_filesystem(filesystem);
+    let context = execution_context_with_mounts(all_builtin_capability_ids(), mounts);
+
+    std::fs::write(temp.path().join("code.rs"), "changed\n").unwrap();
+
+    let missing = invoke_with_context(
         &runtime,
         APPLY_PATCH_CAPABILITY_ID,
         json!({"path": "/workspace/code.rs", "old_string": "old", "new_string": "new"}),
@@ -3843,7 +3850,7 @@ async fn builtin_apply_patch_rejects_same_second_content_changes_after_read() {
     )
     .await
     .unwrap_err();
-    assert_eq!(stale, RuntimeFailureKind::OperationFailed);
+    assert_eq!(missing, RuntimeFailureKind::OperationFailed);
 }
 
 #[tokio::test]
