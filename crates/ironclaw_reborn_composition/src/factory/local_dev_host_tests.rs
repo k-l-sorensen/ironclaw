@@ -12,8 +12,8 @@ use ironclaw_host_api::{
     NetworkTargetPattern, Principal, ResourceEstimate, RuntimeKind, ThreadId, TrustClass, UserId,
 };
 use ironclaw_host_runtime::{
-    RuntimeApprovalGate, RuntimeCapabilityOutcome, RuntimeCapabilityRequest,
-    RuntimeCapabilityResumeRequest, SHELL_CAPABILITY_ID,
+    APPLY_PATCH_CAPABILITY_ID, RuntimeApprovalGate, RuntimeCapabilityOutcome,
+    RuntimeCapabilityRequest, RuntimeCapabilityResumeRequest, SHELL_CAPABILITY_ID,
 };
 use ironclaw_run_state::{ApprovalRequestStore, ApprovalStatus};
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
@@ -234,7 +234,9 @@ impl ironclaw_host_runtime::SandboxCommandTransport for RecordingSandboxTranspor
         Ok(ironclaw_host_runtime::CommandExecutionOutput {
             output: format!("sandbox port: {command}"),
             exit_code: 0,
-            sandboxed: false,
+            // The injected transport acts as the sandbox, so the output is
+            // sandboxed from the host process's perspective.
+            sandboxed: true,
             duration: Duration::from_millis(5),
         })
     }
@@ -523,6 +525,234 @@ fn tenant_sandbox_process_policy() -> ironclaw_host_api::runtime_policy::Effecti
     let mut policy = local_dev_policy();
     policy.process_backend = ironclaw_host_api::runtime_policy::ProcessBackendKind::TenantSandbox;
     policy
+}
+
+fn local_dev_minimal_policy() -> ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy {
+    let mut policy = local_dev_policy();
+    // Override approval policy to Minimal (yolo-equivalent via ApprovalPolicy enum).
+    policy.approval_policy = ironclaw_host_api::runtime_policy::ApprovalPolicy::Minimal;
+    policy
+}
+
+/// Minimal approval policy must complete effectful capabilities without any approval gate.
+/// Verifies `ApprovalPolicy::Minimal => GrantAuthorizer` path in `local_dev_authorizer`.
+#[tokio::test]
+async fn local_dev_minimal_policy_shell_invocation_completes_without_approval_gate() {
+    let dir = tempfile::tempdir().expect("tempdir"); // safety: test-only helper in #[cfg(test)] module.
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev("local-dev-minimal-owner", dir.path().join("local-dev"))
+            .with_runtime_policy(local_dev_minimal_policy()),
+    )
+    .await
+    .expect("local-dev minimal services build"); // safety: test-only helper in #[cfg(test)] module.
+    let host_runtime = services
+        .host_runtime
+        .as_ref()
+        .expect("local-dev host runtime"); // safety: test-only helper in #[cfg(test)] module.
+    let capability_id = CapabilityId::new(SHELL_CAPABILITY_ID).expect("shell capability"); // safety: test-only helper in #[cfg(test)] module.
+    let context = shell_execution_context("local-dev-minimal-owner", "thread-minimal-approval");
+
+    let outcome = host_runtime
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            context,
+            capability_id,
+            ResourceEstimate::default(),
+            serde_json::json!({"command": "echo minimal"}),
+            trust_decision(shell_allowed_effects()),
+        ))
+        .await
+        .expect("minimal shell invocation completes"); // safety: test-only helper in #[cfg(test)] module.
+
+    // Minimal policy must not create an approval gate.
+    assert!(matches!(outcome, RuntimeCapabilityOutcome::Completed(_))); // safety: test-only assertion in #[cfg(test)] module.
+}
+
+/// `authorize_spawn_with_trust` RequireApproval-then-resume end-to-end.
+/// Verifies the spawn gating and resume path is wired correctly.
+#[tokio::test]
+async fn local_dev_ask_destructive_spawn_capability_blocks_then_resumes() {
+    let dir = tempfile::tempdir().expect("tempdir"); // safety: test-only helper in #[cfg(test)] module.
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev(
+            "local-dev-spawn-approval-owner",
+            dir.path().join("local-dev"),
+        )
+        .with_runtime_policy(local_dev_policy()),
+    )
+    .await
+    .expect("local-dev services build"); // safety: test-only helper in #[cfg(test)] module.
+    let local_runtime = services
+        .local_runtime
+        .as_ref()
+        .expect("local-dev runtime substrate"); // safety: test-only helper in #[cfg(test)] module.
+    let host_runtime = services
+        .host_runtime
+        .as_ref()
+        .expect("local-dev host runtime"); // safety: test-only helper in #[cfg(test)] module.
+    let capability_id = CapabilityId::new(SHELL_CAPABILITY_ID).expect("shell capability"); // safety: test-only helper in #[cfg(test)] module.
+    let estimate = ResourceEstimate::default();
+    let input = serde_json::json!({"command": "echo spawn-approved"});
+    let context =
+        shell_execution_context("local-dev-spawn-approval-owner", "thread-spawn-approval");
+
+    let blocked = host_runtime
+        .spawn_capability(RuntimeCapabilityRequest::new(
+            context.clone(),
+            capability_id.clone(),
+            estimate.clone(),
+            input.clone(),
+            trust_decision(shell_allowed_effects()),
+        ))
+        .await
+        .expect("spawn invocation returns approval gate"); // safety: test-only helper in #[cfg(test)] module.
+
+    let RuntimeCapabilityOutcome::ApprovalRequired(gate) = blocked else {
+        panic!("expected approval gate on spawn, got {blocked:?}");
+    };
+    assert_eq!(gate.capability_id, capability_id); // safety: test-only assertion in #[cfg(test)] module.
+
+    ApprovalResolver::new(
+        local_runtime.approval_requests.as_ref(),
+        local_runtime.capability_leases.as_ref(),
+    )
+    .approve_spawn(
+        &context.resource_scope,
+        gate.approval_request_id,
+        shell_lease_approval(),
+    )
+    .await
+    .expect("approval issues spawn lease"); // safety: test-only helper in #[cfg(test)] module.
+
+    let resumed = host_runtime
+        .resume_spawn_capability(RuntimeCapabilityResumeRequest::new(
+            context,
+            gate.approval_request_id,
+            capability_id,
+            estimate,
+            input,
+            trust_decision(shell_allowed_effects()),
+        ))
+        .await
+        .expect("approved spawn invocation resumes"); // safety: test-only helper in #[cfg(test)] module.
+    // spawn_capability returns SpawnedProcess (a live process handle), not Completed.
+    let spawn_ok = matches!(
+        resumed,
+        RuntimeCapabilityOutcome::Completed(_) | RuntimeCapabilityOutcome::SpawnedProcess(_)
+    );
+    assert!(spawn_ok); // safety: test-only assertion in #[cfg(test)] module.
+}
+
+/// A capability invoked without a matching grant must be denied, not upgraded to
+/// RequireApproval. Verifies `other => other` pass-through in
+/// `require_approval_for_local_dev_policy`.
+#[tokio::test]
+async fn local_dev_ungranted_capability_returns_denied_not_approval_gate() {
+    let dir = tempfile::tempdir().expect("tempdir"); // safety: test-only helper in #[cfg(test)] module.
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev("local-dev-deny-owner", dir.path().join("local-dev"))
+            .with_runtime_policy(local_dev_policy()),
+    )
+    .await
+    .expect("local-dev services build"); // safety: test-only helper in #[cfg(test)] module.
+    let host_runtime = services
+        .host_runtime
+        .as_ref()
+        .expect("local-dev host runtime"); // safety: test-only helper in #[cfg(test)] module.
+    // Context grants only shell; apply_patch is not in the grant set.
+    let context = shell_execution_context("local-dev-deny-owner", "thread-deny-passthrough");
+    let capability_id =
+        CapabilityId::new(APPLY_PATCH_CAPABILITY_ID).expect("apply_patch capability"); // safety: test-only helper in #[cfg(test)] module.
+
+    let outcome = host_runtime
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            context,
+            capability_id,
+            ResourceEstimate::default(),
+            serde_json::json!({}),
+            trust_decision(shell_allowed_effects()),
+        ))
+        .await
+        .expect("invocation completes (with failure)"); // safety: test-only helper in #[cfg(test)] module.
+
+    // Ungranted capability must return Failed (Deny), not ApprovalRequired.
+    assert!(matches!(outcome, RuntimeCapabilityOutcome::Failed(_))); // safety: test-only assertion in #[cfg(test)] module.
+}
+
+/// After a one-shot lease is consumed by the first resume, a second invocation
+/// must present a new approval gate — not inherit the spent lease.
+/// Verifies the one-shot property of `has_matching_one_shot_approval_grant`.
+#[tokio::test]
+async fn local_dev_one_shot_lease_regates_on_second_invocation() {
+    let dir = tempfile::tempdir().expect("tempdir"); // safety: test-only helper in #[cfg(test)] module.
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev("local-dev-regate-owner", dir.path().join("local-dev"))
+            .with_runtime_policy(local_dev_policy()),
+    )
+    .await
+    .expect("local-dev services build"); // safety: test-only helper in #[cfg(test)] module.
+    let local_runtime = services
+        .local_runtime
+        .as_ref()
+        .expect("local-dev runtime substrate"); // safety: test-only helper in #[cfg(test)] module.
+    let host_runtime = services
+        .host_runtime
+        .as_ref()
+        .expect("local-dev host runtime"); // safety: test-only helper in #[cfg(test)] module.
+    let capability_id = CapabilityId::new(SHELL_CAPABILITY_ID).expect("shell capability"); // safety: test-only helper in #[cfg(test)] module.
+    let estimate = ResourceEstimate::default();
+    let input = serde_json::json!({"command": "echo regate"});
+    let context = shell_execution_context("local-dev-regate-owner", "thread-regate");
+
+    // First invocation — expect approval gate.
+    let first_blocked = host_runtime
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            context.clone(),
+            capability_id.clone(),
+            estimate.clone(),
+            input.clone(),
+            trust_decision(shell_allowed_effects()),
+        ))
+        .await
+        .expect("first invocation"); // safety: test-only helper in #[cfg(test)] module.
+    let RuntimeCapabilityOutcome::ApprovalRequired(first_gate) = first_blocked else {
+        panic!("expected first approval gate, got {first_blocked:?}");
+    };
+
+    // Approve and resume the first invocation.
+    approve_shell_dispatch(local_runtime, &context, &first_gate).await;
+    let first_resumed = host_runtime
+        .resume_capability(RuntimeCapabilityResumeRequest::new(
+            context.clone(),
+            first_gate.approval_request_id,
+            capability_id.clone(),
+            estimate.clone(),
+            input.clone(),
+            trust_decision(shell_allowed_effects()),
+        ))
+        .await
+        .expect("first resume"); // safety: test-only helper in #[cfg(test)] module.
+    // First resume must complete.
+    let first_ok = matches!(first_resumed, RuntimeCapabilityOutcome::Completed(_));
+    assert!(first_ok); // safety: test-only assertion in #[cfg(test)] module.
+
+    // Second invocation without a new approval — must gate again.
+    // A fresh context is required because each invoke_capability call uses
+    // context.invocation_id to key the run-state record; reusing the same
+    // context would conflict with the completed first-invocation record.
+    let context2 = shell_execution_context("local-dev-regate-owner", "thread-regate");
+    let second = host_runtime
+        .invoke_capability(RuntimeCapabilityRequest::new(
+            context2,
+            capability_id,
+            estimate,
+            input,
+            trust_decision(shell_allowed_effects()),
+        ))
+        .await
+        .expect("second invocation"); // safety: test-only helper in #[cfg(test)] module.
+    // Spent one-shot lease must not bypass approval on second invocation.
+    let regated = matches!(second, RuntimeCapabilityOutcome::ApprovalRequired(_));
+    assert!(regated); // safety: test-only assertion in #[cfg(test)] module.
 }
 
 fn filesystem_root() -> std::path::PathBuf {

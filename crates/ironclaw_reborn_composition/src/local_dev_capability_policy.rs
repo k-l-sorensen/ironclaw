@@ -148,6 +148,13 @@ impl LocalDevCapabilityPolicy {
             network: constraints.network,
             secrets: constraints.secrets,
             resource_ceiling: constraints.resource_ceiling,
+            // Local-dev leases are single-use (max_invocations = 1).
+            // Wall-clock expiry is intentionally None: the policy file does
+            // not configure an expires_at ceiling, and a short hard-coded
+            // timeout would race against slow human approval flows. The
+            // one-shot invocation count is the sole consumption bound.
+            // If invocation-count enforcement ever regresses, this lease
+            // becomes perpetual — see approval gate tests for the invariant.
             expires_at: constraints.expires_at,
             max_invocations: Some(1),
         })

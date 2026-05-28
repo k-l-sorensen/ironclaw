@@ -75,7 +75,7 @@ use crate::input::OAuthClientConfig;
 use crate::input::{RebornRuntimeProcessBinding, RebornStorageInput};
 use crate::lifecycle::{RebornLocalSkillManagementPort, build_local_skill_management_port};
 use crate::local_dev_authorization::local_dev_authorizer;
-use crate::local_dev_capability_policy::local_dev_capability_policy;
+use crate::local_dev_capability_policy::{LocalDevCapabilityPolicy, local_dev_capability_policy};
 use crate::local_dev_mounts::{
     ambient_workspace_mount_view, skill_context_mount_view, workspace_mount_view,
 };
@@ -246,6 +246,10 @@ pub struct RebornServices {
 pub(crate) struct RebornLocalRuntimeServices {
     pub(crate) approval_requests: Arc<LocalDevApprovalRequestStore>,
     pub(crate) capability_leases: Arc<LocalDevCapabilityLeaseStore>,
+    // Used in approval_test_support (cfg(test) only); suppress the dead-code
+    // lint on non-test builds where that module is not compiled in.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) capability_policy: Arc<LocalDevCapabilityPolicy>,
     pub(crate) turn_state: Arc<LocalDevTurnStateStore>,
     pub(crate) checkpoint_state_store: Arc<dyn CheckpointStateStore>,
     pub(crate) loop_checkpoint_store: Arc<dyn LoopCheckpointStore>,
@@ -634,9 +638,15 @@ fn build_local_dev_store_graph(
             reason: error.to_string(),
         })?;
     let skill_management = build_local_skill_management_port(owner_user_id, filesystem)?;
+    let capability_policy = Arc::new(local_dev_capability_policy().map_err(|error| {
+        RebornBuildError::InvalidConfig {
+            reason: format!("local-dev capability policy is invalid: {error}"),
+        }
+    })?);
     let local_runtime = Arc::new(RebornLocalRuntimeServices {
         approval_requests: Arc::clone(&approval_requests),
         capability_leases: Arc::clone(&capability_leases),
+        capability_policy: Arc::clone(&capability_policy),
         turn_state: Arc::clone(&turn_state),
         checkpoint_state_store,
         loop_checkpoint_store,
@@ -699,9 +709,15 @@ fn build_local_dev_store_graph(
             reason: error.to_string(),
         })?;
     let skill_management = build_local_skill_management_port(owner_user_id, filesystem)?;
+    let capability_policy = Arc::new(local_dev_capability_policy().map_err(|error| {
+        RebornBuildError::InvalidConfig {
+            reason: format!("local-dev capability policy is invalid: {error}"),
+        }
+    })?);
     let local_runtime = Arc::new(RebornLocalRuntimeServices {
         approval_requests: Arc::clone(&approval_requests),
         capability_leases: Arc::clone(&capability_leases),
+        capability_policy: Arc::clone(&capability_policy),
         turn_state: Arc::clone(&turn_state),
         checkpoint_state_store,
         loop_checkpoint_store,

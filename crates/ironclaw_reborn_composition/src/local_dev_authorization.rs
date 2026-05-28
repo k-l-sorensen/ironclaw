@@ -90,13 +90,13 @@ pub(crate) fn local_dev_authorizer(
         .map(|policy| policy.approval_policy)
         .unwrap_or(ApprovalPolicy::AskDestructive);
     match approval_policy {
+        // Minimal ~ yolo: skip approval gates entirely and delegate to
+        // the grant authorizer only. A misconfigured policy reaching
+        // build_local_dev with Minimal will run every effectful capability
+        // ungated — intentional, and exercised by the Minimal integration test.
         ApprovalPolicy::Minimal => Arc::new(GrantAuthorizer::new()),
-        ApprovalPolicy::AskAlways
-        | ApprovalPolicy::AskWrites
-        | ApprovalPolicy::AskDestructive
-        | ApprovalPolicy::OrgPolicy
-        | _ => Arc::new(LocalDevApprovalPolicyAuthorizer::new(
-            approval_policy,
+        other => Arc::new(LocalDevApprovalPolicyAuthorizer::new(
+            other,
             capability_policy,
         )),
     }
@@ -122,13 +122,7 @@ fn require_approval_for_local_dev_policy(
                 ) =>
         {
             Decision::RequireApproval {
-                request: approval_request(
-                    context,
-                    descriptor,
-                    estimate,
-                    action_kind,
-                    approval_policy,
-                ),
+                request: approval_request(context, descriptor, estimate, action_kind),
             }
         }
         other => other,
@@ -141,10 +135,14 @@ fn has_matching_one_shot_approval_grant(
     approval_policy: ApprovalPolicy,
     capability_policy: &LocalDevCapabilityPolicy,
 ) -> bool {
+    // Hoist the expected grantee/issuer principals so they are not
+    // re-allocated on every iteration of the any() closure.
+    let expected_grantee = Principal::Extension(context.extension_id.clone());
     context.grants.grants.iter().any(|grant| {
         grant.capability == descriptor.id
             && grant.constraints.max_invocations == Some(1)
-            && grant.grantee == Principal::Extension(context.extension_id.clone())
+            && grant.issued_by == Principal::HostRuntime
+            && grant.grantee == expected_grantee
             && descriptor
                 .effects
                 .iter()
@@ -159,7 +157,6 @@ fn approval_request(
     descriptor: &CapabilityDescriptor,
     estimate: &ResourceEstimate,
     action_kind: LocalDevApprovalActionKind,
-    approval_policy: ApprovalPolicy,
 ) -> ApprovalRequest {
     let action = match action_kind {
         LocalDevApprovalActionKind::Dispatch => Action::Dispatch {
@@ -177,7 +174,7 @@ fn approval_request(
         requested_by: Principal::Extension(context.extension_id.clone()),
         action: Box::new(action),
         invocation_fingerprint: None,
-        reason: format!("local-dev {approval_policy} policy requires approval"),
+        reason: "this action requires your approval".to_string(),
         reusable_scope: None,
     }
 }

@@ -7,7 +7,10 @@ use ironclaw_host_runtime::{
 use ironclaw_run_state::ApprovalRequestStore;
 use ironclaw_trust::TrustDecision;
 
-use crate::RebornServices;
+use crate::{
+    RebornServices,
+    local_dev_capability_policy::{LocalDevApprovalPolicyAction, LocalDevCapabilityPolicyError},
+};
 
 pub(crate) async fn invoke_json_with_local_dev_approval(
     services: &RebornServices,
@@ -46,7 +49,27 @@ pub(crate) async fn invoke_json_with_local_dev_approval(
                 .await
                 .expect("local-dev approval record read")
                 .expect("local-dev approval request persisted");
-            let approval = lease_approval_from_context(&context, &capability);
+            let policy_action = LocalDevApprovalPolicyAction::from_host_action(
+                approval_record.request.action.as_ref(),
+            )
+            .expect("dispatch or spawn action in local-dev approval"); // safety: test-only approval helper compiled only under #[cfg(test)].
+            // For local-dev builtin capabilities, derive lease terms through the
+            // capability policy (single source of truth, can't drift from production).
+            // For extension capabilities not registered in the builtin policy (e.g.
+            // third-party skills like gsuite), fall back to the execution context grants.
+            let approval = match local_runtime.capability_policy.lease_approval_for(
+                policy_action,
+                &local_runtime.workspace_mounts,
+                &local_runtime.skill_mounts,
+            ) {
+                Ok(approval) => approval,
+                Err(LocalDevCapabilityPolicyError::MissingGrant { .. }) => {
+                    lease_approval_from_context(&context, &capability)
+                }
+                Err(error) => {
+                    panic!("capability policy lease approval failed for {capability}: {error}")
+                }
+            };
             let resolver = ApprovalResolver::new(
                 local_runtime.approval_requests.as_ref(),
                 local_runtime.capability_leases.as_ref(),
@@ -84,6 +107,9 @@ pub(crate) async fn invoke_json_with_local_dev_approval(
     }
 }
 
+/// Fallback: build a `LeaseApproval` from an extension capability's grant in
+/// the execution context. Used only when the capability is not registered in the
+/// local-dev builtin policy (e.g. third-party extension skills).
 fn lease_approval_from_context(
     context: &ExecutionContext,
     capability: &CapabilityId,
