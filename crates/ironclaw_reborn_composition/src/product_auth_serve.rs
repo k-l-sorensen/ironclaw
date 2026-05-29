@@ -260,68 +260,41 @@ pub(crate) fn product_auth_route_mount(state: ProductAuthRouteState) -> ProductA
 }
 
 pub(crate) fn product_auth_route_descriptors() -> Vec<IngressRouteDescriptor> {
-    vec![
-        descriptor(
-            OAUTH_START_ROUTE_ID,
-            NetworkMethod::Post,
-            OAUTH_START_PATH,
-            protected_mutation_policy(),
-        ),
-        descriptor(
-            OAUTH_CALLBACK_ROUTE_ID,
-            NetworkMethod::Get,
-            OAUTH_CALLBACK_PATH,
-            callback_policy(),
-        ),
-        descriptor(
-            MANUAL_TOKEN_SUBMIT_ROUTE_ID,
-            NetworkMethod::Post,
-            MANUAL_TOKEN_SUBMIT_PATH,
-            protected_mutation_policy(),
-        ),
-        descriptor(
-            MANUAL_TOKEN_SETUP_ROUTE_ID,
-            NetworkMethod::Post,
-            MANUAL_TOKEN_SETUP_PATH,
-            protected_mutation_policy(),
-        ),
-        descriptor(
+    // All protected mutations share the same LocalGateway + Bearer + per-caller
+    // policy. Listing them as a table keeps the policy choice next to the path
+    // and stops descriptor blocks from drifting per-route.
+    const PROTECTED_MUTATIONS: &[(&str, &str)] = &[
+        (OAUTH_START_ROUTE_ID, OAUTH_START_PATH),
+        (MANUAL_TOKEN_SUBMIT_ROUTE_ID, MANUAL_TOKEN_SUBMIT_PATH),
+        (MANUAL_TOKEN_SETUP_ROUTE_ID, MANUAL_TOKEN_SETUP_PATH),
+        (
             MANUAL_TOKEN_SECRET_SUBMIT_ROUTE_ID,
-            NetworkMethod::Post,
             MANUAL_TOKEN_SECRET_SUBMIT_PATH,
-            protected_mutation_policy(),
         ),
-        descriptor(
-            ACCOUNTS_LIST_ROUTE_ID,
-            NetworkMethod::Post,
-            ACCOUNTS_LIST_PATH,
-            protected_mutation_policy(),
-        ),
-        descriptor(
-            ACCOUNTS_SELECT_ROUTE_ID,
-            NetworkMethod::Post,
-            ACCOUNTS_SELECT_PATH,
-            protected_mutation_policy(),
-        ),
-        descriptor(
-            ACCOUNTS_RECOVERY_ROUTE_ID,
-            NetworkMethod::Post,
-            ACCOUNTS_RECOVERY_PATH,
-            protected_mutation_policy(),
-        ),
-        descriptor(
-            ACCOUNTS_REFRESH_ROUTE_ID,
-            NetworkMethod::Post,
-            ACCOUNTS_REFRESH_PATH,
-            protected_mutation_policy(),
-        ),
-        descriptor(
-            LIFECYCLE_CLEANUP_ROUTE_ID,
-            NetworkMethod::Post,
-            LIFECYCLE_CLEANUP_PATH,
-            protected_mutation_policy(),
-        ),
-    ]
+        (ACCOUNTS_LIST_ROUTE_ID, ACCOUNTS_LIST_PATH),
+        (ACCOUNTS_SELECT_ROUTE_ID, ACCOUNTS_SELECT_PATH),
+        (ACCOUNTS_RECOVERY_ROUTE_ID, ACCOUNTS_RECOVERY_PATH),
+        (ACCOUNTS_REFRESH_ROUTE_ID, ACCOUNTS_REFRESH_PATH),
+        (LIFECYCLE_CLEANUP_ROUTE_ID, LIFECYCLE_CLEANUP_PATH),
+    ];
+    let mut descriptors: Vec<IngressRouteDescriptor> = PROTECTED_MUTATIONS
+        .iter()
+        .map(|(route_id, path)| {
+            descriptor(
+                route_id,
+                NetworkMethod::Post,
+                path,
+                protected_mutation_policy(),
+            )
+        })
+        .collect();
+    descriptors.push(descriptor(
+        OAUTH_CALLBACK_ROUTE_ID,
+        NetworkMethod::Get,
+        OAUTH_CALLBACK_PATH,
+        callback_policy(),
+    ));
+    descriptors
 }
 
 fn descriptor(
@@ -424,6 +397,23 @@ pub(crate) struct ManualTokenSubmitResponse {
     pub(crate) continuation: AuthContinuationRef,
 }
 
+/// Caller-supplied scope fields shared by every product-auth route body.
+///
+/// `invocation_id` is round-tripped from a prior start/setup response so the
+/// host can re-derive the same `AuthProductScope` across follow-up calls
+/// (mirroring the OAuth start/callback pattern). All three fields are
+/// optional: routes default to a fresh scope when the browser has no prior
+/// invocation to carry forward.
+#[derive(Default, Deserialize)]
+struct ScopeFields {
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    thread_id: Option<String>,
+    #[serde(default)]
+    invocation_id: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct ManualTokenSetupHttpRequest {
     provider: String,
@@ -432,12 +422,8 @@ struct ManualTokenSetupHttpRequest {
     run_id: Option<String>,
     #[serde(default)]
     gate_ref: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
-    #[serde(default)]
-    invocation_id: Option<String>,
+    #[serde(flatten)]
+    scope: ScopeFields,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,12 +443,8 @@ pub(crate) struct ManualTokenSetupResponse {
 struct ManualTokenSecretSubmitHttpRequest {
     interaction_id: String,
     token: UnvalidatedRawSecretValue,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
-    #[serde(default)]
-    invocation_id: Option<String>,
+    #[serde(flatten)]
+    scope: ScopeFields,
 }
 
 #[derive(Deserialize)]
@@ -474,12 +456,8 @@ struct AccountsListHttpRequest {
     cursor: Option<String>,
     #[serde(default)]
     limit: Option<usize>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
-    #[serde(default)]
-    invocation_id: Option<String>,
+    #[serde(flatten)]
+    scope: ScopeFields,
 }
 
 #[derive(Deserialize)]
@@ -488,12 +466,8 @@ struct AccountsSelectHttpRequest {
     account_id: String,
     #[serde(default)]
     requester_extension: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
-    #[serde(default)]
-    invocation_id: Option<String>,
+    #[serde(flatten)]
+    scope: ScopeFields,
 }
 
 #[derive(Deserialize)]
@@ -501,12 +475,8 @@ struct AccountsRecoveryHttpRequest {
     provider: String,
     #[serde(default)]
     requester_extension: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
-    #[serde(default)]
-    invocation_id: Option<String>,
+    #[serde(flatten)]
+    scope: ScopeFields,
 }
 
 #[derive(Deserialize)]
@@ -515,24 +485,16 @@ struct AccountsRefreshHttpRequest {
     account_id: String,
     #[serde(default)]
     requester_extension: Option<String>,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
-    #[serde(default)]
-    invocation_id: Option<String>,
+    #[serde(flatten)]
+    scope: ScopeFields,
 }
 
 #[derive(Deserialize)]
 struct LifecycleCleanupHttpRequest {
     extension_id: String,
     action: SecretCleanupAction,
-    #[serde(default)]
-    session_id: Option<String>,
-    #[serde(default)]
-    thread_id: Option<String>,
-    #[serde(default)]
-    invocation_id: Option<String>,
+    #[serde(flatten)]
+    scope: ScopeFields,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -717,8 +679,11 @@ async fn manual_token_submit_handler(
 ) -> Result<Json<ManualTokenSubmitResponse>, ProductAuthRouteFailure> {
     let scope = scope_from_authenticated_caller_parts(
         &caller,
-        request.thread_id.as_ref(),
-        request.session_id.as_ref(),
+        &ScopeFields {
+            session_id: request.session_id.clone(),
+            thread_id: request.thread_id.clone(),
+            invocation_id: None,
+        },
     )?;
     let provider = AuthProviderId::new(request.provider)
         .map_err(|_| ProductAuthRouteFailure::invalid_request())?;
@@ -833,12 +798,7 @@ async fn manual_token_setup_handler(
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Json(request): Json<ManualTokenSetupHttpRequest>,
 ) -> Result<Json<ManualTokenSetupResponse>, ProductAuthRouteFailure> {
-    let scope = scope_from_authenticated_caller_parts_with_invocation(
-        &caller,
-        request.thread_id.as_ref(),
-        request.session_id.as_ref(),
-        request.invocation_id.as_deref(),
-    )?;
+    let scope = scope_from_authenticated_caller_parts(&caller, &request.scope)?;
     let invocation_id = scope.resource.invocation_id;
     let provider = AuthProviderId::new(request.provider)
         .map_err(|_| ProductAuthRouteFailure::invalid_request())?;
@@ -882,12 +842,7 @@ async fn manual_token_secret_submit_handler(
     // read straight off the dedicated body, never echoed back, and never
     // surfaced in model transcript or tool arguments. Only the redacted
     // submit projection is returned.
-    let scope = scope_from_authenticated_caller_parts_with_invocation(
-        &caller,
-        request.thread_id.as_ref(),
-        request.session_id.as_ref(),
-        request.invocation_id.as_deref(),
-    )?;
+    let scope = scope_from_authenticated_caller_parts(&caller, &request.scope)?;
     let interaction_id = parse_interaction_id(&request.interaction_id)?;
     let token = request
         .token
@@ -936,12 +891,7 @@ async fn accounts_list_handler(
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Json(request): Json<AccountsListHttpRequest>,
 ) -> Result<Json<CredentialAccountListPage>, ProductAuthRouteFailure> {
-    let scope = scope_from_authenticated_caller_parts_with_invocation(
-        &caller,
-        request.thread_id.as_ref(),
-        request.session_id.as_ref(),
-        request.invocation_id.as_deref(),
-    )?;
+    let scope = scope_from_authenticated_caller_parts(&caller, &request.scope)?;
     let provider = AuthProviderId::new(request.provider)
         .map_err(|_| ProductAuthRouteFailure::invalid_request())?;
 
@@ -975,12 +925,7 @@ async fn accounts_select_handler(
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Json(request): Json<AccountsSelectHttpRequest>,
 ) -> Result<Json<CredentialAccountProjection>, ProductAuthRouteFailure> {
-    let scope = scope_from_authenticated_caller_parts_with_invocation(
-        &caller,
-        request.thread_id.as_ref(),
-        request.session_id.as_ref(),
-        request.invocation_id.as_deref(),
-    )?;
+    let scope = scope_from_authenticated_caller_parts(&caller, &request.scope)?;
     let provider = AuthProviderId::new(request.provider)
         .map_err(|_| ProductAuthRouteFailure::invalid_request())?;
     let account_id = parse_credential_account_id(&request.account_id)?;
@@ -1006,12 +951,7 @@ async fn accounts_recovery_handler(
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Json(request): Json<AccountsRecoveryHttpRequest>,
 ) -> Result<Json<CredentialRecoveryProjection>, ProductAuthRouteFailure> {
-    let scope = scope_from_authenticated_caller_parts_with_invocation(
-        &caller,
-        request.thread_id.as_ref(),
-        request.session_id.as_ref(),
-        request.invocation_id.as_deref(),
-    )?;
+    let scope = scope_from_authenticated_caller_parts(&caller, &request.scope)?;
     let provider = AuthProviderId::new(request.provider)
         .map_err(|_| ProductAuthRouteFailure::invalid_request())?;
 
@@ -1038,12 +978,7 @@ async fn accounts_refresh_handler(
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Json(request): Json<AccountsRefreshHttpRequest>,
 ) -> Result<Json<CredentialRefreshReport>, ProductAuthRouteFailure> {
-    let scope = scope_from_authenticated_caller_parts_with_invocation(
-        &caller,
-        request.thread_id.as_ref(),
-        request.session_id.as_ref(),
-        request.invocation_id.as_deref(),
-    )?;
+    let scope = scope_from_authenticated_caller_parts(&caller, &request.scope)?;
     let provider = AuthProviderId::new(request.provider)
         .map_err(|_| ProductAuthRouteFailure::invalid_request())?;
     let account_id = parse_credential_account_id(&request.account_id)?;
@@ -1071,12 +1006,7 @@ async fn lifecycle_cleanup_handler(
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Json(request): Json<LifecycleCleanupHttpRequest>,
 ) -> Result<Json<SecretCleanupReport>, ProductAuthRouteFailure> {
-    let scope = scope_from_authenticated_caller_parts_with_invocation(
-        &caller,
-        request.thread_id.as_ref(),
-        request.session_id.as_ref(),
-        request.invocation_id.as_deref(),
-    )?;
+    let scope = scope_from_authenticated_caller_parts(&caller, &request.scope)?;
     let extension_id = parse_extension_id(&request.extension_id)?;
 
     let cleanup_request = SecretCleanupRequest {
@@ -1265,42 +1195,42 @@ fn scope_from_authenticated_caller(
 ) -> Result<AuthProductScope, ProductAuthRouteFailure> {
     scope_from_authenticated_caller_parts(
         caller,
-        request.thread_id.as_ref(),
-        request.session_id.as_ref(),
+        &ScopeFields {
+            session_id: request.session_id.clone(),
+            thread_id: request.thread_id.clone(),
+            invocation_id: None,
+        },
     )
 }
 
+/// Derive an `AuthProductScope` from the authenticated caller plus the
+/// caller-supplied scope fields shared by every product-auth route body.
+///
+/// `invocation_id`, when supplied, must parse as an existing identifier
+/// (round-tripped from a prior start/setup response). Otherwise we mint a
+/// fresh one — mirroring the OAuth start/callback pattern from #4031 so the
+/// host owns the canonical id and the browser carries it forward across
+/// follow-up calls.
 fn scope_from_authenticated_caller_parts(
     caller: &WebUiAuthenticatedCaller,
-    thread_id: Option<&String>,
-    session_id: Option<&String>,
+    fields: &ScopeFields,
 ) -> Result<AuthProductScope, ProductAuthRouteFailure> {
-    scope_from_authenticated_caller_parts_with_invocation(caller, thread_id, session_id, None)
-}
-
-fn scope_from_authenticated_caller_parts_with_invocation(
-    caller: &WebUiAuthenticatedCaller,
-    thread_id: Option<&String>,
-    session_id: Option<&String>,
-    invocation_id: Option<&str>,
-) -> Result<AuthProductScope, ProductAuthRouteFailure> {
-    let thread_id = thread_id
+    let thread_id = fields
+        .thread_id
+        .as_deref()
         .map(|value| {
-            ThreadId::new(value.clone()).map_err(|_| ProductAuthRouteFailure::invalid_request())
+            ThreadId::new(value.to_string()).map_err(|_| ProductAuthRouteFailure::invalid_request())
         })
         .transpose()?;
-    let session_id = session_id
+    let session_id = fields
+        .session_id
+        .as_deref()
         .map(|value| {
-            AuthSessionId::new(value.clone())
+            AuthSessionId::new(value.to_string())
                 .map_err(|_| ProductAuthRouteFailure::invalid_request())
         })
         .transpose()?;
-    // invocation_id, when supplied by the caller, must be a valid existing
-    // identifier (round-tripped from a prior start/setup response). Otherwise
-    // we mint a fresh one — the OAuth start/callback pattern from #4031 uses
-    // the same shape: the host owns the canonical id and the browser carries
-    // it forward across follow-up calls.
-    let invocation_id = match invocation_id {
+    let invocation_id = match fields.invocation_id.as_deref() {
         Some(value) => {
             InvocationId::parse(value).map_err(|_| ProductAuthRouteFailure::invalid_request())?
         }
