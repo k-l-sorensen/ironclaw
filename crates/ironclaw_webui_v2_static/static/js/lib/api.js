@@ -214,6 +214,7 @@ export function resolveGate({
   always,
   credentialRef,
   clientActionId: clientId,
+  signal,
 } = {}) {
   const body = {
     client_action_id: clientId || clientActionId(),
@@ -226,6 +227,7 @@ export function resolveGate({
     {
       method: "POST",
       body: JSON.stringify(body),
+      signal,
     },
   );
 }
@@ -239,6 +241,7 @@ export function submitManualToken({
   threadId,
   runId,
   gateRef,
+  signal,
 } = {}) {
   return apiFetch("/api/reborn/product-auth/manual-token/submit", {
     method: "POST",
@@ -250,6 +253,7 @@ export function submitManualToken({
       run_id: runId,
       gate_ref: gateRef,
     }),
+    signal,
   });
 }
 

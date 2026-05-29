@@ -4,6 +4,7 @@
 
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use axum::body::{Body, to_bytes};
@@ -11,9 +12,11 @@ use axum::extract::ConnectInfo;
 use axum::http::{HeaderValue, Method, Request, StatusCode, header};
 use chrono::{Duration as ChronoDuration, Utc};
 use ironclaw_auth::{
-    AuthContinuationEvent, AuthProductError, AuthProviderClient, InMemoryAuthProductServices,
-    OAuthProviderCallbackRequest, OAuthProviderExchange, OAuthProviderExchangeContext,
-    OAuthProviderRefresh, OAuthProviderRefreshRequest,
+    AuthChallenge, AuthContinuationEvent, AuthInteractionId, AuthInteractionService,
+    AuthProductError, AuthProductScope, AuthProviderClient, AuthProviderId, CredentialAccountLabel,
+    InMemoryAuthProductServices, ManualTokenSetupRequest, OAuthProviderCallbackRequest,
+    OAuthProviderExchange, OAuthProviderExchangeContext, OAuthProviderRefresh,
+    OAuthProviderRefreshRequest, SecretSubmitRequest, SecretSubmitResult,
 };
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
 use ironclaw_product_workflow::{
@@ -1022,4 +1025,155 @@ async fn product_auth_callback_malformed_flow_id_uses_sanitized_error() {
     assert!(!body.contains("malformed-flow-code"));
     assert!(!body.contains("malformed-flow-pkce"));
     assert!(dispatcher.events().is_empty());
+}
+
+#[derive(Debug)]
+struct SetupOkSubmitFailInteractionService;
+
+#[async_trait]
+impl AuthInteractionService for SetupOkSubmitFailInteractionService {
+    async fn request_secret_input(
+        &self,
+        _request: ManualTokenSetupRequest,
+    ) -> Result<AuthChallenge, AuthProductError> {
+        Ok(AuthChallenge::ManualTokenRequired {
+            interaction_id: AuthInteractionId::new(),
+            provider: AuthProviderId::new("github").unwrap(),
+            label: CredentialAccountLabel::new("work").unwrap(),
+            expires_at: Utc::now() + ChronoDuration::minutes(5),
+        })
+    }
+
+    async fn submit_manual_token(
+        &self,
+        _scope: &AuthProductScope,
+        _request: SecretSubmitRequest,
+    ) -> Result<SecretSubmitResult, AuthProductError> {
+        Err(AuthProductError::BackendUnavailable)
+    }
+}
+
+fn build_app_with_failing_interaction(
+    interaction_service: Arc<dyn AuthInteractionService>,
+) -> axum::Router {
+    let shared = Arc::new(InMemoryAuthProductServices::new());
+    let flow_manager: Arc<dyn ironclaw_auth::AuthFlowManager> = shared.clone();
+    let credential_setup_service: Arc<dyn ironclaw_auth::CredentialSetupService> = shared.clone();
+    let credential_account_service: Arc<dyn ironclaw_auth::CredentialAccountService> =
+        shared.clone();
+    let provider_client: Arc<dyn AuthProviderClient> = shared.clone();
+    let cleanup_service: Arc<dyn ironclaw_auth::SecretCleanupService> = shared;
+
+    let product_auth = Arc::new(ironclaw_reborn_composition::RebornProductAuthServices::new(
+        flow_manager,
+        interaction_service,
+        credential_setup_service,
+        credential_account_service,
+        provider_client,
+        cleanup_service,
+        Arc::new(RecordingAuthDispatcher::default()),
+    ));
+    build_app_with_product_auth_service(product_auth)
+}
+
+#[tokio::test]
+async fn product_auth_manual_token_submit_handles_submit_failure_after_setup() {
+    let app = build_app_with_failing_interaction(Arc::new(SetupOkSubmitFailInteractionService));
+
+    let response =
+        post_manual_token_submit(&app, manual_token_body("ghp_setup_ok_secret", json!({}))).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_body_string(response).await;
+    assert!(body.contains("\"code\":\"backend_unavailable\""));
+    assert!(!body.contains("ghp_setup_ok_secret"));
+    assert!(!body.contains("interaction_id"));
+    assert!(!body.contains("credential_ref"));
+}
+
+#[derive(Debug)]
+struct SetupFailInteractionService;
+
+#[async_trait]
+impl AuthInteractionService for SetupFailInteractionService {
+    async fn request_secret_input(
+        &self,
+        _request: ManualTokenSetupRequest,
+    ) -> Result<AuthChallenge, AuthProductError> {
+        Err(AuthProductError::BackendUnavailable)
+    }
+
+    async fn submit_manual_token(
+        &self,
+        _scope: &AuthProductScope,
+        _request: SecretSubmitRequest,
+    ) -> Result<SecretSubmitResult, AuthProductError> {
+        unreachable!("setup-fail test never calls submit");
+    }
+}
+
+#[tokio::test]
+async fn product_auth_manual_token_submit_handles_setup_service_error() {
+    let app = build_app_with_failing_interaction(Arc::new(SetupFailInteractionService));
+
+    let response =
+        post_manual_token_submit(&app, manual_token_body("ghp_setup_fail_secret", json!({}))).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_body_string(response).await;
+    assert!(body.contains("\"code\":\"backend_unavailable\""));
+    assert!(!body.contains("ghp_setup_fail_secret"));
+    assert!(!body.contains("credential_ref"));
+}
+
+#[tokio::test]
+async fn product_auth_manual_token_submit_rejects_invalid_scope_format() {
+    let (app, _) = build_app_with_product_auth();
+
+    let response = post_manual_token_submit(
+        &app,
+        manual_token_body("ghp_invalid_scope_secret", json!({ "thread_id": "." })),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = read_body_string(response).await;
+    assert!(body.contains("\"code\":\"invalid_request\""));
+    assert!(!body.contains("ghp_invalid_scope_secret"));
+}
+
+#[derive(Debug)]
+struct SlowInteractionService;
+
+#[async_trait]
+impl AuthInteractionService for SlowInteractionService {
+    async fn request_secret_input(
+        &self,
+        _request: ManualTokenSetupRequest,
+    ) -> Result<AuthChallenge, AuthProductError> {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        Ok(AuthChallenge::ManualTokenRequired {
+            interaction_id: AuthInteractionId::new(),
+            provider: AuthProviderId::new("github").unwrap(),
+            label: CredentialAccountLabel::new("work").unwrap(),
+            expires_at: Utc::now() + ChronoDuration::minutes(5),
+        })
+    }
+
+    async fn submit_manual_token(
+        &self,
+        _scope: &AuthProductScope,
+        _request: SecretSubmitRequest,
+    ) -> Result<SecretSubmitResult, AuthProductError> {
+        unreachable!("slow test times out before submit");
+    }
+}
+
+#[tokio::test]
+async fn product_auth_manual_token_submit_times_out_slow_backend() {
+    let app = build_app_with_failing_interaction(Arc::new(SlowInteractionService));
+
+    let response =
+        post_manual_token_submit(&app, manual_token_body("ghp_slow_secret", json!({}))).await;
+    assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    let body = read_body_string(response).await;
+    assert!(body.contains("\"code\":\"backend_unavailable\""));
+    assert!(!body.contains("ghp_slow_secret"));
 }

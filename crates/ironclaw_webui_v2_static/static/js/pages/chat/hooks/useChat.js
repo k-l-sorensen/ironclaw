@@ -20,6 +20,10 @@ import { useSSE } from "./useSSE.js";
 export function useChat(threadId) {
   const pendingMessagesRef = React.useRef(new Map());
   const pendingSeqRef = React.useRef(1);
+  const tokenSubmitRef = React.useRef({
+    inFlight: false,
+    credentialRef: null,
+  });
   const [cooldownUntil, setCooldownUntil] = React.useState(0);
   const [now, setNow] = React.useState(Date.now());
   const [activeRun, setActiveRun] = React.useState(null);
@@ -205,27 +209,56 @@ export function useChat(threadId) {
       if (!runId || !gateRef || !provider || !accountLabel) {
         throw new Error("auth gate is missing required credential metadata");
       }
-      const submitted = await submitManualToken({
-        provider,
-        accountLabel,
-        token,
-        threadId,
-        runId,
-        gateRef,
-      });
-      const credentialRef = submitted?.credential_ref;
-      if (!credentialRef) {
-        throw new Error("manual token submit returned no credential_ref");
+      if (tokenSubmitRef.current.inFlight) {
+        throw new Error("auth token submission already in progress");
       }
-      await resolveGateRequest({
-        threadId,
-        runId,
-        gateRef,
-        resolution: "credential_provided",
-        credentialRef,
-      });
-      setPendingGate(null);
-      setIsProcessing(true);
+      tokenSubmitRef.current.inFlight = true;
+
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 30000);
+
+      let credentialRef = tokenSubmitRef.current.credentialRef;
+      try {
+        if (!credentialRef) {
+          const submitted = await submitManualToken({
+            provider,
+            accountLabel,
+            token,
+            threadId,
+            runId,
+            gateRef,
+            signal: controller.signal,
+          });
+          credentialRef = submitted?.credential_ref;
+          if (!credentialRef) {
+            throw new Error("manual token submit returned no credential_ref");
+          }
+          tokenSubmitRef.current.credentialRef = credentialRef;
+        }
+        await resolveGateRequest({
+          threadId,
+          runId,
+          gateRef,
+          resolution: "credential_provided",
+          credentialRef,
+          signal: controller.signal,
+        });
+        setPendingGate(null);
+        setIsProcessing(true);
+        tokenSubmitRef.current = { inFlight: false, credentialRef: null };
+      } catch (err) {
+        if (err.name === "AbortError") {
+          throw new Error(
+            credentialRef
+              ? "gate resolution timed out; credential was saved"
+              : "auth token submission timed out",
+          );
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeoutId);
+        tokenSubmitRef.current.inFlight = false;
+      }
     },
     [pendingGate, threadId],
   );

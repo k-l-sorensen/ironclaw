@@ -8,6 +8,7 @@
 use std::{
     num::{NonZeroU32, NonZeroU64, NonZeroUsize},
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use axum::{
@@ -541,26 +542,38 @@ async fn manual_token_submit_handler(
     };
     let expires_at = Utc::now() + ChronoDuration::seconds(PRODUCT_AUTH_FLOW_MAX_TTL_SECONDS);
 
-    let challenge = state
-        .product_auth
-        .request_manual_token_setup(RebornManualTokenSetupRequest::new(
-            scope.clone(),
-            provider,
-            label,
-            continuation,
-            expires_at,
-        ))
-        .await
-        .map_err(ProductAuthRouteFailure::from)?;
-    let submitted = state
-        .product_auth
-        .submit_manual_token(RebornManualTokenSubmitRequest::new(
-            scope,
-            challenge.interaction_id,
-            token.into_secret(),
-        ))
-        .await
-        .map_err(ProductAuthRouteFailure::from)?;
+    let sequence = async {
+        let challenge = state
+            .product_auth
+            .request_manual_token_setup(RebornManualTokenSetupRequest::new(
+                scope.clone(),
+                provider,
+                label,
+                continuation,
+                expires_at,
+            ))
+            .await
+            .map_err(ProductAuthRouteFailure::from)?;
+        state
+            .product_auth
+            .submit_manual_token(RebornManualTokenSubmitRequest::new(
+                scope,
+                challenge.interaction_id,
+                token.into_secret(),
+            ))
+            .await
+            .map_err(ProductAuthRouteFailure::from)
+    };
+
+    let submitted = match tokio::time::timeout(Duration::from_secs(30), sequence).await {
+        Ok(result) => result?,
+        Err(_) => {
+            return Err(ProductAuthRouteFailure::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                AuthErrorCode::BackendUnavailable,
+            ));
+        }
+    };
 
     Ok(Json(ManualTokenSubmitResponse {
         credential_ref: submitted.account_id,
