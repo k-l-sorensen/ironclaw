@@ -198,14 +198,16 @@ export function useChat(threadId) {
 
   const submitAuthToken = React.useCallback(
     async (token) => {
-      if (!pendingGate) return;
-      const { runId, gateRef } = pendingGate;
-      if (!runId || !gateRef) {
-        throw new Error("submitAuthToken requires a pending auth gate with run_id and gate_ref");
+      if (!pendingGate) {
+        throw new Error("auth gate is no longer pending");
+      }
+      const { runId, gateRef, provider, accountLabel } = pendingGate;
+      if (!runId || !gateRef || !provider || !accountLabel) {
+        throw new Error("auth gate is missing required credential metadata");
       }
       const submitted = await submitManualToken({
-        provider: pendingGate.provider || "github",
-        accountLabel: pendingGate.accountLabel || "GitHub PAT",
+        provider,
+        accountLabel,
         token,
         threadId,
         runId,
@@ -215,9 +217,17 @@ export function useChat(threadId) {
       if (!credentialRef) {
         throw new Error("manual token submit returned no credential_ref");
       }
-      await resolveGate("credential_provided", { credentialRef });
+      await resolveGateRequest({
+        threadId,
+        runId,
+        gateRef,
+        resolution: "credential_provided",
+        credentialRef,
+      });
+      setPendingGate(null);
+      setIsProcessing(true);
     },
-    [pendingGate, resolveGate, threadId],
+    [pendingGate, threadId],
   );
 
   const cancelRun = React.useCallback(

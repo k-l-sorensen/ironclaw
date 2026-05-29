@@ -81,8 +81,7 @@ const OAUTH_RATE_WINDOW_SECONDS: NonZeroU32 = match NonZeroU32::new(60) {
     // SAFETY: 60 is a non-zero literal rate-limit window.
     None => unreachable!(),
 };
-const OAUTH_FLOW_MAX_TTL_SECONDS: i64 = 10 * 60;
-const MANUAL_TOKEN_FLOW_TTL_SECONDS: i64 = 10 * 60;
+const PRODUCT_AUTH_FLOW_MAX_TTL_SECONDS: i64 = 10 * 60;
 const OAUTH_CALLBACK_QUERY_MAX_BYTES: usize = 16 * 1024;
 const OAUTH_CALLBACK_FIELD_MAX_BYTES: usize = 512;
 const OAUTH_CALLBACK_SCOPES_MAX_BYTES: usize = 4 * 1024;
@@ -463,7 +462,7 @@ async fn oauth_start_handler(
 ) -> Result<Json<OAuthStartResponse>, ProductAuthRouteFailure> {
     let now = Utc::now();
     if request.expires_at <= now
-        || request.expires_at > now + ChronoDuration::seconds(OAUTH_FLOW_MAX_TTL_SECONDS)
+        || request.expires_at > now + ChronoDuration::seconds(PRODUCT_AUTH_FLOW_MAX_TTL_SECONDS)
     {
         return Err(ProductAuthRouteFailure::invalid_request());
     }
@@ -531,13 +530,16 @@ async fn manual_token_submit_handler(
         .token
         .into_validated()
         .map_err(|_| ProductAuthRouteFailure::invalid_request())?;
+    // This route only persists a scoped credential and returns its account id.
+    // The browser must still call WebUI v2 resolve_gate, where the turn
+    // coordinator verifies the caller, run id, and gate ref before resuming.
     let continuation = AuthContinuationRef::TurnGateResume {
         turn_run_ref: TurnRunRef::new(request.run_id)
             .map_err(|_| ProductAuthRouteFailure::invalid_request())?,
         gate_ref: AuthGateRef::new(request.gate_ref)
             .map_err(|_| ProductAuthRouteFailure::invalid_request())?,
     };
-    let expires_at = Utc::now() + ChronoDuration::seconds(MANUAL_TOKEN_FLOW_TTL_SECONDS);
+    let expires_at = Utc::now() + ChronoDuration::seconds(PRODUCT_AUTH_FLOW_MAX_TTL_SECONDS);
 
     let challenge = state
         .product_auth
@@ -555,7 +557,7 @@ async fn manual_token_submit_handler(
         .submit_manual_token(RebornManualTokenSubmitRequest::new(
             scope,
             challenge.interaction_id,
-            token.clone_secret(),
+            token.into_secret(),
         ))
         .await
         .map_err(ProductAuthRouteFailure::from)?;
@@ -1042,6 +1044,10 @@ impl RawSecretValue {
 
     fn expose_secret(&self) -> &str {
         self.0.expose_secret()
+    }
+
+    fn into_secret(self) -> SecretString {
+        self.0
     }
 
     fn clone_secret(&self) -> SecretString {

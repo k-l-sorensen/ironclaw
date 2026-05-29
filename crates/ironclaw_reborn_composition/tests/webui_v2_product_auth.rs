@@ -455,6 +455,65 @@ async fn product_auth_manual_token_submit_rejects_invalid_secret_without_echoing
 }
 
 #[tokio::test]
+async fn product_auth_manual_token_submit_oversized_body_rejects_before_auth() {
+    let (app, _) = build_app_with_product_auth();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/reborn/product-auth/manual-token/submit")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("x".repeat(17 * 1024)))
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
+async fn product_auth_manual_token_submit_has_per_caller_rate_limit() {
+    let (app, _) = build_app_with_product_auth();
+
+    for index in 0..20 {
+        let response = post_manual_token_submit(
+            &app,
+            manual_token_body(&format!("ghp_secret_{index}"), json!({})),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    let response =
+        post_manual_token_submit(&app, manual_token_body("ghp_secret_over", json!({}))).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn product_auth_manual_token_submit_invalid_fields_are_sanitized() {
+    let (app, _) = build_app_with_product_auth();
+
+    let invalid_requests = [
+        manual_token_body("ghp_invalid_provider_secret", json!({ "provider": "" })),
+        manual_token_body("ghp_invalid_label_secret", json!({ "account_label": "" })),
+        manual_token_body("ghp_invalid_run_secret", json!({ "run_id": "" })),
+        manual_token_body("ghp_invalid_gate_secret", json!({ "gate_ref": "" })),
+    ];
+
+    for body in invalid_requests {
+        let response = post_manual_token_submit(&app, body).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = read_body_string(response).await;
+        assert!(body.contains("\"code\":\"invalid_request\""));
+        assert!(!body.contains("ghp_invalid_provider_secret"));
+        assert!(!body.contains("ghp_invalid_label_secret"));
+        assert!(!body.contains("ghp_invalid_run_secret"));
+        assert!(!body.contains("ghp_invalid_gate_secret"));
+    }
+}
+
+#[tokio::test]
 async fn product_auth_oauth_start_oversized_body_rejects_before_auth() {
     let (app, _) = build_app_with_product_auth();
     let response = app

@@ -23,9 +23,8 @@ export function AuthTokenCard({ gate, onSubmit, onCancel }) {
       try {
         await onSubmit(value);
         setToken("");
-      } catch (err) {
-        setToken("");
-        setError(err?.message || t("authGate.submitFailed"));
+      } catch (_) {
+        setError(t("authGate.submitFailed"));
       } finally {
         setIsSubmitting(false);
       }
