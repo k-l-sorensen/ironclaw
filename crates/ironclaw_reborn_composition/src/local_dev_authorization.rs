@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use ironclaw_authorization::{GrantAuthorizer, TrustAwareCapabilityDispatchAuthorizer};
 use ironclaw_host_api::{
-    Action, ApprovalRequest, ApprovalRequestId, CapabilityDescriptor, Decision, ExecutionContext,
-    Principal, ResourceEstimate,
+    Action, ApprovalRequest, ApprovalRequestId, CapabilityDescriptor, Decision, EffectKind,
+    ExecutionContext, Principal, ResourceEstimate,
     runtime_policy::{ApprovalPolicy, EffectiveRuntimePolicy},
 };
 use ironclaw_trust::TrustDecision;
@@ -111,12 +111,20 @@ fn require_approval_for_local_dev_policy(
     approval_policy: ApprovalPolicy,
     capability_policy: &LocalDevCapabilityPolicy,
 ) -> Decision {
+    // A spawn exercises SpawnProcess even when the capability's own descriptor
+    // does not declare it: the underlying GrantAuthorizer authorizes spawns
+    // against `spawn_descriptor`, which adds EffectKind::SpawnProcess. Evaluate
+    // the approval gate against the same elevated effect set so a dispatch-only
+    // builtin (e.g. builtin.echo) cannot be spawned as a live process without
+    // an approval gate.
+    let gate_effects = approval_gate_effects(action_kind, descriptor);
     match decision {
         Decision::Allow { .. }
-            if capability_policy.effects_require_approval(approval_policy, &descriptor.effects)
+            if capability_policy.effects_require_approval(approval_policy, &gate_effects)
                 && !has_matching_one_shot_approval_grant(
                     context,
                     descriptor,
+                    &gate_effects,
                     approval_policy,
                     capability_policy,
                 ) =>
@@ -129,9 +137,33 @@ fn require_approval_for_local_dev_policy(
     }
 }
 
+/// Effects the local-dev approval gate evaluates for `action_kind`.
+///
+/// Mirrors `ironclaw_authorization::spawn_descriptor`: a spawn always exercises
+/// `SpawnProcess`, so it is added to the capability's declared effects when
+/// gating a spawn. Dispatch evaluates the declared effects unchanged.
+fn approval_gate_effects(
+    action_kind: LocalDevApprovalActionKind,
+    descriptor: &CapabilityDescriptor,
+) -> Cow<'_, [EffectKind]> {
+    match action_kind {
+        LocalDevApprovalActionKind::Dispatch => Cow::Borrowed(descriptor.effects.as_slice()),
+        LocalDevApprovalActionKind::SpawnCapability => {
+            if descriptor.effects.contains(&EffectKind::SpawnProcess) {
+                Cow::Borrowed(descriptor.effects.as_slice())
+            } else {
+                let mut effects = descriptor.effects.clone();
+                effects.push(EffectKind::SpawnProcess);
+                Cow::Owned(effects)
+            }
+        }
+    }
+}
+
 fn has_matching_one_shot_approval_grant(
     context: &ExecutionContext,
     descriptor: &CapabilityDescriptor,
+    gate_effects: &[EffectKind],
     approval_policy: ApprovalPolicy,
     capability_policy: &LocalDevCapabilityPolicy,
 ) -> bool {
@@ -143,8 +175,9 @@ fn has_matching_one_shot_approval_grant(
             && grant.constraints.max_invocations == Some(1)
             && grant.issued_by == Principal::HostRuntime
             && grant.grantee == expected_grantee
-            && descriptor
-                .effects
+            // Match against the spawn-elevated effect set so a one-shot lease
+            // that does not cover SpawnProcess cannot satisfy a spawn gate.
+            && gate_effects
                 .iter()
                 .all(|effect| grant.constraints.allowed_effects.contains(effect))
             && capability_policy

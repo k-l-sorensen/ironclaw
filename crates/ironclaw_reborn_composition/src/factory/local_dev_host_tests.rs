@@ -12,7 +12,7 @@ use ironclaw_host_api::{
     NetworkTargetPattern, Principal, ResourceEstimate, RuntimeKind, ThreadId, TrustClass, UserId,
 };
 use ironclaw_host_runtime::{
-    APPLY_PATCH_CAPABILITY_ID, RuntimeApprovalGate, RuntimeCapabilityOutcome,
+    APPLY_PATCH_CAPABILITY_ID, ECHO_CAPABILITY_ID, RuntimeApprovalGate, RuntimeCapabilityOutcome,
     RuntimeCapabilityRequest, RuntimeCapabilityResumeRequest, SHELL_CAPABILITY_ID,
 };
 use ironclaw_run_state::{ApprovalRequestStore, ApprovalStatus};
@@ -640,6 +640,90 @@ async fn local_dev_ask_destructive_spawn_capability_blocks_then_resumes() {
         RuntimeCapabilityOutcome::Completed(_) | RuntimeCapabilityOutcome::SpawnedProcess(_)
     );
     assert!(spawn_ok); // safety: test-only assertion in #[cfg(test)] module.
+}
+
+/// Spawning a dispatch-only builtin still exercises SpawnProcess, so the
+/// approval gate must fire even though builtin.echo declares no destructive
+/// effect in its own descriptor. Regression guard for the spawn fail-open:
+/// gating against the raw descriptor effects (which exclude SpawnProcess, and
+/// where DispatchCapability is not in ask_destructive) let echo spawn as a live
+/// process ungated under AskDestructive.
+#[tokio::test]
+async fn local_dev_ask_destructive_spawn_dispatch_only_capability_requires_approval() {
+    let dir = tempfile::tempdir().expect("tempdir"); // safety: test-only helper in #[cfg(test)] module.
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev("local-dev-echo-spawn-owner", dir.path().join("local-dev"))
+            .with_runtime_policy(local_dev_policy()),
+    )
+    .await
+    .expect("local-dev services build"); // safety: test-only helper in #[cfg(test)] module.
+    let host_runtime = services
+        .host_runtime
+        .as_ref()
+        .expect("local-dev host runtime"); // safety: test-only helper in #[cfg(test)] module.
+    let capability_id = CapabilityId::new(ECHO_CAPABILITY_ID).expect("echo capability"); // safety: test-only helper in #[cfg(test)] module.
+    let context = echo_spawn_execution_context("local-dev-echo-spawn-owner", "thread-echo-spawn");
+
+    let outcome = host_runtime
+        .spawn_capability(RuntimeCapabilityRequest::new(
+            context,
+            capability_id,
+            ResourceEstimate::default(),
+            serde_json::json!({"message": "spawn echo"}),
+            trust_decision(echo_spawn_allowed_effects()),
+        ))
+        .await
+        .expect("spawn invocation resolves"); // safety: test-only helper in #[cfg(test)] module.
+
+    assert!(
+        matches!(outcome, RuntimeCapabilityOutcome::ApprovalRequired(_)),
+        "dispatch-only builtin.echo must gate on spawn via SpawnProcess elevation, got {outcome:?}"
+    ); // safety: test-only assertion in #[cfg(test)] module.
+}
+
+fn echo_spawn_execution_context(user_id: &str, thread_id: &str) -> ExecutionContext {
+    let extension_id = ExtensionId::new("local-dev-test-loop").expect("extension id");
+    let capability_id = CapabilityId::new(ECHO_CAPABILITY_ID).expect("echo capability");
+    let grantee = Principal::Extension(extension_id.clone());
+    let grants = CapabilitySet {
+        grants: vec![CapabilityGrant {
+            id: CapabilityGrantId::new(),
+            capability: capability_id,
+            grantee,
+            issued_by: Principal::HostRuntime,
+            constraints: GrantConstraints {
+                allowed_effects: echo_spawn_allowed_effects(),
+                mounts: MountView::default(),
+                network: NetworkPolicy::default(),
+                secrets: Vec::new(),
+                resource_ceiling: None,
+                expires_at: None,
+                max_invocations: None,
+            },
+        }],
+    };
+    let mut context = ExecutionContext::local_default(
+        UserId::new(user_id).expect("user id"),
+        extension_id,
+        RuntimeKind::FirstParty,
+        TrustClass::UserTrusted,
+        grants,
+        MountView::default(),
+    )
+    .expect("execution context");
+    let thread_id = ThreadId::new(thread_id).expect("thread id");
+    context.thread_id = Some(thread_id.clone());
+    context.resource_scope.thread_id = Some(thread_id);
+    context.validate().expect("thread-scoped context");
+    context
+}
+
+// builtin.echo declares only DispatchCapability in its descriptor. The grant and
+// the trust authority ceiling must also cover SpawnProcess so the inner
+// GrantAuthorizer authorizes the spawn (it authorizes against spawn_descriptor)
+// and the request reaches the local-dev approval gate instead of being denied.
+fn echo_spawn_allowed_effects() -> Vec<EffectKind> {
+    vec![EffectKind::DispatchCapability, EffectKind::SpawnProcess]
 }
 
 /// A capability invoked without a matching grant must be denied, not upgraded to
