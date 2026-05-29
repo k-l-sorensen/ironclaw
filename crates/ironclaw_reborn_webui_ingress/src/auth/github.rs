@@ -33,12 +33,19 @@ const GITHUB_TOKEN_URL: &str = "https://github.com/login/oauth/access_token";
 const GITHUB_USER_URL: &str = "https://api.github.com/user";
 const GITHUB_EMAILS_URL: &str = "https://api.github.com/user/emails";
 
-/// Per-request timeout on the GitHub HTTP calls. The default
-/// `reqwest::Client` has no timeout, which would let a hung GitHub
-/// response pin the callback handler indefinitely. 10s comfortably
-/// covers the worst-case TLS handshake + three sequential calls while
-/// failing loud on a real outage. Mirrors `GoogleProvider`.
-const GITHUB_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
+/// Per-call timeout applied by the `reqwest::Client` to each
+/// individual GitHub HTTP request (token, user, emails). Bounds a
+/// single stalled call. The default `reqwest::Client` has no timeout,
+/// which would let a hung GitHub response pin the callback handler
+/// indefinitely.
+const GITHUB_HTTP_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Overall budget for the full `exchange_code` chain (token -> user ->
+/// emails). The per-call timeout bounds one request; without a wrapping
+/// budget, three sequential 8s stalls could pin a Tokio task for ~24s,
+/// so the whole exchange is wrapped in this shorter ceiling. Whichever
+/// limit trips first fails the exchange closed.
+const GITHUB_EXCHANGE_BUDGET: Duration = Duration::from_secs(20);
 
 /// GitHub OAuth provider.
 pub struct GitHubProvider {
@@ -107,11 +114,15 @@ impl GitHubProvider {
             // carries it.
             .user_agent("IronClaw-WebChat-v2")
             .build()
-            // Builder failure here means rustls / tokio runtime is
-            // genuinely broken; fall back to the default client so we
-            // still surface a real OAuthError on the request rather
-            // than a constructor panic.
-            .unwrap_or_else(|_| reqwest::Client::new());
+            // safety: ClientBuilder::build only fails when the rustls /
+            // tokio runtime cannot initialize — an unrecoverable
+            // process-level fault. A silent fallback to
+            // `reqwest::Client::new()` would drop both the timeout and
+            // the User-Agent (letting a hung GitHub call park the task
+            // unbounded, and triggering GitHub 403s), and `new()` is
+            // itself `builder().build().expect(..)` so it panics on the
+            // same condition — making the fallback a misleading no-op.
+            .expect("reqwest client build failed: TLS/runtime init is unrecoverable");
         Self {
             name: OAuthProviderName::new("github").expect("\"github\" satisfies the grammar"), // safety: literal satisfies OAuthProviderName grammar (lowercase ascii, 6 chars); checked by `OAuthProviderName::accepts_lowercase_alphanumeric`
             client_id: config.client_id,
@@ -126,13 +137,14 @@ impl GitHubProvider {
 }
 
 /// GitHub's token endpoint answers `200 OK` even on failure, encoding
-/// the failure as `{ "error": ..., "error_description": ... }` rather
-/// than a non-2xx status, so we must inspect the body either way.
+/// the failure as `{ "error": ... }` rather than a non-2xx status, so
+/// we must inspect the body either way. The human-readable
+/// `error_description` is deliberately NOT deserialized: it can carry
+/// user-identifiable context and we never want it in a log line.
 #[derive(Deserialize)]
 struct GitHubTokenResponse {
     access_token: Option<String>,
     error: Option<String>,
-    error_description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -175,6 +187,30 @@ impl OAuthProvider for GitHubProvider {
         callback_url: &str,
         _code_verifier: &str,
     ) -> Result<OAuthUserProfile, OAuthError> {
+        // Bound the whole token -> user -> emails chain, not just each
+        // individual call. The per-call `GITHUB_HTTP_TIMEOUT` bounds one
+        // request; this wraps the sequence so a partially-degraded
+        // GitHub cannot pin a Tokio task for the sum of every call's
+        // timeout.
+        tokio::time::timeout(
+            GITHUB_EXCHANGE_BUDGET,
+            self.do_exchange_code(code, callback_url),
+        )
+        .await
+        .map_err(|_| OAuthError::CodeExchange("GitHub OAuth exchange timed out".to_string()))?
+    }
+}
+
+impl GitHubProvider {
+    /// Inner exchange body, wrapped by [`OAuthProvider::exchange_code`]
+    /// in an overall timeout budget. Runs the GitHub token -> user ->
+    /// emails sequence and projects the result to an
+    /// [`OAuthUserProfile`].
+    async fn do_exchange_code(
+        &self,
+        code: &str,
+        callback_url: &str,
+    ) -> Result<OAuthUserProfile, OAuthError> {
         // 1. Exchange the authorization code for an access token.
         let resp = self
             .http
@@ -209,9 +245,11 @@ impl OAuthProvider for GitHubProvider {
             .map_err(|err| OAuthError::CodeExchange(err.to_string()))?;
         // GitHub signals failure in the 200 body, not via status.
         if let Some(error) = token.error {
+            // Only the opaque error code is logged; GitHub's
+            // human-readable `error_description` can carry
+            // user-identifiable context and is never deserialized.
             tracing::debug!(
                 error = %error,
-                description = ?token.error_description,
                 "github token endpoint returned an error in the response body"
             );
             return Err(OAuthError::CodeExchange(format!(
@@ -345,6 +383,7 @@ mod tests {
         token_status: StatusCode,
         user_status: StatusCode,
         user_body: serde_json::Value,
+        emails_status: StatusCode,
         emails: Vec<MockEmail>,
     }
 
@@ -360,6 +399,7 @@ mod tests {
                     "name": "The Octocat",
                     "email": null,
                 }),
+                emails_status: StatusCode::OK,
                 emails: vec![
                     MockEmail {
                         email: "secondary@example.com",
@@ -406,7 +446,7 @@ mod tests {
                 "/emails",
                 get(move || {
                     let mock = emails_mock.clone();
-                    async move { Json(mock.emails).into_response() }
+                    async move { (mock.emails_status, Json(mock.emails)).into_response() }
                 }),
             );
 
@@ -553,6 +593,69 @@ mod tests {
         assert!(
             matches!(&err, OAuthError::ProfileFetch(msg) if msg.contains("401")),
             "expected ProfileFetch for user endpoint failure, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_code_rejects_emails_endpoint_failure() {
+        let mut mock = MockGitHub::success();
+        mock.emails_status = StatusCode::INTERNAL_SERVER_ERROR;
+        let addr = spawn_mock(mock).await;
+        let err = exchange(addr).await.expect_err("must reject emails 5xx");
+        assert!(
+            matches!(&err, OAuthError::ProfileFetch(msg) if msg.contains("500")),
+            "expected ProfileFetch for emails endpoint failure, got {err:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn exchange_code_returns_none_email_when_no_verified_and_no_profile_email() {
+        // No verified emails AND a null profile email exercises the
+        // `None => (user.email.clone(), false)` arm with a truly absent
+        // address — the profile carries `email: None`, which is a valid
+        // (directory-handled) shape, NOT an error: `OAuthUserProfile.email`
+        // is `Option` by contract and `UserDirectory` falls back to the
+        // provider-unique id when no verified email is present.
+        let mut mock = MockGitHub::success();
+        mock.user_body = serde_json::json!({
+            "id": 9,
+            "login": "ghost",
+            "name": null,
+            "email": null,
+        });
+        mock.emails = vec![];
+        let addr = spawn_mock(mock).await;
+        let profile = exchange(addr).await.expect("exchange success");
+        assert!(
+            profile.email.is_none(),
+            "email must be None when no verified email and no profile email exist",
+        );
+        assert!(!profile.email_verified);
+        assert_eq!(profile.display_name.as_deref(), Some("ghost"));
+    }
+
+    #[test]
+    fn authorization_url_encodes_state_with_special_characters() {
+        let provider = GitHubProvider::new(cfg());
+        // base64url / JWT-style state can contain `+`, `/`, `=`, and
+        // spaces — all of which must be percent-encoded so the router
+        // recovers the exact value on callback (state is GitHub's only
+        // CSRF mechanism since PKCE is absent).
+        let state = "abc+def/ghi=jkl mno";
+        let url = provider.authorization_url("https://example.com/cb", state, "ignored");
+        let encoded = urlencoding::encode(state);
+        assert!(
+            url.contains(&format!("state={encoded}")),
+            "state must appear percent-encoded; got {url}",
+        );
+        // The raw special characters must not leak into the query.
+        assert!(
+            !url.contains("state=abc+def"),
+            "+ must be percent-encoded: {url}"
+        );
+        assert!(
+            !url.contains("ghi=jkl"),
+            "= inside the state value must be percent-encoded: {url}",
         );
     }
 }

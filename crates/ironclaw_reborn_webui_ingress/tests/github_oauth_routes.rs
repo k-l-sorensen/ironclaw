@@ -447,6 +447,172 @@ async fn callback_exchange_failure_redirects_with_exchange_failed() {
     );
 }
 
+#[tokio::test]
+async fn callback_with_unknown_state_redirects_with_invalid_state_error() {
+    // A callback whose state was never minted (expired out of the
+    // pending-flow store, or fabricated) must fail closed with the
+    // opaque `invalid_state` code and never reach the provider.
+    let addr = spawn_mock_github(MockGitHub::octocat()).await;
+    let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    let router = build_router(vec![github_provider(addr)], store);
+
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/auth/callback/github?code=gh-code&state=does-not-exist")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_str(&resp, header::LOCATION),
+        "/v2?login_error=invalid_state"
+    );
+}
+
+#[tokio::test]
+async fn callback_with_state_replay_fails_closed() {
+    // The pending-flow store's single-use `take` is a documented
+    // security property (CLAUDE.md §Security invariants). A state token
+    // consumed by a successful callback must not mint a second session
+    // when replayed against the same router.
+    let addr = spawn_mock_github(MockGitHub::octocat()).await;
+    let store_inner: Arc<InMemorySessionStore> = Arc::new(InMemorySessionStore::new());
+    let router = build_router(vec![github_provider(addr)], store_inner.clone());
+
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/auth/login/github")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    let state = state_from_location(header_str(&login, header::LOCATION));
+
+    // First callback consumes the state and mints a session.
+    let first = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/auth/callback/github?code=gh-code&state={}",
+                    urlencoding::encode(&state)
+                ))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(first.status(), StatusCode::SEE_OTHER);
+    assert!(header_str(&first, header::LOCATION).starts_with("/v2?login_ticket="));
+    assert_eq!(store_inner.len(), 1);
+
+    // Replaying the SAME state must fail closed — no second session.
+    let replay = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/auth/callback/github?code=gh-code&state={}",
+                    urlencoding::encode(&state)
+                ))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(replay.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_str(&replay, header::LOCATION),
+        "/v2?login_error=invalid_state"
+    );
+    assert_eq!(
+        store_inner.len(),
+        1,
+        "replayed state must NOT mint a second session"
+    );
+}
+
+#[tokio::test]
+async fn callback_profile_fetch_failure_redirects_with_exchange_failed() {
+    // Token exchange succeeds but the `/user` read fails — the real
+    // GitHubProvider returns `OAuthError::ProfileFetch`, which the
+    // router must map to the same opaque `exchange_failed` code as a
+    // token-exchange failure. Covers the ProfileFetch translation path
+    // that the token-500 test (CodeExchange) does not reach.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
+    let addr = listener.local_addr().expect("local_addr");
+    let server = axum::Router::new()
+        .route(
+            "/token",
+            post(|_: Form<HashMap<String, String>>| async {
+                Json(serde_json::json!({
+                    "access_token": "gho_mock_token",
+                    "token_type": "bearer",
+                }))
+            }),
+        )
+        .route("/user", get(|| async { StatusCode::UNAUTHORIZED }));
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, server).await;
+    });
+
+    let store: Arc<dyn SessionStore> = Arc::new(InMemorySessionStore::new());
+    let provider: Arc<dyn OAuthProvider> = Arc::new(GitHubProvider::with_endpoints(
+        GitHubOAuthConfig {
+            client_id: "gh-client-id".to_string(),
+            client_secret: SecretString::from("gh-client-secret".to_string()),
+        },
+        "https://github.test/login/oauth/authorize",
+        format!("http://{addr}/token"),
+        format!("http://{addr}/user"),
+        format!("http://{addr}/emails"),
+    ));
+    let router = build_router(vec![provider], store);
+
+    let login = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/auth/login/github")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    let state = state_from_location(header_str(&login, header::LOCATION));
+
+    let callback = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/auth/callback/github?code=gh-code&state={}",
+                    urlencoding::encode(&state)
+                ))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(callback.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        header_str(&callback, header::LOCATION),
+        "/v2?login_error=exchange_failed",
+    );
+}
+
 // ─── logout revokes the session ────────────────────────────────────────
 
 #[tokio::test]
