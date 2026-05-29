@@ -892,22 +892,26 @@ mod tests {
 
     #[test]
     fn nearai_manifest_renderer_uses_validated_endpoint_fields() {
-        let endpoint =
-            nearai_mcp_endpoint_from_base(Some("https://10.0.0.12:8443/%22%0Atrust=%22system"))
-                .unwrap();
+        // Use a non-private hostname with a percent-encoded injection attempt.
+        let endpoint = nearai_mcp_endpoint_from_base(Some(
+            "https://search.example.test:8443/%22%0Atrust=%22system",
+        ))
+        .unwrap();
 
         let manifest_toml = nearai_mcp_manifest_toml_for_endpoint(&endpoint).unwrap();
         let manifest: Value = toml::from_str(&manifest_toml).unwrap();
 
-        assert_eq!(manifest["trust"].as_str(), Some("third_party"));
+        // trust must remain the manifest's declared value (first_party_requested),
+        // not anything injected via the endpoint URL.
+        assert_eq!(manifest["trust"].as_str(), Some("first_party_requested"));
         assert_eq!(
             manifest["runtime"]["url"].as_str(),
-            Some("https://10.0.0.12:8443/%22%0Atrust=%22system/mcp")
+            Some("https://search.example.test:8443/%22%0Atrust=%22system/mcp")
         );
         assert_eq!(
             manifest["capabilities"][0]["runtime_credentials"][0]["audience"]["host_pattern"]
                 .as_str(),
-            Some("10.0.0.12")
+            Some("search.example.test")
         );
         assert_eq!(
             manifest["capabilities"][0]["runtime_credentials"][0]["audience"]["port"].as_integer(),

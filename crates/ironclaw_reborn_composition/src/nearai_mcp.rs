@@ -20,7 +20,6 @@ pub(crate) struct NearAiMcpEndpoint {
     pub(crate) url: String,
     pub(crate) host_pattern: String,
     pub(crate) port: Option<u16>,
-    deny_private_ip_ranges: bool,
 }
 
 pub(crate) fn nearai_mcp_endpoint_from_env() -> Result<NearAiMcpEndpoint, String> {
@@ -55,8 +54,16 @@ pub(crate) fn nearai_mcp_endpoint_from_base(
     if ip.is_some_and(is_forbidden_endpoint_ip) {
         return Err("NEARAI_BASE_URL host is not allowed".to_string());
     }
+    if ip.is_some_and(is_private_or_loopback_ip) {
+        // The staged ApplyNetworkPolicy grant enforces deny_private_ip_ranges: true
+        // at dispatch. Reject here so config-time and runtime behaviour are consistent.
+        return Err("NEARAI_BASE_URL private/loopback addresses are not permitted; the staged network policy denies them at dispatch".to_string());
+    }
     if matches!(ip, Some(IpAddr::V6(_))) {
         return Err("NEARAI_BASE_URL IPv6 hosts are not supported yet".to_string());
+    }
+    if ip.is_none() && is_non_public_hostname(&host) {
+        return Err("NEARAI_BASE_URL must use a public hostname".to_string());
     }
 
     let mut path = url.path().trim_end_matches('/').to_string();
@@ -75,7 +82,6 @@ pub(crate) fn nearai_mcp_endpoint_from_base(
         url: url.to_string(),
         host_pattern: host,
         port: url.port(),
-        deny_private_ip_ranges: !ip.is_some_and(is_private_or_loopback_ip),
     })
 }
 
@@ -128,13 +134,19 @@ fn nearai_mcp_url_allowed(url: &str, endpoint: &NearAiMcpEndpoint) -> bool {
 }
 
 fn nearai_network_policy(endpoint: &NearAiMcpEndpoint) -> NetworkPolicy {
+    // NOTE: In production, host egress enforces the staged ApplyNetworkPolicy
+    // obligation (from the authorization grant) rather than the request-level
+    // network_policy field carried in McpHostHttpEgressPlan. This planner policy
+    // serves as defence-in-depth for test/local paths. The staged grant must
+    // be kept consistent: deny_private_ip_ranges=true, and allowed_targets
+    // reflecting the same host and port that this planner gates on.
     NetworkPolicy {
         allowed_targets: vec![NetworkTargetPattern {
             scheme: Some(NetworkScheme::Https),
             host_pattern: endpoint.host_pattern.clone(),
             port: endpoint.port,
         }],
-        deny_private_ip_ranges: endpoint.deny_private_ip_ranges,
+        deny_private_ip_ranges: true,
         max_egress_bytes: Some(NEARAI_MCP_NETWORK_EGRESS_LIMIT),
     }
 }
@@ -162,6 +174,17 @@ fn is_private_or_loopback_ip(ip: IpAddr) -> bool {
         IpAddr::V4(ip) => ip.is_private() || ip.is_loopback(),
         IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
     }
+}
+
+/// Reject well-known non-public hostnames that would pass the IP check but
+/// typically resolve to private/loopback addresses. The post-DNS
+/// deny_private_ip_ranges check at dispatch catches them at runtime; this is
+/// a symmetric config-time guard for operator-controlled endpoints.
+fn is_non_public_hostname(host: &str) -> bool {
+    host == "localhost"
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+        || host.ends_with(".localhost")
 }
 
 fn is_forbidden_endpoint_ip(ip: IpAddr) -> bool {
@@ -239,7 +262,6 @@ mod tests {
         assert_eq!(endpoint.url, "https://search.example.test/mcp");
         assert_eq!(endpoint.host_pattern, "search.example.test");
         assert_eq!(endpoint.port, None);
-        assert!(endpoint.deny_private_ip_ranges);
     }
 
     #[test]
@@ -250,16 +272,19 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_validation_allows_private_loopback_https_targets() {
-        let private =
-            nearai_mcp_endpoint_from_base(Some("https://10.0.0.12:8443")).expect("private IP");
-        let loopback =
-            nearai_mcp_endpoint_from_base(Some("https://127.0.0.1")).expect("loopback IP");
+    fn endpoint_validation_rejects_private_loopback_https_targets() {
+        // The staged ApplyNetworkPolicy grant enforces deny_private_ip_ranges: true
+        // at dispatch. Reject at config time so the two layers are consistent.
+        assert!(nearai_mcp_endpoint_from_base(Some("https://10.0.0.12:8443")).is_err());
+        assert!(nearai_mcp_endpoint_from_base(Some("https://127.0.0.1")).is_err());
+        assert!(nearai_mcp_endpoint_from_base(Some("https://192.168.1.1")).is_err());
+    }
 
-        assert_eq!(private.host_pattern, "10.0.0.12");
-        assert_eq!(private.port, Some(8443));
-        assert!(!private.deny_private_ip_ranges);
-        assert!(!loopback.deny_private_ip_ranges);
+    #[test]
+    fn endpoint_validation_rejects_non_public_hostnames() {
+        assert!(nearai_mcp_endpoint_from_base(Some("https://localhost")).is_err());
+        assert!(nearai_mcp_endpoint_from_base(Some("https://my-server.local")).is_err());
+        assert!(nearai_mcp_endpoint_from_base(Some("https://metadata.google.internal")).is_err());
     }
 
     #[test]

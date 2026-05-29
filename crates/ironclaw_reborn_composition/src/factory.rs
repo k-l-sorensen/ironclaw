@@ -231,10 +231,16 @@ where
         tracing::debug!("skipping NEAR AI MCP runtime because host runtime HTTP egress is absent");
         return Ok(services);
     };
-    let endpoint =
-        nearai_mcp_endpoint_from_env().map_err(|reason| RebornBuildError::InvalidConfig {
-            reason: format!("NEAR AI MCP endpoint config is invalid: {reason}"),
-        })?;
+    // Soft-disable the optional MCP runtime on config errors rather than
+    // failing the entire Reborn build. A malformed NEARAI_BASE_URL must not
+    // take down github, gmail, calendar, or any other bundled extension.
+    let endpoint = match nearai_mcp_endpoint_from_env() {
+        Ok(endpoint) => endpoint,
+        Err(reason) => {
+            tracing::warn!("skipping NEAR AI MCP runtime: NEARAI_BASE_URL is invalid: {reason}");
+            return Ok(services);
+        }
+    };
     Ok(services.with_mcp_runtime(nearai_mcp_runtime(
         runtime_ports.runtime_http_egress(),
         endpoint,
@@ -1175,7 +1181,6 @@ fn gsuite_allowed_effects() -> Vec<EffectKind> {
     ]
 }
 
-#[cfg(test)]
 fn nearai_allowed_effects() -> Vec<EffectKind> {
     vec![
         EffectKind::DispatchCapability,
@@ -1956,6 +1961,19 @@ mod tests {
         let services = attach_nearai_mcp_runtime(services).expect("attach is optional");
 
         assert!(services.product_auth_provider_runtime_ports().is_none());
+    }
+
+    #[test]
+    fn attach_nearai_mcp_runtime_soft_disables_on_invalid_base_url() {
+        // A malformed NEARAI_BASE_URL must not fail the entire Reborn build;
+        // the NEAR AI MCP runtime is optional and skips silently on config errors.
+        // Verify via the endpoint validator directly (env var test would require
+        // env mutation which is not safe in parallel tests).
+        use crate::nearai_mcp::nearai_mcp_endpoint_from_base;
+
+        assert!(nearai_mcp_endpoint_from_base(Some("http://not-https.example.test")).is_err());
+        assert!(nearai_mcp_endpoint_from_base(Some("not a url at all")).is_err());
+        assert!(nearai_mcp_endpoint_from_base(Some("https://127.0.0.1")).is_err());
     }
 
     #[cfg(feature = "libsql")]
