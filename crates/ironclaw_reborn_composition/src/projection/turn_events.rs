@@ -220,7 +220,16 @@ async fn blocked_prompt_payload(
         TurnStatus::BlockedResource => {
             Ok(Some(gate_prompt(event, gate_ref_str, "Resource unavailable")))
         }
-        _ => Ok(None),
+        // Non-blocked statuses: no prompt payload. Exhaustive match so a new
+        // TurnStatus variant forces a compile error and an explicit decision.
+        TurnStatus::Queued
+        | TurnStatus::Running
+        | TurnStatus::BlockedDependentRun
+        | TurnStatus::RecoveryRequired
+        | TurnStatus::CancelRequested
+        | TurnStatus::Completed
+        | TurnStatus::Cancelled
+        | TurnStatus::Failed => Ok(None),
     }
 }
 

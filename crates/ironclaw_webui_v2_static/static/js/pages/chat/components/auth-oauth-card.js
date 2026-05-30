@@ -15,9 +15,17 @@
  *   from accessing this window's context.
  */
 import { React, html } from "../../../lib/html.js";
+import { useT } from "../../../lib/i18n.js";
+import { Button } from "../../../design-system/button.js";
+import { Icon } from "../../../design-system/icons.js";
 
 export function AuthOauthCard({ gate, onCancel }) {
+  const t = useT();
   const [opened, setOpened] = React.useState(false);
+
+  const providerLabel = gate.provider
+    ? gate.provider.charAt(0).toUpperCase() + gate.provider.slice(1)
+    : "the provider";
 
   const openAuth = React.useCallback(() => {
     if (!gate.authorizationUrl) return;
@@ -27,61 +35,63 @@ export function AuthOauthCard({ gate, onCancel }) {
     setOpened(true);
   }, [gate.authorizationUrl]);
 
-  const providerLabel = gate.provider
-    ? gate.provider.charAt(0).toUpperCase() + gate.provider.slice(1)
-    : "the provider";
+  const openLabel = opened
+    ? t("authGate.reopenAuthorization", { provider: providerLabel })
+    : t("authGate.openAuthorization", { provider: providerLabel });
 
   return html`
-    <div class="auth-oauth-card border rounded-xl p-4 bg-surface shadow-sm space-y-3">
-      <div class="font-semibold text-base">
-        ${gate.headline || \`Authorize \${providerLabel}\`}
+    <form
+      className="mx-auto w-full max-w-lg rounded-xl border border-[rgba(76,167,230,0.34)] bg-[rgba(76,167,230,0.08)] p-4"
+      onSubmit=${(e) => e.preventDefault()}
+    >
+      <div className="mb-3 flex items-center gap-2">
+        <span className="grid h-8 w-8 place-items-center rounded-md border border-[rgba(76,167,230,0.28)] bg-[rgba(76,167,230,0.1)] text-[#8fc8f2]">
+          <${Icon} name="link" className="h-4 w-4" />
+        </span>
+        <span className="font-semibold text-white">
+          ${gate?.headline || t("authGate.oauthTitle")}
+        </span>
       </div>
 
-      ${gate.accountLabel && html`
-        <div class="text-sm text-muted">
-          Account: ${gate.accountLabel}
+      ${gate?.accountLabel && html`
+        <div className="mb-2 text-xs text-iron-300">
+          ${t("authGate.oauthAccountLabel")} ${gate.accountLabel}
         </div>
       `}
 
-      ${gate.body && html`
-        <div class="text-sm">${gate.body}</div>
+      ${gate?.body && html`
+        <div className="mb-3 text-sm text-iron-200">${gate.body}</div>
       `}
 
-      <div class="flex gap-2 pt-1">
-        <button
+      <div className="flex flex-wrap gap-2">
+        <${Button}
           type="button"
-          class="btn btn-primary flex-1"
-          onClick=${openAuth}
+          variant="primary"
           disabled=${!gate.authorizationUrl}
+          onClick=${openAuth}
         >
-          ${opened
-            ? \`Re-open \${providerLabel} authorization\`
-            : \`Open \${providerLabel} authorization\`}
-        </button>
-
-        ${onCancel && html`
-          <button
-            type="button"
-            class="btn btn-secondary"
-            onClick=${onCancel}
-          >
-            Cancel
-          </button>
-        `}
+          ${openLabel}
+        <//>
+        <${Button}
+          type="button"
+          variant="secondary"
+          onClick=${() => onCancel?.()}
+        >
+          ${t("authGate.cancel")}
+        <//>
       </div>
 
       ${opened && html`
-        <div class="text-xs text-muted">
-          Waiting for authorization to complete\u2026 You can close the popup tab
-          once you\u2019ve approved access.
-        </div>
+        <p className="mt-2 text-xs text-iron-300">
+          ${t("authGate.oauthWaiting")}
+        </p>
       `}
 
-      ${gate.expiresAt && html`
-        <div class="text-xs text-muted">
-          Expires: ${new Date(gate.expiresAt).toLocaleString()}
-        </div>
+      ${gate?.expiresAt && html`
+        <p className="mt-1 text-xs text-iron-300">
+          ${t("authGate.expiresAt")}: ${new Date(gate.expiresAt).toLocaleString()}
+        </p>
       `}
-    </div>
+    </form>
   `;
 }
