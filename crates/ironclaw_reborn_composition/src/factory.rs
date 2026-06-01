@@ -53,7 +53,9 @@ use ironclaw_run_state::{FilesystemApprovalRequestStore, FilesystemRunStateStore
 use ironclaw_run_state::{InMemoryApprovalRequestStore, InMemoryRunStateStore};
 use ironclaw_secrets::SecretStore;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_secrets::{FilesystemCredentialBroker, FilesystemSecretStore};
+use ironclaw_secrets::{
+    FilesystemCredentialBroker, FilesystemSecretStore, SecretMaterial, SecretsCrypto,
+};
 #[cfg(feature = "libsql")]
 use ironclaw_threads::FilesystemSessionThreadService;
 #[cfg(not(feature = "libsql"))]
@@ -251,6 +253,22 @@ where
         registry,
         runtime_http_egress,
     ))))
+}
+
+fn attach_wasm_runtime<F, G, S, R>(
+    services: HostRuntimeServices<F, G, S, R>,
+) -> Result<HostRuntimeServices<F, G, S, R>, RebornBuildError>
+where
+    F: ironclaw_filesystem::RootFilesystem + 'static,
+    G: ironclaw_resources::ResourceGovernor + 'static,
+    S: ironclaw_processes::ProcessStore + 'static,
+    R: ironclaw_processes::ProcessResultStore + 'static,
+{
+    services
+        .try_with_default_wasm_runtime()
+        .map_err(|error| RebornBuildError::InvalidConfig {
+            reason: format!("WASM runtime could not be initialized: {error}"),
+        })
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -470,6 +488,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         Arc::clone(&filesystem),
         runtime_workspace_mounts.clone(),
     ));
+    let local_dev_owner_id = owner_id.clone();
     let owner_user_id = UserId::new(owner_id).map_err(|error| RebornBuildError::InvalidConfig {
         reason: error.to_string(),
     })?;
@@ -486,7 +505,8 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     let turn_coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> = Arc::new(
         DefaultTurnCoordinator::new(Arc::clone(&store_graph.turn_state)),
     );
-    let secret_store: Arc<dyn SecretStore> = Arc::new(ironclaw_secrets::InMemorySecretStore::new());
+    let secret_store: Arc<dyn SecretStore> =
+        local_dev_secret_store(Arc::clone(&filesystem), &root, &local_dev_owner_id)?;
     let mut first_party_registry = builtin_first_party_registry()?;
 
     let local_dev_trust_policy = Arc::new(local_dev_first_party_trust_policy()?);
@@ -524,6 +544,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     }
     services = apply_runtime_process_binding(services, runtime_process_binding);
     services = attach_hosted_mcp_runtime(services)?;
+    services = attach_wasm_runtime(services)?;
     let product_auth_runtime_ports = require_product_auth_runtime_ports(&services)?;
     let google_provider_client = google_oauth_config
         .map(|config| {
@@ -954,6 +975,37 @@ fn local_dev_scoped_filesystem(
     filesystem: Arc<LocalDevRootFilesystem>,
 ) -> Arc<ScopedFilesystem<LocalDevRootFilesystem>> {
     crate::wrap_scoped(filesystem)
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn local_dev_secret_store(
+    filesystem: Arc<LocalDevRootFilesystem>,
+    root: &Path,
+    owner_id: &str,
+) -> Result<Arc<dyn SecretStore>, RebornBuildError> {
+    let master_key = SecretMaterial::from(format!(
+        "ironclaw-local-dev-secret-store-v1:{}:{}",
+        owner_id,
+        root.display()
+    ));
+    let crypto = Arc::new(SecretsCrypto::new(master_key).map_err(|error| {
+        RebornBuildError::InvalidConfig {
+            reason: format!("local-dev secret store key is invalid: {error}"),
+        }
+    })?);
+    Ok(Arc::new(FilesystemSecretStore::new(
+        local_dev_scoped_filesystem(filesystem),
+        crypto,
+    )))
+}
+
+#[cfg(not(any(feature = "libsql", feature = "postgres")))]
+fn local_dev_secret_store(
+    _filesystem: Arc<LocalDevRootFilesystem>,
+    _root: &Path,
+    _owner_id: &str,
+) -> Result<Arc<dyn SecretStore>, RebornBuildError> {
+    Ok(Arc::new(ironclaw_secrets::InMemorySecretStore::new()))
 }
 
 #[cfg(feature = "libsql")]
@@ -1727,6 +1779,7 @@ where
         services,
         production_wiring.runtime_process_binding,
     );
+    let services = attach_wasm_runtime(services)?;
 
     let turn_coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> =
         Arc::new(services.turn_coordinator_for_production()?);
@@ -1866,11 +1919,13 @@ mod tests {
         RuntimeKind, ScopedPath, SecretHandle, TrustClass, UserId, VirtualPath,
     };
     use ironclaw_host_runtime::{
-        RuntimeCapabilityOutcome, RuntimeCapabilityRequest, RuntimeFailureKind,
-        SKILL_INSTALL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID, SKILL_REMOVE_CAPABILITY_ID,
+        RuntimeCapabilityOutcome, RuntimeCapabilityRequest, RuntimeCredentialAccountRequest,
+        RuntimeCredentialAccountResolver, RuntimeFailureKind, SKILL_INSTALL_CAPABILITY_ID,
+        SKILL_LIST_CAPABILITY_ID, SKILL_REMOVE_CAPABILITY_ID,
     };
     use ironclaw_product_workflow::{LifecyclePackageKind, LifecyclePackageRef};
     use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
+    use secrecy::ExposeSecret;
 
     use crate::runtime::SKILL_ACTIVATE_CAPABILITY_ID;
 
@@ -1951,6 +2006,51 @@ mod tests {
             access_secret.as_str().starts_with("product-auth-manual-"),
             "local-dev default product-auth must create durable SecretStore-backed handles"
         );
+        let rebuilt = build_reborn_services(RebornBuildInput::local_dev(
+            owner,
+            dir.path().join("local-dev"),
+        ))
+        .await
+        .expect("rebuilt local-dev services build");
+        let rebuilt_product_auth = rebuilt.product_auth.as_ref().expect("rebuilt product auth");
+        let runtime_resolver = ProductAuthRuntimeCredentialResolver::new(
+            rebuilt_product_auth.runtime_credential_account_selection_service(),
+        );
+        let mut runtime_scope = scope.resource.clone();
+        runtime_scope.invocation_id = InvocationId::new();
+        let resolved_access_secret = runtime_resolver
+            .resolve_access_secret(RuntimeCredentialAccountRequest {
+                scope: &runtime_scope,
+                provider: &RuntimeCredentialAccountProviderId::new("github").unwrap(),
+                requester_extension: &ExtensionId::new("github").unwrap(),
+            })
+            .await
+            .expect("rebuilt runtime resolver must find durable account");
+        assert_eq!(
+            resolved_access_secret, access_secret,
+            "rebuilt runtime resolver must return the persisted manual-token handle"
+        );
+        let rebuilt_root =
+            canonicalize_local_dev_path(&dir.path().join("local-dev"), "storage root")
+                .expect("canonical local-dev root");
+        let rebuilt_workspace =
+            canonicalize_local_dev_path(&rebuilt_root.join("workspace"), "workspace root")
+                .expect("canonical local-dev workspace");
+        let rebuilt_filesystem =
+            build_local_dev_root_filesystem(&rebuilt_root, &rebuilt_workspace, None)
+                .await
+                .expect("rebuilt local-dev filesystem");
+        let rebuilt_secret_store = local_dev_secret_store(rebuilt_filesystem, &rebuilt_root, owner)
+            .expect("rebuilt local-dev secret store");
+        let lease = rebuilt_secret_store
+            .lease_once(&runtime_scope, &resolved_access_secret)
+            .await
+            .expect("rebuilt secret store must lease persisted manual token");
+        let material = rebuilt_secret_store
+            .consume(&runtime_scope, lease.id)
+            .await
+            .expect("rebuilt secret store must consume persisted manual token");
+        assert_eq!(material.expose_secret(), "ghp_local_dev_pat");
 
         let flows = product_auth
             .flow_record_source()
