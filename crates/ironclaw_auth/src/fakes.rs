@@ -138,10 +138,6 @@ impl AuthFlowRecordSource for InMemoryAuthProductServices {
         flows.sort_by_key(|flow| flow.id);
         Ok(flows)
     }
-
-    async fn flow_records_snapshot(&self) -> Result<Vec<AuthFlowRecord>, AuthProductError> {
-        Ok(Self::flow_records_snapshot(self))
-    }
 }
 
 #[async_trait]

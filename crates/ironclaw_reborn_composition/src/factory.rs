@@ -33,8 +33,6 @@ use ironclaw_host_api::runtime_policy::{FilesystemBackendKind, ProcessBackendKin
 use ironclaw_host_api::{
     EffectKind, ExtensionId, HostPath, MountPermissions, MountView, PackageId, UserId, VirtualPath,
 };
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_host_api::{InvocationId, ResourceScope};
 #[cfg(feature = "libsql")]
 use ironclaw_host_api::{MountAlias, MountGrant};
 use ironclaw_host_runtime::{
@@ -84,8 +82,7 @@ use crate::local_dev_mounts::{
     ambient_workspace_mount_view, skill_context_mount_view, skill_management_mount_view,
     workspace_mount_view,
 };
-use crate::mcp::host_mediated_mcp_runtime;
-use crate::mcp_router::McpExecutorRouter;
+use crate::mcp::hosted_http_mcp_runtime;
 use crate::product_auth_runtime_credentials::ProductAuthRuntimeCredentialResolver;
 use crate::{
     RebornAuthContinuationDispatcher, RebornBuildError, RebornBuildInput, RebornCompositionProfile,
@@ -107,7 +104,6 @@ use crate::{
     gsuite::{
         ProductAuthRuntimeGsuiteCredentialStager, register_bundled_gsuite_first_party_handlers,
     },
-    nearai_mcp::{nearai_mcp_endpoint_from_env, nearai_mcp_runtime},
     web_access::register_bundled_web_access_first_party_handlers,
 };
 
@@ -251,31 +247,10 @@ where
     let runtime_http_egress = runtime_ports.runtime_http_egress();
     let registry = services.shared_extension_registry();
 
-    let mut router = McpExecutorRouter::new();
-
-    // NEAR AI MCP — optional; skip gracefully if endpoint env is absent.
-    match nearai_mcp_endpoint_from_env() {
-        Ok(endpoint) => {
-            router.insert(
-                "nearai",
-                nearai_mcp_runtime(runtime_http_egress.clone(), endpoint),
-            );
-        }
-        Err(reason) => {
-            tracing::debug!(
-                "skipping NEAR AI MCP runtime: {reason} \
-                 (this only affects the optional NEAR AI MCP extension)"
-            );
-        }
-    }
-
-    // Notion MCP — host-registry-mediated.
-    router.insert(
-        "notion",
-        Arc::new(host_mediated_mcp_runtime(registry, runtime_http_egress)),
-    );
-
-    Ok(services.with_mcp_runtime(Arc::new(router)))
+    Ok(services.with_mcp_runtime(Arc::new(hosted_http_mcp_runtime(
+        registry,
+        runtime_http_egress,
+    ))))
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
@@ -498,13 +473,6 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     let owner_user_id = UserId::new(owner_id).map_err(|error| RebornBuildError::InvalidConfig {
         reason: error.to_string(),
     })?;
-    #[cfg(any(feature = "libsql", feature = "postgres"))]
-    let product_auth_projection_scope =
-        ResourceScope::local_default(owner_user_id.clone(), InvocationId::new()).map_err(
-            |error| RebornBuildError::InvalidConfig {
-                reason: error.to_string(),
-            },
-        )?;
     let mut store_graph = build_local_dev_store_graph(
         Arc::clone(&filesystem),
         owner_user_id,
@@ -573,13 +541,10 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         None => {
             #[cfg(any(feature = "libsql", feature = "postgres"))]
             {
-                let durable_services = Arc::new(
-                    FilesystemAuthProductServices::new_with_flow_projection_scope(
-                        local_dev_scoped_filesystem(Arc::clone(&filesystem)),
-                        Arc::clone(&secret_store),
-                        product_auth_projection_scope,
-                    ),
-                );
+                let durable_services = Arc::new(FilesystemAuthProductServices::new(
+                    local_dev_scoped_filesystem(Arc::clone(&filesystem)),
+                    Arc::clone(&secret_store),
+                ));
                 let provider_client: Arc<dyn AuthProviderClient> = google_provider_client
                     .unwrap_or_else(|| Arc::new(UnavailableAuthProviderClient));
                 let services = RebornProductAuthServicePorts::from_shared_with_provider(
@@ -664,11 +629,6 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     .await
     .map_err(|error| RebornBuildError::InvalidConfig {
         reason: format!("extension lifecycle state could not be restored: {error}"),
-    })?;
-    services = services.try_with_default_wasm_runtime().map_err(|error| {
-        RebornBuildError::InvalidConfig {
-            reason: format!("local-dev WASM runtime could not be initialized: {error}"),
-        }
     })?;
     let extension_management = Arc::new(RebornLocalExtensionManagementPort::new(
         extension_filesystem,
@@ -1955,6 +1915,8 @@ mod tests {
             ResourceScope::local_default(UserId::new(owner).unwrap(), InvocationId::new()).unwrap(),
             AuthSurface::Callback,
         );
+        let mut scope = scope;
+        scope.resource.thread_id = Some(ironclaw_host_api::ThreadId::new("auth-thread").unwrap());
 
         let challenge = product_auth
             .request_manual_token_setup(crate::RebornManualTokenSetupRequest::new(
@@ -1978,7 +1940,7 @@ mod tests {
         let account = product_auth
             .credential_account_service()
             .get_account(ironclaw_auth::CredentialAccountLookupRequest::new(
-                scope,
+                scope.clone(),
                 submitted.account_id,
             ))
             .await
@@ -1993,7 +1955,13 @@ mod tests {
         let flows = product_auth
             .flow_record_source()
             .expect("local-dev product-auth flow source")
-            .flow_records_snapshot()
+            .flows_for_owner(ironclaw_auth::AuthFlowOwnerScope {
+                tenant_id: scope.resource.tenant_id.clone(),
+                user_id: scope.resource.user_id.clone(),
+                agent_id: scope.resource.agent_id.clone(),
+                project_id: scope.resource.project_id.clone(),
+                thread_id: scope.resource.thread_id.clone().unwrap(),
+            })
             .await
             .unwrap();
         let completed_flow = flows
@@ -2175,6 +2143,19 @@ mod tests {
         assert!(capability_ids.contains(&"notion.notion-query-data-sources"));
         assert!(capability_ids.contains(&"notion.notion-create-comment"));
         assert!(capability_ids.contains(&"notion.notion-get-self"));
+        let search_capability = notion_package
+            .package
+            .manifest
+            .capabilities
+            .iter()
+            .find(|capability| capability.id.as_str() == "notion.notion-search")
+            .expect("notion search capability");
+        assert_eq!(
+            search_capability.runtime_credentials[0].source,
+            RuntimeCredentialRequirementSource::ProductAuthAccount {
+                provider: RuntimeCredentialAccountProviderId::new("notion").unwrap(),
+            }
+        );
 
         extension_management
             .install(notion_ref.clone())
@@ -2203,56 +2184,6 @@ mod tests {
             panic!("expected missing Notion token to open auth gate, got {outcome:?}");
         };
         assert_eq!(gate.capability_id.as_str(), "notion.notion-search");
-    }
-
-    #[tokio::test]
-    async fn local_dev_github_installs_activates_and_reaches_auth_gate() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let services = build_reborn_services(RebornBuildInput::local_dev(
-            "local-dev-github-owner",
-            dir.path().join("local-dev"),
-        ))
-        .await
-        .expect("local-dev services build");
-        let local_runtime = services.local_runtime.as_ref().expect("local runtime");
-        let extension_management = local_runtime
-            .extension_management
-            .as_ref()
-            .expect("extension management");
-        let github_ref =
-            LifecyclePackageRef::new(LifecyclePackageKind::Extension, "github").expect("valid ref");
-
-        extension_management
-            .install(github_ref.clone())
-            .await
-            .expect("install GitHub");
-        extension_management
-            .activate(github_ref)
-            .await
-            .expect("activate GitHub");
-
-        let capability_id = CapabilityId::new("github.search_issues").unwrap();
-        let outcome = services
-            .host_runtime
-            .as_ref()
-            .expect("host runtime")
-            .invoke_capability(RuntimeCapabilityRequest::new(
-                github_context(capability_id.as_str()),
-                capability_id.clone(),
-                ResourceEstimate::default(),
-                serde_json::json!({
-                    "query": "repo:nearai/ironclaw is:issue",
-                    "limit": 1
-                }),
-                trust_decision(),
-            ))
-            .await
-            .expect("runtime invocation completes");
-
-        let RuntimeCapabilityOutcome::AuthRequired(gate) = outcome else {
-            panic!("expected missing GitHub token to open auth gate, got {outcome:?}");
-        };
-        assert_eq!(gate.capability_id, capability_id);
     }
 
     #[tokio::test]
@@ -2742,51 +2673,6 @@ mod tests {
             MountView::new(Vec::new()).expect("valid empty mount view"),
         )
         .expect("valid execution context")
-    }
-
-    fn github_context(capability_id: &str) -> ExecutionContext {
-        let extension_id = ExtensionId::new("caller").expect("valid extension id");
-        ExecutionContext::local_default(
-            UserId::new("local-dev-test-user").expect("valid user id"),
-            extension_id.clone(),
-            RuntimeKind::Wasm,
-            TrustClass::Sandbox,
-            CapabilitySet {
-                grants: vec![CapabilityGrant {
-                    id: CapabilityGrantId::new(),
-                    capability: CapabilityId::new(capability_id).expect("valid capability id"),
-                    grantee: Principal::Extension(extension_id),
-                    issued_by: Principal::HostRuntime,
-                    constraints: GrantConstraints {
-                        allowed_effects: github_allowed_effects(),
-                        mounts: MountView::new(Vec::new()).expect("valid empty mount view"),
-                        network: github_network_policy(),
-                        secrets: vec![SecretHandle::new("github_runtime_token").unwrap()],
-                        resource_ceiling: None,
-                        expires_at: None,
-                        max_invocations: None,
-                    },
-                }],
-            },
-            MountView::new(Vec::new()).expect("valid empty mount view"),
-        )
-        .expect("valid execution context")
-    }
-
-    fn github_allowed_effects() -> Vec<EffectKind> {
-        vec![EffectKind::Network, EffectKind::UseSecret]
-    }
-
-    fn github_network_policy() -> NetworkPolicy {
-        NetworkPolicy {
-            allowed_targets: vec![NetworkTargetPattern {
-                scheme: Some(NetworkScheme::Https),
-                host_pattern: "api.github.com".to_string(),
-                port: None,
-            }],
-            deny_private_ip_ranges: true,
-            max_egress_bytes: None,
-        }
     }
 
     fn web_access_context(capability_id: &str) -> ExecutionContext {

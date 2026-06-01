@@ -224,7 +224,15 @@ where
             .read_flow(scope, flow_id)
             .await?
             .ok_or(AuthProductError::UnknownOrExpiredFlow)?;
-        validate_manual_token_flow(&mut record, scope, &input, now)?;
+        match validate_manual_token_flow(&mut record, scope, &input, now) {
+            Ok(()) => {}
+            Err(AuthProductError::UnknownOrExpiredFlow) => {
+                self.write_flow(scope, &record, CasExpectation::Version(version))
+                    .await?;
+                return Err(AuthProductError::UnknownOrExpiredFlow);
+            }
+            Err(error) => return Err(error),
+        }
         if record.status == AuthFlowStatus::Completed {
             return Ok(record);
         }
@@ -385,7 +393,7 @@ where
         query: TurnGateAuthFlowQuery,
     ) -> Result<Option<AuthFlowRecord>, AuthProductError> {
         Ok(self
-            .flows_for_owner_scope(&query.owner)
+            .flow_records_for_owner(&query.owner)
             .await?
             .into_iter()
             .find(|flow| flow_matches_turn_gate_query(flow, &query)))
@@ -395,14 +403,7 @@ where
         &self,
         owner: ironclaw_auth::AuthFlowOwnerScope,
     ) -> Result<Vec<AuthFlowRecord>, AuthProductError> {
-        self.flows_for_owner_scope(&owner).await
-    }
-
-    async fn flow_records_snapshot(&self) -> Result<Vec<AuthFlowRecord>, AuthProductError> {
-        let Some(scope) = &self.flow_projection_scope else {
-            return Ok(Vec::new());
-        };
-        self.flow_records_for_projection_scope(scope).await
+        self.flow_records_for_owner(&owner).await
     }
 }
 

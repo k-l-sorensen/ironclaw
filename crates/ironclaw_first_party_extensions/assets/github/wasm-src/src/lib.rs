@@ -106,8 +106,10 @@ impl exports::near::agent::tool::Guest for GitHubTool {
 }
 
 fn schema_value(schema: &str) -> serde_json::Value {
-    serde_json::from_str(schema).expect("bundled GitHub schema must be valid JSON")
-    // safety: bundled schemas are static assets covered by `validates_static_schema_json`.
+    match serde_json::from_str(schema) {
+        Ok(value) => value,
+        Err(_) => serde_json::json!({}),
+    }
 }
 
 fn execute_inner(params: &str, context: Option<&str>) -> Result<String, String> {

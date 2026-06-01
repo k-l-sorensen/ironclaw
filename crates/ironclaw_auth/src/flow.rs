@@ -311,13 +311,6 @@ pub trait AuthFlowRecordSource: Send + Sync {
         &self,
         owner: AuthFlowOwnerScope,
     ) -> Result<Vec<AuthFlowRecord>, AuthProductError>;
-
-    /// Returns a durable snapshot of auth-flow records.
-    ///
-    /// Implementations may return a broader snapshot than the caller's
-    /// current scope. Any consumer that projects these records into
-    /// product/user-facing views must scope-filter before exposing them.
-    async fn flow_records_snapshot(&self) -> Result<Vec<AuthFlowRecord>, AuthProductError>;
 }
 
 pub fn flow_matches_turn_gate_query(flow: &AuthFlowRecord, query: &TurnGateAuthFlowQuery) -> bool {

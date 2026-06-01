@@ -8,16 +8,16 @@ use ironclaw_auth::{
     AuthFlowStatus, AuthGateRef, AuthInteractionId, AuthInteractionService, AuthProductError,
     AuthProductScope, AuthProviderClient, AuthProviderId, CredentialAccountChoiceRequest,
     CredentialAccountId, CredentialAccountLabel, CredentialAccountListPage,
-    CredentialAccountListRequest, CredentialAccountProjection, CredentialAccountRecordSource,
-    CredentialAccountService, CredentialAccountStatus, CredentialAccountUpdateBinding,
-    CredentialRecoveryProjection, CredentialRecoveryRequest, CredentialRefreshReport,
-    CredentialRefreshRequest, CredentialSetupService, InMemoryAuthProductServices,
-    ManualTokenCompletionInput, ManualTokenSetupRequest, NewAuthFlow, OAuthAuthorizationUrl,
+    CredentialAccountListRequest, CredentialAccountLookupRequest, CredentialAccountProjection,
+    CredentialAccountRecordSource, CredentialAccountService, CredentialAccountStatus,
+    CredentialAccountUpdateBinding, CredentialRecoveryProjection, CredentialRecoveryRequest,
+    CredentialRefreshReport, CredentialRefreshRequest, CredentialSetupService,
+    InMemoryAuthProductServices, ManualTokenSetupRequest, NewAuthFlow, OAuthAuthorizationUrl,
     OAuthCallbackClaimRequest, OAuthCallbackFailureInput, OAuthCallbackInput,
     OAuthProviderCallbackRequest, OAuthProviderExchangeContext, OpaqueStateHash, PkceVerifierHash,
     ProviderBackedCredentialAccountService, ProviderCallbackOutcome, SecretCleanupReport,
-    SecretCleanupRequest, SecretCleanupService, SecretSubmitRequest, Timestamp,
-    TurnGateAuthFlowQuery, TurnRunRef,
+    SecretCleanupRequest, SecretCleanupService, SecretSubmitRequest, SecretSubmitResult, Timestamp,
+    TurnGateAuthFlowQuery, TurnRunRef, scope_matches,
 };
 use ironclaw_product_adapters::AuthPromptChallengeKind;
 use ironclaw_product_workflow::ProductAuthTurnGateResumeDispatcher;
@@ -27,6 +27,7 @@ use serde::{Deserialize, Serialize};
 use ironclaw_host_api::UserId;
 use ironclaw_turns::{TurnRunId, TurnScope};
 
+use crate::manual_token_flow::{PortBackedManualTokenFlowService, RebornManualTokenFlowService};
 use crate::product_auth_runtime_credentials::{
     ProductAuthRuntimeCredentialAccountSelector, RuntimeCredentialAccountSelectionService,
 };
@@ -251,230 +252,6 @@ fn is_retryable_auth_error(code: AuthErrorCode) -> bool {
     matches!(code, AuthErrorCode::BackendUnavailable)
 }
 
-/// Product-auth ports supplied to Reborn composition before the turn coordinator
-/// exists. The factory turns these ports into a complete
-/// [`RebornProductAuthServices`] after composing the coordinator, so auth
-/// continuations cannot accidentally keep a stale or no-op resume dispatcher.
-#[async_trait]
-#[doc(hidden)]
-pub trait RebornManualTokenFlowService: Send + Sync {
-    async fn request_manual_token_flow(
-        &self,
-        request: ManualTokenSetupRequest,
-    ) -> Result<AuthChallenge, AuthProductError>;
-
-    async fn submit_manual_token_flow(
-        &self,
-        scope: &AuthProductScope,
-        request: SecretSubmitRequest,
-    ) -> Result<ironclaw_auth::SecretSubmitResult, AuthProductError>;
-
-    async fn abandon_manual_token_flow(
-        &self,
-        scope: &AuthProductScope,
-        interaction_id: AuthInteractionId,
-    ) -> Result<bool, AuthProductError>;
-}
-
-#[derive(Clone)]
-struct PortBackedManualTokenFlowService {
-    flow_manager: Arc<dyn AuthFlowManager>,
-    interaction_service: Arc<dyn AuthInteractionService>,
-}
-
-impl PortBackedManualTokenFlowService {
-    fn new(
-        flow_manager: Arc<dyn AuthFlowManager>,
-        interaction_service: Arc<dyn AuthInteractionService>,
-    ) -> Self {
-        Self {
-            flow_manager,
-            interaction_service,
-        }
-    }
-}
-
-#[async_trait]
-impl RebornManualTokenFlowService for PortBackedManualTokenFlowService {
-    async fn request_manual_token_flow(
-        &self,
-        request: ManualTokenSetupRequest,
-    ) -> Result<AuthChallenge, AuthProductError> {
-        request_manual_token_flow_with(
-            self.flow_manager.as_ref(),
-            self.interaction_service.as_ref(),
-            request,
-        )
-        .await
-    }
-
-    async fn submit_manual_token_flow(
-        &self,
-        scope: &AuthProductScope,
-        request: SecretSubmitRequest,
-    ) -> Result<ironclaw_auth::SecretSubmitResult, AuthProductError> {
-        submit_manual_token_flow_with(
-            self.flow_manager.as_ref(),
-            self.interaction_service.as_ref(),
-            scope,
-            request,
-        )
-        .await
-    }
-
-    async fn abandon_manual_token_flow(
-        &self,
-        scope: &AuthProductScope,
-        interaction_id: AuthInteractionId,
-    ) -> Result<bool, AuthProductError> {
-        abandon_manual_token_flow_with(
-            self.flow_manager.as_ref(),
-            self.interaction_service.as_ref(),
-            scope,
-            interaction_id,
-        )
-        .await
-    }
-}
-
-#[async_trait]
-impl<T> RebornManualTokenFlowService for T
-where
-    T: AuthFlowManager + AuthInteractionService + Send + Sync,
-{
-    async fn request_manual_token_flow(
-        &self,
-        request: ManualTokenSetupRequest,
-    ) -> Result<AuthChallenge, AuthProductError> {
-        request_manual_token_flow_with(self, self, request).await
-    }
-
-    async fn submit_manual_token_flow(
-        &self,
-        scope: &AuthProductScope,
-        request: SecretSubmitRequest,
-    ) -> Result<ironclaw_auth::SecretSubmitResult, AuthProductError> {
-        submit_manual_token_flow_with(self, self, scope, request).await
-    }
-
-    async fn abandon_manual_token_flow(
-        &self,
-        scope: &AuthProductScope,
-        interaction_id: AuthInteractionId,
-    ) -> Result<bool, AuthProductError> {
-        abandon_manual_token_flow_with(self, self, scope, interaction_id).await
-    }
-}
-
-async fn request_manual_token_flow_with(
-    flow_manager: &dyn AuthFlowManager,
-    interaction_service: &dyn AuthInteractionService,
-    request: ManualTokenSetupRequest,
-) -> Result<AuthChallenge, AuthProductError> {
-    let flow_scope = request.scope.clone();
-    let flow_provider = request.provider.clone();
-    let flow_continuation = request.continuation.clone();
-    let flow_update_binding = request.update_binding.clone();
-    let flow_expires_at = request.expires_at;
-    let challenge = interaction_service.request_secret_input(request).await?;
-    let AuthChallenge::ManualTokenRequired {
-        interaction_id,
-        provider,
-        label,
-        expires_at,
-    } = &challenge
-    else {
-        return Err(AuthProductError::InvalidRequest {
-            reason: "manual token setup returned an unexpected challenge".to_string(),
-        });
-    };
-    if let Err(error) = flow_manager
-        .create_flow(NewAuthFlow {
-            scope: flow_scope.clone(),
-            kind: AuthFlowKind::IntegrationCredential,
-            provider: flow_provider,
-            challenge: AuthChallenge::ManualTokenRequired {
-                interaction_id: *interaction_id,
-                provider: provider.clone(),
-                label: label.clone(),
-                expires_at: *expires_at,
-            },
-            continuation: flow_continuation,
-            update_binding: flow_update_binding,
-            opaque_state_hash: None,
-            pkce_verifier_hash: None,
-            expires_at: flow_expires_at,
-        })
-        .await
-    {
-        if let Err(cleanup_error) = interaction_service
-            .abandon_manual_token(&flow_scope, *interaction_id)
-            .await
-        {
-            tracing::warn!(
-                interaction_id = %interaction_id,
-                error_code = ?error.code(),
-                cleanup_error_code = ?cleanup_error.code(),
-                "manual-token flow creation failed and interaction cleanup failed"
-            );
-        }
-        return Err(error);
-    }
-    Ok(challenge)
-}
-
-async fn submit_manual_token_flow_with(
-    flow_manager: &dyn AuthFlowManager,
-    interaction_service: &dyn AuthInteractionService,
-    scope: &AuthProductScope,
-    request: SecretSubmitRequest,
-) -> Result<ironclaw_auth::SecretSubmitResult, AuthProductError> {
-    let interaction_id = request.interaction_id;
-    let result = interaction_service
-        .submit_manual_token(scope, request)
-        .await?;
-    if let Err(error) = flow_manager
-        .complete_manual_token(
-            scope,
-            ManualTokenCompletionInput {
-                interaction_id,
-                credential_account_id: result.account_id,
-            },
-        )
-        .await
-    {
-        if let Err(cleanup_error) = flow_manager
-            .cancel_manual_token(scope, interaction_id)
-            .await
-        {
-            tracing::warn!(
-                interaction_id = %interaction_id,
-                error_code = ?error.code(),
-                cleanup_error_code = ?cleanup_error.code(),
-                "manual-token flow completion failed and flow cleanup failed"
-            );
-        }
-        return Err(error);
-    }
-    Ok(result)
-}
-
-async fn abandon_manual_token_flow_with(
-    flow_manager: &dyn AuthFlowManager,
-    interaction_service: &dyn AuthInteractionService,
-    scope: &AuthProductScope,
-    interaction_id: AuthInteractionId,
-) -> Result<bool, AuthProductError> {
-    let interaction_abandoned = interaction_service
-        .abandon_manual_token(scope, interaction_id)
-        .await?;
-    let flow_abandoned = flow_manager
-        .cancel_manual_token(scope, interaction_id)
-        .await?
-        .is_some();
-    Ok(interaction_abandoned || flow_abandoned)
-}
-
 #[derive(Debug)]
 struct UnsupportedCredentialAccountRecordSource;
 
@@ -540,6 +317,7 @@ impl RebornProductAuthServicePorts {
         let manual_token_flow_service = Arc::new(PortBackedManualTokenFlowService::new(
             flow_manager.clone(),
             interaction_service.clone(),
+            credential_account_service.clone(),
         ));
         Self {
             flow_manager,
@@ -607,10 +385,6 @@ impl RebornProductAuthServicePorts {
 
     pub fn credential_account_service(&self) -> Arc<dyn CredentialAccountService> {
         self.credential_account_service.clone()
-    }
-
-    pub fn credential_account_record_source(&self) -> Arc<dyn CredentialAccountRecordSource> {
-        self.credential_account_record_source.clone()
     }
 
     pub(crate) fn into_services(
@@ -719,6 +493,7 @@ impl RebornProductAuthServices {
         let manual_token_flow_service = Arc::new(PortBackedManualTokenFlowService::new(
             flow_manager.clone(),
             interaction_service.clone(),
+            credential_account_service.clone(),
         ));
         Self {
             flow_manager,
@@ -819,7 +594,9 @@ impl RebornProductAuthServices {
         self.credential_account_service.clone()
     }
 
-    pub fn credential_account_record_source(&self) -> Arc<dyn CredentialAccountRecordSource> {
+    pub(crate) fn credential_account_record_source(
+        &self,
+    ) -> Arc<dyn CredentialAccountRecordSource> {
         self.credential_account_record_source.clone()
     }
 
@@ -1095,35 +872,8 @@ impl RebornProductAuthServices {
         };
 
         if should_dispatch_continuation {
-            let emitted_at = Utc::now();
-            let event = AuthContinuationEvent {
-                flow_id: completed.id,
-                scope: completed.scope.clone(),
-                continuation: completed.continuation.clone(),
-                credential_account_id: completed.credential_account_id,
-                emitted_at,
-            };
-            if let Err(error) = self
-                .continuation_dispatcher
-                .dispatch_auth_continuation(event)
-                .await
-            {
-                tracing::debug!(
-                    flow_id = %completed.id,
-                    error_code = ?error.code(),
-                    "reborn auth callback completed but continuation dispatch failed"
-                );
-                let error = match error {
-                    AuthProductError::TokenExchangeFailed
-                    | AuthProductError::ProviderDenied
-                    | AuthProductError::MalformedCallback => AuthProductError::BackendUnavailable,
-                    error => error,
-                };
-                return Err(error.into());
-            }
             completed = self
-                .flow_manager
-                .mark_continuation_dispatched(&completed.scope, completed.id, emitted_at)
+                .dispatch_completed_continuation(completed)
                 .await
                 .map_err(RebornOAuthCallbackError::from)?;
         }
@@ -1219,15 +969,28 @@ impl RebornProductAuthServices {
         &self,
         request: RebornManualTokenSubmitRequest,
     ) -> Result<RebornManualTokenSubmitResponse, RebornManualTokenError> {
-        let result = self
+        let scope = request.scope;
+        let interaction_id = request.interaction_id;
+        let submit = self
             .manual_token_flow_service
             .submit_manual_token_flow(
-                &request.scope,
+                &scope,
                 SecretSubmitRequest {
-                    interaction_id: request.interaction_id,
+                    interaction_id,
                     secret: request.secret,
                 },
             )
+            .await;
+        let (result, completed) = match submit {
+            Ok(completed) => completed,
+            Err(AuthProductError::UnknownOrExpiredFlow) => self
+                .recover_completed_manual_token_submit(&scope, interaction_id)
+                .await?
+                .ok_or(AuthProductError::UnknownOrExpiredFlow)
+                .map_err(RebornManualTokenError::from)?,
+            Err(error) => return Err(RebornManualTokenError::from(error)),
+        };
+        self.dispatch_completed_continuation(completed)
             .await
             .map_err(RebornManualTokenError::from)?;
 
@@ -1236,6 +999,62 @@ impl RebornProductAuthServices {
             status: result.status,
             continuation: result.continuation,
         })
+    }
+
+    async fn recover_completed_manual_token_submit(
+        &self,
+        scope: &AuthProductScope,
+        interaction_id: AuthInteractionId,
+    ) -> Result<Option<(SecretSubmitResult, AuthFlowRecord)>, RebornManualTokenError> {
+        let Some(source) = &self.flow_record_source else {
+            return Ok(None);
+        };
+        let Some(thread_id) = scope.resource.thread_id.clone() else {
+            return Ok(None);
+        };
+        let flows = source
+            .flows_for_owner(AuthFlowOwnerScope {
+                tenant_id: scope.resource.tenant_id.clone(),
+                user_id: scope.resource.user_id.clone(),
+                agent_id: scope.resource.agent_id.clone(),
+                project_id: scope.resource.project_id.clone(),
+                thread_id,
+            })
+            .await
+            .map_err(RebornManualTokenError::from)?;
+        let Some(completed) = flows.into_iter().find(|flow| {
+            flow.status == AuthFlowStatus::Completed
+                && flow.continuation_emitted_at.is_none()
+                && scope_matches(scope, &flow.scope)
+                && matches!(
+                    &flow.challenge,
+                    Some(AuthChallenge::ManualTokenRequired { interaction_id: id, .. })
+                        if id == &interaction_id
+                )
+        }) else {
+            return Ok(None);
+        };
+        let Some(account_id) = completed.credential_account_id else {
+            return Ok(None);
+        };
+        let account = self
+            .credential_account_service
+            .get_account(CredentialAccountLookupRequest::new(
+                completed.scope.clone(),
+                account_id,
+            ))
+            .await
+            .map_err(RebornManualTokenError::from)?
+            .ok_or(AuthProductError::CredentialMissing)
+            .map_err(RebornManualTokenError::from)?;
+        Ok(Some((
+            SecretSubmitResult {
+                account_id,
+                status: account.status,
+                continuation: completed.continuation.clone(),
+            },
+            completed,
+        )))
     }
 
     pub async fn abandon_manual_token(
@@ -1247,6 +1066,44 @@ impl RebornProductAuthServices {
             .abandon_manual_token_flow(scope, interaction_id)
             .await
             .map_err(RebornManualTokenError::from)
+    }
+
+    async fn dispatch_completed_continuation(
+        &self,
+        completed: AuthFlowRecord,
+    ) -> Result<AuthFlowRecord, AuthProductError> {
+        if completed.continuation_emitted_at.is_some() {
+            return Ok(completed);
+        }
+        let emitted_at = Utc::now();
+        let event = AuthContinuationEvent {
+            flow_id: completed.id,
+            scope: completed.scope.clone(),
+            continuation: completed.continuation.clone(),
+            credential_account_id: completed.credential_account_id,
+            emitted_at,
+        };
+        if let Err(error) = self
+            .continuation_dispatcher
+            .dispatch_auth_continuation(event)
+            .await
+        {
+            tracing::debug!(
+                flow_id = %completed.id,
+                error_code = ?error.code(),
+                "reborn auth flow completed but continuation dispatch failed"
+            );
+            let error = match error {
+                AuthProductError::TokenExchangeFailed
+                | AuthProductError::ProviderDenied
+                | AuthProductError::MalformedCallback => AuthProductError::BackendUnavailable,
+                error => error,
+            };
+            return Err(error);
+        }
+        self.flow_manager
+            .mark_continuation_dispatched(&completed.scope, completed.id, emitted_at)
+            .await
     }
 
     #[allow(
@@ -1314,9 +1171,7 @@ impl AuthChallengeProvider for RebornProductAuthServices {
         let source = self.flow_record_source.as_ref()?;
         // The flow source may include records from multiple product surfaces;
         // query by stable owner and gate continuation before exposing metadata.
-        let Some(gate_ref) = AuthGateRef::new(gate_ref.to_string()).ok() else {
-            return None;
-        };
+        let gate_ref = AuthGateRef::new(gate_ref.to_string()).ok()?;
         let flow = source
             .flow_for_turn_gate(TurnGateAuthFlowQuery {
                 owner: AuthFlowOwnerScope {
@@ -1642,6 +1497,32 @@ mod tests {
             _scope: &AuthProductScope,
         ) -> Result<Vec<CredentialAccount>, AuthProductError> {
             unreachable!("constructor tests do not call credential-account read-model methods")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RebornManualTokenFlowService for SharedAuthTestDouble {
+        async fn request_manual_token_flow(
+            &self,
+            _request: ironclaw_auth::ManualTokenSetupRequest,
+        ) -> Result<AuthChallenge, AuthProductError> {
+            unreachable!("constructor tests do not call manual-token flow methods")
+        }
+
+        async fn submit_manual_token_flow(
+            &self,
+            _scope: &AuthProductScope,
+            _request: SecretSubmitRequest,
+        ) -> Result<(SecretSubmitResult, AuthFlowRecord), AuthProductError> {
+            unreachable!("constructor tests do not call manual-token flow methods")
+        }
+
+        async fn abandon_manual_token_flow(
+            &self,
+            _scope: &AuthProductScope,
+            _interaction_id: AuthInteractionId,
+        ) -> Result<bool, AuthProductError> {
+            unreachable!("constructor tests do not call manual-token flow methods")
         }
     }
 
