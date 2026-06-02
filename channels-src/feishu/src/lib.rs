@@ -487,44 +487,89 @@ impl Guest for FeishuChannel {
 
 /// Process events queued by the host-managed Feishu websocket runtime.
 fn process_websocket_event_queue() {
-    let queue_json = channel_host::workspace_read(WEBSOCKET_EVENT_QUEUE_PATH).unwrap_or_default();
-    if queue_json.trim().is_empty() {
-        return;
-    }
+    process_websocket_event_queue_with(
+        || channel_host::workspace_read(WEBSOCKET_EVENT_QUEUE_PATH).unwrap_or_default(),
+        |queue_json| {
+            let _ = channel_host::workspace_write(WEBSOCKET_EVENT_QUEUE_PATH, queue_json);
+        },
+        |frame| process_feishu_event_payload(frame, false),
+        |level, message| channel_host::log(level, message),
+    );
+}
 
-    let frames: Vec<String> = match serde_json::from_str(&queue_json) {
-        Ok(frames) => frames,
-        Err(error) => {
-            channel_host::log(
-                channel_host::LogLevel::Warn,
-                &format!("Failed to deserialize Feishu websocket queue: {error}"),
-            );
-            let _ = channel_host::workspace_write(WEBSOCKET_EVENT_QUEUE_PATH, "[]");
+fn process_websocket_event_queue_with(
+    mut read_queue: impl FnMut() -> String,
+    mut write_queue: impl FnMut(&str),
+    mut process_payload: impl FnMut(&str),
+    mut log: impl FnMut(channel_host::LogLevel, &str),
+) {
+    loop {
+        let queue_json = read_queue();
+        if queue_json.trim().is_empty() {
             return;
         }
-    };
 
-    let _ = channel_host::workspace_write(WEBSOCKET_EVENT_QUEUE_PATH, "[]");
+        let mut frames: Vec<String> = match serde_json::from_str(&queue_json) {
+            Ok(frames) => frames,
+            Err(error) => {
+                log(
+                    channel_host::LogLevel::Warn,
+                    &format!("Failed to deserialize Feishu websocket queue: {error}"),
+                );
+                write_queue("[]");
+                return;
+            }
+        };
 
-    for frame in frames {
-        process_feishu_event_payload(&frame, false);
+        if frames.is_empty() {
+            return;
+        }
+
+        let frame = frames.remove(0);
+        let remaining = match serde_json::to_string(&frames) {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                log(
+                    channel_host::LogLevel::Error,
+                    &format!("Failed to serialize Feishu websocket queue: {error}"),
+                );
+                return;
+            }
+        };
+        write_queue(&remaining);
+        process_payload(&frame);
     }
 }
 
 fn process_feishu_event_payload(body_str: &str, require_webhook_auth: bool) {
+    process_feishu_event_payload_with_workspace(
+        body_str,
+        require_webhook_auth,
+        channel_host::workspace_read,
+        handle_message_event,
+        channel_host::log,
+    );
+}
+
+fn process_feishu_event_payload_with_workspace(
+    body_str: &str,
+    require_webhook_auth: bool,
+    mut workspace_read: impl FnMut(&str) -> Option<String>,
+    mut handle_message: impl FnMut(&serde_json::Value),
+    mut log: impl FnMut(channel_host::LogLevel, &str),
+) -> bool {
     let event: FeishuEvent = match serde_json::from_str(body_str) {
         Ok(e) => e,
         Err(e) => {
-            channel_host::log(
+            log(
                 channel_host::LogLevel::Error,
                 &format!("Failed to parse Feishu event: {}", e),
             );
-            return;
+            return false;
         }
     };
 
-    let configured_token =
-        channel_host::workspace_read(VERIFICATION_TOKEN_PATH).filter(|token| !token.is_empty());
+    let configured_token = workspace_read(VERIFICATION_TOKEN_PATH).filter(|token| !token.is_empty());
     if require_webhook_auth
         && !is_authenticated_webhook(
             false,
@@ -532,11 +577,11 @@ fn process_feishu_event_payload(body_str: &str, require_webhook_auth: bool) {
             request_verification_token(&event),
         )
     {
-        channel_host::log(
+        log(
             channel_host::LogLevel::Warn,
             "Rejecting unauthenticated Feishu webhook request",
         );
-        return;
+        return false;
     }
 
     if !require_webhook_auth
@@ -545,16 +590,16 @@ fn process_feishu_event_payload(body_str: &str, require_webhook_auth: bool) {
             request_verification_token(&event),
         )
     {
-        channel_host::log(
+        log(
             channel_host::LogLevel::Warn,
             "Ignoring Feishu websocket event with missing or mismatched verification token",
         );
-        return;
+        return false;
     }
 
     // Handle URL verification challenge (initial webhook setup).
     if event.event_type.as_deref() == Some("url_verification") {
-        return;
+        return false;
     }
 
     // Handle v2.0 events.
@@ -562,17 +607,19 @@ fn process_feishu_event_payload(body_str: &str, require_webhook_auth: bool) {
         match header.event_type.as_str() {
             "im.message.receive_v1" => {
                 if let Some(event_data) = &event.event {
-                    handle_message_event(event_data);
+                    handle_message(event_data);
+                    return true;
                 }
             }
             other => {
-                channel_host::log(
+                log(
                     channel_host::LogLevel::Debug,
                     &format!("Ignoring event type: {}", other),
                 );
             }
         }
     }
+    false
 }
 
 /// Handle an im.message.receive_v1 event.
@@ -1029,7 +1076,7 @@ fn is_authenticated_websocket_event(
         Some(expected) => request_token
             .map(|provided| bool::from(expected.as_bytes().ct_eq(provided.as_bytes())))
             .unwrap_or(false),
-        None => true,
+        None => false,
     }
 }
 
@@ -1131,12 +1178,12 @@ mod tests {
     #[test]
     fn websocket_auth_requires_matching_token_when_configured() {
         assert!(
-            is_authenticated_websocket_event(None, None),
-            "websocket events are authenticated by the Feishu connection when no token is configured"
+            !is_authenticated_websocket_event(None, None),
+            "websocket events must not be accepted without a configured verification token"
         );
         assert!(
-            is_authenticated_websocket_event(None, Some("token")),
-            "provided event tokens should also be accepted when no token is configured"
+            !is_authenticated_websocket_event(None, Some("token")),
+            "provided event tokens must not be accepted without a configured token to compare"
         );
         assert!(
             !is_authenticated_websocket_event(Some("expected"), None),
@@ -1150,6 +1197,82 @@ mod tests {
             is_authenticated_websocket_event(Some("expected"), Some("expected")),
             "configured verification tokens should accept matching websocket events"
         );
+    }
+
+    #[test]
+    fn process_websocket_event_queue_clears_queue_on_malformed_json() {
+        let queue = std::cell::RefCell::new(r#"{"not":"an array"}"#.to_string());
+        let processed = std::cell::RefCell::new(Vec::<String>::new());
+
+        process_websocket_event_queue_with(
+            || queue.borrow().clone(),
+            |queue_json| {
+                *queue.borrow_mut() = queue_json.to_string();
+            },
+            |frame| processed.borrow_mut().push(frame.to_string()),
+            |_level, _message| {},
+        );
+
+        assert_eq!(queue.borrow().as_str(), "[]");
+        assert!(processed.borrow().is_empty());
+    }
+
+    #[test]
+    fn process_websocket_event_queue_drains_one_frame_before_processing_next() {
+        let queue = std::cell::RefCell::new(serde_json::json!(["first", "second"]).to_string());
+        let processed = std::cell::RefCell::new(Vec::<String>::new());
+
+        process_websocket_event_queue_with(
+            || queue.borrow().clone(),
+            |queue_json| {
+                *queue.borrow_mut() = queue_json.to_string();
+            },
+            |frame| {
+                let mut processed = processed.borrow_mut();
+                if processed.is_empty() {
+                    assert_eq!(
+                        queue.borrow().as_str(),
+                        serde_json::json!(["second"]).to_string()
+                    );
+                }
+                processed.push(frame.to_string());
+            },
+            |_level, _message| {},
+        );
+
+        assert_eq!(
+            processed.borrow().as_slice(),
+            &["first".to_string(), "second".to_string()]
+        );
+        assert_eq!(queue.borrow().as_str(), "[]");
+    }
+
+    #[test]
+    fn process_feishu_event_payload_drops_websocket_event_with_mismatched_token() {
+        let handled = std::cell::RefCell::new(false);
+        let body = serde_json::json!({
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_123",
+                "event_type": "im.message.receive_v1",
+                "token": "wrong"
+            },
+            "event": {}
+        })
+        .to_string();
+
+        let processed = process_feishu_event_payload_with_workspace(
+            &body,
+            false,
+            |path| (path == VERIFICATION_TOKEN_PATH).then(|| "expected".to_string()),
+            |_event| {
+                *handled.borrow_mut() = true;
+            },
+            |_level, _message| {},
+        );
+
+        assert!(!processed);
+        assert!(!*handled.borrow());
     }
 
     #[test]

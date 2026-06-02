@@ -623,15 +623,8 @@ function setupFieldLabel(item) {
   return translateOrFallback('setup.secret.' + item.name, fallback || item.name);
 }
 
-function isFeishuVerificationToken(name, item) {
-  return name === 'feishu' && item && item.name === 'feishu_verification_token';
-}
-
 function isSavedConfigurationResponse(res) {
-  return !!res
-    && res.activated === false
-    && typeof res.message === 'string'
-    && /^Configuration saved\b/.test(res.message);
+  return !!res && res.setup_only === true;
 }
 
 function updateConfigureModalI18n(root) {
@@ -685,7 +678,7 @@ function createConfigureField(item, kind, optionalGroup) {
   labelText.setAttribute('data-configure-label-prompt', item.prompt || item.name);
   labelText.textContent = setupFieldLabel(item);
   label.appendChild(labelText);
-  if (item.optional && !optionalGroup) {
+  if (item.optional && !item.required_when_visible && !optionalGroup) {
     const opt = document.createElement('span');
     opt.className = 'field-optional';
     opt.textContent = I18n.t('config.optional');
@@ -697,7 +690,7 @@ function createConfigureField(item, kind, optionalGroup) {
   inputRow.className = 'configure-input-row';
 
   const hasOptions = Array.isArray(item.options) && item.options.length > 0;
-  const input = hasOptions || item.input_type === 'select'
+  const input = hasOptions
     ? document.createElement('select')
     : document.createElement('input');
   input.name = item.name;
@@ -864,27 +857,19 @@ function renderConfigureModal(name, secrets, setupFields, interactiveLogin, onbo
   form.className = 'configure-form';
 
   const fields = [];
-  const conditionalWebhookSecrets = [];
   const requiredSecrets = [];
   const optionalSecrets = [];
   secrets.forEach(function(secret) {
-    if (isFeishuVerificationToken(name, secret)) {
-      conditionalWebhookSecrets.push(Object.assign({}, secret, {
-        optional: false,
-        visible_when: { name: 'connection_mode', value: 'webhook' },
-        required_when_visible: true
-      }));
-    } else if (secret.optional) {
+    if (secret.optional && !secret.required_when_visible) {
       optionalSecrets.push(secret);
     } else {
       requiredSecrets.push(secret);
     }
   });
-  const requiredSetupFields = setupFields.filter((field) => !field.optional);
-  const optionalSetupFields = setupFields.filter((field) => field.optional);
+  const requiredSetupFields = setupFields.filter((field) => !field.optional || field.required_when_visible);
+  const optionalSetupFields = setupFields.filter((field) => field.optional && !field.required_when_visible);
 
   appendConfigureFieldGroup(form, fields, requiredSecrets, 'secret', false);
-  appendConfigureFieldGroup(form, fields, conditionalWebhookSecrets, 'secret', false);
   appendConfigureFieldGroup(form, fields, requiredSetupFields, 'field', false);
 
   const optionalCount = optionalSecrets.length + optionalSetupFields.length;

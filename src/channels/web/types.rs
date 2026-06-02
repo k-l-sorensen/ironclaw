@@ -558,10 +558,18 @@ pub struct SecretFieldInfo {
     pub optional: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub validation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub visible_when: Option<crate::tools::wasm::SetupVisibilityCondition>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub required_when_visible: bool,
     /// Whether this secret is already stored.
     pub provided: bool,
     /// Whether the secret will be auto-generated if left empty.
     pub auto_generate: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Serialize)]
@@ -635,6 +643,9 @@ pub struct ActionResponse {
     /// Whether the channel was successfully activated after setup.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub activated: Option<bool>,
+    /// Whether configuration was saved without activating the extension.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup_only: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub onboarding_state: Option<ChannelOnboardingState>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -650,6 +661,7 @@ impl ActionResponse {
             awaiting_token: None,
             instructions: None,
             activated: None,
+            setup_only: None,
             onboarding_state: None,
             onboarding: None,
         }
@@ -663,6 +675,7 @@ impl ActionResponse {
             awaiting_token: None,
             instructions: None,
             activated: None,
+            setup_only: None,
             onboarding_state: None,
             onboarding: None,
         }

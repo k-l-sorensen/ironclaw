@@ -27,7 +27,9 @@
       {
         "name": "feishu_verification_token",
         "prompt": "Enter your Feishu/Lark Verification Token (optional for websocket mode; required only if you choose webhook delivery)",
-        "optional": true
+        "optional": true,
+        "visible_when": { "name": "connection_mode", "value": "webhook" },
+        "required_when_visible": true
       }
     ],
     "secret_config_mappings": [

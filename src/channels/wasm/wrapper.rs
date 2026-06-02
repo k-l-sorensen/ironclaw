@@ -82,6 +82,7 @@ const FEISHU_WS_DEFAULT_RECONNECT_COUNT: i32 = -1;
 const FEISHU_WS_DEFAULT_RECONNECT_INTERVAL_SECS: u64 = 120;
 const FEISHU_WS_DEFAULT_RECONNECT_NONCE_SECS: u64 = 30;
 const FEISHU_WS_FRAME_CACHE_TTL_MS: u64 = 10_000;
+const WEBSOCKET_MIN_STABLE_CONNECTION_SECS: u64 = 30;
 const FEISHU_WS_MAX_FRAME_FRAGMENTS: usize = 256;
 const FEISHU_WS_MAX_FRAME_CACHE_ENTRIES: usize = 512;
 const FEISHU_WS_MAX_MERGED_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -1541,7 +1542,7 @@ impl WasmChannel {
             let mut shutdown = std::pin::pin!(shutdown_rx);
             let mut reconnect_attempt = 0u32;
 
-            tracing::info!(
+            tracing::debug!(
                 channel = %channel_name,
                 url = %config.url,
                 "Starting websocket runtime"
@@ -1554,7 +1555,7 @@ impl WasmChannel {
                 &capabilities,
                 workspace_store.as_ref(),
             ) {
-                tracing::info!(
+                tracing::warn!(
                     channel = %channel_name,
                     protocol = ?websocket_protocol,
                     "Skipping websocket runtime start: channel config selected webhook mode"
@@ -1631,7 +1632,6 @@ impl WasmChannel {
                 let connect_result = tokio_tungstenite::connect_async(connect_url.as_str()).await;
                 let (stream, _) = match connect_result {
                     Ok(parts) => {
-                        reconnect_attempt = 0;
                         tracing::info!(channel = %channel_name, "Websocket runtime connected");
                         parts
                     }
@@ -1658,6 +1658,7 @@ impl WasmChannel {
                 };
 
                 let (mut write, mut read) = stream.split();
+                let connected_at = tokio::time::Instant::now();
                 let mut next_heartbeat: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
                 session_state.reset_connection();
                 let mut stop_runtime = false;
@@ -1733,8 +1734,10 @@ impl WasmChannel {
                     break 'reconnect;
                 }
                 if should_reconnect {
-                    let backoff = websocket_reconnect_backoff(reconnect_attempt);
-                    reconnect_attempt = reconnect_attempt.saturating_add(1);
+                    let backoff = websocket_reconnect_backoff_after_connection(
+                        &mut reconnect_attempt,
+                        connected_at.elapsed(),
+                    );
                     tracing::info!(
                         channel = %channel_name,
                         protocol = ?websocket_protocol,
@@ -2043,8 +2046,10 @@ impl WasmChannel {
                 }
 
                 *websocket_outbound_tx_state.write().await = None;
-                let backoff = websocket_reconnect_backoff(reconnect_attempt);
-                reconnect_attempt = reconnect_attempt.saturating_add(1);
+                let backoff = websocket_reconnect_backoff_after_connection(
+                    &mut reconnect_attempt,
+                    connected_at.elapsed(),
+                );
                 tracing::info!(
                     channel = %channel_name,
                     backoff_secs = backoff.as_secs(),
@@ -4419,7 +4424,21 @@ fn websocket_runtime_disabled_by_channel_config(
     workspace_store
         .snapshot()
         .get(&path)
-        .is_some_and(|mode| mode.trim().eq_ignore_ascii_case("webhook"))
+        .and_then(|mode| FeishuConnectionMode::parse(mode))
+        .is_some_and(|mode| mode == FeishuConnectionMode::Webhook)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum FeishuConnectionMode {
+    Websocket,
+    Webhook,
+}
+
+impl FeishuConnectionMode {
+    fn parse(value: &str) -> Option<Self> {
+        serde_json::from_value(serde_json::Value::String(value.trim().to_ascii_lowercase())).ok()
+    }
 }
 
 fn uses_wecom_aibot_protocol(capabilities: &ChannelCapabilities) -> bool {
@@ -4972,6 +4991,18 @@ fn websocket_reconnect_backoff(attempt: u32) -> Duration {
     // thundering-herd when many bots reconnect after a Discord deploy.
     let jitter_ms = rand::thread_rng().gen_range(0..=base_ms / 4);
     Duration::from_millis(base_ms + jitter_ms)
+}
+
+fn websocket_reconnect_backoff_after_connection(
+    reconnect_attempt: &mut u32,
+    connected_for: Duration,
+) -> Duration {
+    if connected_for >= Duration::from_secs(WEBSOCKET_MIN_STABLE_CONNECTION_SECS) {
+        *reconnect_attempt = 0;
+    }
+    let backoff = websocket_reconnect_backoff(*reconnect_attempt);
+    *reconnect_attempt = (*reconnect_attempt).saturating_add(1);
+    backoff
 }
 
 fn websocket_heartbeat_sleep_duration(interval_ms: u64) -> Duration {
@@ -5608,7 +5639,7 @@ impl FeishuEventSessionState {
                 FeishuFrameCacheEntry {
                     parts: vec![None; sum],
                     trace_id,
-                    ack_frame,
+                    ack_frame: ack_frame.clone(),
                     created_at_ms: current_unix_millis(),
                 },
             );
@@ -5619,11 +5650,11 @@ impl FeishuEventSessionState {
                 .frame_cache
                 .get(&message_id)
                 .ok_or_else(|| format!("missing frame cache entry for message {message_id}"))?;
-            let old_part_len = entry.parts[seq].as_ref().map_or(0, Vec::len);
+            if entry.parts[seq].is_some() {
+                return Ok(None);
+            }
             let existing_total = entry.parts.iter().flatten().map(Vec::len).sum::<usize>();
-            existing_total
-                .saturating_sub(old_part_len)
-                .saturating_add(payload.len())
+            existing_total.saturating_add(payload.len())
         };
         if merged_total > FEISHU_WS_MAX_MERGED_PAYLOAD_BYTES {
             self.frame_cache.remove(&message_id);
@@ -5638,6 +5669,7 @@ impl FeishuEventSessionState {
                 .frame_cache
                 .get_mut(&message_id)
                 .ok_or_else(|| format!("missing frame cache entry for message {message_id}"))?;
+            entry.ack_frame = ack_frame;
             entry.parts[seq] = Some(payload);
 
             if !entry.parts.iter().all(Option::is_some) {
@@ -5679,7 +5711,8 @@ impl FeishuEventSessionState {
     fn prune_expired_cache(&mut self) {
         let now = current_unix_millis();
         self.frame_cache.retain(|_, entry| {
-            now.saturating_sub(entry.created_at_ms) <= FEISHU_WS_FRAME_CACHE_TTL_MS
+            now.checked_sub(entry.created_at_ms)
+                .is_some_and(|age| age <= FEISHU_WS_FRAME_CACHE_TTL_MS)
         });
     }
 }
@@ -7307,15 +7340,16 @@ mod tests {
         PreparedChannelModule, WasmChannelRuntime, WasmChannelRuntimeConfig,
     };
     use crate::channels::wasm::wrapper::{
-        DiscordGatewayWebsocketConfig, EmitDispatchContext, FeishuEventSessionState, FeishuWsFrame,
-        FeishuWsHeader, HttpResponse, TELEGRAM_TEST_API_BASE_ENV, TEST_HTTP_REWRITE_MAP_ENV,
-        WEBSOCKET_EVENT_QUEUE_MAX_ITEMS, WasmChannel, WebsocketAuthPreflight,
-        WebsocketCloseDisposition, WebsocketConnectPreparationError, WebsocketFrameAction,
-        WebsocketPollContext, WebsocketProtocolConfig, WebsocketProtocolKind,
-        WebsocketRuntimeConfig, WebsocketStartDecision, WecomAibotSessionState,
-        build_discord_gateway_presence_update, build_websocket_identify_message,
-        build_websocket_resume_message, build_wecom_aibot_ping_message,
-        build_wecom_aibot_subscribe_message, classify_websocket_close_code, decode_feishu_ws_frame,
+        DiscordGatewayWebsocketConfig, EmitDispatchContext, FeishuEventSessionState,
+        FeishuFrameCacheEntry, FeishuWsFrame, FeishuWsHeader, HttpResponse,
+        TELEGRAM_TEST_API_BASE_ENV, TEST_HTTP_REWRITE_MAP_ENV, WEBSOCKET_EVENT_QUEUE_MAX_ITEMS,
+        WasmChannel, WebsocketAuthPreflight, WebsocketCloseDisposition,
+        WebsocketConnectPreparationError, WebsocketFrameAction, WebsocketPollContext,
+        WebsocketProtocolConfig, WebsocketProtocolKind, WebsocketRuntimeConfig,
+        WebsocketStartDecision, WecomAibotSessionState, build_discord_gateway_presence_update,
+        build_websocket_identify_message, build_websocket_resume_message,
+        build_wecom_aibot_ping_message, build_wecom_aibot_subscribe_message,
+        classify_websocket_close_code, current_unix_millis, decode_feishu_ws_frame,
         discord_gateway_presence_status, drain_guest_logs, encode_feishu_ws_frame,
         feishu_endpoint_error, generated_image_delivery_key, parse_websocket_invalid_session,
         parse_websocket_ready_session, parse_wecom_aibot_frame, prepare_response_attachments,
@@ -7323,7 +7357,8 @@ mod tests {
         should_warn_on_heartbeat_interval, spawn_websocket_poll, uses_owner_broadcast_target,
         validate_feishu_connect_url, websocket_auth_preflight, websocket_heartbeat_sleep_duration,
         websocket_processing_queue_path, websocket_queue_path, websocket_reconnect_backoff,
-        websocket_runtime_disabled_by_channel_config, websocket_start_decision,
+        websocket_reconnect_backoff_after_connection, websocket_runtime_disabled_by_channel_config,
+        websocket_start_decision,
     };
     use crate::channels::{OutgoingAttachment, OutgoingResponse};
     use crate::pairing::PairingStore;
@@ -7897,6 +7932,33 @@ mod tests {
     }
 
     #[test]
+    fn test_feishu_websocket_runtime_not_disabled_for_websocket_mode() {
+        let capabilities = feishu_websocket_capabilities();
+        let config = WebsocketRuntimeConfig::from_capabilities(&capabilities)
+            .expect("feishu websocket config should be parsed");
+        let workspace_store = ChannelWorkspaceStore::new();
+
+        assert!(!websocket_runtime_disabled_by_channel_config(
+            &config,
+            &capabilities,
+            &workspace_store
+        ));
+
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            capabilities.prefix_workspace_path("connection_mode"),
+            "websocket".to_string(),
+        );
+        workspace_store.restore_snapshot(&snapshot);
+
+        assert!(!websocket_runtime_disabled_by_channel_config(
+            &config,
+            &capabilities,
+            &workspace_store
+        ));
+    }
+
+    #[test]
     fn test_feishu_websocket_connect_url_validation_rejects_unsafe_targets() {
         let capabilities = feishu_websocket_capabilities();
         let config = WebsocketRuntimeConfig::from_capabilities(&capabilities)
@@ -7927,6 +7989,60 @@ mod tests {
             validate_feishu_connect_url(&feishu, "wss://127.0.0.1/ws?device_id=d&service_id=1")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_feishu_effective_base_url_reads_workspace_override() {
+        let capabilities = feishu_websocket_capabilities();
+        let config = WebsocketRuntimeConfig::from_capabilities(&capabilities)
+            .expect("feishu websocket config should be parsed");
+        let WebsocketProtocolConfig::FeishuEvent(feishu) = config.protocol else {
+            panic!("expected feishu websocket config");
+        };
+        let workspace_store = ChannelWorkspaceStore::new();
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            capabilities.prefix_workspace_path("api_base"),
+            "https://open.larksuite.com/open-apis/".to_string(),
+        );
+        workspace_store.restore_snapshot(&snapshot);
+
+        assert_eq!(
+            super::feishu_effective_base_url(&feishu, &capabilities, &workspace_store)
+                .expect("lark base URL should be allowed"),
+            "https://open.larksuite.com"
+        );
+    }
+
+    #[test]
+    fn test_feishu_effective_base_url_rejects_disallowed_origin() {
+        let capabilities = feishu_websocket_capabilities();
+        let config = WebsocketRuntimeConfig::from_capabilities(&capabilities)
+            .expect("feishu websocket config should be parsed");
+        let WebsocketProtocolConfig::FeishuEvent(feishu) = config.protocol else {
+            panic!("expected feishu websocket config");
+        };
+        let workspace_store = ChannelWorkspaceStore::new();
+        let mut snapshot = HashMap::new();
+        snapshot.insert(
+            capabilities.prefix_workspace_path("api_base"),
+            "https://example.invalid".to_string(),
+        );
+        workspace_store.restore_snapshot(&snapshot);
+
+        let error = super::feishu_effective_base_url(&feishu, &capabilities, &workspace_store)
+            .expect_err("disallowed base URL should be rejected");
+
+        assert!(error.contains("not in the capability allowlist"));
+
+        snapshot.insert(
+            capabilities.prefix_workspace_path("api_base"),
+            "not a url".to_string(),
+        );
+        workspace_store.restore_snapshot(&snapshot);
+        let error = super::feishu_effective_base_url(&feishu, &capabilities, &workspace_store)
+            .expect_err("invalid base URL should be rejected");
+        assert!(error.contains("invalid Feishu websocket base URL"));
     }
 
     #[test]
@@ -8211,7 +8327,7 @@ mod tests {
             headers.get("message_id").map(String::as_str),
             Some("fragmented-message")
         );
-        assert_eq!(headers.get("seq").map(String::as_str), Some("0"));
+        assert_eq!(headers.get("seq").map(String::as_str), Some("1"));
     }
 
     #[test]
@@ -8305,6 +8421,51 @@ mod tests {
             feishu_ack_code(&ack_bytes),
             u64::from(super::FEISHU_WS_ACK_INTERNAL_ERROR)
         );
+        assert!(state.frame_cache.is_empty());
+    }
+
+    #[test]
+    fn test_feishu_websocket_duplicate_fragment_seq_does_not_overwrite_payload() {
+        let first = feishu_event_frame("duplicate-seq", 0, 2, b"{");
+        let duplicate = feishu_event_frame("duplicate-seq", 0, 2, br#""bad":"#);
+        let second = feishu_event_frame("duplicate-seq", 1, 2, b"}");
+        let mut state = FeishuEventSessionState::new();
+
+        assert!(
+            state
+                .process_binary_frame(&encode_feishu_ws_frame(&first), "feishu")
+                .is_empty()
+        );
+        assert!(
+            state
+                .process_binary_frame(&encode_feishu_ws_frame(&duplicate), "feishu")
+                .is_empty()
+        );
+        let (enqueued, _ack_bytes) = take_feishu_event_actions(
+            state.process_binary_frame(&encode_feishu_ws_frame(&second), "feishu"),
+        );
+
+        assert_eq!(enqueued, "{}");
+    }
+
+    #[test]
+    fn test_feishu_websocket_prune_drops_future_timestamp_entries() {
+        let frame = feishu_event_frame("future-cache", 0, 2, b"{");
+        let mut state = FeishuEventSessionState::new();
+        state.frame_cache.insert(
+            "future-cache".to_string(),
+            FeishuFrameCacheEntry {
+                parts: vec![Some(b"{".to_vec()), None],
+                trace_id: "trace".to_string(),
+                ack_frame: frame,
+                created_at_ms: current_unix_millis()
+                    .saturating_add(super::FEISHU_WS_FRAME_CACHE_TTL_MS)
+                    .saturating_add(1),
+            },
+        );
+
+        state.prune_expired_cache();
+
         assert!(state.frame_cache.is_empty());
     }
 
@@ -8446,6 +8607,26 @@ mod tests {
         check(5, 32);
         check(6, 64);
         check(10, 64); // capped at 2^6
+    }
+
+    #[test]
+    fn test_websocket_reconnect_backoff_after_connection_only_resets_after_stable_duration() {
+        let mut attempt = 3;
+        let _backoff =
+            websocket_reconnect_backoff_after_connection(&mut attempt, Duration::from_secs(1));
+        assert_eq!(
+            attempt, 4,
+            "short-lived successful connections must keep increasing reconnect backoff"
+        );
+
+        let _backoff = websocket_reconnect_backoff_after_connection(
+            &mut attempt,
+            Duration::from_secs(super::WEBSOCKET_MIN_STABLE_CONNECTION_SECS),
+        );
+        assert_eq!(
+            attempt, 1,
+            "stable connections should reset before scheduling the next reconnect"
+        );
     }
 
     /// Build a Discord-like channel capability set with `connect_on_start=true`

@@ -766,6 +766,18 @@ pub struct ToolSecretSetupSchema {
     /// If true, the user may skip this secret.
     #[serde(default)]
     pub optional: bool,
+    /// Optional condition controlling when the setup UI should display it.
+    #[serde(default)]
+    pub visible_when: Option<SetupVisibilityCondition>,
+    /// If true, this secret is required whenever `visible_when` matches.
+    #[serde(default)]
+    pub required_when_visible: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SetupVisibilityCondition {
+    pub name: String,
+    pub value: String,
 }
 
 /// A non-secret field required during tool setup.

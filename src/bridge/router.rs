@@ -1698,6 +1698,7 @@ async fn submit_pending_auth_credential(
             crate::extensions::ConfigureResult {
                 message: format!("Credential '{}' stored.", credential_name),
                 activated: true,
+                setup_only: false,
                 pairing_required: false,
                 auth_url: None,
                 onboarding_state: None,

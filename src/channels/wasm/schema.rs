@@ -524,6 +524,14 @@ pub struct SecretSetupSchema {
     #[serde(default)]
     pub optional: bool,
 
+    /// Optional condition controlling when the setup UI should display it.
+    #[serde(default)]
+    pub visible_when: Option<crate::tools::wasm::SetupVisibilityCondition>,
+
+    /// If true, this secret is required whenever `visible_when` matches.
+    #[serde(default)]
+    pub required_when_visible: bool,
+
     /// Auto-generate configuration if the user doesn't provide a value.
     #[serde(default)]
     pub auto_generate: Option<AutoGenerateSchema>,

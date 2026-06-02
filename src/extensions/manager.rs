@@ -1129,7 +1129,8 @@ impl ExtensionManager {
 
         if let Some(store) = self.settings_store() {
             let stored_overrides =
-                Self::load_wasm_channel_runtime_override_map_for_user(store, &self.user_id).await?;
+                Self::load_wasm_channel_runtime_override_map_for_user(store, activation_user_id)
+                    .await?;
             let prefix = format!("{name}:");
             for (setting_key, value) in stored_overrides {
                 let Some(config_key) = setting_key.strip_prefix(&prefix) else {
@@ -7529,6 +7530,8 @@ impl ExtensionManager {
                         prompt: secret.prompt.clone(),
                         optional: secret.optional,
                         validation: secret.validation.clone(),
+                        visible_when: secret.visible_when.clone(),
+                        required_when_visible: secret.required_when_visible,
                         provided,
                         auto_generate: secret.auto_generate.is_some(),
                     });
@@ -7591,6 +7594,8 @@ impl ExtensionManager {
                             prompt: secret.prompt.clone(),
                             optional: secret.optional,
                             validation: None,
+                            visible_when: secret.visible_when.clone(),
+                            required_when_visible: secret.required_when_visible,
                             provided,
                             auto_generate: false,
                         });
@@ -8372,6 +8377,7 @@ impl ExtensionManager {
                     return Ok(ConfigureResult {
                         message,
                         activated: true,
+                        setup_only: false,
                         pairing_required: false,
                         auth_url,
                         onboarding_state: None,
@@ -8387,6 +8393,7 @@ impl ExtensionManager {
                     return Ok(ConfigureResult {
                         message: format!("Configuration saved for '{}'.", name),
                         activated: false,
+                        setup_only: true,
                         pairing_required: false,
                         auth_url: None,
                         onboarding_state: None,
@@ -8406,6 +8413,7 @@ impl ExtensionManager {
                     name
                 ),
                 activated: false,
+                setup_only: false,
                 pairing_required: false,
                 auth_url: auth_result.auth_url().map(String::from),
                 onboarding_state: None,
@@ -8423,6 +8431,7 @@ impl ExtensionManager {
                 return Ok(ConfigureResult {
                     message: format!("Configuration saved for '{}'.", name),
                     activated: false,
+                    setup_only: true,
                     pairing_required: false,
                     auth_url: None,
                     onboarding_state: None,
@@ -8479,6 +8488,7 @@ impl ExtensionManager {
                 Ok(ConfigureResult {
                     message,
                     activated: true,
+                    setup_only: false,
                     pairing_required: needs_pairing,
                     auth_url: None,
                     onboarding_state: if needs_pairing {
@@ -8516,6 +8526,7 @@ impl ExtensionManager {
                         name, e
                     ),
                     activated: false,
+                    setup_only: false,
                     pairing_required: false,
                     auth_url: None,
                     onboarding_state: None,
@@ -10768,6 +10779,101 @@ mod tests {
             .expect("reload setup schema");
         assert!(setup.fields[0].provided);
         assert_eq!(setup.fields[0].value.as_deref(), Some("webhook"));
+    }
+
+    #[tokio::test]
+    async fn test_load_channel_runtime_config_overrides_uses_activation_user_id() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, _db_dir) = make_test_store().await;
+        let tools_dir = dir.path().join("tools");
+        let channels_dir = dir.path().join("channels");
+        let mgr =
+            make_test_manager_with_dirs(None, tools_dir, channels_dir, Some(Arc::clone(&store)));
+        store
+            .set_setting(
+                "delegated",
+                super::WASM_CHANNEL_RUNTIME_OVERRIDES_SETTING_KEY,
+                &serde_json::json!({
+                    "feishu:connection_mode": "webhook"
+                }),
+            )
+            .await
+            .expect("persist delegated runtime override");
+
+        let runtime_overrides = mgr
+            .load_channel_runtime_config_overrides("feishu", "delegated")
+            .await
+            .expect("load delegated runtime overrides");
+
+        assert_eq!(
+            runtime_overrides.get("connection_mode"),
+            Some(&serde_json::json!("webhook"))
+        );
+        assert!(
+            mgr.load_channel_runtime_config_overrides("feishu", "test")
+                .await
+                .expect("load owner runtime overrides")
+                .is_empty(),
+            "owner scoped overrides should not leak into delegated activation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_wasm_channel_setup_schema_exposes_secret_visibility_conditions() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (store, _db_dir) = make_test_store().await;
+        let channels_dir = write_test_channel(
+            dir.path(),
+            "feishu",
+            r#"{
+                "version": "0.1.0",
+                "wit_version": "0.3.0",
+                "type": "channel",
+                "name": "feishu",
+                "setup": {
+                    "required_secrets": [
+                        {
+                            "name": "feishu_verification_token",
+                            "prompt": "Verification token",
+                            "optional": true,
+                            "visible_when": { "name": "connection_mode", "value": "webhook" },
+                            "required_when_visible": true
+                        }
+                    ],
+                    "required_fields": [
+                        {
+                            "name": "connection_mode",
+                            "prompt": "Message receiving mode",
+                            "optional": true,
+                            "input_type": "select",
+                            "options": [
+                                { "value": "websocket" },
+                                { "value": "webhook" }
+                            ]
+                        }
+                    ]
+                }
+            }"#,
+        );
+        let tools_dir = dir.path().join("tools");
+        let mgr =
+            make_test_manager_with_dirs(None, tools_dir, channels_dir, Some(Arc::clone(&store)));
+
+        let setup = mgr
+            .get_setup_schema("feishu", "test")
+            .await
+            .expect("load setup schema");
+
+        assert_eq!(setup.secrets.len(), 1);
+        assert!(setup.secrets[0].optional);
+        assert!(setup.secrets[0].required_when_visible);
+        assert_eq!(
+            setup.secrets[0]
+                .visible_when
+                .as_ref()
+                .map(|condition| (condition.name.as_str(), condition.value.as_str())),
+            Some(("connection_mode", "webhook"))
+        );
     }
 
     #[tokio::test]
