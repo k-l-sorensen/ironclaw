@@ -174,9 +174,12 @@ impl LocalDevCapabilityPolicy {
             ApprovalPolicy::AskDestructive => effects
                 .iter()
                 .any(|effect| self.approval_gates.ask_destructive.contains(effect)),
-            // Effective local policies should be concrete by the time they
-            // reach composition. If they are not, fail toward prompting.
-            ApprovalPolicy::OrgPolicy | _ => !effects.is_empty(),
+            // OrgPolicy is resolved server-side; if it reaches local composition
+            // unresolved, fail toward prompting (require approval).
+            ApprovalPolicy::OrgPolicy => !effects.is_empty(),
+            // Any future ApprovalPolicy variants default to fail-safe: require
+            // approval for non-empty effects rather than silently disabling gates.
+            _ => !effects.is_empty(),
         }
     }
 }
