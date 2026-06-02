@@ -1,38 +1,22 @@
 //! Cross-tenant authz regression for `POST /v1/responses`.
 //!
-//! Z1 (zmanian, 2026-05-17): `create_response_handler` used to stamp
-//! whatever `thread_uuid` the caller's `previous_response_id` decoded
-//! to into the outbound `notify_thread_id` / `client_thread_id`
-//! metadata without checking conversation ownership. Alice could
-//! therefore POST a `previous_response_id` belonging to Bob and the
-//! agent loop would tag callbacks back to Bob.
+//! `create_response_handler` decodes a `thread_uuid` from the caller's
+//! `previous_response_id` and stamps it into outbound
+//! `notify_thread_id` / `client_thread_id`. Without an ownership check,
+//! Alice could POST Bob's `previous_response_id` and have callbacks
+//! tagged to Bob's thread. The handler mirrors the GET-path
+//! `conversation_belongs_to_user` check and 404s on a foreign id
+//! (404 not 403 — don't leak existence); it fails closed when
+//! `state.store` is `None`.
 //!
-//! PR #3669 fixed the handler to mirror the GET-path
-//! `conversation_belongs_to_user` check, returning 404 for foreign
-//! `previous_response_id` (404 — not 403 — so the endpoint doesn't
-//! leak existence). zmanian's re-review at HEAD `35dcd225` flagged
-//! that the new check no-ops when `state.store` is `None` (silent
-//! authz bypass on a misconfigured deployment) AND that the claimed
-//! cross-tenant integration test was missing.
+//! Drives the handler over real HTTP with two tokens:
+//!   1. Alice's token + Bob's response id ⇒ 404, no `IncomingMessage`.
+//!   2. Alice's token + her own response id ⇒ passes; message lands on
+//!      `msg_tx` (pins against over-rotating to "404 everything").
 //!
-//! This file is the missing test. Per `.claude/rules/testing.md`
-//! ("Test Through the Caller"), the assertion drives
-//! `create_response_handler` over real HTTP with a real
-//! `Database`-backed store and two distinct tokens. Two cases:
-//!
-//! 1. Foreign-`previous_response_id` (Alice's token, Bob's response
-//!    id) must reject with **404 `invalid_request_error`** and must
-//!    NOT enqueue an `IncomingMessage` on the agent channel.
-//! 2. Same-user `previous_response_id` (Alice's token, Alice's
-//!    response id) must pass the gate. We pin this by capturing the
-//!    `IncomingMessage` on `msg_tx` — proof the request reached the
-//!    agent-loop dispatch past the authz check. Without this pin a
-//!    future over-rotation that 404s every `previous_response_id`
-//!    would silently still satisfy case 1.
-//!
-//! Gated on `feature = "libsql"` because the suite needs a real DB
-//! backend to seed conversations into and to satisfy the new
-//! fail-closed `state.store.is_some()` requirement on the POST path.
+//! libsql-gated: needs a real DB to seed conversations and to satisfy
+//! the fail-closed `state.store.is_some()` requirement.
+
 
 #![cfg(feature = "libsql")]
 
