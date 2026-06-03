@@ -1315,9 +1315,10 @@ impl WasmChannel {
         // Serialize back
         *config_guard = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
+        let redacted_config = redact_config_json_for_log(&config_guard);
         tracing::debug!(
             channel = %self.name,
-            config = %*config_guard,
+            config = %redacted_config,
             "Updated channel config"
         );
 
@@ -3212,12 +3213,15 @@ impl WasmChannel {
                 // No-op, too noisy
             }
             StatusUpdate::ImageGenerated { data_url, .. }
-                if uses_wecom_aibot_protocol(&self.capabilities) =>
+                if should_stage_generated_image_for_final_response(
+                    &self.name,
+                    &self.capabilities,
+                ) =>
             {
-                // WeCom AI Bot stream replies are updated by req_id/stream id.
-                // Sending the image as its own final frame before the assistant's
-                // final text lets the text response overwrite the image. Stage
-                // it and deliver it with the final on_respond payload instead.
+                // Some WASM channel transports need generated images delivered
+                // together with the final text response: WeCom websocket frames
+                // can overwrite earlier image frames, and Feishu sends images
+                // through AgentResponse attachments rather than status updates.
                 self.cancel_typing_task().await;
 
                 match stage_generated_image_data_url(data_url) {
@@ -4446,6 +4450,13 @@ fn uses_wecom_aibot_protocol(capabilities: &ChannelCapabilities) -> bool {
         WebsocketRuntimeConfig::from_capabilities(capabilities).map(|config| config.protocol),
         Some(WebsocketProtocolConfig::WecomAibot(_))
     )
+}
+
+fn should_stage_generated_image_for_final_response(
+    channel_name: &str,
+    capabilities: &ChannelCapabilities,
+) -> bool {
+    uses_wecom_aibot_protocol(capabilities) || channel_name == "feishu"
 }
 
 fn normalize_websocket_protocol_name(protocol: &str) -> Option<&'static str> {
@@ -5899,6 +5910,47 @@ fn redact_websocket_url(url: &str) -> String {
         redacted.push_str("?<redacted>");
     }
     redacted
+}
+
+fn redact_config_json_for_log(config_json: &str) -> String {
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(config_json) else {
+        return "<invalid-json>".to_string();
+    };
+    redact_sensitive_config_keys(&mut value);
+    serde_json::to_string(&value).unwrap_or_else(|_| "<invalid-json>".to_string())
+}
+
+fn redact_sensitive_config_keys(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                if is_sensitive_config_key(key) {
+                    *child = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_sensitive_config_keys(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_sensitive_config_keys(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_sensitive_config_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key == "secret"
+        || key.ends_with("_secret")
+        || key == "token"
+        || key.ends_with("_token")
+        || key == "password"
+        || key.ends_with("_password")
+        || key == "api_key"
+        || key.ends_with("_api_key")
+        || key == "authorization"
 }
 
 fn build_feishu_ws_ping_frame(service_id: i32) -> Vec<u8> {
@@ -8064,6 +8116,29 @@ mod tests {
             redact_websocket_url("wss://open.feishu.cn/ws?device_id=d&service_id=s#frag"),
             "wss://open.feishu.cn/ws?<redacted>"
         );
+    }
+
+    #[test]
+    fn test_redact_config_json_for_log_redacts_sensitive_keys() {
+        let config = serde_json::json!({
+            "app_id": "cli_abc",
+            "app_secret": "secret-value",
+            "verification_token": "token-value",
+            "nested": {
+                "api_key": "api-key-value",
+                "mode": "websocket"
+            }
+        });
+
+        let redacted = super::redact_config_json_for_log(&config.to_string());
+
+        assert!(redacted.contains("\"app_id\":\"cli_abc\""));
+        assert!(redacted.contains("\"app_secret\":\"<redacted>\""));
+        assert!(redacted.contains("\"verification_token\":\"<redacted>\""));
+        assert!(redacted.contains("\"api_key\":\"<redacted>\""));
+        assert!(!redacted.contains("secret-value"));
+        assert!(!redacted.contains("token-value"));
+        assert!(!redacted.contains("api-key-value"));
     }
 
     #[test]

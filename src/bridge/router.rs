@@ -5014,6 +5014,8 @@ fn spawn_post_park_continuation(
 
         let response_text: Option<String> = match &outcome {
             ThreadOutcome::Completed { response } => {
+                forward_v2_generated_images_to_channel(&store, &channels, thread_id, &message)
+                    .await;
                 if let Some(ref db) = db {
                     persist_v2_tool_calls(&store, db, thread_id, &message).await;
                 }
@@ -5500,6 +5502,13 @@ async fn await_thread_outcome(
     let result = match outcome {
         ThreadOutcome::Completed { response } => {
             debug!(thread_id = %thread_id, "engine v2: completed");
+            forward_v2_generated_images_to_channel(
+                &state.store,
+                &agent.channels,
+                thread_id,
+                message,
+            )
+            .await;
 
             // Text-based auth fallback: detect authentication_required in the
             // response and enter auth mode. This is a defense-in-depth safety net
@@ -6147,6 +6156,78 @@ async fn persist_v2_tool_calls(
             .await
     {
         tracing::warn!(thread_id = %thread_id, "failed to persist v2 tool_calls to v1 DB: {e}");
+    }
+}
+
+fn generated_image_statuses_from_v2_thread(thread: &ironclaw_engine::Thread) -> Vec<StatusUpdate> {
+    let mut statuses = Vec::new();
+    for (index, msg) in thread.internal_messages.iter().enumerate() {
+        if msg.role != ironclaw_engine::MessageRole::ActionResult {
+            continue;
+        }
+        let Some(action_name) = msg.action_name.as_deref() else {
+            continue;
+        };
+        if !matches!(action_name, "image_generate" | "image_edit") {
+            continue;
+        }
+        let Some(sentinel) =
+            crate::generated_images::GeneratedImageSentinel::from_output(&msg.content)
+        else {
+            continue;
+        };
+        let data_url = sentinel.data_url().unwrap_or_default();
+        if data_url.is_empty() {
+            tracing::warn!(
+                thread_id = %thread.id,
+                action_name,
+                "engine v2 generated image sentinel has no data URL; skipping channel image delivery"
+            );
+            continue;
+        }
+        statuses.push(StatusUpdate::ImageGenerated {
+            event_id: msg
+                .action_call_id
+                .clone()
+                .unwrap_or_else(|| format!("v2-generated-image-{index}")),
+            data_url: data_url.to_string(),
+            path: sentinel.path().map(String::from),
+        });
+    }
+    statuses
+}
+
+async fn forward_v2_generated_images_to_channel(
+    store: &std::sync::Arc<dyn Store>,
+    channels: &std::sync::Arc<crate::channels::ChannelManager>,
+    thread_id: ironclaw_engine::ThreadId,
+    message: &IncomingMessage,
+) {
+    let thread = match store.load_thread(thread_id).await {
+        Ok(Some(thread)) => thread,
+        Ok(None) => return,
+        Err(e) => {
+            tracing::debug!(
+                thread_id = %thread_id,
+                error = %e,
+                "failed to load thread for generated image channel delivery"
+            );
+            return;
+        }
+    };
+
+    for status in generated_image_statuses_from_v2_thread(&thread) {
+        if let Err(e) = channels
+            .send_status(&message.channel, status, &message.metadata)
+            .await
+        {
+            tracing::debug!(
+                thread_id = %thread_id,
+                channel = %message.channel,
+                error = %e,
+                "failed to forward generated image status to channel"
+            );
+        }
     }
 }
 
@@ -9187,6 +9268,58 @@ mod tests {
             } if call_id.as_deref() == Some("call-memory-read-1")
                 && duration_ms == &Some(42)
                 && *success
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_v2_generated_images_to_channel_sends_image_status() {
+        let store = Arc::new(TestStore::new());
+        let mut thread = ironclaw_engine::Thread::new(
+            "goal",
+            ironclaw_engine::ThreadType::Foreground,
+            ironclaw_engine::ProjectId::new(),
+            "alice",
+            ironclaw_engine::ThreadConfig::default(),
+        );
+        thread.add_internal_message(ironclaw_engine::ThreadMessage::action_result(
+            "call-image-1",
+            "image_generate",
+            &serde_json::json!({
+                "type": "image_generated",
+                "data": "data:image/png;base64,YWJj",
+                "media_type": "image/png",
+            })
+            .to_string(),
+        ));
+        let thread_id = thread.id;
+        store.save_thread(&thread).await.expect("save thread");
+
+        let statuses = Arc::new(TokioMutex::new(Vec::new()));
+        let manager = ChannelManager::new();
+        manager
+            .add(Box::new(RecordingStatusChannel {
+                name: "feishu".to_string(),
+                statuses: Arc::clone(&statuses),
+            }))
+            .await;
+        let manager = Arc::new(manager);
+        let store: Arc<dyn Store> = store;
+        let message = IncomingMessage::new("feishu", "alice", "generate image")
+            .with_metadata(serde_json::json!({"message_id": "om_1"}));
+
+        forward_v2_generated_images_to_channel(&store, &manager, thread_id, &message).await;
+
+        let statuses = statuses.lock().await;
+        assert_eq!(statuses.len(), 1);
+        assert!(matches!(
+            &statuses[0],
+            StatusUpdate::ImageGenerated {
+                event_id,
+                data_url,
+                path,
+            } if event_id == "call-image-1"
+                && data_url == "data:image/png;base64,YWJj"
+                && path.is_none()
         ));
     }
 

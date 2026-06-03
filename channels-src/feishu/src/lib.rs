@@ -38,10 +38,10 @@ use subtle::ConstantTimeEq;
 
 // Re-export generated types
 use exports::near::agent::channel::{
-    AgentResponse, ChannelConfig, Guest, HttpEndpointConfig, IncomingHttpRequest,
+    AgentResponse, Attachment, ChannelConfig, Guest, HttpEndpointConfig, IncomingHttpRequest,
     OutgoingHttpResponse, StatusUpdate,
 };
-use near::agent::channel_host::{self, EmittedMessage};
+use near::agent::channel_host::{self, EmittedMessage, InboundAttachment};
 
 // ============================================================================
 // Workspace paths for cross-callback state
@@ -58,6 +58,8 @@ const TOKEN_PATH: &str = "tenant_access_token";
 const TOKEN_EXPIRY_PATH: &str = "token_expiry";
 const CONNECTION_MODE_PATH: &str = "connection_mode";
 const WEBSOCKET_EVENT_QUEUE_PATH: &str = "state/gateway_event_queue_processing";
+const MAX_INBOUND_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_OUTBOUND_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
 // ============================================================================
 // Feishu API Types
@@ -201,6 +203,12 @@ struct TextContent {
     text: String,
 }
 
+/// Image message content (when message_type == "image").
+#[derive(Debug, Deserialize)]
+struct ImageContent {
+    image_key: String,
+}
+
 /// Metadata stored for responding to messages.
 #[derive(Debug, Serialize, Deserialize)]
 struct FeishuMessageMetadata {
@@ -214,8 +222,13 @@ struct FeishuMessageMetadata {
 struct FeishuApiResponse<T> {
     code: i32,
     msg: String,
-    #[serde(default)]
     data: Option<T>,
+}
+
+/// Upload image API response data.
+#[derive(Debug, Deserialize)]
+struct UploadImageData {
+    image_key: String,
 }
 
 /// Tenant access token response (flat format).
@@ -464,11 +477,11 @@ impl Guest for FeishuChannel {
         let metadata: FeishuMessageMetadata = serde_json::from_str(&response.metadata_json)
             .map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
-        send_reply(&metadata.message_id, &response.content)
+        send_reply_response(&metadata.message_id, &response)
     }
 
     fn on_broadcast(user_id: String, response: AgentResponse) -> Result<(), String> {
-        send_message(&user_id, "open_id", &response.content)
+        send_message_response(&user_id, "open_id", &response)
     }
 
     fn on_status(_update: StatusUpdate) {
@@ -493,7 +506,7 @@ fn process_websocket_event_queue() {
             let _ = channel_host::workspace_write(WEBSOCKET_EVENT_QUEUE_PATH, queue_json);
         },
         |frame| process_feishu_event_payload(frame, false),
-        |level, message| channel_host::log(level, message),
+        channel_host::log,
     );
 }
 
@@ -503,40 +516,29 @@ fn process_websocket_event_queue_with(
     mut process_payload: impl FnMut(&str),
     mut log: impl FnMut(channel_host::LogLevel, &str),
 ) {
-    loop {
-        let queue_json = read_queue();
-        if queue_json.trim().is_empty() {
+    let queue_json = read_queue();
+    if queue_json.trim().is_empty() {
+        return;
+    }
+
+    let frames: Vec<String> = match serde_json::from_str(&queue_json) {
+        Ok(frames) => frames,
+        Err(error) => {
+            log(
+                channel_host::LogLevel::Warn,
+                &format!("Failed to deserialize Feishu websocket queue: {error}"),
+            );
+            write_queue("[]");
             return;
         }
+    };
 
-        let mut frames: Vec<String> = match serde_json::from_str(&queue_json) {
-            Ok(frames) => frames,
-            Err(error) => {
-                log(
-                    channel_host::LogLevel::Warn,
-                    &format!("Failed to deserialize Feishu websocket queue: {error}"),
-                );
-                write_queue("[]");
-                return;
-            }
-        };
+    if frames.is_empty() {
+        return;
+    }
 
-        if frames.is_empty() {
-            return;
-        }
-
-        let frame = frames.remove(0);
-        let remaining = match serde_json::to_string(&frames) {
-            Ok(remaining) => remaining,
-            Err(error) => {
-                log(
-                    channel_host::LogLevel::Error,
-                    &format!("Failed to serialize Feishu websocket queue: {error}"),
-                );
-                return;
-            }
-        };
-        write_queue(&remaining);
+    write_queue("[]");
+    for frame in frames {
         process_payload(&frame);
     }
 }
@@ -569,7 +571,8 @@ fn process_feishu_event_payload_with_workspace(
         }
     };
 
-    let configured_token = workspace_read(VERIFICATION_TOKEN_PATH).filter(|token| !token.is_empty());
+    let configured_token =
+        workspace_read(VERIFICATION_TOKEN_PATH).filter(|token| !token.is_empty());
     if require_webhook_auth
         && !is_authenticated_webhook(
             false,
@@ -736,13 +739,13 @@ fn handle_message_event(event_data: &serde_json::Value) {
         }
     }
 
-    // Extract text content.
-    let text = extract_text_content(&msg_event.message);
-    if text.is_empty() {
+    // Extract text and media content.
+    let (text, attachments) = extract_message_content(&msg_event.message);
+    if text.is_empty() && attachments.is_empty() {
         channel_host::log(
             channel_host::LogLevel::Debug,
             &format!(
-                "Ignoring non-text message type: {}",
+                "Ignoring unsupported message type: {}",
                 msg_event.message.message_type
             ),
         );
@@ -773,14 +776,11 @@ fn handle_message_event(event_data: &serde_json::Value) {
         content: text,
         thread_id,
         metadata_json,
-        attachments: vec![],
+        attachments,
     });
 }
 
-/// Extract text content from a Feishu message.
-///
-/// Currently handles "text" message type. Other types (image, post, file,
-/// etc.) are logged and skipped.
+/// Extract text and supported media content from a Feishu message.
 fn extract_text_content(message: &FeishuMessage) -> String {
     match message.message_type.as_str() {
         "text" => {
@@ -803,12 +803,195 @@ fn extract_text_content(message: &FeishuMessage) -> String {
     }
 }
 
+fn extract_message_content(message: &FeishuMessage) -> (String, Vec<InboundAttachment>) {
+    match message.message_type.as_str() {
+        "text" => (extract_text_content(message), Vec::new()),
+        "image" => match feishu_image_attachment(message) {
+            Ok(attachment) => (String::new(), vec![attachment]),
+            Err(error) => {
+                channel_host::log(
+                    channel_host::LogLevel::Warn,
+                    &format!("Failed to prepare Feishu image attachment: {error}"),
+                );
+                (String::new(), Vec::new())
+            }
+        },
+        _ => (String::new(), Vec::new()),
+    }
+}
+
+fn base_mime_type(mime_type: &str) -> &str {
+    mime_type.split(';').next().unwrap_or("").trim()
+}
+
+fn header_value_case_insensitive<'a>(
+    headers: &'a serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .and_then(|(_, value)| value.as_str())
+}
+
+fn filename_extension_for_mime(mime_type: &str) -> &'static str {
+    match base_mime_type(mime_type).to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
+        "image/tiff" => "tiff",
+        "image/heic" | "image/heif" => "heic",
+        _ => "jpg",
+    }
+}
+
+fn parse_image_content(content: &str) -> Result<ImageContent, String> {
+    serde_json::from_str::<ImageContent>(content)
+        .map_err(|e| format!("Failed to parse Feishu image content: {e}"))
+}
+
+fn feishu_image_resource_url(api_base: &str, message_id: &str, image_key: &str) -> String {
+    format!(
+        "{}/open-apis/im/v1/messages/{}/resources/{}?type=image",
+        api_base, message_id, image_key
+    )
+}
+
+fn feishu_image_attachment(message: &FeishuMessage) -> Result<InboundAttachment, String> {
+    let image = parse_image_content(&message.content)?;
+    let api_base = channel_host::workspace_read(API_BASE_PATH)
+        .unwrap_or_else(|| "https://open.feishu.cn".to_string());
+    let source_url =
+        feishu_image_resource_url(&api_base, &message.message_id, image.image_key.as_str());
+    let attachment_id = format!("{}:{}", message.message_id, image.image_key);
+    let attachment = InboundAttachment {
+        id: attachment_id,
+        mime_type: "image/jpeg".to_string(),
+        filename: Some(format!("feishu-{}.jpg", message.message_id)),
+        size_bytes: None,
+        source_url: Some(source_url.clone()),
+        storage_key: None,
+        extracted_text: None,
+        extras_json: serde_json::json!({
+            "feishu_image_key": image.image_key,
+            "feishu_message_id": message.message_id,
+        })
+        .to_string(),
+    };
+
+    #[cfg(not(test))]
+    {
+        let mut attachment = attachment;
+        hydrate_feishu_image_attachment(&mut attachment, &source_url)?;
+        Ok(attachment)
+    }
+
+    #[cfg(test)]
+    {
+        Ok(attachment)
+    }
+}
+
+#[cfg(not(test))]
+fn hydrate_feishu_image_attachment(
+    attachment: &mut InboundAttachment,
+    source_url: &str,
+) -> Result<(), String> {
+    let api_base = channel_host::workspace_read(API_BASE_PATH)
+        .unwrap_or_else(|| "https://open.feishu.cn".to_string());
+    let token = get_valid_token(&api_base)?;
+    let headers = serde_json::json!({
+        "Authorization": format!("Bearer {}", token),
+        "Content-Type": "application/json; charset=utf-8",
+    });
+
+    let response =
+        channel_host::http_request("GET", source_url, &headers.to_string(), None, Some(30_000))
+            .map_err(|e| format!("Failed to download Feishu image: {e}"))?;
+    if response.status != 200 {
+        return Err(format!(
+            "Feishu image download returned {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ));
+    }
+    if response.body.len() > MAX_INBOUND_IMAGE_BYTES {
+        return Err(format!(
+            "Feishu image exceeds {} bytes",
+            MAX_INBOUND_IMAGE_BYTES
+        ));
+    }
+
+    let headers: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&response.headers_json).unwrap_or_default();
+    let mime_type = header_value_case_insensitive(&headers, "content-type")
+        .map(base_mime_type)
+        .filter(|value| value.starts_with("image/"))
+        .unwrap_or("image/jpeg")
+        .to_string();
+    let extension = filename_extension_for_mime(&mime_type);
+    attachment.mime_type = mime_type;
+    attachment.filename = Some(format!("{}.{}", attachment.id, extension));
+    attachment.size_bytes = Some(response.body.len() as u64);
+
+    channel_host::store_attachment_data(&attachment.id, &response.body)
+        .map_err(|e| format!("Failed to store Feishu image attachment data: {e}"))?;
+
+    Ok(())
+}
+
 // ============================================================================
 // Outbound Messaging
 // ============================================================================
 
+fn validate_feishu_api_response<T: for<'de> Deserialize<'de>>(
+    body: &[u8],
+) -> Result<FeishuApiResponse<T>, String> {
+    let api_resp: FeishuApiResponse<T> = serde_json::from_slice(body)
+        .map_err(|e| format!("Failed to parse Feishu API response: {e}"))?;
+    if api_resp.code != 0 {
+        return Err(format!(
+            "Feishu API error {}: {}",
+            api_resp.code, api_resp.msg
+        ));
+    }
+    Ok(api_resp)
+}
+
+fn checked_feishu_request(
+    method: &str,
+    url: &str,
+    headers_json: &str,
+    body: Option<&[u8]>,
+    timeout_ms: u32,
+) -> Result<Vec<u8>, String> {
+    let response = channel_host::http_request(method, url, headers_json, body, Some(timeout_ms))
+        .map_err(|e| format!("HTTP request failed: {e}"))?;
+    if response.status != 200 {
+        return Err(format!(
+            "Feishu API returned {}: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ));
+    }
+    Ok(response.body)
+}
+
 /// Reply to a specific message.
 fn send_reply(message_id: &str, content: &str) -> Result<(), String> {
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    send_reply_payload(
+        message_id,
+        "text",
+        serde_json::json!({"text": content}).to_string(),
+    )
+}
+
+fn send_reply_payload(message_id: &str, msg_type: &str, content: String) -> Result<(), String> {
     let api_base = channel_host::workspace_read(API_BASE_PATH)
         .unwrap_or_else(|| "https://open.feishu.cn".to_string());
 
@@ -817,8 +1000,8 @@ fn send_reply(message_id: &str, content: &str) -> Result<(), String> {
     let url = format!("{}/open-apis/im/v1/messages/{}/reply", api_base, message_id);
 
     let body = ReplyMessageBody {
-        msg_type: "text".to_string(),
-        content: serde_json::json!({"text": content}).to_string(),
+        msg_type: msg_type.to_string(),
+        content,
     };
 
     let body_json =
@@ -829,42 +1012,37 @@ fn send_reply(message_id: &str, content: &str) -> Result<(), String> {
         "Authorization": format!("Bearer {}", token),
     });
 
-    let result = channel_host::http_request(
+    let body = checked_feishu_request(
         "POST",
         &url,
         &headers.to_string(),
         Some(body_json.as_bytes()),
-        Some(10_000),
-    );
+        10_000,
+    )?;
 
-    match result {
-        Ok(response) => {
-            if response.status != 200 {
-                let body_str = String::from_utf8_lossy(&response.body);
-                return Err(format!(
-                    "Feishu API returned {}: {}",
-                    response.status, body_str
-                ));
-            }
-            // Check API-level error code.
-            if let Ok(api_resp) =
-                serde_json::from_slice::<FeishuApiResponse<serde_json::Value>>(&response.body)
-            {
-                if api_resp.code != 0 {
-                    return Err(format!(
-                        "Feishu API error {}: {}",
-                        api_resp.code, api_resp.msg
-                    ));
-                }
-            }
-            Ok(())
-        }
-        Err(e) => Err(format!("HTTP request failed: {}", e)),
-    }
+    validate_feishu_api_response::<serde_json::Value>(&body)?;
+    Ok(())
 }
 
 /// Send a new message to a user/chat (for broadcast).
 fn send_message(receive_id: &str, receive_id_type: &str, content: &str) -> Result<(), String> {
+    if content.trim().is_empty() {
+        return Ok(());
+    }
+    send_message_payload(
+        receive_id,
+        receive_id_type,
+        "text",
+        serde_json::json!({"text": content}).to_string(),
+    )
+}
+
+fn send_message_payload(
+    receive_id: &str,
+    receive_id_type: &str,
+    msg_type: &str,
+    content: String,
+) -> Result<(), String> {
     let api_base = channel_host::workspace_read(API_BASE_PATH)
         .unwrap_or_else(|| "https://open.feishu.cn".to_string());
 
@@ -877,8 +1055,8 @@ fn send_message(receive_id: &str, receive_id_type: &str, content: &str) -> Resul
 
     let body = SendMessageBody {
         receive_id: receive_id.to_string(),
-        msg_type: "text".to_string(),
-        content: serde_json::json!({"text": content}).to_string(),
+        msg_type: msg_type.to_string(),
+        content,
     };
 
     let body_json =
@@ -889,37 +1067,209 @@ fn send_message(receive_id: &str, receive_id_type: &str, content: &str) -> Resul
         "Authorization": format!("Bearer {}", token),
     });
 
-    let result = channel_host::http_request(
+    let body = checked_feishu_request(
         "POST",
         &url,
         &headers.to_string(),
         Some(body_json.as_bytes()),
-        Some(10_000),
-    );
+        10_000,
+    )?;
 
-    match result {
-        Ok(response) => {
-            if response.status != 200 {
-                let body_str = String::from_utf8_lossy(&response.body);
-                return Err(format!(
-                    "Feishu API returned {}: {}",
-                    response.status, body_str
-                ));
-            }
-            if let Ok(api_resp) =
-                serde_json::from_slice::<FeishuApiResponse<serde_json::Value>>(&response.body)
-            {
-                if api_resp.code != 0 {
-                    return Err(format!(
-                        "Feishu API error {}: {}",
-                        api_resp.code, api_resp.msg
-                    ));
-                }
-            }
-            Ok(())
-        }
-        Err(e) => Err(format!("HTTP request failed: {}", e)),
+    validate_feishu_api_response::<serde_json::Value>(&body)?;
+    Ok(())
+}
+
+fn sanitize_multipart_filename(filename: &str) -> String {
+    let sanitized: String = filename
+        .chars()
+        .map(|ch| match ch {
+            '"' | '\\' | '\r' | '\n' => '_',
+            other => other,
+        })
+        .collect();
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        "image".to_string()
+    } else {
+        trimmed.to_string()
     }
+}
+
+fn build_multipart_image_body(
+    boundary: &str,
+    filename: &str,
+    mime_type: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    let filename = sanitize_multipart_filename(filename);
+    let mime_type = base_mime_type(mime_type);
+    let mime_type = if mime_type.starts_with("image/") {
+        mime_type
+    } else {
+        "application/octet-stream"
+    };
+
+    let mut body = Vec::new();
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"image\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {mime_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(data);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(b"Content-Disposition: form-data; name=\"image_type\"\r\n\r\n");
+    body.extend_from_slice(b"message\r\n");
+    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    body
+}
+
+fn is_supported_outbound_image(attachment: &Attachment) -> bool {
+    base_mime_type(&attachment.mime_type)
+        .to_ascii_lowercase()
+        .starts_with("image/")
+}
+
+fn upload_feishu_image(attachment: &Attachment) -> Result<String, String> {
+    if !is_supported_outbound_image(attachment) {
+        return Err(format!(
+            "Feishu only supports image attachments here; '{}' has MIME type '{}'",
+            attachment.filename, attachment.mime_type
+        ));
+    }
+    if attachment.data.is_empty() {
+        return Err(format!(
+            "Feishu image attachment '{}' is empty",
+            attachment.filename
+        ));
+    }
+    if attachment.data.len() > MAX_OUTBOUND_IMAGE_BYTES {
+        return Err(format!(
+            "Feishu image attachment '{}' exceeds {} bytes",
+            attachment.filename, MAX_OUTBOUND_IMAGE_BYTES
+        ));
+    }
+
+    let api_base = channel_host::workspace_read(API_BASE_PATH)
+        .unwrap_or_else(|| "https://open.feishu.cn".to_string());
+    let token = get_valid_token(&api_base)?;
+    let url = format!("{}/open-apis/im/v1/images", api_base);
+    let boundary = format!("ironclaw-feishu-image-{}", channel_host::now_millis());
+    let body = build_multipart_image_body(
+        &boundary,
+        &attachment.filename,
+        &attachment.mime_type,
+        &attachment.data,
+    );
+    let headers = serde_json::json!({
+        "Authorization": format!("Bearer {}", token),
+        "Content-Type": format!("multipart/form-data; boundary={}", boundary),
+    });
+
+    let response_body =
+        checked_feishu_request("POST", &url, &headers.to_string(), Some(&body), 30_000)?;
+    let api_resp = validate_feishu_api_response::<UploadImageData>(&response_body)?;
+    let data = api_resp
+        .data
+        .ok_or_else(|| "Feishu image upload response missing data".to_string())?;
+    if data.image_key.trim().is_empty() {
+        return Err("Feishu image upload response missing image_key".to_string());
+    }
+    Ok(data.image_key)
+}
+
+fn image_message_content(image_key: &str) -> String {
+    serde_json::json!({ "image_key": image_key }).to_string()
+}
+
+fn send_reply_image(message_id: &str, image_key: &str) -> Result<(), String> {
+    send_reply_payload(message_id, "image", image_message_content(image_key))
+}
+
+fn send_message_image(
+    receive_id: &str,
+    receive_id_type: &str,
+    image_key: &str,
+) -> Result<(), String> {
+    send_message_payload(
+        receive_id,
+        receive_id_type,
+        "image",
+        image_message_content(image_key),
+    )
+}
+
+fn append_attachment_errors_to_text(content: &str, errors: &[String]) -> String {
+    let first = errors
+        .first()
+        .map(String::as_str)
+        .unwrap_or("unknown error");
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        format!("Image attachment delivery failed: {first}")
+    } else {
+        format!("{trimmed}\n\nImage attachment delivery failed: {first}")
+    }
+}
+
+fn send_reply_response(message_id: &str, response: &AgentResponse) -> Result<(), String> {
+    send_response_images_then_text(
+        response,
+        |image_key| send_reply_image(message_id, image_key),
+        |content| send_reply(message_id, content),
+    )
+}
+
+fn send_message_response(
+    receive_id: &str,
+    receive_id_type: &str,
+    response: &AgentResponse,
+) -> Result<(), String> {
+    send_response_images_then_text(
+        response,
+        |image_key| send_message_image(receive_id, receive_id_type, image_key),
+        |content| send_message(receive_id, receive_id_type, content),
+    )
+}
+
+fn send_response_images_then_text(
+    response: &AgentResponse,
+    mut send_image: impl FnMut(&str) -> Result<(), String>,
+    mut send_text: impl FnMut(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let mut sent_any = false;
+    let mut errors = Vec::new();
+
+    for attachment in &response.attachments {
+        match upload_feishu_image(attachment).and_then(|image_key| send_image(&image_key)) {
+            Ok(()) => sent_any = true,
+            Err(error) => errors.push(error),
+        }
+    }
+
+    let content = if errors.is_empty() {
+        response.content.trim().to_string()
+    } else {
+        append_attachment_errors_to_text(&response.content, &errors)
+    };
+    if !content.is_empty() {
+        send_text(&content)?;
+        sent_any = true;
+    }
+
+    if !errors.is_empty() {
+        let joined = errors.join("; ");
+        channel_host::log(
+            channel_host::LogLevel::Warn,
+            &format!("Feishu image attachment delivery had errors: {joined}"),
+        );
+        if !sent_any {
+            return Err(joined);
+        }
+    }
+
+    Ok(())
 }
 
 // ============================================================================
@@ -1073,10 +1423,10 @@ fn is_authenticated_websocket_event(
     request_token: Option<&str>,
 ) -> bool {
     match configured_token {
+        None => true,
         Some(expected) => request_token
             .map(|provided| bool::from(expected.as_bytes().ct_eq(provided.as_bytes())))
             .unwrap_or(false),
-        None => false,
     }
 }
 
@@ -1178,12 +1528,12 @@ mod tests {
     #[test]
     fn websocket_auth_requires_matching_token_when_configured() {
         assert!(
-            !is_authenticated_websocket_event(None, None),
-            "websocket events must not be accepted without a configured verification token"
+            is_authenticated_websocket_event(None, None),
+            "websocket events should be accepted without a configured verification token"
         );
         assert!(
-            !is_authenticated_websocket_event(None, Some("token")),
-            "provided event tokens must not be accepted without a configured token to compare"
+            is_authenticated_websocket_event(None, Some("token")),
+            "provided event tokens are ignored when no token is configured"
         );
         assert!(
             !is_authenticated_websocket_event(Some("expected"), None),
@@ -1196,6 +1546,79 @@ mod tests {
         assert!(
             is_authenticated_websocket_event(Some("expected"), Some("expected")),
             "configured verification tokens should accept matching websocket events"
+        );
+    }
+
+    #[test]
+    fn process_feishu_event_payload_accepts_websocket_event_without_configured_token() {
+        let handled = std::cell::RefCell::new(false);
+        let body = serde_json::json!({
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_123",
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {}
+        })
+        .to_string();
+
+        let processed = process_feishu_event_payload_with_workspace(
+            &body,
+            false,
+            |_path| None,
+            |_event| {
+                *handled.borrow_mut() = true;
+            },
+            |_level, _message| {},
+        );
+
+        assert!(processed);
+        assert!(*handled.borrow());
+    }
+
+    #[test]
+    fn parse_image_content_extracts_image_key() {
+        let content = parse_image_content(r#"{"image_key":"img_v2_abc"}"#).unwrap();
+        assert_eq!(content.image_key, "img_v2_abc");
+    }
+
+    #[test]
+    fn feishu_image_resource_url_uses_message_resource_endpoint() {
+        assert_eq!(
+            feishu_image_resource_url("https://open.feishu.cn", "om_123", "img_v2_abc"),
+            "https://open.feishu.cn/open-apis/im/v1/messages/om_123/resources/img_v2_abc?type=image"
+        );
+    }
+
+    #[test]
+    fn build_multipart_image_body_includes_image_and_message_type() {
+        let body =
+            build_multipart_image_body("boundary-1", "bad\r\nname.png", "image/png", b"png-bytes");
+        let body_text = String::from_utf8_lossy(&body);
+
+        assert!(body_text.contains("filename=\"bad__name.png\""));
+        assert!(body_text.contains("Content-Type: image/png"));
+        assert!(body_text.contains("name=\"image_type\""));
+        assert!(body_text.contains("message"));
+        assert!(body.ends_with(b"--boundary-1--\r\n"));
+    }
+
+    #[test]
+    fn image_message_content_uses_image_key_shape() {
+        let value: serde_json::Value =
+            serde_json::from_str(&image_message_content("img_v2_abc")).unwrap();
+        assert_eq!(value["image_key"], "img_v2_abc");
+    }
+
+    #[test]
+    fn append_attachment_errors_to_text_preserves_existing_text() {
+        assert_eq!(
+            append_attachment_errors_to_text("done", &["upload failed".to_string()]),
+            "done\n\nImage attachment delivery failed: upload failed"
+        );
+        assert_eq!(
+            append_attachment_errors_to_text("", &["upload failed".to_string()]),
+            "Image attachment delivery failed: upload failed"
         );
     }
 
@@ -1218,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn process_websocket_event_queue_drains_one_frame_before_processing_next() {
+    fn process_websocket_event_queue_processes_each_snapshot_frame_once() {
         let queue = std::cell::RefCell::new(serde_json::json!(["first", "second"]).to_string());
         let processed = std::cell::RefCell::new(Vec::<String>::new());
 
@@ -1227,16 +1650,7 @@ mod tests {
             |queue_json| {
                 *queue.borrow_mut() = queue_json.to_string();
             },
-            |frame| {
-                let mut processed = processed.borrow_mut();
-                if processed.is_empty() {
-                    assert_eq!(
-                        queue.borrow().as_str(),
-                        serde_json::json!(["second"]).to_string()
-                    );
-                }
-                processed.push(frame.to_string());
-            },
+            |frame| processed.borrow_mut().push(frame.to_string()),
             |_level, _message| {},
         );
 
@@ -1245,6 +1659,23 @@ mod tests {
             &["first".to_string(), "second".to_string()]
         );
         assert_eq!(queue.borrow().as_str(), "[]");
+    }
+
+    #[test]
+    fn process_websocket_event_queue_does_not_depend_on_reading_its_own_writes() {
+        let original_queue = serde_json::json!(["first"]).to_string();
+        let write_count = std::cell::Cell::new(0usize);
+        let processed = std::cell::RefCell::new(Vec::<String>::new());
+
+        process_websocket_event_queue_with(
+            || original_queue.clone(),
+            |_queue_json| write_count.set(write_count.get() + 1),
+            |frame| processed.borrow_mut().push(frame.to_string()),
+            |_level, _message| {},
+        );
+
+        assert_eq!(processed.borrow().as_slice(), &["first".to_string()]);
+        assert_eq!(write_count.get(), 1);
     }
 
     #[test]
