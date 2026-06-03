@@ -29,14 +29,20 @@
 //! ```
 
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
+use tokio::net::TcpStream;
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_tungstenite::tungstenite::protocol::Message as WebsocketMessage;
+use tokio_tungstenite::tungstenite::{
+    Error as WebsocketError, handshake::client::Response as WebsocketResponse,
+};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 use wasmtime::Store;
 use wasmtime::component::Linker;
@@ -64,6 +70,7 @@ use crate::secrets::host_matches_pattern;
 use crate::tools::wasm::credential_injector::{InjectedCredentials, inject_credential};
 use crate::tools::wasm::{
     LogLevel, WasmResourceLimiter, reject_private_ip, ssrf_safe_client_builder,
+    validate_and_resolve_http_target,
 };
 use ironclaw_common::CredentialName;
 use ironclaw_safety::LeakDetector;
@@ -76,20 +83,7 @@ const WEBSOCKET_EVENT_PROCESSING_QUEUE_RELATIVE_PATH: &str = "state/gateway_even
 const WEBSOCKET_EVENT_QUEUE_MAX_ITEMS: usize = 100;
 const WEBSOCKET_OUTBOUND_QUEUE_CAPACITY: usize = 32;
 const WEBSOCKET_OUTBOUND_MAX_FRAME_BYTES: usize = 2 * 1024 * 1024;
-const FEISHU_WS_ENDPOINT_PATH: &str = "/callback/ws/endpoint";
-const FEISHU_WS_DEFAULT_PING_INTERVAL_SECS: u64 = 120;
-const FEISHU_WS_DEFAULT_RECONNECT_COUNT: i32 = -1;
-const FEISHU_WS_DEFAULT_RECONNECT_INTERVAL_SECS: u64 = 120;
-const FEISHU_WS_DEFAULT_RECONNECT_NONCE_SECS: u64 = 30;
-const FEISHU_WS_FRAME_CACHE_TTL_MS: u64 = 10_000;
 const WEBSOCKET_MIN_STABLE_CONNECTION_SECS: u64 = 30;
-const FEISHU_WS_MAX_FRAME_FRAGMENTS: usize = 256;
-const FEISHU_WS_MAX_FRAME_CACHE_ENTRIES: usize = 512;
-const FEISHU_WS_MAX_MERGED_PAYLOAD_BYTES: usize = 1024 * 1024;
-const FEISHU_WS_MAX_HEADERS: usize = 64;
-const FEISHU_WS_ACK_OK: u16 = 200;
-const FEISHU_WS_ACK_INTERNAL_ERROR: u16 = 500;
-const FEISHU_WS_ENDPOINT_INTERNAL_ERROR_CODE: i64 = 1_000_040_343;
 const WECHAT_CHANNEL_NAME: &str = "wechat";
 const CHANNEL_BOUND_USER_ID_CONFIG_KEY: &str = "bound_user_id";
 #[cfg(any(test, debug_assertions))]
@@ -1588,7 +1582,7 @@ impl WasmChannel {
             let mut session_state = WebsocketSessionState::new(&config, Some(&websocket_auth));
 
             'reconnect: loop {
-                let connect_url = match session_state
+                let connect_target = match session_state
                     .connect_url(
                         &config,
                         Some(&websocket_auth),
@@ -1622,7 +1616,7 @@ impl WasmChannel {
                             tokio::select! {
                                 _ = tokio::time::sleep(backoff) => continue 'reconnect,
                                 _ = &mut shutdown => {
-                                    tracing::info!(channel = %channel_name, "Stopping websocket runtime");
+                                    tracing::debug!(channel = %channel_name, "Stopping websocket runtime");
                                     *websocket_outbound_tx_state.write().await = None;
                                     break 'reconnect;
                                 }
@@ -1630,10 +1624,11 @@ impl WasmChannel {
                         }
                     },
                 };
-                let connect_result = tokio_tungstenite::connect_async(connect_url.as_str()).await;
+                let connect_result = connect_websocket_target(&connect_target).await;
+                let connect_url = connect_target.url.clone();
                 let (stream, _) = match connect_result {
                     Ok(parts) => {
-                        tracing::info!(channel = %channel_name, "Websocket runtime connected");
+                        tracing::debug!(channel = %channel_name, "Websocket runtime connected");
                         parts
                     }
                     Err(error) => {
@@ -1650,7 +1645,7 @@ impl WasmChannel {
                         tokio::select! {
                             _ = tokio::time::sleep(backoff) => continue 'reconnect,
                             _ = &mut shutdown => {
-                                tracing::info!(channel = %channel_name, "Stopping websocket runtime");
+                                tracing::debug!(channel = %channel_name, "Stopping websocket runtime");
                                 *websocket_outbound_tx_state.write().await = None;
                                 break 'reconnect;
                             }
@@ -1720,13 +1715,15 @@ impl WasmChannel {
                                     error = %error,
                                     "Failed to enqueue websocket bootstrap frame"
                                 );
+                                should_reconnect = true;
+                                break;
                             }
                         }
                     }
                 }
 
                 if stop_runtime {
-                    tracing::info!(
+                    tracing::debug!(
                         channel = %channel_name,
                         protocol = ?websocket_protocol,
                         "Stopping websocket runtime per protocol request"
@@ -1739,7 +1736,7 @@ impl WasmChannel {
                         &mut reconnect_attempt,
                         connected_at.elapsed(),
                     );
-                    tracing::info!(
+                    tracing::debug!(
                         channel = %channel_name,
                         protocol = ?websocket_protocol,
                         backoff_secs = backoff.as_secs(),
@@ -1748,7 +1745,7 @@ impl WasmChannel {
                     tokio::select! {
                         _ = tokio::time::sleep(backoff) => continue 'reconnect,
                         _ = &mut shutdown => {
-                            tracing::info!(channel = %channel_name, "Stopping websocket runtime");
+                            tracing::debug!(channel = %channel_name, "Stopping websocket runtime");
                             *websocket_outbound_tx_state.write().await = None;
                             break 'reconnect;
                         }
@@ -1801,7 +1798,7 @@ impl WasmChannel {
                             }
                         }
                         _ = &mut shutdown => {
-                            tracing::info!(channel = %channel_name, "Stopping websocket runtime");
+                            tracing::debug!(channel = %channel_name, "Stopping websocket runtime");
                             *websocket_outbound_tx_state.write().await = None;
                             break 'reconnect;
                         }
@@ -1849,7 +1846,8 @@ impl WasmChannel {
                                                     WEBSOCKET_EVENT_QUEUE_MAX_ITEMS,
                                                 ) {
                                                     tracing::warn!(channel = %channel_name, error = %error, "Failed to enqueue websocket text frame");
-                                                    continue;
+                                                    should_break = true;
+                                                    break;
                                                 }
 
                                                 if let Ok(poll_guard) = Arc::clone(&websocket_poll_lock).try_lock_owned() {
@@ -1945,7 +1943,8 @@ impl WasmChannel {
                                                     WEBSOCKET_EVENT_QUEUE_MAX_ITEMS,
                                                 ) {
                                                     tracing::warn!(channel = %channel_name, error = %error, "Failed to enqueue websocket binary frame");
-                                                    continue;
+                                                    should_break = true;
+                                                    break;
                                                 }
 
                                                 if let Ok(poll_guard) = Arc::clone(&websocket_poll_lock).try_lock_owned() {
@@ -2028,7 +2027,7 @@ impl WasmChannel {
                                     break;
                                 }
                                 None => {
-                                    tracing::info!(channel = %channel_name, "Websocket runtime closed by peer");
+                                    tracing::debug!(channel = %channel_name, "Websocket runtime closed by peer");
                                     break;
                                 }
                             }
@@ -2037,7 +2036,7 @@ impl WasmChannel {
                 }
 
                 if stop_runtime {
-                    tracing::info!(
+                    tracing::debug!(
                         channel = %channel_name,
                         protocol = ?websocket_protocol,
                         "Stopping websocket runtime per protocol request"
@@ -2051,7 +2050,7 @@ impl WasmChannel {
                     &mut reconnect_attempt,
                     connected_at.elapsed(),
                 );
-                tracing::info!(
+                tracing::debug!(
                     channel = %channel_name,
                     backoff_secs = backoff.as_secs(),
                     "Websocket runtime disconnected; reconnect scheduled"
@@ -2059,7 +2058,7 @@ impl WasmChannel {
                 tokio::select! {
                     _ = tokio::time::sleep(backoff) => {}
                     _ = &mut shutdown => {
-                        tracing::info!(channel = %channel_name, "Stopping websocket runtime");
+                        tracing::debug!(channel = %channel_name, "Stopping websocket runtime");
                         *websocket_outbound_tx_state.write().await = None;
                         break 'reconnect;
                     }
@@ -3213,10 +3212,7 @@ impl WasmChannel {
                 // No-op, too noisy
             }
             StatusUpdate::ImageGenerated { data_url, .. }
-                if should_stage_generated_image_for_final_response(
-                    &self.name,
-                    &self.capabilities,
-                ) =>
+                if should_stage_generated_image_for_final_response(&self.capabilities) =>
             {
                 // Some WASM channel transports need generated images delivered
                 // together with the final text response: WeCom websocket frames
@@ -4369,6 +4365,20 @@ fn validate_websocket_capability_url(
         .then_some(())
 }
 
+const FEISHU_WS_ENDPOINT_PATH: &str = "/callback/ws/endpoint";
+const FEISHU_WS_DEFAULT_PING_INTERVAL_SECS: u64 = 120;
+const FEISHU_WS_DEFAULT_RECONNECT_COUNT: i32 = -1;
+const FEISHU_WS_DEFAULT_RECONNECT_INTERVAL_SECS: u64 = 120;
+const FEISHU_WS_DEFAULT_RECONNECT_NONCE_SECS: u64 = 30;
+const FEISHU_WS_FRAME_CACHE_TTL_MS: u64 = 10_000;
+const FEISHU_WS_MAX_FRAME_FRAGMENTS: usize = 256;
+const FEISHU_WS_MAX_FRAME_CACHE_ENTRIES: usize = 512;
+const FEISHU_WS_MAX_MERGED_PAYLOAD_BYTES: usize = 1024 * 1024;
+const FEISHU_WS_MAX_HEADERS: usize = 64;
+const FEISHU_WS_ACK_OK: u16 = 200;
+const FEISHU_WS_ACK_INTERNAL_ERROR: u16 = 500;
+const FEISHU_WS_ENDPOINT_INTERNAL_ERROR_CODE: i64 = 1_000_040_343;
+
 fn validate_feishu_websocket_base_url(
     http: &crate::tools::wasm::HttpCapability,
     base_url: &str,
@@ -4452,11 +4462,15 @@ fn uses_wecom_aibot_protocol(capabilities: &ChannelCapabilities) -> bool {
     )
 }
 
-fn should_stage_generated_image_for_final_response(
-    channel_name: &str,
-    capabilities: &ChannelCapabilities,
-) -> bool {
-    uses_wecom_aibot_protocol(capabilities) || channel_name == "feishu"
+fn uses_feishu_event_protocol(capabilities: &ChannelCapabilities) -> bool {
+    matches!(
+        WebsocketRuntimeConfig::from_capabilities(capabilities).map(|config| config.protocol),
+        Some(WebsocketProtocolConfig::FeishuEvent(_))
+    )
+}
+
+fn should_stage_generated_image_for_final_response(capabilities: &ChannelCapabilities) -> bool {
+    uses_wecom_aibot_protocol(capabilities) || uses_feishu_event_protocol(capabilities)
 }
 
 fn normalize_websocket_protocol_name(protocol: &str) -> Option<&'static str> {
@@ -5344,6 +5358,67 @@ impl WebsocketConnectPreparationError {
     }
 }
 
+#[derive(Debug, Clone)]
+struct WebsocketConnectTarget {
+    url: String,
+    resolved_addrs: Option<Vec<SocketAddr>>,
+}
+
+impl WebsocketConnectTarget {
+    fn unpinned(url: impl Into<String>) -> Self {
+        Self {
+            url: url.into(),
+            resolved_addrs: None,
+        }
+    }
+
+    fn pinned(url: impl Into<String>, resolved_addrs: Vec<SocketAddr>) -> Self {
+        Self {
+            url: url.into(),
+            resolved_addrs: Some(resolved_addrs),
+        }
+    }
+}
+
+type WebsocketConnectResult = Result<
+    (
+        WebSocketStream<MaybeTlsStream<TcpStream>>,
+        WebsocketResponse,
+    ),
+    WebsocketError,
+>;
+
+async fn connect_websocket_target(target: &WebsocketConnectTarget) -> WebsocketConnectResult {
+    if let Some(addrs) = target.resolved_addrs.as_deref() {
+        return connect_websocket_to_pinned_addrs(&target.url, addrs).await;
+    }
+
+    tokio_tungstenite::connect_async(target.url.as_str()).await
+}
+
+async fn connect_websocket_to_pinned_addrs(
+    url: &str,
+    addrs: &[SocketAddr],
+) -> WebsocketConnectResult {
+    let mut last_error = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(socket) => {
+                return tokio_tungstenite::client_async_tls_with_config(url, socket, None, None)
+                    .await;
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    Err(WebsocketError::Io(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::AddrNotAvailable,
+            "websocket target resolved to no addresses",
+        )
+    })))
+}
+
 #[derive(Debug, serde::Deserialize)]
 struct FeishuWsEndpointResponse {
     code: i64,
@@ -5425,7 +5500,7 @@ impl FeishuEventSessionState {
         auth: Option<&ResolvedWebsocketAuth>,
         capabilities: &ChannelCapabilities,
         workspace_store: &ChannelWorkspaceStore,
-    ) -> Result<String, WebsocketConnectPreparationError> {
+    ) -> Result<WebsocketConnectTarget, WebsocketConnectPreparationError> {
         let WebsocketProtocolConfig::FeishuEvent(feishu) = &config.protocol else {
             return Err(WebsocketConnectPreparationError::terminal(
                 "not a Feishu websocket protocol",
@@ -5517,16 +5592,21 @@ impl FeishuEventSessionState {
         })?;
         self.apply_client_config(data.client_config);
 
-        let parsed = validate_feishu_connect_url(feishu, &data.url)
+        let connect_target = validate_feishu_connect_url(feishu, &data.url)
+            .await
             .map_err(WebsocketConnectPreparationError::terminal)?;
-        let service_id = parsed
+        let service_id = connect_target
+            .url
             .query_pairs()
             .find_map(|(key, value)| (key == "service_id").then(|| value.parse::<i32>().ok()))
             .flatten()
             .unwrap_or(0);
         self.service_id = service_id;
 
-        Ok(data.url)
+        Ok(WebsocketConnectTarget::pinned(
+            connect_target.url.to_string(),
+            connect_target.resolved_addrs,
+        ))
     }
 
     fn apply_client_config(&mut self, config: FeishuWsClientConfig) {
@@ -5843,10 +5923,15 @@ fn normalized_url_origin(value: &str) -> Option<String> {
     Some(format!("{scheme}://{host}{port}"))
 }
 
-fn validate_feishu_connect_url(
+struct ValidatedFeishuConnectUrl {
+    url: url::Url,
+    resolved_addrs: Vec<SocketAddr>,
+}
+
+async fn validate_feishu_connect_url(
     config: &FeishuEventWebsocketConfig,
     connect_url: &str,
-) -> Result<url::Url, String> {
+) -> Result<ValidatedFeishuConnectUrl, String> {
     let parsed = url::Url::parse(connect_url)
         .map_err(|error| format!("Feishu websocket endpoint returned invalid URL: {error}"))?;
     if parsed.scheme() != "wss" {
@@ -5875,10 +5960,14 @@ fn validate_feishu_connect_url(
     private_ip_probe_url
         .set_scheme("https")
         .map_err(|_| "failed to build Feishu websocket endpoint safety probe".to_string())?;
-    reject_private_ip(private_ip_probe_url.as_str())
+    let target = validate_and_resolve_http_target(private_ip_probe_url.as_str())
+        .await
         .map_err(|error| format!("Feishu websocket endpoint failed safety check: {error}"))?;
 
-    Ok(parsed)
+    Ok(ValidatedFeishuConnectUrl {
+        url: parsed,
+        resolved_addrs: target.resolved_addrs().to_vec(),
+    })
 }
 
 fn feishu_endpoint_error(code: i64, msg: &str) -> Option<WebsocketConnectPreparationError> {
@@ -6492,10 +6581,12 @@ impl WebsocketSessionState {
         auth: Option<&ResolvedWebsocketAuth>,
         capabilities: &ChannelCapabilities,
         workspace_store: &ChannelWorkspaceStore,
-    ) -> Result<String, WebsocketConnectPreparationError> {
+    ) -> Result<WebsocketConnectTarget, WebsocketConnectPreparationError> {
         match self {
-            Self::Discord(state) => Ok(state.connect_url(&config.url).to_string()),
-            Self::WecomAibot(_) => Ok(config.url.clone()),
+            Self::Discord(state) => Ok(WebsocketConnectTarget::unpinned(
+                state.connect_url(&config.url),
+            )),
+            Self::WecomAibot(_) => Ok(WebsocketConnectTarget::unpinned(config.url.clone())),
             Self::FeishuEvent(state) => {
                 state
                     .connect_url(config, auth, capabilities, workspace_store)
@@ -7941,6 +8032,22 @@ mod tests {
     }
 
     #[test]
+    fn test_generated_image_staging_uses_websocket_protocol_capabilities() {
+        assert!(super::should_stage_generated_image_for_final_response(
+            &feishu_websocket_capabilities()
+        ));
+        assert!(super::should_stage_generated_image_for_final_response(
+            &wecom_websocket_capabilities()
+        ));
+
+        let capabilities = ChannelCapabilities::for_channel("feishu");
+        assert!(
+            !super::should_stage_generated_image_for_final_response(&capabilities),
+            "channel name alone must not opt into generated-image staging"
+        );
+    }
+
+    #[test]
     fn test_feishu_websocket_runtime_config_requires_endpoint_allowlist() {
         let tool_capabilities = ToolCapabilities {
             http: Some(HttpCapability::new(vec![
@@ -8010,8 +8117,8 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_feishu_websocket_connect_url_validation_rejects_unsafe_targets() {
+    #[tokio::test]
+    async fn test_feishu_websocket_connect_url_validation_rejects_unsafe_targets() {
         let capabilities = feishu_websocket_capabilities();
         let config = WebsocketRuntimeConfig::from_capabilities(&capabilities)
             .expect("feishu websocket config should be parsed");
@@ -8020,12 +8127,18 @@ mod tests {
         };
 
         feishu.allowed_connect_hosts = vec!["8.8.8.8".to_string()];
-        assert!(
+        let validated =
             validate_feishu_connect_url(&feishu, "wss://8.8.8.8/ws?device_id=d&service_id=1")
-                .is_ok()
+                .await
+                .expect("public IP target should validate");
+        assert_eq!(
+            validated.url.as_str(),
+            "wss://8.8.8.8/ws?device_id=d&service_id=1"
         );
+        assert_eq!(validated.resolved_addrs.len(), 1);
         assert!(
             validate_feishu_connect_url(&feishu, "ws://8.8.8.8/ws?device_id=d&service_id=1")
+                .await
                 .is_err()
         );
         assert!(
@@ -8033,12 +8146,14 @@ mod tests {
                 &feishu,
                 "wss://example.invalid/ws?device_id=d&service_id=1"
             )
+            .await
             .is_err()
         );
 
         feishu.allowed_connect_hosts = vec!["127.0.0.1".to_string()];
         assert!(
             validate_feishu_connect_url(&feishu, "wss://127.0.0.1/ws?device_id=d&service_id=1")
+                .await
                 .is_err()
         );
     }
@@ -8445,6 +8560,35 @@ mod tests {
         assert_eq!(
             feishu_ack_code(&ack_bytes),
             u64::from(super::FEISHU_WS_ACK_INTERNAL_ERROR)
+        );
+        assert!(state.frame_cache.is_empty());
+    }
+
+    #[test]
+    fn test_feishu_websocket_out_of_range_fragment_seq_emits_error_ack() {
+        let frame = feishu_event_frame("bad-seq", 2, 2, b"{}");
+        let encoded = encode_feishu_ws_frame(&frame);
+        let mut state = FeishuEventSessionState::new();
+
+        let ack_bytes = take_feishu_ack_action(state.process_binary_frame(&encoded, "feishu"));
+
+        assert_eq!(
+            feishu_ack_code(&ack_bytes),
+            u64::from(super::FEISHU_WS_ACK_INTERNAL_ERROR)
+        );
+        assert!(state.frame_cache.is_empty());
+    }
+
+    #[test]
+    fn test_feishu_websocket_truncated_binary_frame_is_rejected_by_caller() {
+        let encoded = vec![0x08, 0x80];
+        let mut state = FeishuEventSessionState::new();
+
+        let actions = state.process_binary_frame(&encoded, "feishu");
+
+        assert!(
+            actions.is_empty(),
+            "truncated frame has no reliable identity to ACK"
         );
         assert!(state.frame_cache.is_empty());
     }

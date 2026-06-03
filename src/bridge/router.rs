@@ -9308,7 +9308,7 @@ mod tests {
         thread.add_internal_message(ironclaw_engine::ThreadMessage::action_result(
             "call-image-1",
             "image_generate",
-            &serde_json::json!({
+            serde_json::json!({
                 "type": "image_generated",
                 "data": "data:image/png;base64,YWJj",
                 "media_type": "image/png",
