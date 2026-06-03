@@ -39,7 +39,7 @@ use subtle::ConstantTimeEq;
 // Re-export generated types
 use exports::near::agent::channel::{
     AgentResponse, Attachment, ChannelConfig, Guest, HttpEndpointConfig, IncomingHttpRequest,
-    OutgoingHttpResponse, StatusUpdate,
+    OutgoingHttpResponse, PollConfig, StatusUpdate,
 };
 use near::agent::channel_host::{self, EmittedMessage, InboundAttachment};
 
@@ -58,6 +58,8 @@ const TOKEN_PATH: &str = "tenant_access_token";
 const TOKEN_EXPIRY_PATH: &str = "token_expiry";
 const CONNECTION_MODE_PATH: &str = "connection_mode";
 const WEBSOCKET_EVENT_QUEUE_PATH: &str = "state/gateway_event_queue_processing";
+const WEBHOOK_EVENT_QUEUE_PATH: &str = "state/webhook_event_queue";
+const WEBHOOK_POLL_INTERVAL_MS: u32 = 30_000;
 const MAX_INBOUND_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const MAX_OUTBOUND_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
@@ -395,7 +397,7 @@ impl Guest for FeishuChannel {
                 methods: vec!["POST".to_string()],
                 require_secret: false,
             }],
-            poll: None,
+            poll: poll_config_for_connection_mode(connection_mode),
         })
     }
 
@@ -448,29 +450,22 @@ impl Guest for FeishuChannel {
             }
         }
 
-        // Handle v2.0 events.
-        if let Some(header) = &event.header {
-            match header.event_type.as_str() {
-                "im.message.receive_v1" => {
-                    if let Some(event_data) = &event.event {
-                        handle_message_event(event_data);
-                    }
-                }
-                other => {
-                    channel_host::log(
-                        channel_host::LogLevel::Debug,
-                        &format!("Ignoring event type: {}", other),
-                    );
-                }
-            }
+        if let Err(error) = enqueue_webhook_event(body_str) {
+            channel_host::log(
+                channel_host::LogLevel::Error,
+                &format!("Failed to enqueue Feishu webhook event: {error}"),
+            );
+            return json_response(500, serde_json::json!({"error": "Failed to enqueue event"}));
         }
 
-        // Always respond 200 quickly (Feishu expects fast responses).
+        // Feishu expects a fast acknowledgement. Non-challenge events are
+        // processed by on_poll so attachment downloads cannot block this reply.
         json_response(200, serde_json::json!({}))
     }
 
     fn on_poll() {
         process_websocket_event_queue();
+        process_webhook_event_queue();
     }
 
     fn on_respond(response: AgentResponse) -> Result<(), String> {
@@ -498,6 +493,13 @@ impl Guest for FeishuChannel {
 // Message Handling
 // ============================================================================
 
+fn poll_config_for_connection_mode(connection_mode: &str) -> Option<PollConfig> {
+    (connection_mode == "webhook").then_some(PollConfig {
+        interval_ms: WEBHOOK_POLL_INTERVAL_MS,
+        enabled: true,
+    })
+}
+
 /// Process events queued by the host-managed Feishu websocket runtime.
 fn process_websocket_event_queue() {
     process_websocket_event_queue_with(
@@ -508,6 +510,54 @@ fn process_websocket_event_queue() {
         |frame| process_feishu_event_payload(frame, false),
         channel_host::log,
     );
+}
+
+fn enqueue_webhook_event(body_str: &str) -> Result<(), String> {
+    enqueue_event_payload_with(
+        || channel_host::workspace_read(WEBHOOK_EVENT_QUEUE_PATH).unwrap_or_default(),
+        |queue_json| channel_host::workspace_write(WEBHOOK_EVENT_QUEUE_PATH, queue_json),
+        body_str,
+        channel_host::log,
+    )
+}
+
+fn process_webhook_event_queue() {
+    process_websocket_event_queue_with(
+        || channel_host::workspace_read(WEBHOOK_EVENT_QUEUE_PATH).unwrap_or_default(),
+        |queue_json| {
+            let _ = channel_host::workspace_write(WEBHOOK_EVENT_QUEUE_PATH, queue_json);
+        },
+        process_verified_feishu_event_payload,
+        channel_host::log,
+    );
+}
+
+fn enqueue_event_payload_with(
+    mut read_queue: impl FnMut() -> String,
+    mut write_queue: impl FnMut(&str) -> Result<(), String>,
+    payload: &str,
+    mut log: impl FnMut(channel_host::LogLevel, &str),
+) -> Result<(), String> {
+    let queue_json = read_queue();
+    let mut frames: Vec<String> = if queue_json.trim().is_empty() {
+        Vec::new()
+    } else {
+        match serde_json::from_str(&queue_json) {
+            Ok(frames) => frames,
+            Err(error) => {
+                log(
+                    channel_host::LogLevel::Warn,
+                    &format!("Replacing malformed Feishu webhook queue: {error}"),
+                );
+                Vec::new()
+            }
+        }
+    };
+
+    frames.push(payload.to_string());
+    let queue_json =
+        serde_json::to_string(&frames).map_err(|e| format!("Failed to serialize queue: {e}"))?;
+    write_queue(&queue_json)
 }
 
 fn process_websocket_event_queue_with(
@@ -553,9 +603,47 @@ fn process_feishu_event_payload(body_str: &str, require_webhook_auth: bool) {
     );
 }
 
+fn process_verified_feishu_event_payload(body_str: &str) {
+    process_feishu_event_payload_with_workspace_auth(
+        body_str,
+        FeishuEventAuthMode::AlreadyVerified,
+        channel_host::workspace_read,
+        handle_message_event,
+        channel_host::log,
+    );
+}
+
+#[derive(Clone, Copy)]
+enum FeishuEventAuthMode {
+    Websocket,
+    Webhook,
+    AlreadyVerified,
+}
+
 fn process_feishu_event_payload_with_workspace(
     body_str: &str,
     require_webhook_auth: bool,
+    mut workspace_read: impl FnMut(&str) -> Option<String>,
+    mut handle_message: impl FnMut(&serde_json::Value),
+    mut log: impl FnMut(channel_host::LogLevel, &str),
+) -> bool {
+    let auth_mode = if require_webhook_auth {
+        FeishuEventAuthMode::Webhook
+    } else {
+        FeishuEventAuthMode::Websocket
+    };
+    process_feishu_event_payload_with_workspace_auth(
+        body_str,
+        auth_mode,
+        &mut workspace_read,
+        &mut handle_message,
+        &mut log,
+    )
+}
+
+fn process_feishu_event_payload_with_workspace_auth(
+    body_str: &str,
+    auth_mode: FeishuEventAuthMode,
     mut workspace_read: impl FnMut(&str) -> Option<String>,
     mut handle_message: impl FnMut(&serde_json::Value),
     mut log: impl FnMut(channel_host::LogLevel, &str),
@@ -573,31 +661,35 @@ fn process_feishu_event_payload_with_workspace(
 
     let configured_token =
         workspace_read(VERIFICATION_TOKEN_PATH).filter(|token| !token.is_empty());
-    if require_webhook_auth
-        && !is_authenticated_webhook(
-            false,
-            configured_token.as_deref(),
-            request_verification_token(&event),
-        )
-    {
-        log(
-            channel_host::LogLevel::Warn,
-            "Rejecting unauthenticated Feishu webhook request",
-        );
-        return false;
-    }
-
-    if !require_webhook_auth
-        && !is_authenticated_websocket_event(
-            configured_token.as_deref(),
-            request_verification_token(&event),
-        )
-    {
-        log(
-            channel_host::LogLevel::Warn,
-            "Ignoring Feishu websocket event with missing or mismatched verification token",
-        );
-        return false;
+    match auth_mode {
+        FeishuEventAuthMode::Webhook
+            if !is_authenticated_webhook(
+                false,
+                configured_token.as_deref(),
+                request_verification_token(&event),
+            ) =>
+        {
+            log(
+                channel_host::LogLevel::Warn,
+                "Rejecting unauthenticated Feishu webhook request",
+            );
+            return false;
+        }
+        FeishuEventAuthMode::Websocket
+            if !is_authenticated_websocket_event(
+                configured_token.as_deref(),
+                request_verification_token(&event),
+            ) =>
+        {
+            log(
+                channel_host::LogLevel::Warn,
+                "Ignoring Feishu websocket event with missing or mismatched verification token",
+            );
+            return false;
+        }
+        FeishuEventAuthMode::Webhook
+        | FeishuEventAuthMode::Websocket
+        | FeishuEventAuthMode::AlreadyVerified => {}
     }
 
     // Handle URL verification challenge (initial webhook setup).
@@ -1183,6 +1275,11 @@ fn image_message_content(image_key: &str) -> String {
     serde_json::json!({ "image_key": image_key }).to_string()
 }
 
+enum FeishuResponsePart {
+    Image(String),
+    Text(String),
+}
+
 fn send_reply_image(message_id: &str, image_key: &str) -> Result<(), String> {
     send_reply_payload(message_id, "image", image_message_content(image_key))
 }
@@ -1214,10 +1311,11 @@ fn append_attachment_errors_to_text(content: &str, errors: &[String]) -> String 
 }
 
 fn send_reply_response(message_id: &str, response: &AgentResponse) -> Result<(), String> {
-    send_response_images_then_text(
+    send_reply_response_with_upload(
+        message_id,
         response,
-        |image_key| send_reply_image(message_id, image_key),
-        |content| send_reply(message_id, content),
+        upload_feishu_image,
+        send_reply_payload,
     )
 }
 
@@ -1226,23 +1324,70 @@ fn send_message_response(
     receive_id_type: &str,
     response: &AgentResponse,
 ) -> Result<(), String> {
-    send_response_images_then_text(
+    send_message_response_with_upload(
+        receive_id,
+        receive_id_type,
         response,
-        |image_key| send_message_image(receive_id, receive_id_type, image_key),
-        |content| send_message(receive_id, receive_id_type, content),
+        upload_feishu_image,
+        |receive_id, receive_id_type, msg_type, content| {
+            send_message_payload(receive_id, receive_id_type, msg_type, content)
+        },
     )
 }
 
-fn send_response_images_then_text(
+fn send_reply_response_with_upload(
+    message_id: &str,
     response: &AgentResponse,
-    mut send_image: impl FnMut(&str) -> Result<(), String>,
-    mut send_text: impl FnMut(&str) -> Result<(), String>,
+    upload_image: impl FnMut(&Attachment) -> Result<String, String>,
+    mut send_payload: impl FnMut(&str, &str, String) -> Result<(), String>,
+) -> Result<(), String> {
+    send_response_images_then_text_with_upload(response, upload_image, |part| match part {
+        FeishuResponsePart::Image(image_key) => {
+            send_payload(message_id, "image", image_message_content(&image_key))
+        }
+        FeishuResponsePart::Text(content) => send_payload(
+            message_id,
+            "text",
+            serde_json::json!({"text": content}).to_string(),
+        ),
+    })
+}
+
+fn send_message_response_with_upload(
+    receive_id: &str,
+    receive_id_type: &str,
+    response: &AgentResponse,
+    upload_image: impl FnMut(&Attachment) -> Result<String, String>,
+    mut send_payload: impl FnMut(&str, &str, &str, String) -> Result<(), String>,
+) -> Result<(), String> {
+    send_response_images_then_text_with_upload(response, upload_image, |part| match part {
+        FeishuResponsePart::Image(image_key) => send_payload(
+            receive_id,
+            receive_id_type,
+            "image",
+            image_message_content(&image_key),
+        ),
+        FeishuResponsePart::Text(content) => send_payload(
+            receive_id,
+            receive_id_type,
+            "text",
+            serde_json::json!({"text": content}).to_string(),
+        ),
+    })
+}
+
+fn send_response_images_then_text_with_upload(
+    response: &AgentResponse,
+    mut upload_image: impl FnMut(&Attachment) -> Result<String, String>,
+    mut send_part: impl FnMut(FeishuResponsePart) -> Result<(), String>,
 ) -> Result<(), String> {
     let mut sent_any = false;
     let mut errors = Vec::new();
 
     for attachment in &response.attachments {
-        match upload_feishu_image(attachment).and_then(|image_key| send_image(&image_key)) {
+        match upload_image(attachment)
+            .and_then(|image_key| send_part(FeishuResponsePart::Image(image_key)))
+        {
             Ok(()) => sent_any = true,
             Err(error) => errors.push(error),
         }
@@ -1254,7 +1399,7 @@ fn send_response_images_then_text(
         append_attachment_errors_to_text(&response.content, &errors)
     };
     if !content.is_empty() {
-        send_text(&content)?;
+        send_part(FeishuResponsePart::Text(content))?;
         sent_any = true;
     }
 
@@ -1498,6 +1643,14 @@ mod tests {
     }
 
     #[test]
+    fn webhook_mode_enables_polling_for_deferred_events() {
+        let poll = poll_config_for_connection_mode("webhook").unwrap();
+        assert!(poll.enabled);
+        assert_eq!(poll.interval_ms, WEBHOOK_POLL_INTERVAL_MS);
+        assert!(poll_config_for_connection_mode("websocket").is_none());
+    }
+
+    #[test]
     fn webhook_auth_requires_host_auth_or_matching_verification_token() {
         assert!(
             !is_authenticated_webhook(false, None, Some("token")),
@@ -1611,6 +1764,58 @@ mod tests {
     }
 
     #[test]
+    fn send_reply_response_uploads_image_reply_before_text_reply() {
+        let response = AgentResponse {
+            message_id: "agent-msg-1".to_string(),
+            content: "generated".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: vec![Attachment {
+                filename: "result.png".to_string(),
+                mime_type: "image/png".to_string(),
+                data: b"png-bytes".to_vec(),
+            }],
+        };
+        let uploaded = std::cell::RefCell::new(Vec::<String>::new());
+        let sent = std::cell::RefCell::new(Vec::<(String, String, String)>::new());
+
+        send_reply_response_with_upload(
+            "om_123",
+            &response,
+            |attachment| {
+                uploaded.borrow_mut().push(format!(
+                    "{}:{}:{}",
+                    attachment.filename,
+                    attachment.mime_type,
+                    attachment.data.len()
+                ));
+                Ok("img_v2_uploaded".to_string())
+            },
+            |message_id, msg_type, content| {
+                sent.borrow_mut()
+                    .push((message_id.to_string(), msg_type.to_string(), content));
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            uploaded.borrow().as_slice(),
+            &["result.png:image/png:9".to_string()]
+        );
+        let sent = sent.borrow();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].0, "om_123");
+        assert_eq!(sent[0].1, "image");
+        let image_content: serde_json::Value = serde_json::from_str(&sent[0].2).unwrap();
+        assert_eq!(image_content["image_key"], "img_v2_uploaded");
+        assert_eq!(sent[1].0, "om_123");
+        assert_eq!(sent[1].1, "text");
+        let text_content: serde_json::Value = serde_json::from_str(&sent[1].2).unwrap();
+        assert_eq!(text_content["text"], "generated");
+    }
+
+    #[test]
     fn append_attachment_errors_to_text_preserves_existing_text() {
         assert_eq!(
             append_attachment_errors_to_text("done", &["upload failed".to_string()]),
@@ -1676,6 +1881,62 @@ mod tests {
 
         assert_eq!(processed.borrow().as_slice(), &["first".to_string()]);
         assert_eq!(write_count.get(), 1);
+    }
+
+    #[test]
+    fn enqueue_event_payload_appends_to_existing_queue() {
+        let queue = std::cell::RefCell::new(serde_json::json!(["first"]).to_string());
+
+        enqueue_event_payload_with(
+            || queue.borrow().clone(),
+            |queue_json| {
+                *queue.borrow_mut() = queue_json.to_string();
+                Ok(())
+            },
+            "second",
+            |_level, _message| {},
+        )
+        .unwrap();
+
+        let frames: Vec<String> = serde_json::from_str(&queue.borrow()).unwrap();
+        assert_eq!(frames, vec!["first".to_string(), "second".to_string()]);
+    }
+
+    #[test]
+    fn queued_webhook_event_is_processed_as_already_verified() {
+        let body = serde_json::json!({
+            "schema": "2.0",
+            "header": {
+                "event_id": "evt_123",
+                "event_type": "im.message.receive_v1"
+            },
+            "event": {}
+        })
+        .to_string();
+        let queue = std::cell::RefCell::new(serde_json::json!([body]).to_string());
+        let handled = std::cell::RefCell::new(false);
+
+        process_websocket_event_queue_with(
+            || queue.borrow().clone(),
+            |queue_json| {
+                *queue.borrow_mut() = queue_json.to_string();
+            },
+            |frame| {
+                process_feishu_event_payload_with_workspace_auth(
+                    frame,
+                    FeishuEventAuthMode::AlreadyVerified,
+                    |path| (path == VERIFICATION_TOKEN_PATH).then(|| "expected".to_string()),
+                    |_event| {
+                        *handled.borrow_mut() = true;
+                    },
+                    |_level, _message| {},
+                );
+            },
+            |_level, _message| {},
+        );
+
+        assert_eq!(queue.borrow().as_str(), "[]");
+        assert!(*handled.borrow());
     }
 
     #[test]
