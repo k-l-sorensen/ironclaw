@@ -472,7 +472,13 @@ impl Guest for FeishuChannel {
         let metadata: FeishuMessageMetadata = serde_json::from_str(&response.metadata_json)
             .map_err(|e| format!("Failed to parse metadata: {}", e))?;
 
-        send_reply_response(&metadata.message_id, &response)
+        send_response_to_metadata(
+            &metadata,
+            &response,
+            send_reply_response,
+            send_message_response,
+            channel_host::log,
+        )
     }
 
     fn on_broadcast(user_id: String, response: AgentResponse) -> Result<(), String> {
@@ -1335,6 +1341,35 @@ fn send_message_response(
     )
 }
 
+fn send_response_to_metadata(
+    metadata: &FeishuMessageMetadata,
+    response: &AgentResponse,
+    mut send_reply: impl FnMut(&str, &AgentResponse) -> Result<(), String>,
+    mut send_message: impl FnMut(&str, &str, &AgentResponse) -> Result<(), String>,
+    mut log: impl FnMut(channel_host::LogLevel, &str),
+) -> Result<(), String> {
+    match send_reply(&metadata.message_id, response) {
+        Ok(()) => Ok(()),
+        Err(reply_error) => {
+            if metadata.chat_id.trim().is_empty() {
+                return Err(reply_error);
+            }
+
+            log(
+                channel_host::LogLevel::Warn,
+                &format!(
+                    "Failed to reply to Feishu message; falling back to chat send: {reply_error}"
+                ),
+            );
+            send_message(&metadata.chat_id, "chat_id", response).map_err(|fallback_error| {
+                format!(
+                    "Failed to reply to Feishu message ({reply_error}); fallback chat send also failed ({fallback_error})"
+                )
+            })
+        }
+    }
+}
+
 fn send_reply_response_with_upload(
     message_id: &str,
     response: &AgentResponse,
@@ -1813,6 +1848,112 @@ mod tests {
         assert_eq!(sent[1].1, "text");
         let text_content: serde_json::Value = serde_json::from_str(&sent[1].2).unwrap();
         assert_eq!(text_content["text"], "generated");
+    }
+
+    #[test]
+    fn send_response_to_metadata_uses_reply_when_available() {
+        let metadata = FeishuMessageMetadata {
+            chat_id: "oc_chat".to_string(),
+            message_id: "om_msg".to_string(),
+            chat_type: "group".to_string(),
+        };
+        let response = AgentResponse {
+            message_id: "agent-msg-1".to_string(),
+            content: "generated".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: Vec::new(),
+        };
+        let replied = std::cell::RefCell::new(Vec::<String>::new());
+        let fallback_sent = std::cell::Cell::new(false);
+
+        send_response_to_metadata(
+            &metadata,
+            &response,
+            |message_id, _response| {
+                replied.borrow_mut().push(message_id.to_string());
+                Ok(())
+            },
+            |_receive_id, _receive_id_type, _response| {
+                fallback_sent.set(true);
+                Ok(())
+            },
+            |_level, _message| {},
+        )
+        .unwrap();
+
+        assert_eq!(replied.borrow().as_slice(), &["om_msg".to_string()]);
+        assert!(!fallback_sent.get());
+    }
+
+    #[test]
+    fn send_response_to_metadata_falls_back_to_chat_send_when_reply_fails() {
+        let metadata = FeishuMessageMetadata {
+            chat_id: "oc_chat".to_string(),
+            message_id: "om_msg".to_string(),
+            chat_type: "group".to_string(),
+        };
+        let response = AgentResponse {
+            message_id: "agent-msg-1".to_string(),
+            content: "generated".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: Vec::new(),
+        };
+        let sent = std::cell::RefCell::new(Vec::<(String, String)>::new());
+        let warnings = std::cell::RefCell::new(Vec::<String>::new());
+
+        send_response_to_metadata(
+            &metadata,
+            &response,
+            |_message_id, _response| Err("reply expired".to_string()),
+            |receive_id, receive_id_type, _response| {
+                sent.borrow_mut()
+                    .push((receive_id.to_string(), receive_id_type.to_string()));
+                Ok(())
+            },
+            |level, message| {
+                if matches!(level, channel_host::LogLevel::Warn) {
+                    warnings.borrow_mut().push(message.to_string());
+                }
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            sent.borrow().as_slice(),
+            &[("oc_chat".to_string(), "chat_id".to_string())]
+        );
+        assert_eq!(warnings.borrow().len(), 1);
+        assert!(warnings.borrow()[0].contains("reply expired"));
+    }
+
+    #[test]
+    fn send_response_to_metadata_returns_combined_error_when_fallback_fails() {
+        let metadata = FeishuMessageMetadata {
+            chat_id: "oc_chat".to_string(),
+            message_id: "om_msg".to_string(),
+            chat_type: "group".to_string(),
+        };
+        let response = AgentResponse {
+            message_id: "agent-msg-1".to_string(),
+            content: "generated".to_string(),
+            thread_id: None,
+            metadata_json: "{}".to_string(),
+            attachments: Vec::new(),
+        };
+
+        let error = send_response_to_metadata(
+            &metadata,
+            &response,
+            |_message_id, _response| Err("reply expired".to_string()),
+            |_receive_id, _receive_id_type, _response| Err("missing permission".to_string()),
+            |_level, _message| {},
+        )
+        .unwrap_err();
+
+        assert!(error.contains("reply expired"));
+        assert!(error.contains("missing permission"));
     }
 
     #[test]

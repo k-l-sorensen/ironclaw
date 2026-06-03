@@ -524,6 +524,27 @@ fn resumed_action_result_message(
     ironclaw_engine::ThreadMessage::action_result(call_id, action_name, rendered)
 }
 
+fn engine_content_parts_from_llm(
+    parts: &[ironclaw_llm::ContentPart],
+) -> Vec<ironclaw_engine::MessageContentPart> {
+    parts
+        .iter()
+        .map(|part| match part {
+            ironclaw_llm::ContentPart::Text { text } => {
+                ironclaw_engine::MessageContentPart::Text { text: text.clone() }
+            }
+            ironclaw_llm::ContentPart::ImageUrl { image_url } => {
+                ironclaw_engine::MessageContentPart::ImageUrl {
+                    image_url: ironclaw_engine::MessageImageUrl {
+                        url: image_url.url.clone(),
+                        detail: image_url.detail.clone(),
+                    },
+                }
+            }
+        })
+        .collect()
+}
+
 /// Extract the tool output for `call_id` from a Responses API
 /// `function_call_output` resolution payload. The handler builds the
 /// payload as `{"outputs": [{"call_id": ..., "output": <string|json>}]}`.
@@ -4593,16 +4614,18 @@ async fn handle_with_engine_inner(
     )
     .await;
 
-    // Engine v2 threads are text-only today, so attachments must be folded
-    // into the effective user content before routing to the engine. This
-    // preserves extracted document text, project-local file paths, and
-    // attachment metadata in both the engine thread and the dual-written
-    // gateway history.
+    // Attachments are folded into effective text for persisted metadata and
+    // also converted into transient multimodal parts for the engine's current
+    // LLM turn.
     let augmented = crate::agent::augment_with_attachments(content, &persisted_attachments);
     let effective_content = augmented
         .as_ref()
         .map(|result| result.text.as_str())
         .unwrap_or(content);
+    let content_parts = augmented
+        .as_ref()
+        .map(|result| engine_content_parts_from_llm(&result.image_parts))
+        .unwrap_or_default();
 
     // Fire any active OnEvent missions whose pattern (and optional channel
     // filter) match this inbound message. Mission firings here are side
@@ -4716,9 +4739,10 @@ async fn handle_with_engine_inner(
     // the same user.
     let thread_id = match state
         .conversation_manager
-        .handle_user_message(
+        .handle_user_message_with_content_parts(
             conv_id,
             effective_content,
+            content_parts,
             project_id,
             &message.user_id,
             thread_config,
@@ -10789,6 +10813,100 @@ mod tests {
 
         *lock.write().await = None;
         outcome.expect("router attachment persistence test");
+    }
+
+    #[tokio::test]
+    async fn handle_with_engine_passes_image_attachments_as_content_parts() {
+        let _engine_guard = ENGINE_STATE_TEST_LOCK.lock().await;
+        let _cwd_guard = CWD_TEST_LOCK.lock().await;
+        let lock = ENGINE_STATE.get_or_init(|| RwLock::new(None));
+        *lock.write().await = None;
+
+        let outcome = async {
+            let store = Arc::new(TestStore::new());
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let _cwd = CurrentDirGuard::enter(temp_dir.path());
+            let mut state = make_expected_test_state(store.clone());
+            state.project_root = temp_dir.path().join("projects");
+            *lock.write().await = Some(state);
+
+            let (agent, _statuses) = make_router_test_agent(None).await;
+            let message = IncomingMessage::new("gateway", "alice", "What is in this image?")
+                .with_attachments(vec![crate::channels::IncomingAttachment {
+                    id: "img-1".to_string(),
+                    kind: crate::channels::AttachmentKind::Image,
+                    mime_type: "image/png".to_string(),
+                    filename: Some("screenshot.png".to_string()),
+                    size_bytes: Some(4),
+                    source_url: None,
+                    storage_key: None,
+                    local_path: None,
+                    extracted_text: None,
+                    data: vec![0x89, 0x50, 0x4E, 0x47],
+                    duration_secs: None,
+                }]);
+
+            let _ = handle_with_engine_inner(&agent, &message, &message.content, 0)
+                .await
+                .expect("router handled image message");
+
+            let thread = store
+                .threads
+                .read()
+                .await
+                .values()
+                .next()
+                .cloned()
+                .expect("thread saved");
+            let user_msg = thread
+                .messages
+                .iter()
+                .find(|msg| msg.role == ironclaw_engine::MessageRole::User)
+                .expect("user message recorded");
+
+            assert!(
+                user_msg.content.contains("you can already see this image"),
+                "expected visual-context hint, got: {}",
+                user_msg.content
+            );
+            assert!(
+                user_msg
+                    .content
+                    .contains("project_path=\".ironclaw/attachments/alice/"),
+                "expected saved project path in user content, got: {}",
+                user_msg.content
+            );
+            assert_eq!(
+                user_msg.content_parts.len(),
+                1,
+                "expected image content part to reach engine message"
+            );
+            match &user_msg.content_parts[0] {
+                ironclaw_engine::MessageContentPart::ImageUrl { image_url } => {
+                    assert!(
+                        image_url.url.starts_with("data:image/png;base64,"),
+                        "expected data URL image part, got: {}",
+                        image_url.url
+                    );
+                    assert_eq!(image_url.detail.as_deref(), Some("auto"));
+                }
+                other => panic!("expected image content part, got: {other:?}"),
+            }
+
+            assert!(
+                message
+                    .attachments
+                    .first()
+                    .is_some_and(|attachment| !attachment.data.is_empty()),
+                "source message should remain unchanged"
+            );
+
+            Ok::<(), crate::error::Error>(())
+        }
+        .await;
+
+        *lock.write().await = None;
+        outcome.expect("router image content part test");
     }
 
     #[tokio::test]
