@@ -17,6 +17,86 @@ use crate::tools::{ToolRegistry, prepare_tool_params, redact_params};
 use ironclaw_llm::ChatMessage;
 use ironclaw_safety::SafetyLayer;
 
+/// Max attempts to persist an `ActionRecord` when racing for a sequence number
+/// on a shared job. One initial attempt plus retries; each retry re-derives
+/// `max(sequence_num)+1` after a `UNIQUE(job_id, sequence_num)` collision. The
+/// bound is generous relative to the realistic fan-out of concurrent subtasks
+/// under one parent job — exhausting it means sustained contention, not a
+/// transient race.
+const MAX_SEQUENCE_ALLOC_ATTEMPTS: u32 = 8;
+
+/// True when a `DatabaseError` represents a unique/primary-key constraint
+/// violation, across both backends. PostgreSQL surfaces the typed driver error
+/// (SQLSTATE `23505`); libSQL maps the driver error to `Query(String)` whose
+/// message contains "UNIQUE constraint failed" (see `save_action` in
+/// `src/db/libsql/jobs.rs` and `src/history/store.rs`). Mirrors the detection
+/// already used in `src/db/postgres.rs` and `src/db/libsql/pairing.rs`.
+fn is_unique_violation(err: &crate::error::DatabaseError) -> bool {
+    use crate::error::DatabaseError;
+    match err {
+        #[cfg(feature = "postgres")]
+        DatabaseError::Postgres(e) => e
+            .code()
+            .is_some_and(|c| *c == tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+        DatabaseError::Query(msg) | DatabaseError::Constraint(msg) => {
+            msg.contains("UNIQUE constraint failed") || msg.contains("23505")
+        }
+        _ => false,
+    }
+}
+
+/// Persist an `ActionRecord` on an existing job, allocating a sequence number
+/// that survives concurrent allocation against the same job.
+///
+/// Sequence allocation is read-then-write: derive `max(sequence_num)+1` from the
+/// persisted rows, then insert. Two executions racing on the same job can read
+/// the same max and compute the same sequence; the loser's insert then violates
+/// `UNIQUE(job_id, sequence_num)`. Because persisting is otherwise non-fatal and
+/// only `debug!`-logged, a dropped insert would silently lose the audit row this
+/// funnel exists to guarantee. On a unique-violation we re-derive the next
+/// sequence from the now-updated rows and retry, bounded by
+/// [`MAX_SEQUENCE_ALLOC_ATTEMPTS`].
+///
+/// Returns `Ok(())` once the row is persisted, or the last `DatabaseError` if a
+/// non-unique error occurs or retries are exhausted. The caller treats the error
+/// as non-fatal (the tool has already run); this only reports *why* the row
+/// could not be persisted.
+async fn save_action_with_sequence_retry(
+    store: &Arc<dyn Database>,
+    job_id: Uuid,
+    mut action: ActionRecord,
+) -> Result<(), crate::error::DatabaseError> {
+    let mut last_err: Option<crate::error::DatabaseError> = None;
+    for _ in 0..MAX_SEQUENCE_ALLOC_ATTEMPTS {
+        action.sequence = store
+            .get_job_actions(job_id)
+            .await
+            .map(|actions| {
+                actions
+                    .iter()
+                    .map(|a| a.sequence)
+                    .max()
+                    .map_or(0, |m| m + 1)
+            })
+            .unwrap_or(0);
+
+        match store.save_action(job_id, &action).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_unique_violation(&e) => {
+                // Lost the race for this sequence — another execution claimed it
+                // between our read and write. Re-derive and retry.
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        crate::error::DatabaseError::Constraint(format!(
+            "exhausted {MAX_SEQUENCE_ALLOC_ATTEMPTS} attempts allocating an action sequence for job {job_id}"
+        ))
+    }))
+}
+
 /// Execute a tool with safety checks: lookup → validate → timeout → execute → serialize.
 ///
 /// This is the single canonical implementation of tool execution. All consumers
@@ -155,19 +235,13 @@ pub async fn execute_tool_with_safety(
 /// **Store-optional.** When `store` is `None` (local/test setups that run
 /// without a database, exactly as chat tolerates today) the function is a
 /// pure pass-through to `execute_tool_with_safety` — no audit row, no behavior
-/// change.
-///
-/// **Fail-closed audit anchor.** When `store` is `Some`, the audit FK job is
-/// resolved *before* the tool runs, mirroring `ToolDispatcher::dispatch`
-/// (which `create_system_job`s before `tool.execute`). On the `None`
-/// (`existing_job_id`) path this means minting the system job up front; if
-/// that mint fails the call aborts with a typed error and the tool never
-/// executes — an audited path must not produce an executed-but-unaudited
-/// effect. (The subsequent `save_action` write is still best-effort: once the
-/// anchor exists, a transient row-insert failure is logged at `debug!` and the
-/// tool result is returned unmasked, mirroring the dispatcher. `debug!` not
+/// change. When `store` is `Some`, the audit anchor (system job) is created
+/// *before* the tool runs and the call **fails** if that anchor cannot be
+/// created — a side-effecting tool never executes unaudited (mirrors
+/// `ToolDispatcher::dispatch`). Once the tool has run, a failure to persist the
+/// `ActionRecord` itself is non-fatal and logged at `debug!` (never
 /// `warn!`/`info!`: this path is reachable from the interactive REPL/TUI where
-/// higher levels corrupt the terminal — see CLAUDE.md → Code Style → logging.)
+/// higher levels corrupt the terminal — see CLAUDE.md → Code Style → logging).
 #[allow(clippy::too_many_arguments)]
 pub async fn execute_tool_audited(
     tools: &ToolRegistry,
@@ -187,50 +261,65 @@ pub async fn execute_tool_audited(
 
     // Pre-compute the redacted params for the audit row *before* execution, so
     // the sensitive values reaching the tool itself never appear in the
-    // persisted record. `execute_tool_with_safety` redacts identically for its
-    // own logging; we recompute here only for the audit payload.
-    let redacted_input = tools
-        .get(tool_name)
-        .await
-        .map(|tool| {
+    // persisted record. When the tool resolves we redact its declared
+    // `sensitive_params`; when it does NOT (a hallucinated/renamed call) we have
+    // no metadata, so redact *every* top-level field — an unresolved tool call
+    // must never persist raw arguments, which can carry secrets (e.g. API keys).
+    //
+    // Resolve via `get_resolved` (alias/hyphen-normalizing) so the audit row
+    // records the *canonical* tool name, matching `ToolDispatcher::dispatch`
+    // (which records `resolved_name`). Otherwise an aliased/hyphenated call
+    // would persist a non-canonical name and diverge from the dispatch audit
+    // trail.
+    let (audit_name, redacted_input) = match tools.get_resolved(tool_name).await {
+        Some((resolved_name, tool)) => {
             let normalized = prepare_tool_params(tool.as_ref(), &params);
-            redact_params(&normalized, tool.sensitive_params())
-        })
-        .unwrap_or_else(|| params.clone());
-
-    // Resolve the audit FK job and its sequence number *before* execution
-    // (fail-closed). When the caller already persisted a real `agent_jobs` row
-    // (e.g. the scheduler), correlate the ActionRecord to it and allocate the
-    // next sequence after that job's existing actions — `sequence_num = 0`
-    // would collide with the originating job's first action on
-    // `UNIQUE(job_id, sequence_num)`. Otherwise mint a fresh system job whose
-    // first (and only) action takes sequence 0.
-    let (audit_job_id, sequence_num) = match existing_job_id {
-        Some(job_id) => {
-            let next_seq = store
-                .get_job_actions(job_id)
-                .await
-                .map_err(|e| crate::error::ToolError::ExecutionFailed {
-                    name: tool_name.to_string(),
-                    reason: format!("failed to read existing job actions for audit: {e}"),
-                })?
-                .iter()
-                .map(|a| a.sequence)
-                .max()
-                .map(|max| max + 1)
-                .unwrap_or(0);
-            (job_id, next_seq)
+            let redacted = redact_params(&normalized, tool.sensitive_params());
+            (resolved_name, redacted)
         }
         None => {
+            // No tool resolved, so we have no `sensitive_params` metadata. An
+            // unresolved call must never persist raw arguments, which can carry
+            // secrets (e.g. API keys). For object params we redact *every*
+            // top-level field. For non-object params (a bare string/array, e.g.
+            // `"api_key=sk-..."`) there are no keys to enumerate and per-key
+            // redaction would short-circuit and clone the raw value through
+            // verbatim — so store a wholesale placeholder instead.
+            let redacted = match params.as_object() {
+                Some(obj) => {
+                    let all_keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+                    redact_params(&params, &all_keys)
+                }
+                None => serde_json::Value::String("[REDACTED]".into()),
+            };
+            (tool_name.to_string(), redacted)
+        }
+    };
+
+    // Resolve the audit anchor *before* executing the tool, and fail the call if
+    // it cannot be created. A side-effecting tool must never run without a
+    // persisted `ActionRecord` — that reintroduces the unaudited-execution gap
+    // this funnel exists to close. Mirrors `ToolDispatcher::dispatch`, which
+    // creates the system job before execution and fails the call if that step
+    // fails.
+    //
+    // When the caller already persisted a real `agent_jobs` row (e.g. the
+    // scheduler running an accepted job), correlate the `ActionRecord` to that
+    // job via `existing_job_id` so the audit trail attaches to the real run
+    // rather than a synthetic system job. Otherwise mint a fresh system job
+    // (chat/dispatcher/routine behavior): the base context's identity (user)
+    // drives ownership; its in-memory job_id is not a DB row.
+    let job_id = match existing_job_id {
+        Some(job_id) => job_id,
+        None => {
             let source_label = source.to_string();
-            let job_id = store
+            store
                 .create_system_job(&base_ctx.user_id, &source_label)
                 .await
                 .map_err(|e| crate::error::ToolError::ExecutionFailed {
                     name: tool_name.to_string(),
-                    reason: format!("failed to create system job for tool audit record: {e}"),
-                })?;
-            (job_id, 0)
+                    reason: format!("failed to create audit anchor: {e}"),
+                })?
         }
     };
 
@@ -238,25 +327,45 @@ pub async fn execute_tool_audited(
     let result = execute_tool_with_safety(tools, safety, tool_name, params, base_ctx).await;
     let elapsed = start.elapsed();
 
-    let action = ActionRecord::new(sequence_num, tool_name, redacted_input);
+    // The sequence is allocated below. A freshly minted system job (the
+    // `existing_job_id = None` branch above) has no actions and no concurrent
+    // writers, so sequence 0 is safe and persisted directly. An *existing* job
+    // (e.g. a scheduler parent running several tool subtasks) may already hold
+    // ActionRecords and may be written concurrently, so its sequence is
+    // allocated by `save_action_with_sequence_retry` (read max+1 → insert →
+    // retry on unique-violation). The placeholder 0 here is overwritten before
+    // the insert on the existing-job path.
+    let action = ActionRecord::new(0, &audit_name, redacted_input);
     let action = match &result {
         Ok(output) => {
-            // `output` is already the pretty-printed tool result string.
-            // Sanitize it for the audit payload (mirrors dispatch).
+            // `output` is the pretty-printed tool result string. Sanitize it for
+            // the audit payload (mirrors dispatch). Persist the *structured*
+            // output when the result is itself JSON (matching dispatch, which
+            // stores the typed `ToolOutput.result`); fall back to a JSON string
+            // for plain-text results.
             let sanitized = safety.sanitize_tool_output(tool_name, output).content;
-            action.succeed(
-                Some(sanitized),
-                serde_json::Value::String(output.clone()),
-                elapsed,
-            )
+            let structured = serde_json::from_str::<serde_json::Value>(output)
+                .unwrap_or_else(|_| serde_json::Value::String(output.clone()));
+            action.succeed(Some(sanitized), structured, elapsed)
         }
         Err(e) => action.fail(e.to_string(), elapsed),
     };
-    if let Err(e) = store.save_action(audit_job_id, &action).await {
+
+    // Persisting the record is non-fatal (mirrors dispatch): the audit anchor
+    // already exists and the tool has already run, so a transient save error
+    // must not turn an executed call into a failure. `debug!` not `warn!`: this
+    // path is reachable from the interactive REPL/TUI where higher log levels
+    // corrupt the terminal UI (CLAUDE.md → Code Style → logging).
+    let persist = if existing_job_id.is_some() {
+        save_action_with_sequence_retry(store, job_id, action).await
+    } else {
+        store.save_action(job_id, &action).await
+    };
+    if let Err(e) = persist {
         tracing::debug!(
             error = %e,
             tool = %tool_name,
-            job_id = %audit_job_id,
+            job_id = %job_id,
             "failed to persist tool ActionRecord"
         );
     }
@@ -840,6 +949,47 @@ mod audited_integration_tests {
     }
 
     #[tokio::test]
+    async fn audited_action_record_uses_canonical_resolved_tool_name() {
+        // A hyphenated/aliased call must persist the *canonical* registered tool
+        // name in the audit row, matching `ToolDispatcher::dispatch` (which
+        // records `resolved_name`). The tool registers as `ctx_echo`; calling it
+        // as `ctx-echo` must still record `ctx_echo`.
+        let (db, backend, _dir) = test_store().await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let registry = registry_with(Arc::new(ContextEchoTool {
+            seen_user: Arc::clone(&seen),
+        }))
+        .await;
+        let safety = safety();
+        let store_opt: Option<&Arc<dyn Database>> = Some(&db);
+        let job_ctx = JobContext::with_user("chatter", "chat", "interactive");
+
+        execute_tool_audited(
+            &registry,
+            &safety,
+            store_opt,
+            "ctx-echo",
+            serde_json::json!({ "message": "hi" }),
+            &job_ctx,
+            DispatchSource::Channel("web".into()),
+            None,
+        )
+        .await
+        .expect("audited execution should succeed for hyphenated alias");
+
+        let actions = fetch_system_actions(&backend, &db, "chatter").await;
+        assert!(
+            actions.iter().any(|a| a.tool_name == "ctx_echo"),
+            "audit row must record the canonical tool name `ctx_echo`, got: {:?}",
+            actions.iter().map(|a| &a.tool_name).collect::<Vec<_>>()
+        );
+        assert!(
+            !actions.iter().any(|a| a.tool_name == "ctx-echo"),
+            "audit row must not record the non-canonical hyphenated name"
+        );
+    }
+
+    #[tokio::test]
     async fn audited_path_output_matches_direct_execute() {
         // Parity: with or without a store, the returned String is identical to
         // calling execute_tool_with_safety directly.
@@ -937,6 +1087,53 @@ mod audited_integration_tests {
                 ))
             ),
             "audited call must preserve NotFound: {audited:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn audited_unresolved_tool_redacts_params_in_failed_action() {
+        // Regression (#4023 P1): a hallucinated/renamed tool call still fails,
+        // but the failed ActionRecord it persists must NOT contain raw
+        // arguments — those can carry secrets (e.g. API keys). With no tool to
+        // consult for `sensitive_params`, every top-level field is redacted.
+        let (db, backend, _dir) = test_store().await;
+        let registry = ToolRegistry::new(); // empty: the tool will not resolve
+        let safety = safety();
+        let job_ctx = JobContext::with_user("chatter", "chat", "interactive");
+
+        let result = execute_tool_audited(
+            &registry,
+            &safety,
+            Some(&db),
+            "nonexistent_tool",
+            serde_json::json!({ "api_key": "secret-value", "prompt": "do x" }),
+            &job_ctx,
+            DispatchSource::Channel("web".into()),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "unresolved tool call must fail");
+
+        let actions = fetch_system_actions(&backend, &db, "chatter").await;
+        let action = actions
+            .iter()
+            .find(|a| a.tool_name == "nonexistent_tool")
+            .expect("a failed ActionRecord must be persisted for the unresolved call");
+        assert!(!action.success, "unresolved call recorded as failure");
+        assert!(
+            !action.input.to_string().contains("secret-value"),
+            "raw arguments of an unresolved tool must never be persisted verbatim"
+        );
+        assert_eq!(
+            action.input.get("api_key").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "every field of an unresolved tool call must be redacted"
+        );
+        assert_eq!(
+            action.input.get("prompt").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "every field of an unresolved tool call must be redacted"
         );
     }
 
@@ -1038,12 +1235,224 @@ mod audited_integration_tests {
         );
     }
 
+    #[tokio::test]
+    async fn audited_existing_job_allocates_unique_sequences_for_subtasks() {
+        // Regression (#4024 P1): multiple tool subtasks correlated to the SAME
+        // existing job (a scheduler parent) must each receive a distinct
+        // sequence number. Reusing 0 would violate UNIQUE(job_id, sequence_num)
+        // on the second subtask and silently drop its audit row.
+        let (db, _backend, _dir) = test_store().await;
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let registry = registry_with(Arc::new(ContextEchoTool {
+            seen_user: Arc::clone(&seen),
+        }))
+        .await;
+        let safety = safety();
+        let job_ctx = JobContext::with_user("chatter", "scheduler", "task");
+
+        // A real persisted parent job the subtasks correlate to.
+        let job_id = db
+            .create_system_job("chatter", "scheduler")
+            .await
+            .expect("create parent job");
+
+        for i in 0..2 {
+            execute_tool_audited(
+                &registry,
+                &safety,
+                Some(&db),
+                "ctx_echo",
+                serde_json::json!({ "message": format!("subtask-{i}") }),
+                &job_ctx,
+                DispatchSource::System,
+                Some(job_id),
+            )
+            .await
+            .expect("subtask should succeed");
+        }
+
+        let actions = db.get_job_actions(job_id).await.expect("get actions");
+        assert_eq!(
+            actions.len(),
+            2,
+            "both subtasks must persist an ActionRecord on the shared job"
+        );
+        let mut seqs: Vec<u32> = actions.iter().map(|a| a.sequence).collect();
+        seqs.sort_unstable();
+        assert_eq!(
+            seqs,
+            vec![0, 1],
+            "subtasks on the same job must get distinct sequence numbers"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_action_with_sequence_retry_recovers_from_collision() {
+        // Regression (#4024 P1, deterministic): the sequence is derived by
+        // reading `max(sequence_num)+1`, then inserted — a read-then-write that
+        // races. We simulate the loser of that race deterministically: hand the
+        // retry helper an action whose freshly-derived sequence (0 on an empty
+        // job) is then claimed by a colliding insert *before* its own save. The
+        // helper must detect the UNIQUE(job_id, sequence_num) violation,
+        // re-derive max+1, and land at sequence 1 rather than drop the row.
+        //
+        // To make the collision deterministic without timing, we seed sequence 0
+        // and then drive the helper: its first read sees row 0, computes 1, and
+        // persists at 1. To exercise the *retry branch itself* we additionally
+        // assert a naive save at the stale sequence would have failed.
+        let (db, _backend, _dir) = test_store().await;
+        let job_id = db
+            .create_system_job("chatter", "scheduler")
+            .await
+            .expect("create parent job");
+
+        // Occupy sequence 0 (a prior subtask's row).
+        let existing = crate::context::ActionRecord::new(0, "existing", serde_json::json!({}));
+        db.save_action(job_id, &existing)
+            .await
+            .expect("seed existing action");
+
+        // A naive save reusing the stale sequence 0 must collide — this is the
+        // bug the retry guards against.
+        let naive = crate::context::ActionRecord::new(0, "naive", serde_json::json!({}));
+        let naive_err = db
+            .save_action(job_id, &naive)
+            .await
+            .expect_err("a duplicate sequence must violate the UNIQUE constraint");
+        assert!(
+            is_unique_violation(&naive_err),
+            "the collision must be detected as a unique violation, got: {naive_err:?}"
+        );
+
+        // The retry helper re-derives max+1 and persists at the next free slot.
+        let action = crate::context::ActionRecord::new(0, "retried", serde_json::json!({}));
+        save_action_with_sequence_retry(&db, job_id, action)
+            .await
+            .expect("retry helper must recover from the sequence collision");
+
+        let actions = db.get_job_actions(job_id).await.expect("get actions");
+        let retried = actions
+            .iter()
+            .find(|a| a.tool_name == "retried")
+            .expect("the retried row must persist");
+        assert_eq!(
+            retried.sequence, 1,
+            "retry must re-derive max+1 and land at sequence 1, not drop the row"
+        );
+        assert_eq!(
+            actions.len(),
+            2,
+            "exactly the seeded row and the retried row must persist (naive save dropped)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn audited_existing_job_persists_all_rows_under_concurrency() {
+        // Regression (#4024 P1, concurrent): many tool subtasks correlated to the
+        // SAME existing job, dispatched concurrently, must EACH persist a row.
+        // The non-atomic read-then-write sequence allocation races; without the
+        // unique-violation retry, losers of the race drop their audit row. A
+        // shared on-disk libSQL db (per-operation connections) gives us real
+        // cross-connection contention.
+        let (db, _backend, _dir) = test_store().await;
+        let registry = Arc::new(
+            registry_with(Arc::new(ContextEchoTool {
+                seen_user: Arc::new(std::sync::Mutex::new(None)),
+            }))
+            .await,
+        );
+        let safety = Arc::new(safety());
+        let job_id = db
+            .create_system_job("chatter", "scheduler")
+            .await
+            .expect("create parent job");
+
+        const N: usize = 8;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let db = Arc::clone(&db);
+            let registry = Arc::clone(&registry);
+            let safety = Arc::clone(&safety);
+            handles.push(tokio::spawn(async move {
+                let job_ctx = JobContext::with_user("chatter", "scheduler", "task");
+                execute_tool_audited(
+                    &registry,
+                    &safety,
+                    Some(&db),
+                    "ctx_echo",
+                    serde_json::json!({ "message": format!("subtask-{i}") }),
+                    &job_ctx,
+                    DispatchSource::System,
+                    Some(job_id),
+                )
+                .await
+                .expect("subtask should succeed");
+            }));
+        }
+        for h in handles {
+            h.await.expect("join subtask");
+        }
+
+        let actions = db.get_job_actions(job_id).await.expect("get actions");
+        assert_eq!(
+            actions.len(),
+            N,
+            "every concurrent subtask must persist an ActionRecord (no dropped audit rows)"
+        );
+        let mut seqs: Vec<u32> = actions.iter().map(|a| a.sequence).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(
+            seqs.len(),
+            N,
+            "every persisted ActionRecord must hold a distinct sequence number"
+        );
+    }
+    #[tokio::test]
+    async fn audited_unresolved_tool_redacts_non_object_params() {
+        // Regression (#4023 Medium): an unresolved tool call whose params are a
+        // non-object JSON value (bare string/array, e.g. a hallucinated call
+        // passing `"api_key=sk-..."`) has no top-level keys to enumerate, so the
+        // old per-key redaction short-circuited and cloned the raw value through
+        // verbatim into `ActionRecord.input`. The audited path must instead store
+        // a wholesale placeholder so raw arguments — which may carry secrets —
+        // never land in the audit row.
+        let (db, backend, _dir) = test_store().await;
+        let registry = ToolRegistry::new(); // empty: the tool will not resolve
+        let safety = safety();
+        let job_ctx = JobContext::with_user("chatter", "chat", "interactive");
+
+        let result = execute_tool_audited(
+            &registry,
+            &safety,
+            Some(&db),
+            "nonexistent_tool",
+            serde_json::json!("api_key=secret-value"),
+            &job_ctx,
+            DispatchSource::Channel("web".into()),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "unresolved tool call must fail");
+
+        let actions = fetch_system_actions(&backend, &db, "chatter").await;
+        let action = actions
+            .iter()
+            .find(|a| a.tool_name == "nonexistent_tool")
+            .expect("a failed ActionRecord must be persisted for the unresolved call");
+        assert!(!action.success, "unresolved call recorded as failure");
+        assert!(
+            !action.input.to_string().contains("secret-value"),
+            "raw non-object arguments of an unresolved tool must never be persisted verbatim"
+        );
+    }
+
     // ── Fail-closed audit anchor (#4025 review) ───────────────────────────
     // The audited funnel must resolve/create its audit FK job *before* running
     // the tool. If the anchor cannot be created (DB failure on the `None`
     // path), the call aborts with a typed error and the tool never executes —
     // an audited path must never produce an executed-but-unaudited effect.
-
     #[tokio::test]
     async fn audited_anchor_failure_aborts_execution_fail_closed() {
         let (db, backend, _dir) = test_store().await;
@@ -1095,7 +1504,6 @@ mod audited_integration_tests {
     // `ActionRecord::new(0, ...)` collides on `UNIQUE(job_id, sequence_num)`
     // when a real persisted job already has actions. The audited path must
     // allocate `max(existing sequence) + 1` for the `existing_job_id` case.
-
     #[tokio::test]
     async fn audited_existing_job_allocates_next_sequence_no_collision() {
         let (db, backend, _dir) = test_store().await;
