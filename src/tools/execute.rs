@@ -17,6 +17,86 @@ use crate::tools::{ToolRegistry, prepare_tool_params, redact_params};
 use ironclaw_llm::ChatMessage;
 use ironclaw_safety::SafetyLayer;
 
+/// Max attempts to persist an `ActionRecord` when racing for a sequence number
+/// on a shared job. One initial attempt plus retries; each retry re-derives
+/// `max(sequence_num)+1` after a `UNIQUE(job_id, sequence_num)` collision. The
+/// bound is generous relative to the realistic fan-out of concurrent subtasks
+/// under one parent job — exhausting it means sustained contention, not a
+/// transient race.
+const MAX_SEQUENCE_ALLOC_ATTEMPTS: u32 = 8;
+
+/// True when a `DatabaseError` represents a unique/primary-key constraint
+/// violation, across both backends. PostgreSQL surfaces the typed driver error
+/// (SQLSTATE `23505`); libSQL maps the driver error to `Query(String)` whose
+/// message contains "UNIQUE constraint failed" (see `save_action` in
+/// `src/db/libsql/jobs.rs` and `src/history/store.rs`). Mirrors the detection
+/// already used in `src/db/postgres.rs` and `src/db/libsql/pairing.rs`.
+fn is_unique_violation(err: &crate::error::DatabaseError) -> bool {
+    use crate::error::DatabaseError;
+    match err {
+        #[cfg(feature = "postgres")]
+        DatabaseError::Postgres(e) => e
+            .code()
+            .is_some_and(|c| *c == tokio_postgres::error::SqlState::UNIQUE_VIOLATION),
+        DatabaseError::Query(msg) | DatabaseError::Constraint(msg) => {
+            msg.contains("UNIQUE constraint failed") || msg.contains("23505")
+        }
+        _ => false,
+    }
+}
+
+/// Persist an `ActionRecord` on an existing job, allocating a sequence number
+/// that survives concurrent allocation against the same job.
+///
+/// Sequence allocation is read-then-write: derive `max(sequence_num)+1` from the
+/// persisted rows, then insert. Two executions racing on the same job can read
+/// the same max and compute the same sequence; the loser's insert then violates
+/// `UNIQUE(job_id, sequence_num)`. Because persisting is otherwise non-fatal and
+/// only `debug!`-logged, a dropped insert would silently lose the audit row this
+/// funnel exists to guarantee. On a unique-violation we re-derive the next
+/// sequence from the now-updated rows and retry, bounded by
+/// [`MAX_SEQUENCE_ALLOC_ATTEMPTS`].
+///
+/// Returns `Ok(())` once the row is persisted, or the last `DatabaseError` if a
+/// non-unique error occurs or retries are exhausted. The caller treats the error
+/// as non-fatal (the tool has already run); this only reports *why* the row
+/// could not be persisted.
+async fn save_action_with_sequence_retry(
+    store: &Arc<dyn Database>,
+    job_id: Uuid,
+    mut action: ActionRecord,
+) -> Result<(), crate::error::DatabaseError> {
+    let mut last_err: Option<crate::error::DatabaseError> = None;
+    for _ in 0..MAX_SEQUENCE_ALLOC_ATTEMPTS {
+        action.sequence = store
+            .get_job_actions(job_id)
+            .await
+            .map(|actions| {
+                actions
+                    .iter()
+                    .map(|a| a.sequence)
+                    .max()
+                    .map_or(0, |m| m + 1)
+            })
+            .unwrap_or(0);
+
+        match store.save_action(job_id, &action).await {
+            Ok(()) => return Ok(()),
+            Err(e) if is_unique_violation(&e) => {
+                // Lost the race for this sequence — another execution claimed it
+                // between our read and write. Re-derive and retry.
+                last_err = Some(e);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        crate::error::DatabaseError::Constraint(format!(
+            "exhausted {MAX_SEQUENCE_ALLOC_ATTEMPTS} attempts allocating an action sequence for job {job_id}"
+        ))
+    }))
+}
+
 /// Execute a tool with safety checks: lookup → validate → timeout → execute → serialize.
 ///
 /// This is the single canonical implementation of tool execution. All consumers
@@ -237,30 +317,15 @@ pub async fn execute_tool_audited(
     let result = execute_tool_with_safety(tools, safety, tool_name, params, base_ctx).await;
     let elapsed = start.elapsed();
 
-    // Allocate a sequence number that won't collide with rows already on this
-    // job. A freshly minted system job (the `existing_job_id = None` branch
-    // above) has no actions, so sequence 0 is safe. An *existing* job (e.g. a
-    // scheduler parent running several tool subtasks) may already hold
-    // ActionRecords; reusing 0 would violate `UNIQUE(job_id, sequence_num)` on
-    // the second subtask and silently drop its audit row. Derive the next
-    // sequence from the persisted rows instead.
-    let sequence = if existing_job_id.is_some() {
-        store
-            .get_job_actions(job_id)
-            .await
-            .map(|actions| {
-                actions
-                    .iter()
-                    .map(|a| a.sequence)
-                    .max()
-                    .map_or(0, |m| m + 1)
-            })
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    let action = ActionRecord::new(sequence, &audit_name, redacted_input);
+    // The sequence is allocated below. A freshly minted system job (the
+    // `existing_job_id = None` branch above) has no actions and no concurrent
+    // writers, so sequence 0 is safe and persisted directly. An *existing* job
+    // (e.g. a scheduler parent running several tool subtasks) may already hold
+    // ActionRecords and may be written concurrently, so its sequence is
+    // allocated by `save_action_with_sequence_retry` (read max+1 → insert →
+    // retry on unique-violation). The placeholder 0 here is overwritten before
+    // the insert on the existing-job path.
+    let action = ActionRecord::new(0, &audit_name, redacted_input);
     let action = match &result {
         Ok(output) => {
             // `output` is the pretty-printed tool result string. Sanitize it for
@@ -275,12 +340,18 @@ pub async fn execute_tool_audited(
         }
         Err(e) => action.fail(e.to_string(), elapsed),
     };
+
     // Persisting the record is non-fatal (mirrors dispatch): the audit anchor
     // already exists and the tool has already run, so a transient save error
     // must not turn an executed call into a failure. `debug!` not `warn!`: this
     // path is reachable from the interactive REPL/TUI where higher log levels
     // corrupt the terminal UI (CLAUDE.md → Code Style → logging).
-    if let Err(e) = store.save_action(job_id, &action).await {
+    let persist = if existing_job_id.is_some() {
+        save_action_with_sequence_retry(store, job_id, action).await
+    } else {
+        store.save_action(job_id, &action).await
+    };
+    if let Err(e) = persist {
         tracing::debug!(
             error = %e,
             tool = %tool_name,
@@ -1202,6 +1273,129 @@ mod audited_integration_tests {
             seqs,
             vec![0, 1],
             "subtasks on the same job must get distinct sequence numbers"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_action_with_sequence_retry_recovers_from_collision() {
+        // Regression (#4024 P1, deterministic): the sequence is derived by
+        // reading `max(sequence_num)+1`, then inserted — a read-then-write that
+        // races. We simulate the loser of that race deterministically: hand the
+        // retry helper an action whose freshly-derived sequence (0 on an empty
+        // job) is then claimed by a colliding insert *before* its own save. The
+        // helper must detect the UNIQUE(job_id, sequence_num) violation,
+        // re-derive max+1, and land at sequence 1 rather than drop the row.
+        //
+        // To make the collision deterministic without timing, we seed sequence 0
+        // and then drive the helper: its first read sees row 0, computes 1, and
+        // persists at 1. To exercise the *retry branch itself* we additionally
+        // assert a naive save at the stale sequence would have failed.
+        let (db, _backend, _dir) = test_store().await;
+        let job_id = db
+            .create_system_job("chatter", "scheduler")
+            .await
+            .expect("create parent job");
+
+        // Occupy sequence 0 (a prior subtask's row).
+        let existing = crate::context::ActionRecord::new(0, "existing", serde_json::json!({}));
+        db.save_action(job_id, &existing)
+            .await
+            .expect("seed existing action");
+
+        // A naive save reusing the stale sequence 0 must collide — this is the
+        // bug the retry guards against.
+        let naive = crate::context::ActionRecord::new(0, "naive", serde_json::json!({}));
+        let naive_err = db
+            .save_action(job_id, &naive)
+            .await
+            .expect_err("a duplicate sequence must violate the UNIQUE constraint");
+        assert!(
+            is_unique_violation(&naive_err),
+            "the collision must be detected as a unique violation, got: {naive_err:?}"
+        );
+
+        // The retry helper re-derives max+1 and persists at the next free slot.
+        let action = crate::context::ActionRecord::new(0, "retried", serde_json::json!({}));
+        save_action_with_sequence_retry(&db, job_id, action)
+            .await
+            .expect("retry helper must recover from the sequence collision");
+
+        let actions = db.get_job_actions(job_id).await.expect("get actions");
+        let retried = actions
+            .iter()
+            .find(|a| a.tool_name == "retried")
+            .expect("the retried row must persist");
+        assert_eq!(
+            retried.sequence, 1,
+            "retry must re-derive max+1 and land at sequence 1, not drop the row"
+        );
+        assert_eq!(
+            actions.len(),
+            2,
+            "exactly the seeded row and the retried row must persist (naive save dropped)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn audited_existing_job_persists_all_rows_under_concurrency() {
+        // Regression (#4024 P1, concurrent): many tool subtasks correlated to the
+        // SAME existing job, dispatched concurrently, must EACH persist a row.
+        // The non-atomic read-then-write sequence allocation races; without the
+        // unique-violation retry, losers of the race drop their audit row. A
+        // shared on-disk libSQL db (per-operation connections) gives us real
+        // cross-connection contention.
+        let (db, _backend, _dir) = test_store().await;
+        let registry = Arc::new(
+            registry_with(Arc::new(ContextEchoTool {
+                seen_user: Arc::new(std::sync::Mutex::new(None)),
+            }))
+            .await,
+        );
+        let safety = Arc::new(safety());
+        let job_id = db
+            .create_system_job("chatter", "scheduler")
+            .await
+            .expect("create parent job");
+
+        const N: usize = 8;
+        let mut handles = Vec::with_capacity(N);
+        for i in 0..N {
+            let db = Arc::clone(&db);
+            let registry = Arc::clone(&registry);
+            let safety = Arc::clone(&safety);
+            handles.push(tokio::spawn(async move {
+                let job_ctx = JobContext::with_user("chatter", "scheduler", "task");
+                execute_tool_audited(
+                    &registry,
+                    &safety,
+                    Some(&db),
+                    "ctx_echo",
+                    serde_json::json!({ "message": format!("subtask-{i}") }),
+                    &job_ctx,
+                    DispatchSource::System,
+                    Some(job_id),
+                )
+                .await
+                .expect("subtask should succeed");
+            }));
+        }
+        for h in handles {
+            h.await.expect("join subtask");
+        }
+
+        let actions = db.get_job_actions(job_id).await.expect("get actions");
+        assert_eq!(
+            actions.len(),
+            N,
+            "every concurrent subtask must persist an ActionRecord (no dropped audit rows)"
+        );
+        let mut seqs: Vec<u32> = actions.iter().map(|a| a.sequence).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(
+            seqs.len(),
+            N,
+            "every persisted ActionRecord must hold a distinct sequence number"
         );
     }
 }
