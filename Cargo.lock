@@ -4921,6 +4921,7 @@ dependencies = [
  "ironclaw_processes",
  "ironclaw_product_adapters",
  "ironclaw_product_workflow",
+ "ironclaw_product_workflow_storage",
  "ironclaw_reborn",
  "ironclaw_reborn_composition",
  "ironclaw_reborn_config",

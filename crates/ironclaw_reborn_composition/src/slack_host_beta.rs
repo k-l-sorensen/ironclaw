@@ -8,23 +8,28 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ironclaw_conversations::InMemoryConversationServices;
+use ironclaw_conversations::RebornFilesystemConversationServices;
 use ironclaw_host_api::{AgentId, ProjectId, ResourceScope, TenantId, UserId};
-use ironclaw_outbound::{InMemoryOutboundStateStore, OutboundStateStore};
+use ironclaw_outbound::{FilesystemOutboundStateStore, OutboundStateStore};
 use ironclaw_product_adapters::{
     AdapterInstallationId, DeclaredEgressHost, DeclaredEgressTarget, DeliveryStatus,
     EgressCredentialHandle, ExternalActorRef, OutboundDeliverySink, ProductAdapter,
     ProductAdapterId, ProtocolHttpEgress,
 };
 use ironclaw_product_workflow::{
-    DefaultInboundTurnService, DefaultProductWorkflow, InMemoryIdempotencyLedger,
-    ProductActorUserResolutionRequest, ProductActorUserResolver, ProductConversationBindingService,
-    ProductInstallationKey, ProductInstallationScope, ProductWorkflowError,
-    StaticProductInstallationResolver,
+    DefaultInboundTurnService, DefaultProductWorkflow, ProductActorUserResolutionRequest,
+    ProductActorUserResolver, ProductConversationBindingService, ProductInstallationKey,
+    ProductInstallationScope, ProductWorkflowError, StaticProductInstallationResolver,
 };
+use ironclaw_product_workflow_storage::RebornFilesystemIdempotencyLedger;
 use ironclaw_slack_v2_adapter::{
     SLACK_API_HOST, SLACK_USER_ACTOR_KIND, SLACK_V2_ADAPTER_ID, SlackV2Adapter,
     SlackV2AdapterConfig, slack_request_signature_auth_requirement,
+};
+use ironclaw_turns::{
+    CancelRunRequest, CancelRunResponse, GetRunStateRequest, ResumeTurnRequest, ResumeTurnResponse,
+    SubmitTurnRequest, SubmitTurnResponse, TurnCoordinator, TurnError, TurnRunId, TurnRunState,
+    TurnScope,
 };
 use ironclaw_wasm_product_adapters::{
     EgressPolicy, HmacWebhookAuth, NativeProductAdapterRunner, NativeProductAdapterRunnerConfig,
@@ -60,9 +65,8 @@ use crate::webui_serve::PublicRouteMount;
 const SLACK_BOT_TOKEN_HANDLE: &str = "slack_bot_token";
 const SLACK_SIGNATURE_HEADER: &str = "X-Slack-Signature";
 const SLACK_TIMESTAMP_HEADER: &str = "X-Slack-Request-Timestamp";
-const SLACK_WEBHOOK_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(2);
+const SLACK_WEBHOOK_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(55);
 const SLACK_MAX_IN_FLIGHT_WEBHOOKS: usize = 64;
-const SLACK_IDEMPOTENCY_LEDGER_SETTLED_LIMIT: usize = 10_000;
 
 struct NoopSlackDeliverySink;
 
@@ -153,6 +157,8 @@ pub enum SlackHostBetaBuildError {
     RuntimeHttpEgressUnavailable,
     #[error("Slack host-beta requires durable host state")]
     DurableHostStateUnavailable,
+    #[error("Slack host-beta durable host state failed to initialize: {reason}")]
+    DurableHostStateInitFailed { reason: String },
     #[error(
         "Slack host-beta personal binding requires [slack].api_app_id for tenant app-scoped pairing"
     )]
@@ -166,14 +172,16 @@ pub struct SlackHostBetaMounts {
     pub personal_binding_pairing: SlackPersonalBindingPairingRouteConfig,
 }
 
-pub fn build_slack_events_route_mount(
+pub async fn build_slack_events_route_mount(
     runtime: &RebornRuntime,
     config: SlackHostBetaConfig,
 ) -> Result<PublicRouteMount, SlackHostBetaBuildError> {
-    build_slack_host_beta_mounts(runtime, config).map(|mounts| mounts.events)
+    build_slack_host_beta_mounts(runtime, config)
+        .await
+        .map(|mounts| mounts.events)
 }
 
-pub fn build_slack_host_beta_mounts(
+pub async fn build_slack_host_beta_mounts(
     runtime: &RebornRuntime,
     config: SlackHostBetaConfig,
 ) -> Result<SlackHostBetaMounts, SlackHostBetaBuildError> {
@@ -224,7 +232,8 @@ pub fn build_slack_host_beta_mounts(
         runtime,
         config,
         actor_user_resolver,
-    )?;
+    )
+    .await?;
 
     Ok(SlackHostBetaMounts {
         events,
@@ -232,16 +241,18 @@ pub fn build_slack_host_beta_mounts(
     })
 }
 
-pub fn build_slack_events_route_mount_with_actor_user_resolver(
+pub async fn build_slack_events_route_mount_with_actor_user_resolver(
     runtime: &RebornRuntime,
     config: SlackHostBetaConfig,
     actor_user_resolver: Arc<dyn ProductActorUserResolver>,
 ) -> Result<PublicRouteMount, SlackHostBetaBuildError> {
     // The resolver controls inbound Slack actor binding. `config.user_id` still
     // scopes the host-mediated Slack bot-token egress for this beta route.
-    tracing::warn!(
-        "Slack host-beta uses in-memory conversation bindings, idempotency ledger, and outbound state; Slack continuity, retry deduplication, and delivery state are lost on process restart"
-    );
+    let local_runtime = runtime
+        .services()
+        .local_runtime
+        .as_ref()
+        .ok_or(SlackHostBetaBuildError::DurableHostStateUnavailable)?;
     let adapter_id = ProductAdapterId::new(SLACK_V2_ADAPTER_ID)
         .map_err(|reason| invalid_config("adapter_id", reason.to_string()))?;
     let token_handle = slack_bot_token_handle()?;
@@ -252,7 +263,15 @@ pub fn build_slack_events_route_mount_with_actor_user_resolver(
         auth_requirement: slack_request_signature_auth_requirement(),
     }));
 
-    let conversations = Arc::new(InMemoryConversationServices::default());
+    let conversations = Arc::new(
+        RebornFilesystemConversationServices::new(Arc::clone(&local_runtime.host_state_filesystem))
+            .await
+            .map_err(
+                |error| SlackHostBetaBuildError::DurableHostStateInitFailed {
+                    reason: error.to_string(),
+                },
+            )?,
+    );
     let conversation_port: Arc<dyn ironclaw_conversations::ConversationBindingService> =
         conversations.clone();
     let actor_pairings: Arc<dyn ironclaw_conversations::ConversationActorPairingService> =
@@ -260,7 +279,7 @@ pub fn build_slack_events_route_mount_with_actor_user_resolver(
     let scope = ProductInstallationScope::with_default_scope(
         config.tenant_id.clone(),
         config.agent_id.clone(),
-        config.project_id.clone(),
+        None,
     )
     .with_actor_user_resolver(actor_user_resolver, actor_pairings);
     let installation_resolver = StaticProductInstallationResolver::new([(
@@ -272,15 +291,17 @@ pub fn build_slack_events_route_mount_with_actor_user_resolver(
     let inbound = Arc::new(DefaultInboundTurnService::new(
         binding.clone(),
         runtime.webui_thread_service(),
-        runtime.webui_turn_coordinator(),
+        Arc::new(WakeOnSubmitTurnCoordinator::new(
+            runtime.webui_turn_coordinator(),
+            runtime.turn_runner_waker(),
+        )),
     ));
     let workflow = Arc::new(
         DefaultProductWorkflow::new(
             inbound,
-            Arc::new(InMemoryIdempotencyLedger::with_settled_entry_limit(
-                NonZeroUsize::new(SLACK_IDEMPOTENCY_LEDGER_SETTLED_LIMIT).ok_or_else(|| {
-                    invalid_config("idempotency_ledger_limit", "must be non-zero".to_string())
-                })?,
+            Arc::new(RebornFilesystemIdempotencyLedger::new(
+                Arc::clone(&local_runtime.host_state_filesystem),
+                slack_egress_scope(&config),
             )),
             Arc::new(binding.clone()),
         )
@@ -305,7 +326,9 @@ pub fn build_slack_events_route_mount_with_actor_user_resolver(
     ));
 
     let egress = slack_protocol_egress(runtime, &config, token_handle)?;
-    let outbound = Arc::new(InMemoryOutboundStateStore::default());
+    let outbound = Arc::new(FilesystemOutboundStateStore::new(Arc::clone(
+        &local_runtime.host_state_filesystem,
+    )));
     let outbound_store: Arc<dyn OutboundStateStore> = outbound.clone();
     let preferences: Arc<dyn ironclaw_outbound::CommunicationPreferenceRepository> = outbound;
     let delivery_sink: Arc<dyn OutboundDeliverySink> = Arc::new(NoopSlackDeliverySink);
@@ -384,6 +407,54 @@ fn slack_declared_egress_targets(
     let host = DeclaredEgressHost::new(SLACK_API_HOST)
         .map_err(|reason| invalid_config("slack_api_host", reason.to_string()))?;
     Ok(vec![DeclaredEgressTarget::new(host, Some(token_handle))])
+}
+
+struct WakeOnSubmitTurnCoordinator {
+    inner: Arc<dyn TurnCoordinator>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl WakeOnSubmitTurnCoordinator {
+    fn new(inner: Arc<dyn TurnCoordinator>, wake: Arc<dyn Fn() + Send + Sync>) -> Self {
+        Self { inner, wake }
+    }
+}
+
+#[async_trait::async_trait]
+impl TurnCoordinator for WakeOnSubmitTurnCoordinator {
+    async fn prepare_turn(&self, scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        self.inner.prepare_turn(scope).await
+    }
+
+    async fn abort_prepared_turn(&self, run_id: TurnRunId) -> Result<(), TurnError> {
+        self.inner.abort_prepared_turn(run_id).await
+    }
+
+    async fn submit_turn(
+        &self,
+        request: SubmitTurnRequest,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        let response = self.inner.submit_turn(request).await;
+        if response.is_ok() {
+            (self.wake)();
+        }
+        response
+    }
+
+    async fn resume_turn(
+        &self,
+        request: ResumeTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        self.inner.resume_turn(request).await
+    }
+
+    async fn cancel_run(&self, request: CancelRunRequest) -> Result<CancelRunResponse, TurnError> {
+        self.inner.cancel_run(request).await
+    }
+
+    async fn get_run_state(&self, request: GetRunStateRequest) -> Result<TurnRunState, TurnError> {
+        self.inner.get_run_state(request).await
+    }
 }
 
 #[derive(Clone)]
@@ -496,9 +567,9 @@ mod tests {
     const PROJECT: &str = "project:slack-host";
     const USER: &str = "user:slack-host";
     const INSTALLATION: &str = "install_host_beta";
-    const TEAM: &str = "T-HOST";
-    const API_APP: &str = "A-HOST";
-    const SLACK_USER: &str = "U-HOST";
+    const TEAM: &str = "THOST";
+    const API_APP: &str = "AHOST";
+    const SLACK_USER: &str = "UHOST";
     const SECRET: &str = "host-signing-secret";
 
     type HmacSha256 = Hmac<sha2::Sha256>;
@@ -507,7 +578,9 @@ mod tests {
     async fn build_slack_events_route_mount_builds_signed_route_from_reborn_runtime() {
         let (runtime, _root) = runtime().await;
 
-        let mount = build_slack_events_route_mount(&runtime, config()).expect("route builds");
+        let mount = build_slack_events_route_mount(&runtime, config())
+            .await
+            .expect("route builds");
         assert_eq!(mount.descriptors.len(), 1);
         assert!(mount.drain.is_some());
 
@@ -551,6 +624,7 @@ mod tests {
             config(),
             resolver.clone(),
         )
+        .await
         .expect("route builds");
 
         let body = dm_event_body();
@@ -586,7 +660,7 @@ mod tests {
         let (mut runtime, _root) = runtime().await;
         runtime.set_local_runtime_http_egress_for_test(None);
 
-        let error = match build_slack_events_route_mount(&runtime, config()) {
+        let error = match build_slack_events_route_mount(&runtime, config()).await {
             Ok(_) => panic!("Slack route requires runtime HTTP egress"),
             Err(error) => error,
         };
@@ -603,13 +677,15 @@ mod tests {
         let (mut runtime, _root) = runtime().await;
         let egress = Arc::new(RecordingRuntimeHttpEgress::default());
         runtime.set_local_runtime_http_egress_for_test(Some(egress.clone()));
-        let mount = build_slack_events_route_mount(&runtime, config()).expect("route builds");
+        let mount = build_slack_events_route_mount(&runtime, config())
+            .await
+            .expect("route builds");
         let body = r#"{
             "type":"event_callback",
-            "team_id":"T-HOST",
-            "api_app_id":"A-HOST",
+            "team_id":"THOST",
+            "api_app_id":"AHOST",
             "event_id":"Ev-host-beta-dispatch",
-            "event":{"type":"message","channel_type":"im","user":"U-HOST","channel":"D-HOST","text":"hello","ts":"1710000000.000010"}
+            "event":{"type":"message","channel_type":"im","user":"UHOST","channel":"DHOST","text":"hello","ts":"1710000000.000010"}
         }"#;
         let timestamp = current_unix_timestamp();
 
@@ -633,14 +709,16 @@ mod tests {
             drain.drain().await;
         }
         let history = wait_for_slack_thread_history(&runtime).await;
-        assert_eq!(history.messages.len(), 1);
+        assert_eq!(history.messages.len(), 2);
         assert_eq!(history.messages[0].content.as_deref(), Some("hello"));
+        assert_eq!(history.messages[1].content.as_deref(), Some("ok"));
         assert_eq!(
             history.messages[0].source_binding_id.as_deref(),
             Some(
-                "adapter:8:slack_v2;installation:17:install_host_beta;agent:16:agent:slack-host;project:18:project:slack-host;space:6:T-HOST;conversation:6:D-HOST;topic:0:;"
+                "adapter:8:slack_v2;installation:17:install_host_beta;agent:16:agent:slack-host;project:0:;space:5:THOST;conversation:5:DHOST;topic:0:;"
             )
         );
+        wait_for_slack_posted_text(&egress, "ok").await;
 
         runtime.shutdown().await.expect("runtime shuts down");
     }
@@ -664,7 +742,9 @@ mod tests {
         .await
         .expect("runtime builds");
 
-        let mounts = build_slack_host_beta_mounts(&runtime, config()).expect("mounts build");
+        let mounts = build_slack_host_beta_mounts(&runtime, config())
+            .await
+            .expect("mounts build");
         let pairing_mount =
             slack_personal_binding_pairing_route_mount(mounts.personal_binding_pairing);
 
@@ -685,8 +765,9 @@ mod tests {
         let (mut runtime, _root) = runtime().await;
         let egress = Arc::new(RecordingRuntimeHttpEgress::default());
         runtime.set_local_runtime_http_egress_for_test(Some(egress.clone()));
-        let mounts =
-            build_slack_host_beta_mounts(&runtime, config_without_legacy_actor()).expect("mounts");
+        let mounts = build_slack_host_beta_mounts(&runtime, config_without_legacy_actor())
+            .await
+            .expect("mounts");
 
         let first_body =
             dm_event_body_with("Ev-host-beta-pairing-first", "pair me", "1710000000.000020");
@@ -731,11 +812,13 @@ mod tests {
         }
 
         let history = wait_for_slack_thread_history(&runtime).await;
-        assert_eq!(history.messages.len(), 1);
+        assert_eq!(history.messages.len(), 2);
         assert_eq!(
             history.messages[0].content.as_deref(),
             Some("after pairing")
         );
+        assert_eq!(history.messages[1].content.as_deref(), Some("ok"));
+        wait_for_slack_posted_text(&egress, "ok").await;
 
         runtime.shutdown().await.expect("runtime shuts down");
     }
@@ -772,7 +855,7 @@ mod tests {
         })
         .expect("team-only config still parses");
 
-        let error = match build_slack_host_beta_mounts(&runtime, team_only_config) {
+        let error = match build_slack_host_beta_mounts(&runtime, team_only_config).await {
             Ok(_) => panic!("pairing requires tenant app selector"),
             Err(error) => error,
         };
@@ -919,7 +1002,7 @@ mod tests {
         let scope = ThreadScope {
             tenant_id: TenantId::new(TENANT).expect("tenant"),
             agent_id: AgentId::new(AGENT).expect("agent"),
-            project_id: Some(ProjectId::new(PROJECT).expect("project")),
+            project_id: None,
             owner_user_id: Some(UserId::new(USER).expect("user")),
             mission_id: None,
         };
@@ -966,14 +1049,14 @@ mod tests {
     fn dm_event_body() -> &'static str {
         r#"{
           "type":"event_callback",
-          "team_id":"T-HOST",
-          "api_app_id":"A-HOST",
+          "team_id":"THOST",
+          "api_app_id":"AHOST",
           "event_id":"Ev-host-beta-custom-resolver",
           "event":{
             "type":"message",
             "channel_type":"im",
-            "user":"U-HOST",
-            "channel":"D-HOST",
+            "user":"UHOST",
+            "channel":"DHOST",
             "text":"hello",
             "ts":"1710000000.000001"
           }
@@ -990,7 +1073,7 @@ mod tests {
                 "type": "message",
                 "channel_type": "im",
                 "user": SLACK_USER,
-                "channel": "D-HOST",
+                "channel": "DHOST",
                 "text": text,
                 "ts": ts
             }
@@ -1020,6 +1103,23 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         panic!("Slack pairing notifier did not post a pairing code");
+    }
+
+    async fn wait_for_slack_posted_text(egress: &RecordingRuntimeHttpEgress, expected: &str) {
+        for _ in 0..80 {
+            if egress
+                .posted_slack_texts()
+                .iter()
+                .any(|text| text == expected)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!(
+            "Slack final reply was not posted with expected text {expected:?}; posted texts: {:?}",
+            egress.posted_slack_texts()
+        );
     }
 
     #[derive(Debug)]
@@ -1106,7 +1206,7 @@ mod tests {
             request: RuntimeHttpEgressRequest,
         ) -> Result<RuntimeHttpEgressResponse, ironclaw_host_api::RuntimeHttpEgressError> {
             let response = if request.url.contains("/api/conversations.open") {
-                br#"{"ok":true,"channel":{"id":"D-HOST"}}"#.to_vec()
+                br#"{"ok":true,"channel":{"id":"DHOST"}}"#.to_vec()
             } else {
                 br#"{"ok":true}"#.to_vec()
             };
@@ -1127,7 +1227,7 @@ mod tests {
     }
 
     impl RecordingRuntimeHttpEgress {
-        fn pairing_code(&self) -> Option<String> {
+        fn posted_slack_texts(&self) -> Vec<String> {
             self.requests
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1137,12 +1237,16 @@ mod tests {
                     serde_json::from_slice::<serde_json::Value>(&request.body).ok()
                 })
                 .filter_map(|body| body["text"].as_str().map(str::to_string))
-                .find_map(|text| {
-                    text.split(" code ")
-                        .nth(1)
-                        .and_then(|suffix| suffix.split(" in WebChat").next())
-                        .map(str::to_string)
-                })
+                .collect()
+        }
+
+        fn pairing_code(&self) -> Option<String> {
+            self.posted_slack_texts().into_iter().find_map(|text| {
+                text.split(" code ")
+                    .nth(1)
+                    .and_then(|suffix| suffix.split(" in WebChat").next())
+                    .map(str::to_string)
+            })
         }
     }
 }

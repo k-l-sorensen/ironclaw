@@ -7,7 +7,6 @@
 
 use std::sync::Arc;
 
-#[cfg(any(feature = "libsql", feature = "postgres"))]
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 #[cfg(feature = "libsql")]
@@ -16,14 +15,12 @@ use ironclaw_filesystem::LibSqlRootFilesystem;
 use ironclaw_filesystem::PostgresRootFilesystem;
 use ironclaw_filesystem::{
     CasExpectation, Entry, FilesystemError, IndexKey, IndexValue, RecordKind, RecordVersion,
-    RootFilesystem,
+    RootFilesystem, ScopedFilesystem,
 };
-use ironclaw_host_api::VirtualPath;
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-use ironclaw_product_workflow::IdempotencyLedger;
+use ironclaw_host_api::{ResourceScope, ScopedPath, VirtualPath};
 use ironclaw_product_workflow::{
-    ActionFingerprintKey, ActionPhase, IdempotencyDecision, ProductInboundAction,
-    ProductWorkflowError,
+    ActionFingerprintKey, ActionPhase, IdempotencyDecision, IdempotencyLedger,
+    ProductInboundAction, ProductWorkflowError,
 };
 
 const DEFAULT_IN_FLIGHT_LEASE: Duration = Duration::seconds(60);
@@ -31,22 +28,19 @@ const DEFAULT_LEDGER_ROOT: &str = "/engine/product_workflow/idempotency/actions"
 const ACTION_RECORD_KIND: &str = "product_workflow_action";
 
 struct FilesystemIdempotencyLedger {
-    filesystem: Arc<dyn RootFilesystem>,
-    root: VirtualPath,
+    filesystem: Arc<dyn LedgerFilesystem>,
+    root: String,
     in_flight_lease: Duration,
 }
 
 impl FilesystemIdempotencyLedger {
-    fn new(filesystem: Arc<dyn RootFilesystem>) -> Self {
-        Self::with_in_flight_lease(filesystem, DEFAULT_IN_FLIGHT_LEASE)
+    fn new_root(filesystem: Arc<dyn RootFilesystem>) -> Self {
+        Self::with_root_lease(filesystem, DEFAULT_IN_FLIGHT_LEASE)
     }
 
-    fn with_in_flight_lease(
-        filesystem: Arc<dyn RootFilesystem>,
-        in_flight_lease: Duration,
-    ) -> Self {
+    fn with_root_lease(filesystem: Arc<dyn RootFilesystem>, in_flight_lease: Duration) -> Self {
         Self {
-            filesystem,
+            filesystem: Arc::new(RootLedgerFilesystem { filesystem }),
             root: default_ledger_root(),
             in_flight_lease,
         }
@@ -58,8 +52,39 @@ impl FilesystemIdempotencyLedger {
         in_flight_lease: Duration,
     ) -> Self {
         Self {
-            filesystem,
-            root,
+            filesystem: Arc::new(RootLedgerFilesystem { filesystem }),
+            root: root.as_str().to_string(),
+            in_flight_lease,
+        }
+    }
+
+    fn new_scoped<F>(
+        filesystem: Arc<ScopedFilesystem<F>>,
+        scope: ResourceScope,
+        in_flight_lease: Duration,
+    ) -> Self
+    where
+        F: RootFilesystem + 'static,
+    {
+        Self {
+            filesystem: Arc::new(ScopedLedgerFilesystem { filesystem, scope }),
+            root: DEFAULT_LEDGER_ROOT.to_string(),
+            in_flight_lease,
+        }
+    }
+
+    fn with_scoped_root<F>(
+        filesystem: Arc<ScopedFilesystem<F>>,
+        scope: ResourceScope,
+        root: ScopedPath,
+        in_flight_lease: Duration,
+    ) -> Self
+    where
+        F: RootFilesystem + 'static,
+    {
+        Self {
+            filesystem: Arc::new(ScopedLedgerFilesystem { filesystem, scope }),
+            root: root.as_str().to_string(),
             in_flight_lease,
         }
     }
@@ -69,7 +94,7 @@ impl FilesystemIdempotencyLedger {
         fingerprint: ActionFingerprintKey,
         received_at: DateTime<Utc>,
     ) -> Result<IdempotencyDecision, ProductWorkflowError> {
-        let path = action_path(&self.root, &fingerprint)?;
+        let path = action_path(&self.root, &fingerprint);
         let action = ProductInboundAction::begin(fingerprint, received_at);
         match self
             .filesystem
@@ -110,7 +135,7 @@ impl FilesystemIdempotencyLedger {
     }
 
     async fn settle(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
-        let path = action_path(&self.root, &action.fingerprint)?;
+        let path = action_path(&self.root, &action.fingerprint);
         loop {
             let Some((current, version)) = load_action(self.filesystem.as_ref(), &path).await?
             else {
@@ -149,7 +174,7 @@ impl FilesystemIdempotencyLedger {
     }
 
     async fn release(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
-        let path = action_path(&self.root, &action.fingerprint)?;
+        let path = action_path(&self.root, &action.fingerprint);
         loop {
             let Some((current, version)) = load_action(self.filesystem.as_ref(), &path).await?
             else {
@@ -178,6 +203,78 @@ impl FilesystemIdempotencyLedger {
     }
 }
 
+/// Scoped-filesystem-backed product workflow idempotency ledger.
+///
+/// Construct with the same [`ScopedFilesystem`] handle used by the Reborn host
+/// stores. The supplied [`ResourceScope`] controls how the `/engine` alias is
+/// tenant/user rewritten on every operation.
+pub struct RebornFilesystemIdempotencyLedger<F>
+where
+    F: RootFilesystem,
+{
+    inner: FilesystemIdempotencyLedger,
+    _filesystem: std::marker::PhantomData<F>,
+}
+
+impl<F> RebornFilesystemIdempotencyLedger<F>
+where
+    F: RootFilesystem + 'static,
+{
+    pub fn new(filesystem: Arc<ScopedFilesystem<F>>, scope: ResourceScope) -> Self {
+        Self::with_in_flight_lease(filesystem, scope, DEFAULT_IN_FLIGHT_LEASE)
+    }
+
+    pub fn with_in_flight_lease(
+        filesystem: Arc<ScopedFilesystem<F>>,
+        scope: ResourceScope,
+        in_flight_lease: Duration,
+    ) -> Self {
+        Self {
+            inner: FilesystemIdempotencyLedger::new_scoped(filesystem, scope, in_flight_lease),
+            _filesystem: std::marker::PhantomData,
+        }
+    }
+
+    pub fn with_root(
+        filesystem: Arc<ScopedFilesystem<F>>,
+        scope: ResourceScope,
+        root: ScopedPath,
+        in_flight_lease: Duration,
+    ) -> Self {
+        Self {
+            inner: FilesystemIdempotencyLedger::with_scoped_root(
+                filesystem,
+                scope,
+                root,
+                in_flight_lease,
+            ),
+            _filesystem: std::marker::PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<F> IdempotencyLedger for RebornFilesystemIdempotencyLedger<F>
+where
+    F: RootFilesystem + 'static,
+{
+    async fn begin_or_replay(
+        &self,
+        fingerprint: ActionFingerprintKey,
+        received_at: DateTime<Utc>,
+    ) -> Result<IdempotencyDecision, ProductWorkflowError> {
+        self.inner.begin_or_replay(fingerprint, received_at).await
+    }
+
+    async fn settle(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
+        self.inner.settle(action).await
+    }
+
+    async fn release(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
+        self.inner.release(action).await
+    }
+}
+
 /// libSQL-backed product workflow idempotency ledger using the shared
 /// SQL filesystem backend for persistence.
 #[cfg(feature = "libsql")]
@@ -189,7 +286,7 @@ pub struct RebornLibSqlIdempotencyLedger {
 impl RebornLibSqlIdempotencyLedger {
     pub fn new(filesystem: Arc<LibSqlRootFilesystem>) -> Self {
         Self {
-            inner: FilesystemIdempotencyLedger::new(filesystem),
+            inner: FilesystemIdempotencyLedger::new_root(filesystem),
         }
     }
 
@@ -198,7 +295,7 @@ impl RebornLibSqlIdempotencyLedger {
         in_flight_lease: Duration,
     ) -> Self {
         Self {
-            inner: FilesystemIdempotencyLedger::with_in_flight_lease(filesystem, in_flight_lease),
+            inner: FilesystemIdempotencyLedger::with_root_lease(filesystem, in_flight_lease),
         }
     }
 
@@ -244,7 +341,7 @@ pub struct RebornPostgresIdempotencyLedger {
 impl RebornPostgresIdempotencyLedger {
     pub fn new(filesystem: Arc<PostgresRootFilesystem>) -> Self {
         Self {
-            inner: FilesystemIdempotencyLedger::new(filesystem),
+            inner: FilesystemIdempotencyLedger::new_root(filesystem),
         }
     }
 
@@ -253,7 +350,7 @@ impl RebornPostgresIdempotencyLedger {
         in_flight_lease: Duration,
     ) -> Self {
         Self {
-            inner: FilesystemIdempotencyLedger::with_in_flight_lease(filesystem, in_flight_lease),
+            inner: FilesystemIdempotencyLedger::with_root_lease(filesystem, in_flight_lease),
         }
     }
 
@@ -285,6 +382,78 @@ impl IdempotencyLedger for RebornPostgresIdempotencyLedger {
 
     async fn release(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
         self.inner.release(action).await
+    }
+}
+
+#[async_trait]
+trait LedgerFilesystem: Send + Sync {
+    async fn put(
+        &self,
+        path: &str,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError>;
+
+    async fn get(
+        &self,
+        path: &str,
+    ) -> Result<Option<ironclaw_filesystem::VersionedEntry>, FilesystemError>;
+}
+
+struct RootLedgerFilesystem {
+    filesystem: Arc<dyn RootFilesystem>,
+}
+
+#[async_trait]
+impl LedgerFilesystem for RootLedgerFilesystem {
+    async fn put(
+        &self,
+        path: &str,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        let path = VirtualPath::new(path.to_string()).map_err(FilesystemError::from)?;
+        self.filesystem.put(&path, entry, cas).await
+    }
+
+    async fn get(
+        &self,
+        path: &str,
+    ) -> Result<Option<ironclaw_filesystem::VersionedEntry>, FilesystemError> {
+        let path = VirtualPath::new(path.to_string()).map_err(FilesystemError::from)?;
+        self.filesystem.get(&path).await
+    }
+}
+
+struct ScopedLedgerFilesystem<F>
+where
+    F: RootFilesystem,
+{
+    filesystem: Arc<ScopedFilesystem<F>>,
+    scope: ResourceScope,
+}
+
+#[async_trait]
+impl<F> LedgerFilesystem for ScopedLedgerFilesystem<F>
+where
+    F: RootFilesystem + 'static,
+{
+    async fn put(
+        &self,
+        path: &str,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        let path = ScopedPath::new(path.to_string()).map_err(FilesystemError::from)?;
+        self.filesystem.put(&self.scope, &path, entry, cas).await
+    }
+
+    async fn get(
+        &self,
+        path: &str,
+    ) -> Result<Option<ironclaw_filesystem::VersionedEntry>, FilesystemError> {
+        let path = ScopedPath::new(path.to_string()).map_err(FilesystemError::from)?;
+        self.filesystem.get(&self.scope, &path).await
     }
 }
 
@@ -325,8 +494,8 @@ fn expired_received_at(received_at: DateTime<Utc>, lease: Duration) -> DateTime<
 }
 
 async fn load_action(
-    filesystem: &dyn RootFilesystem,
-    path: &VirtualPath,
+    filesystem: &dyn LedgerFilesystem,
+    path: &str,
 ) -> Result<Option<(ProductInboundAction, RecordVersion)>, ProductWorkflowError> {
     let Some(entry) = filesystem
         .get(path)
@@ -398,25 +567,21 @@ fn phase_label(phase: ActionPhase) -> &'static str {
     }
 }
 
-fn action_path(
-    root: &VirtualPath,
-    fingerprint: &ActionFingerprintKey,
-) -> Result<VirtualPath, ProductWorkflowError> {
-    let path = format!(
+fn action_path(root: &str, fingerprint: &ActionFingerprintKey) -> String {
+    format!(
         "{}/{}/{}/{}/{}/{}/{}.json",
-        root.as_str().trim_end_matches('/'),
+        root.trim_end_matches('/'),
         hex_component(fingerprint.adapter_id.as_str()),
         hex_component(fingerprint.installation_id.as_str()),
         hex_component(fingerprint.external_actor_ref.kind()),
         hex_component(fingerprint.external_actor_ref.id()),
         hex_component(fingerprint.source_binding_key.as_str()),
         hex_component(fingerprint.external_event_id.as_str())
-    );
-    VirtualPath::new(path).map_err(|error| durable_error("construct action path", error))
+    )
 }
 
-fn default_ledger_root() -> VirtualPath {
-    VirtualPath::new(DEFAULT_LEDGER_ROOT).expect("DEFAULT_LEDGER_ROOT is valid") // safety: hard-coded /engine virtual path literal.
+fn default_ledger_root() -> String {
+    DEFAULT_LEDGER_ROOT.to_string()
 }
 
 fn hex_component(value: &str) -> String {
