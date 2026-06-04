@@ -392,6 +392,7 @@ pub enum LifecycleExtensionCredentialSetup {
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleExtensionSource {
     HostBundled,
+    Installed,
     Registry,
 }
 

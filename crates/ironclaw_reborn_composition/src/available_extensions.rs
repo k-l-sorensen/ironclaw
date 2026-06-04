@@ -83,9 +83,8 @@ impl AvailableExtensionPackage {
             description: self.package.manifest.description.clone(),
             source: match self.package.manifest.source {
                 ManifestSource::HostBundled => LifecycleExtensionSource::HostBundled,
-                ManifestSource::InstalledLocal | ManifestSource::RegistryInstalled => {
-                    LifecycleExtensionSource::Registry
-                }
+                ManifestSource::InstalledLocal => LifecycleExtensionSource::Installed,
+                ManifestSource::RegistryInstalled => LifecycleExtensionSource::Registry,
             },
             runtime_kind: runtime_kind(&self.package.manifest.runtime),
             visible_capability_ids,

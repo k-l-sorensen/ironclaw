@@ -87,7 +87,7 @@ impl RebornLocalSkillManagementPort {
         .await?)
     }
 
-    pub(crate) async fn install_from_ironhub(
+    pub(crate) async fn install_from_url(
         &self,
         name: Option<&str>,
         content: &str,

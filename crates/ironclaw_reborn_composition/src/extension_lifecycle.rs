@@ -292,6 +292,7 @@ impl RebornLocalExtensionManagementPort {
     ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
         let package_ref = available.package_ref.clone();
         let plan = prepare_install(&available)?;
+        let _operation_guard = self.operation_lock.lock().await;
         if force
             && self
                 .installation_store
@@ -300,9 +301,8 @@ impl RebornLocalExtensionManagementPort {
                 .map_err(map_extension_installation_error)?
                 .is_some()
         {
-            self.remove(package_ref.clone()).await?;
+            self.remove_locked(package_ref.clone()).await?;
         }
-        let _operation_guard = self.operation_lock.lock().await;
         if !force {
             self.ensure_not_installed(&available.package.id, plan.installation.installation_id())
                 .await?;
@@ -486,8 +486,15 @@ impl RebornLocalExtensionManagementPort {
         &self,
         package_ref: LifecyclePackageRef,
     ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
-        let (extension_id, installation_id) = extension_ids_from_package_ref(&package_ref)?;
         let _operation_guard = self.operation_lock.lock().await;
+        self.remove_locked(package_ref).await
+    }
+
+    async fn remove_locked(
+        &self,
+        package_ref: LifecyclePackageRef,
+    ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
+        let (extension_id, installation_id) = extension_ids_from_package_ref(&package_ref)?;
         let installation = self
             .load_installation(&extension_id, &installation_id)
             .await?;
