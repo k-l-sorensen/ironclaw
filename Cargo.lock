@@ -5002,6 +5002,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironclaw_reborn_openai_compat"
+version = "0.1.0"
+dependencies = [
+ "axum 0.8.9",
+ "http 1.4.1",
+ "http-body-util",
+ "ironclaw_host_api",
+ "ironclaw_product_adapters",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower 0.5.3",
+ "tracing",
+]
+
+[[package]]
 name = "ironclaw_reborn_traces"
 version = "0.1.0"
 dependencies = [
