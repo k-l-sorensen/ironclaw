@@ -278,11 +278,21 @@ pub async fn execute_tool_audited(
             (resolved_name, redacted)
         }
         None => {
-            let all_keys: Vec<&str> = params
-                .as_object()
-                .map(|m| m.keys().map(String::as_str).collect())
-                .unwrap_or_default();
-            (tool_name.to_string(), redact_params(&params, &all_keys))
+            // No tool resolved, so we have no `sensitive_params` metadata. An
+            // unresolved call must never persist raw arguments, which can carry
+            // secrets (e.g. API keys). For object params we redact *every*
+            // top-level field. For non-object params (a bare string/array, e.g.
+            // `"api_key=sk-..."`) there are no keys to enumerate and per-key
+            // redaction would short-circuit and clone the raw value through
+            // verbatim — so store a wholesale placeholder instead.
+            let redacted = match params.as_object() {
+                Some(obj) => {
+                    let all_keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+                    redact_params(&params, &all_keys)
+                }
+                None => serde_json::Value::String("[REDACTED]".into()),
+            };
+            (tool_name.to_string(), redacted)
         }
     };
 
@@ -1396,6 +1406,45 @@ mod audited_integration_tests {
             seqs.len(),
             N,
             "every persisted ActionRecord must hold a distinct sequence number"
+        );
+    }
+    #[tokio::test]
+    async fn audited_unresolved_tool_redacts_non_object_params() {
+        // Regression (#4023 Medium): an unresolved tool call whose params are a
+        // non-object JSON value (bare string/array, e.g. a hallucinated call
+        // passing `"api_key=sk-..."`) has no top-level keys to enumerate, so the
+        // old per-key redaction short-circuited and cloned the raw value through
+        // verbatim into `ActionRecord.input`. The audited path must instead store
+        // a wholesale placeholder so raw arguments — which may carry secrets —
+        // never land in the audit row.
+        let (db, backend, _dir) = test_store().await;
+        let registry = ToolRegistry::new(); // empty: the tool will not resolve
+        let safety = safety();
+        let job_ctx = JobContext::with_user("chatter", "chat", "interactive");
+
+        let result = execute_tool_audited(
+            &registry,
+            &safety,
+            Some(&db),
+            "nonexistent_tool",
+            serde_json::json!("api_key=secret-value"),
+            &job_ctx,
+            DispatchSource::Channel("web".into()),
+            None,
+        )
+        .await;
+
+        assert!(result.is_err(), "unresolved tool call must fail");
+
+        let actions = fetch_system_actions(&backend, &db, "chatter").await;
+        let action = actions
+            .iter()
+            .find(|a| a.tool_name == "nonexistent_tool")
+            .expect("a failed ActionRecord must be persisted for the unresolved call");
+        assert!(!action.success, "unresolved call recorded as failure");
+        assert!(
+            !action.input.to_string().contains("secret-value"),
+            "raw non-object arguments of an unresolved tool must never be persisted verbatim"
         );
     }
 }
