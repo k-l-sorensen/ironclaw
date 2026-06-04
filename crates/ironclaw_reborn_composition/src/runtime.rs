@@ -603,11 +603,6 @@ impl RebornRuntime {
         self.turn_coordinator.clone()
     }
 
-    pub(crate) fn turn_runner_waker(&self) -> Arc<dyn Fn() + Send + Sync> {
-        let wake_sender = self.wake_sender.clone();
-        Arc::new(move || wake_sender.wake())
-    }
-
     pub(crate) fn webui_event_stream(&self) -> Arc<dyn ProjectionStream> {
         self.projection_services.webui_event_stream()
     }

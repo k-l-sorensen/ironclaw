@@ -10,7 +10,11 @@ use chrono::{Duration, Utc};
 use ironclaw_filesystem::LibSqlRootFilesystem;
 #[cfg(feature = "postgres")]
 use ironclaw_filesystem::PostgresRootFilesystem;
-use ironclaw_host_api::VirtualPath;
+use ironclaw_filesystem::{InMemoryBackend, ScopedFilesystem};
+use ironclaw_host_api::{
+    AgentId, InvocationId, MountAlias, MountGrant, MountPermissions, MountView, ProjectId,
+    ResourceScope, TenantId, UserId, VirtualPath,
+};
 use ironclaw_product_adapters::{
     AdapterInstallationId, ExternalActorRef, ExternalEventId, ProductAdapterId, ProductInboundAck,
 };
@@ -18,6 +22,7 @@ use ironclaw_product_workflow::{
     ActionFingerprintKey, IdempotencyDecision, IdempotencyLedger, ProductInboundAction,
     ProductWorkflowError, SourceBindingKey,
 };
+use ironclaw_product_workflow_storage::RebornFilesystemIdempotencyLedger;
 #[cfg(feature = "libsql")]
 use ironclaw_product_workflow_storage::RebornLibSqlIdempotencyLedger;
 #[cfg(feature = "postgres")]
@@ -43,6 +48,29 @@ fn custom_root(suffix: &str) -> VirtualPath {
         "/engine/product_workflow/idempotency/test_roots/{suffix}"
     ))
     .expect("valid custom ledger root")
+}
+
+fn scoped_filesystem() -> Arc<ScopedFilesystem<InMemoryBackend>> {
+    let backend = Arc::new(InMemoryBackend::new());
+    let mounts = MountView::new(vec![MountGrant::new(
+        MountAlias::new("/engine").expect("engine alias"),
+        VirtualPath::new("/engine/scoped-workflow-storage").expect("engine target"),
+        MountPermissions::read_write_list_delete(),
+    )])
+    .expect("mount view");
+    Arc::new(ScopedFilesystem::with_fixed_view(backend, mounts))
+}
+
+fn resource_scope(user_id: &str) -> ResourceScope {
+    ResourceScope {
+        tenant_id: TenantId::new("tenant:workflow-storage").expect("tenant"),
+        user_id: UserId::new(user_id).expect("user"),
+        agent_id: Some(AgentId::new("agent:workflow-storage").expect("agent")),
+        project_id: Some(ProjectId::new("project:workflow-storage").expect("project")),
+        mission_id: None,
+        thread_id: None,
+        invocation_id: InvocationId::new(),
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -273,6 +301,34 @@ async fn assert_actor_identity_is_part_of_fingerprint_path(
             .expect("begin second actor"),
         IdempotencyDecision::New(_)
     ));
+}
+
+#[tokio::test]
+async fn scoped_filesystem_settled_action_replays() {
+    let filesystem = scoped_filesystem();
+    let ledger = RebornFilesystemIdempotencyLedger::with_in_flight_lease(
+        Arc::clone(&filesystem),
+        resource_scope("user:scoped-replay"),
+        Duration::seconds(10),
+    );
+    let reopened = RebornFilesystemIdempotencyLedger::with_in_flight_lease(
+        filesystem,
+        resource_scope("user:scoped-replay"),
+        Duration::seconds(10),
+    );
+
+    assert_settled_action_survives_reopen_and_replays(&ledger, &reopened, "scoped-replay").await;
+}
+
+#[tokio::test]
+async fn scoped_filesystem_in_flight_action_blocks_until_lease_expires() {
+    let ledger = RebornFilesystemIdempotencyLedger::with_in_flight_lease(
+        scoped_filesystem(),
+        resource_scope("user:scoped-lease"),
+        Duration::seconds(10),
+    );
+
+    assert_in_flight_action_blocks_until_lease_expires(&ledger, "scoped-lease").await;
 }
 
 #[cfg(feature = "libsql")]

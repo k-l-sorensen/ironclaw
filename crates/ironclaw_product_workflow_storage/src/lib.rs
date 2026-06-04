@@ -206,8 +206,8 @@ impl FilesystemIdempotencyLedger {
 /// Scoped-filesystem-backed product workflow idempotency ledger.
 ///
 /// Construct with the same [`ScopedFilesystem`] handle used by the Reborn host
-/// stores. The supplied [`ResourceScope`] controls how the `/engine` alias is
-/// tenant/user rewritten on every operation.
+/// stores. The supplied [`ResourceScope`] is passed to the filesystem for every
+/// operation so the filesystem's mount resolver owns any tenant/user rewriting.
 pub struct RebornFilesystemIdempotencyLedger<F>
 where
     F: RootFilesystem,
