@@ -1583,7 +1583,17 @@ impl EffectBridgeAdapter {
         // `existing_job_id = None`: the bridge carries an in-memory
         // `JobContext` (no backing `agent_jobs` row), so the funnel mints a
         // fresh system job for the audit FK — identical to the chat path.
-        let audit_source = crate::tools::dispatch::DispatchSource::Channel("engine_v2".into());
+        // Attribute the audit to the thread's real originating channel
+        // (`gateway`/`slack`/...) when present, matching the chat/restart
+        // audited paths. `engine_v2` is only the fallback for channel-less
+        // system threads (background missions, schedulers) that have no real
+        // actor channel to record.
+        let audit_source = crate::tools::dispatch::DispatchSource::Channel(
+            context
+                .source_channel
+                .clone()
+                .unwrap_or_else(|| "engine_v2".into()),
+        );
         let result = if let Some(intercepted) = sandbox_result {
             // Sandbox-intercepted: the tool ran in the mount/container backend,
             // NOT via a local `Tool::execute`, so we cannot route through

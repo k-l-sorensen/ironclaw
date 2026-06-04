@@ -477,6 +477,34 @@ mod audited_funnel {
         actions
     }
 
+    /// Collect the `title` of every system job (the audited funnel encodes the
+    /// `DispatchSource` label into the title as `System: <source>` —
+    /// `create_system_job` stores the source there, the `source` column is the
+    /// fixed `"system"` category marker). Used to assert the audit attributes
+    /// the originating channel rather than the synthetic `engine_v2` fallback.
+    async fn system_job_titles(backend: &LibSqlBackend) -> Vec<String> {
+        use libsql::params;
+        let conn = backend.connect().await.expect("connect");
+        let mut rows = conn
+            .query(
+                "SELECT title FROM agent_jobs WHERE category = 'system' AND user_id = ?1",
+                params!["test-user"],
+            )
+            .await
+            .expect("query system jobs");
+        let mut titles = Vec::new();
+        while let Some(row) = rows.next().await.expect("next row") {
+            titles.push(row.get::<String>(0).expect("job title"));
+        }
+        titles
+    }
+
+    fn context_with_channel(project_id: ProjectId, channel: &str) -> ThreadExecutionContext {
+        let mut ctx = make_context(project_id);
+        ctx.source_channel = Some(channel.to_string());
+        ctx
+    }
+
     #[tokio::test]
     async fn host_branch_persists_redacted_action_record() {
         let (db, backend, _dir) = test_db().await;
@@ -578,6 +606,110 @@ mod audited_funnel {
         assert_eq!(
             actions[0].tool_name, "file_write",
             "sandbox-dispatched call must produce the same audit shape (tool name) as host"
+        );
+    }
+
+    /// The audit's `DispatchSource` must be derived from the thread's real
+    /// `source_channel` (e.g. `gateway`/`slack`), not flattened to the
+    /// synthetic `engine_v2` label. Drives the host branch with a distinct
+    /// originating channel and asserts the persisted system job carries it.
+    #[tokio::test]
+    async fn audit_source_reflects_real_origin_channel() {
+        let (db, backend, _dir) = test_db().await;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(SecretEchoTool)).await;
+
+        let adapter = Arc::new(
+            EffectBridgeAdapter::new(
+                tools,
+                Arc::new(SafetyLayer::new(&SafetyConfig {
+                    max_output_length: 100_000,
+                    injection_check_enabled: false,
+                })),
+                Arc::new(HookRegistry::default()),
+                Some(Arc::clone(&db)),
+            )
+            .with_global_auto_approve(true),
+        );
+
+        let ctx = context_with_channel(ProjectId::new(), "slack");
+        let lease = make_lease(ctx.thread_id);
+
+        let result = adapter
+            .execute_action(
+                "audit_echo",
+                serde_json::json!({ "note": "hello", "secret": "s3cr3t-value" }),
+                &lease,
+                &ctx,
+            )
+            .await
+            .expect("host execute_action should succeed");
+        assert!(!result.is_error, "host branch should succeed: {result:?}");
+
+        let titles = system_job_titles(&backend).await;
+        assert_eq!(
+            titles.len(),
+            1,
+            "expected exactly one system job, found {}: {titles:?}",
+            titles.len()
+        );
+        assert!(
+            titles[0].contains("channel:slack"),
+            "audit must record the real origin channel `slack`, got: {}",
+            titles[0]
+        );
+        assert!(
+            !titles[0].contains("engine_v2"),
+            "audit must not flatten a real channel to the `engine_v2` fallback, got: {}",
+            titles[0]
+        );
+    }
+
+    /// When the thread has no originating channel (a channel-less system
+    /// thread), the audit falls back to the synthetic `engine_v2` label.
+    #[tokio::test]
+    async fn audit_source_falls_back_to_engine_v2_when_channelless() {
+        let (db, backend, _dir) = test_db().await;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(SecretEchoTool)).await;
+
+        let adapter = Arc::new(
+            EffectBridgeAdapter::new(
+                tools,
+                Arc::new(SafetyLayer::new(&SafetyConfig {
+                    max_output_length: 100_000,
+                    injection_check_enabled: false,
+                })),
+                Arc::new(HookRegistry::default()),
+                Some(Arc::clone(&db)),
+            )
+            .with_global_auto_approve(true),
+        );
+
+        // `make_context` leaves `source_channel = None`.
+        let ctx = make_context(ProjectId::new());
+        let lease = make_lease(ctx.thread_id);
+
+        adapter
+            .execute_action(
+                "audit_echo",
+                serde_json::json!({ "note": "hello" }),
+                &lease,
+                &ctx,
+            )
+            .await
+            .expect("host execute_action should succeed");
+
+        let titles = system_job_titles(&backend).await;
+        assert_eq!(
+            titles.len(),
+            1,
+            "expected exactly one system job: {titles:?}"
+        );
+        assert!(
+            titles[0].contains("channel:engine_v2"),
+            "channel-less thread must fall back to `engine_v2`, got: {}",
+            titles[0]
         );
     }
 }
