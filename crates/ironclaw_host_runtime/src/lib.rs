@@ -1343,6 +1343,10 @@ fn sanitize_runtime_response(
         if exact_redacted.contains("[REDACTED]") {
             redaction_applied = true;
         }
+        // `response_leak_blocked` rides the recoverable `ResponseError` path (reason_code()
+        // only special-cases response_body_limit_exceeded). Safe — the detector re-blocks any
+        // re-issued request — but can spin a bounded retry loop; a dedicated Permanent reason
+        // code is the documented follow-up. See first_party_tools/http.rs http_error().
         let cleaned = detector.scan_and_clean(&exact_redacted).map_err(|_| {
             RuntimeHttpEgressError::Response {
                 reason: "response_leak_blocked".to_string(),
@@ -1362,6 +1366,10 @@ fn sanitize_runtime_response(
     if exact_body_redacted {
         redaction_applied = true;
     }
+    // `response_leak_blocked` rides the recoverable `ResponseError` path (reason_code() only
+    // special-cases response_body_limit_exceeded). Safe — the detector re-blocks any re-issued
+    // request — but can spin a bounded retry loop; a dedicated Permanent reason code is the
+    // documented follow-up. See first_party_tools/http.rs http_error().
     let cleaned =
         detector
             .scan_and_clean(&exact_redacted)

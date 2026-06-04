@@ -294,10 +294,26 @@ fn http_error(error: RuntimeHttpEgressError) -> FirstPartyCapabilityError {
         // (retry, try a different endpoint, tell the user), not a fatal violation of our
         // own output contract. Mapping it to OutputDecode/InvalidOutput would classify it
         // as Permanent and abort the entire agent run.
+        //
+        // Note: `response_leak_blocked` (the leak detector found unredactable secrets in
+        // the response, synthesized as `RuntimeHttpEgressError::Response` in
+        // sanitize_runtime_response in lib.rs) also rides this recoverable `ResponseError`
+        // path, since reason_code() only special-cases `response_body_limit_exceeded`. This
+        // is safe — the leak detector re-runs and re-blocks on any re-issued request, so
+        // nothing leaks — but it can produce a bounded retry loop (the model re-requests and
+        // re-triggers the block, capped by the loop's global iteration limit). Giving
+        // `response_leak_blocked` a dedicated Permanent reason code so the run aborts instead
+        // of spinning is the documented follow-up.
         RuntimeHttpEgressReasonCode::ResponseError => RuntimeDispatchErrorKind::OperationFailed,
         // An oversized remote response body is likewise an operational/remote condition,
         // not a violation of our own output contract, so it must stay recoverable and
         // model-visible rather than aborting the run.
+        //
+        // This intentionally diverges from a guest exceeding its own declared output
+        // (`OutputTooLarge`), which stays Permanent and aborts: an oversized *remote* body is
+        // an operational/remote condition, whereas a guest overflowing its declared output is
+        // a genuine contract violation. The two "output too large" paths therefore differ in
+        // fatality by design, not oversight.
         RuntimeHttpEgressReasonCode::ResponseBodyLimitExceeded => {
             RuntimeDispatchErrorKind::OperationFailed
         }
