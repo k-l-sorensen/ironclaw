@@ -6,6 +6,8 @@
 //! facade. Authorization, run-state transitions, approval leases, process
 //! lifecycle, and runtime execution semantics remain in their owning crates.
 
+mod process_executor;
+
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -13,6 +15,7 @@ use ironclaw_approvals::ApprovalResolver;
 use ironclaw_authorization::{
     CapabilityLeaseStore, InMemoryCapabilityLeaseStore, TrustAwareCapabilityDispatchAuthorizer,
 };
+use ironclaw_capabilities::CapabilityObligationHandler;
 use ironclaw_dispatcher::{
     RuntimeAdapter, RuntimeAdapterRequest, RuntimeAdapterResult, RuntimeDispatcher,
 };
@@ -20,16 +23,15 @@ use ironclaw_events::{
     AuditSink, DurableAuditLog, DurableAuditSink, DurableEventLog, DurableEventSink, EventSink,
     InMemoryAuditSink, InMemoryDurableAuditLog, InMemoryDurableEventLog, InMemoryEventSink,
 };
-use ironclaw_extensions::{ExtensionRegistry, ExtensionRuntime};
+use ironclaw_extensions::{ExtensionRegistry, ExtensionRuntime, SharedExtensionRegistry};
 #[cfg(feature = "libsql")]
 use ironclaw_filesystem::LibSqlRootFilesystem;
 #[cfg(feature = "postgres")]
 use ironclaw_filesystem::PostgresRootFilesystem;
 use ironclaw_filesystem::{LocalFilesystem, RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{
-    CapabilityDispatchRequest, CapabilityDispatcher, CapabilityId, DispatchError,
-    ResourceReservationId, ResourceScope, ResourceUsage, RuntimeDispatchErrorKind,
-    RuntimeHttpEgress, RuntimeKind,
+    CapabilityDispatcher, CapabilityId, DispatchError, ResourceReservationId, ResourceScope,
+    ResourceUsage, RuntimeDispatchErrorKind, RuntimeHttpEgress, RuntimeKind, SecretHandle,
     runtime_policy::{
         DeploymentMode, EffectiveRuntimePolicy, FilesystemBackendKind, NetworkMode,
         ProcessBackendKind, RuntimeProfile, SecretMode,
@@ -38,8 +40,7 @@ use ironclaw_host_api::{
 use ironclaw_mcp::{McpError, McpExecutionRequest, McpExecutor, McpInvocation};
 use ironclaw_network::NetworkHttpEgress;
 use ironclaw_processes::{
-    BackgroundFailureStage, InMemoryProcessResultStore, InMemoryProcessStore,
-    ProcessExecutionError, ProcessExecutionRequest, ProcessExecutionResult, ProcessExecutor,
+    BackgroundFailureStage, InMemoryProcessResultStore, InMemoryProcessStore, ProcessExecutor,
     ProcessManager, ProcessResultStore, ProcessServices, ProcessStore,
 };
 use ironclaw_reborn_event_store::{
@@ -55,7 +56,10 @@ use ironclaw_run_state::{
     InMemoryApprovalRequestStore, InMemoryRunStateStore, RunStateApprovalStore, RunStateStore,
 };
 use ironclaw_scripts::{ScriptError, ScriptExecutionRequest, ScriptExecutor, ScriptInvocation};
-use ironclaw_secrets::{InMemorySecretStore, SecretStore};
+use ironclaw_secrets::{
+    CredentialAccountStore, CredentialSessionStore, InMemoryCredentialBroker, InMemorySecretStore,
+    SecretStore, SecretStoreError,
+};
 use ironclaw_trust::{HostTrustPolicy, TrustPolicy};
 use ironclaw_turns::{
     DefaultTurnCoordinator, FilesystemTurnStateStore, InMemoryTurnStateStore,
@@ -70,7 +74,8 @@ use ironclaw_wasm::{
 };
 
 use crate::obligations::{
-    NetworkObligationPolicyStore, RuntimeSecretInjectionStore, SharedSecretStore,
+    NetworkObligationPolicyStore, RuntimeCredentialAccountResolver, RuntimeSecretInjectionStore,
+    SharedSecretStore,
 };
 use crate::{
     BuiltinObligationHandler, CapabilitySurfaceVersion, DefaultHostRuntime,
@@ -80,6 +85,7 @@ use crate::{
     RuntimeBackendHealth, RuntimeProcessPort, TenantSandboxProcessPort, TurnRunExecutor,
     TurnRunScheduler, TurnRunSchedulerConfig, plan_capability,
 };
+use process_executor::{HostProcessExecutor, RuntimeDispatchProcessExecutor};
 
 type SharedRuntimeHttpEgress = Arc<Mutex<Option<Arc<dyn RuntimeHttpEgress>>>>;
 
@@ -87,6 +93,7 @@ mod builder;
 mod production_services;
 mod production_wiring;
 mod runtime_adapters;
+mod wasm_diagnostics;
 
 use production_wiring::{
     ProductionComponentType, ProductionComponentTypes, ProductionImplementationReadiness,
@@ -115,7 +122,7 @@ where
     S: ProcessStore + 'static,
     R: ProcessResultStore + 'static,
 {
-    registry: Arc<ExtensionRegistry>,
+    registry: Arc<SharedExtensionRegistry>,
     trust_policy: Arc<dyn TrustPolicy>,
     trust_policy_configured: bool,
     filesystem: Arc<F>,
@@ -130,6 +137,9 @@ where
     event_sink: Option<Arc<dyn EventSink>>,
     audit_sink: Option<Arc<dyn AuditSink>>,
     secret_store: Option<Arc<dyn SecretStore>>,
+    credential_account_store: Arc<dyn CredentialAccountStore>,
+    credential_session_store: Arc<dyn CredentialSessionStore>,
+    runtime_credential_account_resolver: Option<Arc<dyn RuntimeCredentialAccountResolver>>,
     network_policy_store: Arc<NetworkObligationPolicyStore>,
     secret_injection_store: Arc<RuntimeSecretInjectionStore>,
     process_lifecycle_store: Arc<ProcessObligationLifecycleStore>,
@@ -140,6 +150,7 @@ where
     wasm_credential_provider: Option<Arc<dyn WasmRuntimeCredentialProvider>>,
     runtime_health: Option<Arc<dyn RuntimeBackendHealth>>,
     runtime_policy: Option<EffectiveRuntimePolicy>,
+    process_sandbox_executor: Option<Arc<dyn ProcessExecutor>>,
     script_runtime: Option<Arc<dyn ScriptExecutor>>,
     mcp_runtime: Option<Arc<dyn McpExecutor>>,
     first_party_runtime: Option<Arc<FirstPartyCapabilityRegistry>>,
@@ -149,6 +160,109 @@ where
     turn_run_transition_port: Option<Arc<dyn TurnRunTransitionPort>>,
     turn_run_wake_notifier: Option<Arc<dyn TurnRunWakeNotifier>>,
     component_types: ProductionComponentTypes,
+}
+
+/// Canonical host-runtime ports used by product-auth provider adapters.
+///
+/// This intentionally exposes only the already-composed egress, obligation
+/// handler, and scoped one-shot secret staging operation. Product/auth adapters
+/// must not receive the mutable handoff stores that back those ports.
+#[derive(Clone)]
+pub struct ProductAuthProviderRuntimePorts {
+    runtime_http_egress: Arc<dyn RuntimeHttpEgress>,
+    obligation_handler: Arc<dyn CapabilityObligationHandler>,
+    secret_store: Arc<dyn SecretStore>,
+    secret_injection_store: Arc<RuntimeSecretInjectionStore>,
+}
+
+/// Alias for [`ironclaw_host_api::CredentialStageError`].
+///
+/// The shared type lives in `ironclaw_host_api` so that per-extension staging
+/// traits can use it without a dependency on `ironclaw_host_runtime`.
+pub type ProductAuthCredentialStageError = ironclaw_host_api::CredentialStageError;
+
+impl ProductAuthProviderRuntimePorts {
+    fn new(
+        runtime_http_egress: Arc<dyn RuntimeHttpEgress>,
+        obligation_handler: Arc<dyn CapabilityObligationHandler>,
+        secret_store: Arc<dyn SecretStore>,
+        secret_injection_store: Arc<RuntimeSecretInjectionStore>,
+    ) -> Self {
+        Self {
+            runtime_http_egress,
+            obligation_handler,
+            secret_store,
+            secret_injection_store,
+        }
+    }
+
+    pub fn runtime_http_egress(&self) -> Arc<dyn RuntimeHttpEgress> {
+        Arc::clone(&self.runtime_http_egress)
+    }
+
+    pub fn obligation_handler(&self) -> Arc<dyn CapabilityObligationHandler> {
+        Arc::clone(&self.obligation_handler)
+    }
+
+    pub async fn stage_secret_once(
+        &self,
+        scope: &ResourceScope,
+        capability_id: &CapabilityId,
+        handle: &SecretHandle,
+    ) -> Result<(), ProductAuthCredentialStageError> {
+        self.stage_secret_from_scope_once(scope, scope, capability_id, handle)
+            .await
+    }
+
+    pub async fn stage_secret_from_scope_once(
+        &self,
+        source_scope: &ResourceScope,
+        target_scope: &ResourceScope,
+        capability_id: &CapabilityId,
+        handle: &SecretHandle,
+    ) -> Result<(), ProductAuthCredentialStageError> {
+        let lease = self
+            .secret_store
+            .lease_once(source_scope, handle)
+            .await
+            .map_err(stage_secret_error)?;
+        let secret = self
+            .secret_store
+            .consume(source_scope, lease.id)
+            .await
+            .map_err(stage_secret_error)?;
+        self.secret_injection_store
+            .insert(target_scope, capability_id, handle, secret)
+            .map_err(|_| ProductAuthCredentialStageError::Backend)
+    }
+}
+
+/// Classify a [`SecretStoreError`] for the host staging surface.
+///
+/// Unknown / expired / revoked secrets are all user-actionable re-auth
+/// conditions: they map to [`ProductAuthCredentialStageError::AuthRequired`]
+/// so the runtime auth gate fires instead of surfacing a generic backend
+/// failure. Anything else is a true backend defect.
+///
+/// Used in production by [`ProductAuthProviderRuntimePorts::stage_secret_once`]
+/// and by the obligation-handler `stage_credential_material` helper so the
+/// WASM `InjectCredentialAccountOnce` lane and the first-party stager lane
+/// share identical AuthRequired classification. Crate-private: cross-crate
+/// callers must go through one of the two staging entry points above.
+pub(crate) fn stage_secret_error(error: SecretStoreError) -> ProductAuthCredentialStageError {
+    // Unknown / expired / revoked / consumed / unknown-lease are all user-actionable
+    // re-auth conditions: the credential is missing or no longer valid.  Anything
+    // else is a true backend defect.
+    if error.is_unknown_secret()
+        || error.is_unknown_lease()
+        || error.is_expired()
+        || error.is_revoked()
+        || error.is_consumed()
+    {
+        ProductAuthCredentialStageError::AuthRequired
+    } else {
+        ProductAuthCredentialStageError::Backend
+    }
 }
 
 impl<F, G, S, R> HostRuntimeServices<F, G, S, R>
@@ -174,8 +288,11 @@ where
             Arc::clone(&secret_injection_store),
             governor.clone(),
         ));
+        let credential_broker = Arc::new(InMemoryCredentialBroker::new());
+        let credential_account_store: Arc<dyn CredentialAccountStore> = credential_broker.clone();
+        let credential_session_store: Arc<dyn CredentialSessionStore> = credential_broker;
         Self {
-            registry,
+            registry: Arc::new(SharedExtensionRegistry::new((*registry).clone())),
             trust_policy: Arc::new(HostTrustPolicy::fail_closed()),
             trust_policy_configured: false,
             filesystem,
@@ -190,6 +307,9 @@ where
             event_sink: None,
             audit_sink: None,
             secret_store: None,
+            credential_account_store,
+            credential_session_store,
+            runtime_credential_account_resolver: None,
             network_policy_store,
             secret_injection_store,
             process_lifecycle_store,
@@ -200,6 +320,7 @@ where
             wasm_credential_provider: None,
             runtime_health: None,
             runtime_policy: None,
+            process_sandbox_executor: None,
             script_runtime: None,
             mcp_runtime: None,
             first_party_runtime: None,
@@ -221,6 +342,8 @@ where
                 event_sink: None,
                 audit_sink: None,
                 secret_store: None,
+                credential_account_store: None,
+                credential_session_store: None,
                 runtime_http_egress: None,
                 runtime_http_egress_verified: false,
                 runtime_process_port: ProductionComponentType::of::<LocalHostProcessPort>(),
@@ -242,7 +365,7 @@ where
 
     /// Builds a runtime dispatcher with every configured runtime adapter.
     fn runtime_dispatcher(&self) -> RuntimeDispatcher<'static, F, G> {
-        let mut dispatcher = RuntimeDispatcher::from_arcs(
+        let mut dispatcher = RuntimeDispatcher::from_shared_registry(
             Arc::clone(&self.registry),
             Arc::clone(&self.filesystem),
             Arc::clone(&self.governor),
@@ -258,6 +381,10 @@ where
             Arc::clone(&self.process_port),
             self.secret_store.clone(),
         );
+        if let Some(audit_sink) = &self.audit_sink {
+            invocation_services_resolver =
+                invocation_services_resolver.with_audit_sink(Arc::clone(audit_sink));
+        }
         if let Some(process_port) = &self.tenant_sandbox_process_port {
             invocation_services_resolver = invocation_services_resolver
                 .with_tenant_sandbox_process_port(Arc::clone(process_port));
@@ -309,6 +436,23 @@ where
     }
 
     /// Builds the upper facade without production validation.
+    pub fn shared_extension_registry(&self) -> Arc<SharedExtensionRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    /// Returns the canonical host-runtime egress/obligation ports for
+    /// product-auth provider adapters.
+    pub fn product_auth_provider_runtime_ports(&self) -> Option<ProductAuthProviderRuntimePorts> {
+        let runtime_http_egress = runtime_http_egress(&self.runtime_http_egress)?;
+        let secret_store = self.secret_store.clone()?;
+        Some(ProductAuthProviderRuntimePorts::new(
+            runtime_http_egress,
+            Arc::new(self.builtin_obligation_handler()),
+            secret_store,
+            Arc::clone(&self.secret_injection_store),
+        ))
+    }
+
     #[doc(hidden)]
     pub fn host_runtime_for_local_testing(&self) -> DefaultHostRuntime {
         self.build_host_runtime()
@@ -318,8 +462,10 @@ where
     /// stores, cancellation registry, result store, and runtime health graph.
     fn build_host_runtime(&self) -> DefaultHostRuntime {
         let dispatcher: Arc<dyn CapabilityDispatcher> = Arc::new(self.runtime_dispatcher());
-        let process_executor =
-            Arc::new(RuntimeDispatchProcessExecutor::new(Arc::clone(&dispatcher)));
+        let process_executor = Arc::new(HostProcessExecutor::new(
+            Arc::new(RuntimeDispatchProcessExecutor::new(Arc::clone(&dispatcher))),
+            self.process_sandbox_executor.clone(),
+        ));
         let lifecycle_process_store = Arc::clone(&self.process_lifecycle_store);
         let process_store: Arc<dyn ProcessStore> = lifecycle_process_store.clone();
         let result_failure_cleanup_store = Arc::clone(&lifecycle_process_store);
@@ -365,14 +511,16 @@ where
             .runtime_policy
             .clone()
             .unwrap_or_else(local_testing_runtime_policy);
+        let surface_filesystem: Arc<dyn RootFilesystem> = self.filesystem.clone();
 
-        let mut runtime = DefaultHostRuntime::new(
+        let mut runtime = DefaultHostRuntime::from_shared_registry(
             Arc::clone(&self.registry),
             dispatcher,
             Arc::clone(&self.authorizer),
             self.surface_version.clone(),
             runtime_policy,
         )
+        .with_surface_filesystem(surface_filesystem)
         .with_trust_policy_dyn(Arc::clone(&self.trust_policy))
         .with_process_manager(process_manager)
         .with_process_store(process_store)
@@ -408,6 +556,9 @@ where
         }
         if let Some(secret_store) = &self.secret_store {
             handler = handler.with_secret_store_dyn(Arc::clone(secret_store));
+        }
+        if let Some(resolver) = &self.runtime_credential_account_resolver {
+            handler = handler.with_credential_account_resolver_dyn(Arc::clone(resolver));
         }
 
         handler
@@ -449,8 +600,8 @@ where
         let Some(first_party_runtime) = &self.first_party_runtime else {
             return false;
         };
-        let mut declared = self
-            .registry
+        let registry = self.registry.snapshot();
+        let mut declared = registry
             .capabilities()
             .filter(|descriptor| descriptor.runtime == RuntimeKind::FirstParty)
             .peekable();
@@ -464,7 +615,7 @@ where
         let Some(first_party_runtime) = &self.first_party_runtime else {
             return false;
         };
-        self.registry.capabilities().any(|descriptor| {
+        self.registry.snapshot().capabilities().any(|descriptor| {
             descriptor.runtime == RuntimeKind::FirstParty
                 && descriptor.id.as_str() == crate::SHELL_CAPABILITY_ID
                 && first_party_runtime.contains_handler(&descriptor.id)
@@ -488,7 +639,7 @@ fn local_only_runtime_policy_reason(policy: &EffectiveRuntimePolicy) -> Option<&
     }
     if matches!(
         policy.filesystem_backend,
-        FilesystemBackendKind::HostWorkspace
+        FilesystemBackendKind::HostWorkspace | FilesystemBackendKind::HostWorkspaceAndHome
     ) {
         return Some("host_workspace_filesystem");
     }
@@ -558,61 +709,6 @@ impl RuntimeBackendHealth for RegisteredRuntimeHealth {
             .collect::<Vec<_>>();
         normalize_runtime_kinds(&mut missing);
         Ok(missing)
-    }
-}
-
-#[derive(Clone)]
-struct RuntimeDispatchProcessExecutor {
-    dispatcher: Arc<dyn CapabilityDispatcher>,
-}
-
-impl RuntimeDispatchProcessExecutor {
-    pub(crate) fn new(dispatcher: Arc<dyn CapabilityDispatcher>) -> Self {
-        Self { dispatcher }
-    }
-}
-
-#[async_trait]
-impl ProcessExecutor for RuntimeDispatchProcessExecutor {
-    async fn execute(
-        &self,
-        request: ProcessExecutionRequest,
-    ) -> Result<ProcessExecutionResult, ProcessExecutionError> {
-        if request.cancellation.is_cancelled() {
-            return Err(ProcessExecutionError::new("cancelled"));
-        }
-        let result = self
-            .dispatcher
-            .dispatch_json(CapabilityDispatchRequest {
-                capability_id: request.capability_id,
-                scope: request.scope,
-                estimate: request.estimate,
-                mounts: Some(request.mounts),
-                resource_reservation: request.resource_reservation,
-                input: request.input,
-            })
-            .await
-            .map_err(|error| ProcessExecutionError::new(dispatch_error_kind(&error)))?;
-        if request.cancellation.is_cancelled() {
-            return Err(ProcessExecutionError::new("cancelled"));
-        }
-        Ok(ProcessExecutionResult {
-            output: result.output,
-        })
-    }
-}
-
-fn dispatch_error_kind(error: &DispatchError) -> &'static str {
-    match error {
-        DispatchError::UnknownCapability { .. } => "unknown_capability",
-        DispatchError::UnknownProvider { .. } => "unknown_provider",
-        DispatchError::RuntimeMismatch { .. } => "runtime_mismatch",
-        DispatchError::MissingRuntimeBackend { .. } => "missing_runtime_backend",
-        DispatchError::UnsupportedRuntime { .. } => "unsupported_runtime",
-        DispatchError::Mcp { kind }
-        | DispatchError::Script { kind }
-        | DispatchError::Wasm { kind }
-        | DispatchError::FirstParty { kind } => kind.event_kind(),
     }
 }
 

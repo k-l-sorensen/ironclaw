@@ -19,7 +19,8 @@ use ironclaw_host_runtime::{
     VisibleCapabilitySurface as HostVisibleCapabilitySurface,
 };
 use ironclaw_loop_support::{
-    HostRuntimeLoopCapabilityPortFactory, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
+    CapabilityResultWrite, HostRuntimeLoopCapabilityPortFactory, LoopCapabilityInputResolver,
+    LoopCapabilityResultWriter,
 };
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 use ironclaw_turns::{
@@ -327,6 +328,7 @@ impl HostRuntime for SingleToolHostRuntime {
             RuntimeCapabilityCompleted {
                 capability_id: request.capability_id,
                 output: serde_json::json!({"ok": true}),
+                display_preview: None,
                 usage: ResourceUsage::default(),
             },
         )))
@@ -410,9 +412,7 @@ struct UnusedResultWriter;
 impl LoopCapabilityResultWriter for UnusedResultWriter {
     async fn write_capability_result(
         &self,
-        _run_context: &LoopRunContext,
-        _capability_id: &CapabilityId,
-        _output: serde_json::Value,
+        _write: CapabilityResultWrite<'_>,
     ) -> Result<LoopResultRef, AgentLoopHostError> {
         LoopResultRef::new("result:factory").map_err(|_| {
             AgentLoopHostError::new(

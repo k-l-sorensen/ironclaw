@@ -1,15 +1,20 @@
+use crate::OAuthClientConfig;
 use chrono::{Duration, Utc};
 use ironclaw_auth::{
     AuthChallenge, AuthContinuationRef, AuthErrorCode, AuthFlowId, AuthFlowKind, AuthGateRef,
     AuthProductScope, AuthProviderId, AuthSessionId, AuthSurface, AuthorizationCodeHash,
     CredentialAccountLabel, InMemoryAuthProductServices, LifecyclePackageRef, NewAuthFlow,
-    OAuthAuthorizationCode, OAuthAuthorizationUrl, OAuthProviderCallbackRequest, OpaqueStateHash,
-    PkceVerifierHash, PkceVerifierSecret, ProviderScope, TurnRunRef,
+    OAuthAuthorizationCode, OAuthAuthorizationUrl, OAuthClientId, OAuthProviderCallbackRequest,
+    OAuthRedirectUri, OpaqueStateHash, PkceVerifierHash, PkceVerifierSecret, ProviderScope,
+    TurnRunRef,
 };
+use ironclaw_capabilities::{CapabilityObligationHandler, CapabilityObligationRequest};
 use ironclaw_host_api::{
-    AgentId, InvocationId, ProjectId, ResourceScope, TenantId, ThreadId, UserId,
+    AgentId, InvocationId, ProjectId, ResourceScope, RuntimeHttpEgress, RuntimeHttpEgressError,
+    RuntimeHttpEgressRequest, RuntimeHttpEgressResponse, TenantId, ThreadId, UserId,
 };
 use ironclaw_product_workflow::ProductAuthTurnGateResumeDispatcher;
+use ironclaw_secrets::InMemorySecretStore;
 use ironclaw_turns::{
     AcceptedMessageRef, BlockedReason, CancelRunRequest, CancelRunResponse, GetRunStateRequest,
     IdempotencyKey, LoopCheckpointStateRef, ReplyTargetBindingRef, RunProfileRequest,
@@ -19,8 +24,11 @@ use ironclaw_turns::{
     runner::{BlockRunRequest, ClaimRunRequest, TurnRunTransitionPort},
 };
 use secrecy::SecretString;
+use std::sync::Mutex;
 
 use super::*;
+use crate::notion_oauth::{NOTION_PROVIDER_ID, notion_provider_spec};
+use crate::oauth_provider_client::HostOAuthProviderClient;
 
 #[derive(Clone)]
 struct ErrorTurnCoordinator {
@@ -29,6 +37,10 @@ struct ErrorTurnCoordinator {
 
 #[async_trait::async_trait]
 impl TurnCoordinator for ErrorTurnCoordinator {
+    async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        Ok(TurnRunId::new())
+    }
+
     async fn submit_turn(
         &self,
         _request: SubmitTurnRequest,
@@ -52,13 +64,87 @@ impl TurnCoordinator for ErrorTurnCoordinator {
     }
 }
 
+#[derive(Debug, Default)]
+struct NoopContinuationDispatcher;
+
+#[async_trait::async_trait]
+impl RebornAuthContinuationDispatcher for NoopContinuationDispatcher {
+    async fn dispatch_auth_continuation(
+        &self,
+        _event: ironclaw_auth::AuthContinuationEvent,
+    ) -> Result<(), ironclaw_auth::AuthProductError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Default)]
+struct NoopObligationHandler;
+
+#[async_trait::async_trait]
+impl CapabilityObligationHandler for NoopObligationHandler {
+    async fn satisfy(
+        &self,
+        _request: CapabilityObligationRequest<'_>,
+    ) -> Result<(), ironclaw_capabilities::CapabilityObligationError> {
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct RecordingOAuthEgress {
+    response_body: Vec<u8>,
+    requests: Mutex<Vec<RuntimeHttpEgressRequest>>,
+}
+
+impl RecordingOAuthEgress {
+    fn ok(response_body: Vec<u8>) -> Self {
+        Self {
+            response_body,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn single_request(&self) -> RuntimeHttpEgressRequest {
+        let requests = self
+            .requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if requests.len() != 1 {
+            panic!("expected exactly one OAuth egress request");
+        }
+        requests[0].clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl RuntimeHttpEgress for RecordingOAuthEgress {
+    async fn execute(
+        &self,
+        request: RuntimeHttpEgressRequest,
+    ) -> Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError> {
+        self.requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(request);
+        Ok(RuntimeHttpEgressResponse {
+            status: 200,
+            headers: vec![("content-type".to_string(), "application/json".to_string())],
+            body: self.response_body.clone(),
+            saved_body: None,
+            request_bytes: 0,
+            response_bytes: 0,
+            redaction_applied: true,
+        })
+    }
+}
+
 #[tokio::test]
 async fn local_dev_oauth_turn_gate_callback_resumes_default_turn_coordinator() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let services = build_reborn_services(RebornBuildInput::local_dev(
-        "local-dev-auth-owner",
-        dir.path().join("local-dev"),
-    ))
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev("local-dev-auth-owner", dir.path().join("local-dev"))
+            .with_product_auth_ports(in_memory_product_auth_ports()),
+    )
     .await
     .expect("local-dev services build");
     let product_auth = services.product_auth.as_ref().expect("product auth");
@@ -79,6 +165,10 @@ async fn local_dev_oauth_turn_gate_callback_resumes_default_turn_coordinator() {
             requested_run_profile: Some(RunProfileRequest::new("default").unwrap()),
             idempotency_key: IdempotencyKey::new("submit-auth-callback").unwrap(),
             received_at: Utc::now(),
+            requested_run_id: None,
+            parent_run_id: None,
+            subagent_depth: 0,
+            spawn_tree_root_run_id: None,
         })
         .await
         .expect("submit turn");
@@ -106,6 +196,7 @@ async fn local_dev_oauth_turn_gate_callback_resumes_default_turn_coordinator() {
             state_ref: LoopCheckpointStateRef::new("checkpoint:auth-callback").unwrap(),
             reason: BlockedReason::Auth {
                 gate_ref: gate_ref.clone(),
+                credential_requirements: Vec::new(),
             },
         })
         .await
@@ -114,6 +205,7 @@ async fn local_dev_oauth_turn_gate_callback_resumes_default_turn_coordinator() {
     let flow = product_auth
         .flow_manager()
         .create_flow(NewAuthFlow {
+            id: None,
             scope: auth_scope.clone(),
             kind: AuthFlowKind::IntegrationCredential,
             provider: provider(),
@@ -135,7 +227,7 @@ async fn local_dev_oauth_turn_gate_callback_resumes_default_turn_coordinator() {
 
     let response = product_auth
         .handle_oauth_callback(crate::RebornOAuthCallbackRequest {
-            scope: auth_scope,
+            scope: auth_scope.clone(),
             flow_id: flow.id,
             opaque_state_hash: state_hash(),
             outcome: crate::RebornOAuthCallbackOutcome::Authorized {
@@ -175,12 +267,151 @@ async fn local_dev_oauth_turn_gate_callback_resumes_default_turn_coordinator() {
 }
 
 #[tokio::test]
+async fn local_dev_google_oauth_backend_builds_with_host_provider_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev("local-dev-google-oauth-owner", dir.path().join("local-dev"))
+            .with_google_oauth_backend(OAuthClientConfig {
+                client_id: OAuthClientId::new("google-client-123").expect("client id"),
+                client_secret: None,
+                redirect_uri: OAuthRedirectUri::new("https://app.example/oauth/google/callback")
+                    .expect("redirect uri"),
+                hosted_domain_hint: None,
+            }),
+    )
+    .await
+    .expect("local-dev services build");
+    assert!(services.product_auth.is_some());
+}
+
+#[tokio::test]
+async fn local_dev_notion_oauth_backend_builds_with_host_provider_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev("local-dev-notion-oauth-owner", dir.path().join("local-dev"))
+            .with_google_oauth_backend(OAuthClientConfig {
+                client_id: OAuthClientId::new("google-client-123").expect("client id"),
+                client_secret: None,
+                redirect_uri: OAuthRedirectUri::new("https://app.example/oauth/google/callback")
+                    .expect("redirect uri"),
+                hosted_domain_hint: None,
+            })
+            .with_notion_oauth_backend(OAuthClientConfig {
+                client_id: OAuthClientId::new("notion-client-123").expect("client id"),
+                client_secret: None,
+                redirect_uri: OAuthRedirectUri::new("https://app.example/oauth/notion/callback")
+                    .expect("redirect uri"),
+                hosted_domain_hint: None,
+            }),
+    )
+    .await
+    .expect("local-dev services build");
+    assert!(services.product_auth.is_some());
+}
+
+#[tokio::test]
+async fn local_dev_notion_dcr_oauth_backend_builds_and_wires_registry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev(
+            "local-dev-notion-dcr-oauth-owner",
+            dir.path().join("local-dev"),
+        )
+        .with_notion_dcr_oauth_backend("http://127.0.0.1:3000", "Ironclaw")
+        .expect("notion dcr config"),
+    )
+    .await
+    .expect("local-dev services build");
+
+    assert!(services.product_auth.is_some());
+    assert!(
+        services
+            .product_auth
+            .as_ref()
+            .and_then(|product_auth| product_auth.as_auth_challenge_provider())
+            .is_some(),
+        "DCR-backed product auth must expose the challenge provider projection path"
+    );
+}
+
+#[tokio::test]
+async fn oauth_callback_exchanges_notion_through_reborn_product_auth_boundary() {
+    let egress = Arc::new(RecordingOAuthEgress::ok(
+        br#"{"access_token":"notion-access","refresh_token":"notion-refresh","expires_in":3600,"token_type":"Bearer"}"#.to_vec(),
+    ));
+    let provider_client = HostOAuthProviderClient::new(
+        notion_provider_spec(),
+        egress.clone(),
+        Arc::new(InMemorySecretStore::new()),
+        Arc::new(NoopObligationHandler),
+        OAuthClientId::new("notion-client-123").expect("client id"),
+        OAuthRedirectUri::new("https://app.example/oauth/notion/callback").expect("redirect uri"),
+    )
+    .expect("notion provider client");
+    let services = RebornProductAuthServices::from_shared(
+        Arc::new(InMemoryAuthProductServices::new()),
+        Arc::new(NoopContinuationDispatcher),
+    )
+    .with_provider_client(Arc::new(provider_client));
+    let auth_scope = auth_scope_for_turn(
+        &turn_scope(),
+        &TurnActor::new(UserId::new("alice").unwrap()),
+    );
+    let flow_id = create_notion_flow(
+        &services,
+        auth_scope.clone(),
+        AuthContinuationRef::SetupOnly,
+    )
+    .await;
+
+    let response = services
+        .handle_oauth_callback(notion_authorized_request(auth_scope, flow_id))
+        .await
+        .expect("notion callback succeeds through product auth");
+
+    assert_eq!(response.flow_id, flow_id);
+    assert!(response.credential_account_id.is_some());
+    let request = egress.single_request();
+    assert_eq!(request.url, "https://mcp.notion.com/token");
+    let body = form_params(&request.body);
+    assert_eq!(
+        body.get("grant_type").map(String::as_str),
+        Some("authorization_code")
+    );
+    assert_eq!(
+        body.get("resource").map(String::as_str),
+        Some("https://mcp.notion.com/mcp")
+    );
+}
+
+#[tokio::test]
+async fn local_dev_google_oauth_backend_accepts_optional_client_secret_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev(
+            "local-dev-google-oauth-secret-owner",
+            dir.path().join("local-dev"),
+        )
+        .with_google_oauth_backend(OAuthClientConfig {
+            client_id: OAuthClientId::new("google-client-123").expect("client id"),
+            client_secret: Some(SecretString::from("raw-client-secret".to_string())),
+            redirect_uri: OAuthRedirectUri::new("https://app.example/oauth/google/callback")
+                .expect("redirect uri"),
+            hosted_domain_hint: None,
+        }),
+    )
+    .await
+    .expect("local-dev services build");
+    assert!(services.product_auth.is_some());
+}
+
+#[tokio::test]
 async fn oauth_callback_with_stale_gate_maps_to_terminal_invalid_request() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let services = build_reborn_services(RebornBuildInput::local_dev(
-        "local-dev-auth-stale-owner",
-        dir.path().join("local-dev"),
-    ))
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev("local-dev-auth-stale-owner", dir.path().join("local-dev"))
+            .with_product_auth_ports(in_memory_product_auth_ports()),
+    )
     .await
     .expect("local-dev services build");
     let product_auth = services.product_auth.as_ref().expect("product auth");
@@ -222,10 +453,13 @@ async fn oauth_callback_with_stale_gate_maps_to_terminal_invalid_request() {
 #[tokio::test]
 async fn oauth_callback_with_lifecycle_activation_returns_ok_without_resume() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let services = build_reborn_services(RebornBuildInput::local_dev(
-        "local-dev-auth-lifecycle-owner",
-        dir.path().join("local-dev"),
-    ))
+    let services = build_reborn_services(
+        RebornBuildInput::local_dev(
+            "local-dev-auth-lifecycle-owner",
+            dir.path().join("local-dev"),
+        )
+        .with_product_auth_ports(in_memory_product_auth_ports()),
+    )
     .await
     .expect("local-dev services build");
     let product_auth = services.product_auth.as_ref().expect("product auth");
@@ -309,6 +543,11 @@ fn turn_scope() -> TurnScope {
 }
 
 #[cfg(test)]
+fn in_memory_product_auth_ports() -> RebornProductAuthServicePorts {
+    RebornProductAuthServicePorts::from_shared(Arc::new(InMemoryAuthProductServices::new()))
+}
+
+#[cfg(test)]
 fn auth_scope_for_turn(scope: &TurnScope, actor: &TurnActor) -> AuthProductScope {
     AuthProductScope::new(
         ResourceScope {
@@ -331,8 +570,18 @@ fn provider() -> AuthProviderId {
 }
 
 #[cfg(test)]
+fn notion_provider() -> AuthProviderId {
+    AuthProviderId::new(NOTION_PROVIDER_ID).unwrap()
+}
+
+#[cfg(test)]
 fn label() -> CredentialAccountLabel {
     CredentialAccountLabel::new("work github").unwrap()
+}
+
+#[cfg(test)]
+fn notion_label() -> CredentialAccountLabel {
+    CredentialAccountLabel::new("work notion").unwrap()
 }
 
 #[cfg(test)]
@@ -363,6 +612,10 @@ async fn submit_and_block_auth_run(
             requested_run_profile: Some(RunProfileRequest::new("default").unwrap()),
             idempotency_key: IdempotencyKey::new("submit-auth-callback-2").unwrap(),
             received_at: Utc::now(),
+            requested_run_id: None,
+            parent_run_id: None,
+            subagent_depth: 0,
+            spawn_tree_root_run_id: None,
         })
         .await
         .expect("submit turn");
@@ -389,6 +642,7 @@ async fn submit_and_block_auth_run(
             state_ref: LoopCheckpointStateRef::new("checkpoint:auth-callback-2").unwrap(),
             reason: BlockedReason::Auth {
                 gate_ref: ironclaw_turns::GateRef::new(gate_ref).unwrap(),
+                credential_requirements: Vec::new(),
             },
         })
         .await
@@ -405,6 +659,7 @@ async fn create_flow(
     product_auth
         .flow_manager()
         .create_flow(NewAuthFlow {
+            id: None,
             scope,
             kind: AuthFlowKind::IntegrationCredential,
             provider: provider(),
@@ -421,6 +676,35 @@ async fn create_flow(
         .await
         .expect("auth flow")
         .id
+}
+
+async fn create_notion_flow(
+    product_auth: &RebornProductAuthServices,
+    scope: AuthProductScope,
+    continuation: AuthContinuationRef,
+) -> AuthFlowId {
+    match product_auth
+        .flow_manager()
+        .create_flow(NewAuthFlow {
+            id: None,
+            scope,
+            kind: AuthFlowKind::IntegrationCredential,
+            provider: notion_provider(),
+            challenge: AuthChallenge::OAuthUrl {
+                authorization_url: authorization_url("https://mcp.notion.com/oauth/authorize"),
+                expires_at: Utc::now() + Duration::minutes(5),
+            },
+            continuation,
+            update_binding: None,
+            opaque_state_hash: Some(state_hash()),
+            pkce_verifier_hash: Some(pkce_hash()),
+            expires_at: Utc::now() + Duration::minutes(5),
+        })
+        .await
+    {
+        Ok(flow) => flow.id,
+        Err(error) => panic!("notion auth flow failed: {error:?}"),
+    }
 }
 
 #[cfg(test)]
@@ -452,6 +736,34 @@ fn authorized_request(
     }
 }
 
+fn notion_authorized_request(
+    scope: AuthProductScope,
+    flow_id: AuthFlowId,
+) -> crate::RebornOAuthCallbackRequest {
+    crate::RebornOAuthCallbackRequest {
+        scope,
+        flow_id,
+        opaque_state_hash: state_hash(),
+        outcome: crate::RebornOAuthCallbackOutcome::Authorized {
+            provider_request: OAuthProviderCallbackRequest {
+                provider: notion_provider(),
+                account_label: notion_label(),
+                authorization_code: OAuthAuthorizationCode::new(SecretString::from(
+                    "raw-notion-auth-code".to_string(),
+                ))
+                .unwrap(),
+                authorization_code_hash: code_hash(),
+                pkce_verifier: PkceVerifierSecret::new(SecretString::from(
+                    "raw-notion-pkce-verifier".to_string(),
+                ))
+                .unwrap(),
+                pkce_verifier_hash: pkce_hash(),
+                scopes: vec![provider_scope("workspace")],
+            },
+        },
+    }
+}
+
 #[cfg(test)]
 fn state_hash() -> OpaqueStateHash {
     OpaqueStateHash::new(fake_digest("state-hash")).unwrap()
@@ -474,4 +786,8 @@ fn fake_digest(value: &str) -> String {
             hash.wrapping_mul(31).wrapping_add(u64::from(byte))
         })
     )
+}
+
+fn form_params(body: &[u8]) -> std::collections::BTreeMap<String, String> {
+    url::form_urlencoded::parse(body).into_owned().collect()
 }

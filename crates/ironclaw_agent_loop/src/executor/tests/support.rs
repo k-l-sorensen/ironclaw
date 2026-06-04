@@ -7,33 +7,40 @@ use ironclaw_turns::{
     AgentLoopDriverDescriptor, LoopFailureKind, LoopMessageRef, RunProfileId, RunProfileVersion,
     TurnCheckpointId, TurnId, TurnRunId, TurnScope,
     run_profile::{
-        AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, CancellationPolicy,
-        CapabilityBatchInvocation, CapabilityCallCandidate, CapabilityDescriptorView,
-        CapabilityInputRef, CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceProfileId,
-        CapabilitySurfaceVersion, CheckpointPolicy, CheckpointSchemaId, ConcurrencyClass,
-        ContextProfileId, FinalizeAssistantMessage, LoopCancelReasonKind, LoopCancellationPort,
-        LoopCancellationSignal, LoopCheckpointKind, LoopCheckpointRequest, LoopCheckpointStateRef,
+        AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, AssistantReply,
+        CancellationPolicy, CapabilityBatchInvocation, CapabilityCallCandidate,
+        CapabilityDescriptorView, CapabilityInputRef, CapabilityInvocation, CapabilityOutcome,
+        CapabilitySurfaceProfileId, CapabilitySurfaceVersion, CheckpointPolicy, CheckpointSchemaId,
+        ConcurrencyClass, ContextProfileId, FinalizeAssistantMessage, LoopCancelReasonKind,
+        LoopCancellationPort, LoopCancellationSignal, LoopCheckpointKind, LoopCheckpointRequest,
+        LoopCheckpointStateRef, LoopCompactionError, LoopCompactionRequest, LoopCompactionResponse,
         LoopContextBundle, LoopContextRequest, LoopDriverId, LoopInputAck, LoopInputAckToken,
         LoopInputBatch, LoopInputCursor, LoopInputCursorToken, LoopModelMessage, LoopModelRequest,
         LoopModelResponse, LoopPromptBundle, LoopPromptBundleRef, LoopPromptBundleRequest,
-        LoopRunContext, ModelProfileId, ModelStreamChunk, ParentLoopOutput, ProviderToolCallReplay,
-        RedactedRunProfileProvenance, ResolvedRunProfile, ResourceBudgetPolicy, ResourceBudgetTier,
-        RunClassId, RunProfileFingerprint, RuntimeProfileConstraints, SchedulingClass,
-        StageCheckpointPayloadRequest, SteeringPolicy, VisibleCapabilityRequest,
-        VisibleCapabilitySurface,
+        LoopRunContext, ModelProfileId, ModelStreamChunk, ParentLoopOutput, PromptMode,
+        ProviderToolCallReplay, RedactedRunProfileProvenance, ResolvedRunProfile,
+        ResourceBudgetPolicy, ResourceBudgetTier, RunClassId, RunProfileFingerprint,
+        RuntimeProfileConstraints, SchedulingClass, StageCheckpointPayloadRequest, SteeringPolicy,
+        VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
 };
 
 use crate::{
     default_planner::DefaultPlanner,
     family::{ComponentDigest, ComponentIdentity, LoopFamily, LoopFamilyId},
-    state::{CheckpointKind, GateStrategyState, LoopExecutionState},
+    state::{CheckpointKind, GateStrategyState, LoopExecutionState, StopStrategyState},
     strategies::{
         CapabilityErrorClass, CapabilityErrorSummary, CapabilityFilter, CapabilityStrategy,
-        GateHandlingStrategy, GateOutcome, GateSummary, InputDrainStrategy, ModelErrorSummary,
-        RecoveryOutcome, RecoveryStrategy, RetryScope,
+        ContextStrategy, DefaultCompactionStrategy, GateHandlingStrategy, GateOutcome, GateSummary,
+        InputDrainStrategy, ModelErrorSummary, RecoveryOutcome, RecoveryStrategy,
+        ReplyAdmissionOutcome, ReplyAdmissionStrategy, RetryAlteration, RetryScope,
+        StopConditionStrategy, StopKind, StopOutcome, TurnSummary,
     },
 };
+
+mod compaction;
+
+use compaction::MockCompactionSupport;
 
 #[derive(Clone)]
 pub(super) struct MockHost {
@@ -42,6 +49,7 @@ pub(super) struct MockHost {
     model_errors: Arc<Mutex<VecDeque<AgentLoopHostError>>>,
     model_requests: Arc<Mutex<Vec<LoopModelRequest>>>,
     prompt_requests: Arc<Mutex<Vec<LoopPromptBundleRequest>>>,
+    compaction: MockCompactionSupport,
     input_batches: Arc<Mutex<VecDeque<LoopInputBatch>>>,
     acked_input_tokens: Arc<Mutex<Vec<LoopInputAckToken>>>,
     batch_outcomes: Arc<Mutex<VecDeque<ironclaw_turns::run_profile::CapabilityBatchOutcome>>>,
@@ -56,7 +64,9 @@ pub(super) struct MockHost {
     visible_surface_version: CapabilitySurfaceVersion,
     progress_events: Arc<Mutex<Vec<ironclaw_turns::run_profile::LoopProgressEvent>>>,
     fail_progress_port: bool,
+    fail_append_result_ref: bool,
     cancellation: Arc<Mutex<Option<LoopCancellationSignal>>>,
+    cancellation_notify: Arc<tokio::sync::Notify>,
     cancel_after_poll_inputs: Arc<Mutex<bool>>,
     cancel_after_prompt_bundle_count: Arc<Mutex<Option<usize>>>,
     cancel_after_checkpoint: Arc<Mutex<Option<LoopCheckpointKind>>>,
@@ -75,6 +85,7 @@ impl MockHost {
             model_errors: Arc::new(Mutex::new(VecDeque::new())),
             model_requests: Arc::new(Mutex::new(Vec::new())),
             prompt_requests: Arc::new(Mutex::new(Vec::new())),
+            compaction: MockCompactionSupport::new(),
             input_batches: Arc::new(Mutex::new(VecDeque::new())),
             acked_input_tokens: Arc::new(Mutex::new(Vec::new())),
             batch_outcomes: Arc::new(Mutex::new(VecDeque::new())),
@@ -89,7 +100,9 @@ impl MockHost {
             visible_surface_version: surface_version(),
             progress_events: Arc::new(Mutex::new(Vec::new())),
             fail_progress_port: false,
+            fail_append_result_ref: false,
             cancellation: Arc::new(Mutex::new(None)),
+            cancellation_notify: Arc::new(tokio::sync::Notify::new()),
             cancel_after_poll_inputs: Arc::new(Mutex::new(false)),
             cancel_after_prompt_bundle_count: Arc::new(Mutex::new(None)),
             cancel_after_checkpoint: Arc::new(Mutex::new(None)),
@@ -129,6 +142,11 @@ impl MockHost {
 
     pub(super) fn with_failing_progress_port(mut self) -> Self {
         self.fail_progress_port = true;
+        self
+    }
+
+    pub(super) fn with_failing_result_append(mut self) -> Self {
+        self.fail_append_result_ref = true;
         self
     }
 
@@ -199,6 +217,7 @@ impl MockHost {
             reason_kind,
             requested_at: chrono::Utc::now(),
         });
+        self.cancellation_notify.notify_waiters();
     }
 
     pub(super) fn cancel_after_checkpoint(self, kind: LoopCheckpointKind) -> Self {
@@ -278,6 +297,92 @@ impl GateHandlingStrategy for FixedGateStrategy {
     }
 }
 
+pub(super) enum FixedReplyAdmissionPolicy {
+    RejectFirst,
+    RejectAlways,
+}
+
+pub(super) struct FixedReplyAdmissionStrategy {
+    policy: FixedReplyAdmissionPolicy,
+}
+
+#[async_trait]
+impl ReplyAdmissionStrategy for FixedReplyAdmissionStrategy {
+    async fn admit_reply(
+        &self,
+        state: &LoopExecutionState,
+        _reply: &AssistantReply,
+    ) -> ReplyAdmissionOutcome {
+        let should_reject = match self.policy {
+            FixedReplyAdmissionPolicy::RejectFirst => {
+                state.reply_admission_state.rejected_reply_candidates == 0
+            }
+            FixedReplyAdmissionPolicy::RejectAlways => true,
+        };
+        if should_reject {
+            return ReplyAdmissionOutcome::RejectFinal {
+                rejection: crate::state::ReplyAdmissionRejection::stop_condition_not_met(),
+            };
+        }
+        ReplyAdmissionOutcome::AcceptFinal
+    }
+}
+
+pub(super) struct NoInlineContextStrategy;
+
+#[async_trait]
+impl ContextStrategy for NoInlineContextStrategy {
+    async fn plan_context_request(
+        &self,
+        _state: &LoopExecutionState,
+    ) -> crate::strategies::ContextPlan {
+        crate::strategies::ContextPlan {
+            request: LoopPromptBundleRequest {
+                mode: PromptMode::TextOnly,
+                context_cursor: None,
+                surface_version: None,
+                checkpoint_state_ref: None,
+                max_messages: Some(16),
+                inline_messages: Vec::new(),
+                capability_view: None,
+            },
+            emitted_admission_control: false,
+        }
+    }
+}
+
+pub(super) struct StopAfterObservedTurns {
+    turns_completed: u32,
+}
+
+#[async_trait]
+impl StopConditionStrategy for StopAfterObservedTurns {
+    async fn observe_completed_turn(
+        &self,
+        state: &LoopExecutionState,
+        _just_completed: &TurnSummary,
+    ) -> StopStrategyState {
+        StopStrategyState {
+            turns_completed: state.stop_state.turns_completed.saturating_add(1),
+            ..state.stop_state.clone()
+        }
+    }
+
+    async fn should_stop_after_observed_turn(
+        &self,
+        state: &LoopExecutionState,
+        _just_completed: &TurnSummary,
+    ) -> StopOutcome {
+        if state.stop_state.turns_completed >= self.turns_completed {
+            StopOutcome::Stop {
+                kind: StopKind::GracefulStop,
+            }
+        } else {
+            StopOutcome::Continue {}
+        }
+    }
+}
+
 pub(super) struct RetryPolicyDeniedRecoveryStrategy;
 
 #[async_trait]
@@ -308,6 +413,34 @@ impl RecoveryStrategy for RetryPolicyDeniedRecoveryStrategy {
         RecoveryOutcome::Abort {
             recovery: state.recovery_state.clone(),
             failure_kind: LoopFailureKind::DriverBug,
+        }
+    }
+}
+
+pub(super) struct ShrinkContextCallScopeRecoveryStrategy;
+
+#[async_trait]
+impl RecoveryStrategy for ShrinkContextCallScopeRecoveryStrategy {
+    async fn on_capability_error(
+        &self,
+        state: &LoopExecutionState,
+        _err: &CapabilityErrorSummary,
+    ) -> RecoveryOutcome {
+        RecoveryOutcome::Abort {
+            recovery: state.recovery_state.clone(),
+            failure_kind: LoopFailureKind::CapabilityProtocolError,
+        }
+    }
+
+    async fn on_model_error(
+        &self,
+        state: &LoopExecutionState,
+        _err: &ModelErrorSummary,
+    ) -> RecoveryOutcome {
+        RecoveryOutcome::Retry {
+            recovery: state.recovery_state.clone(),
+            scope: RetryScope::Call,
+            alter: Some(RetryAlteration::ShrinkContext),
         }
     }
 }
@@ -353,6 +486,7 @@ impl ironclaw_turns::run_profile::LoopPromptPort for MockHost {
                 content_ref: LoopMessageRef::new("msg:user").expect("valid"),
             }],
             surface_version: self.prompt_surface_version.clone(),
+            compaction_message_index: self.compaction.next_prompt_index(),
             instruction_fingerprint: None,
             identity_message_count: 0,
             instruction_snippet_count: 0,
@@ -507,6 +641,12 @@ impl ironclaw_turns::run_profile::LoopTranscriptPort for MockHost {
         &self,
         request: AppendCapabilityResultRef,
     ) -> Result<LoopMessageRef, AgentLoopHostError> {
+        if self.fail_append_result_ref {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::TranscriptWriteFailed,
+                "append failed",
+            ));
+        }
         self.appended_result_refs
             .lock()
             .expect("lock")
@@ -579,27 +719,53 @@ impl ironclaw_turns::run_profile::LoopProgressPort for MockHost {
     }
 }
 
+#[async_trait]
+impl ironclaw_turns::run_profile::LoopCompactionPort for MockHost {
+    async fn compact_loop_context(
+        &self,
+        request: LoopCompactionRequest,
+    ) -> Result<LoopCompactionResponse, LoopCompactionError> {
+        self.compact_loop_context_for_tests(request).await
+    }
+}
+
+#[async_trait]
 impl LoopCancellationPort for MockHost {
     fn observe_cancellation(&self) -> Option<LoopCancellationSignal> {
         self.cancellation.lock().expect("lock").clone()
     }
+
+    async fn cancellation_requested(&self) -> LoopCancellationSignal {
+        crate::test_support::wait_for_cancellation_signal(
+            &self.cancellation,
+            &self.cancellation_notify,
+        )
+        .await
+    }
 }
 
 pub(super) fn reply_response() -> LoopModelResponse {
+    reply_response_with_text("hello")
+}
+
+pub(super) fn reply_response_with_text(text: &str) -> LoopModelResponse {
     LoopModelResponse {
         chunks: vec![ModelStreamChunk {
-            safe_text_delta: "hello".to_string(),
+            safe_text_delta: text.to_string(),
         }],
+        safe_reasoning_deltas: Vec::new(),
         output: ParentLoopOutput::AssistantReply(ironclaw_turns::run_profile::AssistantReply {
-            content: "hello".to_string(),
+            content: text.to_string(),
         }),
         effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
+        usage: None,
     }
 }
 
 pub(super) fn calls_response() -> LoopModelResponse {
     LoopModelResponse {
         chunks: Vec::new(),
+        safe_reasoning_deltas: Vec::new(),
         output: ParentLoopOutput::CapabilityCalls(vec![CapabilityCallCandidate {
             surface_version: surface_version(),
             capability_id: capability_id(),
@@ -608,12 +774,14 @@ pub(super) fn calls_response() -> LoopModelResponse {
             provider_replay: None,
         }]),
         effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
+        usage: None,
     }
 }
 
 pub(super) fn two_calls_response() -> LoopModelResponse {
     LoopModelResponse {
         chunks: Vec::new(),
+        safe_reasoning_deltas: Vec::new(),
         output: ParentLoopOutput::CapabilityCalls(vec![
             CapabilityCallCandidate {
                 surface_version: surface_version(),
@@ -631,12 +799,14 @@ pub(super) fn two_calls_response() -> LoopModelResponse {
             },
         ]),
         effective_model_profile_id: ModelProfileId::new("model").expect("valid"), // safety: test-only fixture
+        usage: None,
     }
 }
 
 pub(super) fn provider_calls_response() -> LoopModelResponse {
     LoopModelResponse {
         chunks: Vec::new(),
+        safe_reasoning_deltas: Vec::new(),
         output: ParentLoopOutput::CapabilityCalls(vec![CapabilityCallCandidate {
             surface_version: surface_version(),
             capability_id: capability_id(),
@@ -655,12 +825,14 @@ pub(super) fn provider_calls_response() -> LoopModelResponse {
             }),
         }]),
         effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
+        usage: None,
     }
 }
 
 pub(super) fn provider_two_calls_response() -> LoopModelResponse {
     LoopModelResponse {
         chunks: Vec::new(),
+        safe_reasoning_deltas: Vec::new(),
         output: ParentLoopOutput::CapabilityCalls(vec![
             CapabilityCallCandidate {
                 surface_version: surface_version(),
@@ -698,12 +870,14 @@ pub(super) fn provider_two_calls_response() -> LoopModelResponse {
             },
         ]),
         effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
+        usage: None,
     }
 }
 
 pub(super) fn stale_surface_calls_response() -> LoopModelResponse {
     LoopModelResponse {
         chunks: Vec::new(),
+        safe_reasoning_deltas: Vec::new(),
         output: ParentLoopOutput::CapabilityCalls(vec![CapabilityCallCandidate {
             surface_version: stale_surface_version(),
             capability_id: capability_id(),
@@ -712,12 +886,14 @@ pub(super) fn stale_surface_calls_response() -> LoopModelResponse {
             provider_replay: None,
         }]),
         effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
+        usage: None,
     }
 }
 
 pub(super) fn mixed_surface_calls_response() -> LoopModelResponse {
     LoopModelResponse {
         chunks: Vec::new(),
+        safe_reasoning_deltas: Vec::new(),
         output: ParentLoopOutput::CapabilityCalls(vec![
             CapabilityCallCandidate {
                 surface_version: stale_surface_version(),
@@ -735,6 +911,7 @@ pub(super) fn mixed_surface_calls_response() -> LoopModelResponse {
             },
         ]),
         effective_model_profile_id: ModelProfileId::new("model").expect("valid"),
+        usage: None,
     }
 }
 
@@ -798,6 +975,46 @@ pub(super) fn family_with_gate_outcome(outcome: GateOutcome) -> LoopFamily {
     LoopFamily::new(id, version, Arc::new(planner))
 }
 
+pub(super) fn family_with_compaction_strategy(strategy: DefaultCompactionStrategy) -> LoopFamily {
+    let planner = DefaultPlanner::compose_default().with_compaction(Arc::new(strategy));
+    let id = LoopFamilyId::new("executor-compaction-test").expect("valid test family id");
+    let version =
+        ComponentIdentity::from_static("executor-compaction-test", ComponentDigest([5; 32]));
+    LoopFamily::new(id, version, Arc::new(planner))
+}
+
+pub(super) fn family_with_stop_after_observed_turns(turns_completed: u32) -> LoopFamily {
+    let planner = DefaultPlanner::compose_default()
+        .with_stop(Arc::new(StopAfterObservedTurns { turns_completed }));
+    let id = LoopFamilyId::new("executor-stop-test").expect("valid test family id");
+    let version = ComponentIdentity::from_static("executor-stop-test", ComponentDigest([6; 32]));
+    LoopFamily::new(id, version, Arc::new(planner))
+}
+
+pub(super) fn family_with_reply_admission(policy: FixedReplyAdmissionPolicy) -> LoopFamily {
+    let planner = DefaultPlanner::compose_default()
+        .with_reply_admission(Arc::new(FixedReplyAdmissionStrategy { policy }));
+    let id = LoopFamilyId::new("executor-reply-admission-test").expect("valid test family id");
+    let version =
+        ComponentIdentity::from_static("executor-reply-admission-test", ComponentDigest([7; 32]));
+    LoopFamily::new(id, version, Arc::new(planner))
+}
+
+pub(super) fn family_with_reply_admission_without_inline_context(
+    policy: FixedReplyAdmissionPolicy,
+) -> LoopFamily {
+    let planner = DefaultPlanner::compose_default()
+        .with_reply_admission(Arc::new(FixedReplyAdmissionStrategy { policy }))
+        .with_context(Arc::new(NoInlineContextStrategy));
+    let id =
+        LoopFamilyId::new("executor-reply-admission-no-inline-test").expect("valid test family id");
+    let version = ComponentIdentity::from_static(
+        "executor-reply-admission-no-inline-test",
+        ComponentDigest([8; 32]),
+    );
+    LoopFamily::new(id, version, Arc::new(planner))
+}
+
 pub(super) fn empty_gate_state() -> GateStrategyState {
     GateStrategyState::default()
 }
@@ -809,6 +1026,18 @@ pub(super) fn family_with_retry_policy_denied_recovery() -> LoopFamily {
     let version = ComponentIdentity::from_static(
         "executor-retry-policy-denied-test",
         ComponentDigest([3; 32]),
+    );
+    LoopFamily::new(id, version, Arc::new(planner))
+}
+
+pub(super) fn family_with_shrink_context_call_scope_recovery() -> LoopFamily {
+    let planner = DefaultPlanner::compose_default()
+        .with_recovery(Arc::new(ShrinkContextCallScopeRecoveryStrategy));
+    let id =
+        LoopFamilyId::new("executor-shrink-context-call-scope-test").expect("valid test family id");
+    let version = ComponentIdentity::from_static(
+        "executor-shrink-context-call-scope-test",
+        ComponentDigest([9; 32]),
     );
     LoopFamily::new(id, version, Arc::new(planner))
 }

@@ -8,14 +8,19 @@
 mod echo;
 mod http;
 mod json;
+mod memory;
 mod schemas;
 mod shell;
 mod skill_management;
+mod skill_url_install;
+mod spawn_subagent;
 mod time;
+mod trigger_management;
 
-use std::{sync::Arc, time::Instant};
+use std::{future::Future, panic::AssertUnwindSafe, sync::Arc, time::Instant};
 
 use async_trait::async_trait;
+use futures_util::FutureExt as _;
 use ironclaw_extensions::{
     CapabilityManifest, CapabilityVisibility, ExtensionError, ExtensionManifest, ExtensionPackage,
     ExtensionRuntime, MANIFEST_SCHEMA_VERSION, ManifestSource,
@@ -26,7 +31,8 @@ use ironclaw_first_party_extensions::coding::{
 use ironclaw_host_api::{
     CapabilityId, CapabilityProfileSchemaRef, EffectKind, ExtensionId, HostApiError,
     PermissionMode, RequestedTrustClass, ResourceCeiling, ResourceEstimate, ResourceProfile,
-    ResourceUsage, RuntimeDispatchErrorKind, TrustClass, VirtualPath,
+    ResourceUsage, RuntimeDispatchErrorKind, RuntimeHttpEgressError, RuntimeHttpEgressResponse,
+    TrustClass, VirtualPath,
 };
 
 use crate::{
@@ -37,13 +43,23 @@ use crate::{
 pub(crate) use self::schemas::resolve_builtin_input_schema_ref;
 
 pub use echo::ECHO_CAPABILITY_ID;
-pub use http::HTTP_CAPABILITY_ID;
+pub use http::{HTTP_CAPABILITY_ID, HTTP_SAVE_CAPABILITY_ID};
 pub use json::JSON_CAPABILITY_ID;
+pub use memory::{
+    MEMORY_READ_CAPABILITY_ID, MEMORY_SEARCH_CAPABILITY_ID, MEMORY_TREE_CAPABILITY_ID,
+    MEMORY_WRITE_CAPABILITY_ID,
+};
 pub use shell::SHELL_CAPABILITY_ID;
 pub use skill_management::{
     SKILL_INSTALL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID, SKILL_REMOVE_CAPABILITY_ID,
 };
+pub use spawn_subagent::SPAWN_SUBAGENT_CAPABILITY_ID;
 pub use time::TIME_CAPABILITY_ID;
+#[cfg(any(test, feature = "test-support"))]
+pub use trigger_management::TriggerManagementClock;
+pub use trigger_management::{
+    TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID, TRIGGER_REMOVE_CAPABILITY_ID,
+};
 
 pub const BUILTIN_FIRST_PARTY_PROVIDER: &str = "builtin";
 pub const READ_FILE_CAPABILITY_ID: &str = "builtin.read_file";
@@ -57,7 +73,7 @@ const MAX_FIRST_PARTY_INPUT_BYTES: usize = 1_048_576;
 const MAX_WRITE_FILE_INPUT_BYTES: usize = 6 * 1024 * 1024;
 const MAX_APPLY_PATCH_INPUT_BYTES: usize = 21 * 1024 * 1024;
 const FIRST_PARTY_DEFAULT_OUTPUT_BYTES: u64 = 16 * 1024;
-const FIRST_PARTY_MAX_OUTPUT_BYTES: u64 = 1_048_576;
+pub(super) const FIRST_PARTY_MAX_OUTPUT_BYTES: u64 = 1_048_576;
 const FIRST_PARTY_DEFAULT_WALL_CLOCK_MS: u64 = 100;
 const FIRST_PARTY_MAX_WALL_CLOCK_MS: u64 = 5_000;
 
@@ -140,10 +156,14 @@ pub fn builtin_first_party_package() -> Result<ExtensionPackage, ExtensionError>
                     time::manifest()?,
                     json::manifest()?,
                     http::manifest()?,
+                    http::save_manifest()?,
                     shell::manifest()?,
+                    spawn_subagent::manifest()?,
                 ];
+                capabilities.extend(memory::manifests()?);
                 capabilities.extend(coding_manifests()?);
                 capabilities.extend(skill_management::manifests()?);
+                capabilities.extend(trigger_management::manifests()?);
                 capabilities
             },
         },
@@ -166,18 +186,63 @@ fn coding_manifests() -> Result<Vec<CapabilityManifest>, ExtensionError> {
         .collect()
 }
 
-/// Create handlers for all built-in first-party capabilities.
-pub fn builtin_first_party_handlers() -> Result<FirstPartyCapabilityRegistry, HostApiError> {
+/// Create handlers for all built-in first-party capabilities using an
+/// explicitly composed trigger repository.
+pub fn builtin_first_party_handlers(
+    trigger_repository: Arc<dyn ironclaw_triggers::TriggerRepository>,
+) -> Result<FirstPartyCapabilityRegistry, HostApiError> {
+    let mut registry = builtin_first_party_base_registry()?;
+    trigger_management::insert_handlers(&mut registry, trigger_repository)?;
+    Ok(registry)
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn builtin_first_party_handlers_with_trigger_clock(
+    trigger_repository: Arc<dyn ironclaw_triggers::TriggerRepository>,
+    trigger_clock: Arc<dyn TriggerManagementClock>,
+) -> Result<FirstPartyCapabilityRegistry, HostApiError> {
+    let mut registry = builtin_first_party_base_registry()?;
+    trigger_management::insert_handlers_with_clock(
+        &mut registry,
+        trigger_repository,
+        trigger_clock,
+    )?;
+    Ok(registry)
+}
+
+fn builtin_first_party_base_registry() -> Result<FirstPartyCapabilityRegistry, HostApiError> {
     let handler = Arc::new(BuiltinFirstPartyTools::default());
     let mut registry = FirstPartyCapabilityRegistry::new()
         .with_handler(CapabilityId::new(ECHO_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(TIME_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(JSON_CAPABILITY_ID)?, handler.clone())
         .with_handler(CapabilityId::new(HTTP_CAPABILITY_ID)?, handler.clone())
+        .with_handler(CapabilityId::new(HTTP_SAVE_CAPABILITY_ID)?, handler.clone())
+        .with_handler(
+            CapabilityId::new(MEMORY_SEARCH_CAPABILITY_ID)?,
+            handler.clone(),
+        )
+        .with_handler(
+            CapabilityId::new(MEMORY_WRITE_CAPABILITY_ID)?,
+            handler.clone(),
+        )
+        .with_handler(
+            CapabilityId::new(MEMORY_READ_CAPABILITY_ID)?,
+            handler.clone(),
+        )
+        .with_handler(
+            CapabilityId::new(MEMORY_TREE_CAPABILITY_ID)?,
+            handler.clone(),
+        )
         .with_handler(CapabilityId::new(SHELL_CAPABILITY_ID)?, handler.clone());
     for metadata in CODING_CAPABILITIES {
         registry.insert_handler(CapabilityId::new(metadata.id)?, handler.clone());
     }
+    registry.insert_handler(
+        CapabilityId::new(SPAWN_SUBAGENT_CAPABILITY_ID)?,
+        handler.clone(),
+    );
     skill_management::insert_handlers(&mut registry)?;
     Ok(registry)
 }
@@ -213,37 +278,49 @@ fn first_party_capability_manifest(
 #[derive(Debug, Default)]
 pub struct BuiltinFirstPartyTools {
     coding_state: CodingCapabilityState,
+    memory_state: memory::MemoryCapabilityState,
 }
 
 #[async_trait]
 impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
     async fn dispatch(
         &self,
-        request: FirstPartyCapabilityRequest,
+        mut request: FirstPartyCapabilityRequest,
     ) -> Result<FirstPartyCapabilityResult, FirstPartyCapabilityError> {
         bounded_input_size(request.capability_id.as_str(), &request.input)?;
+        normalize_optional_null_sentinels(&mut request);
         let start = Instant::now();
         let mut network_egress_bytes = 0;
-        let output = match request.capability_id.as_str() {
-            ECHO_CAPABILITY_ID => echo::dispatch(&request.input)?,
-            TIME_CAPABILITY_ID => time::dispatch(&request.input)?,
-            JSON_CAPABILITY_ID => json::dispatch(&request.input)?,
-            HTTP_CAPABILITY_ID => {
+        let (output, display_preview) = match request.capability_id.as_str() {
+            ECHO_CAPABILITY_ID => (echo::dispatch(&request.input)?, None),
+            TIME_CAPABILITY_ID => (time::dispatch(&request.input)?, None),
+            JSON_CAPABILITY_ID => (json::dispatch(&request.input)?, None),
+            HTTP_CAPABILITY_ID | HTTP_SAVE_CAPABILITY_ID => {
                 let result = http::dispatch(&request).await?;
                 network_egress_bytes = result.network_egress_bytes;
-                result.output
+                (result.output, None)
+            }
+            MEMORY_SEARCH_CAPABILITY_ID
+            | MEMORY_WRITE_CAPABILITY_ID
+            | MEMORY_READ_CAPABILITY_ID
+            | MEMORY_TREE_CAPABILITY_ID => {
+                let mut result = memory::dispatch(&self.memory_state, &request).await?;
+                result.usage.output_bytes =
+                    bounded_output_bytes(&result.output, FIRST_PARTY_MAX_OUTPUT_BYTES)?;
+                return Ok(result);
             }
             SHELL_CAPABILITY_ID => {
                 let (output, duration) = shell::dispatch(&request).await?;
                 let wall_clock_ms = duration.as_millis().try_into().unwrap_or(u64::MAX);
-                let output_bytes = bounded_output_bytes(&output).map_err(|error| {
-                    error.with_usage(ResourceUsage {
-                        wall_clock_ms,
-                        network_egress_bytes,
-                        process_count: 1,
-                        ..ResourceUsage::default()
-                    })
-                })?;
+                let output_bytes = bounded_output_bytes(&output, FIRST_PARTY_MAX_OUTPUT_BYTES)
+                    .map_err(|error| {
+                        error.with_usage(ResourceUsage {
+                            wall_clock_ms,
+                            network_egress_bytes,
+                            process_count: 1,
+                            ..ResourceUsage::default()
+                        })
+                    })?;
                 return Ok(FirstPartyCapabilityResult::new(
                     output,
                     ResourceUsage {
@@ -255,6 +332,7 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
                     },
                 ));
             }
+            SPAWN_SUBAGENT_CAPABILITY_ID => (spawn_subagent::dispatch(), None),
             capability_id => {
                 let Some(metadata) = coding_capability_metadata(capability_id) else {
                     return Err(FirstPartyCapabilityError::new(
@@ -268,14 +346,20 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
                     Arc::clone(&request.services.filesystem),
                     &request.input,
                 );
-                self.coding_state
+                let result = self
+                    .coding_state
                     .dispatch(&request)
                     .await
-                    .map_err(coding_error)?
+                    .map_err(coding_error)?;
+                (result.output, result.display_preview)
             }
         };
         let wall_clock_ms = start.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
-        let output_bytes = bounded_output_bytes(&output).map_err(|error| {
+        let output_limit_bytes = match request.capability_id.as_str() {
+            HTTP_CAPABILITY_ID | HTTP_SAVE_CAPABILITY_ID => http::MAX_HTTP_OUTPUT_BYTES,
+            _ => FIRST_PARTY_MAX_OUTPUT_BYTES,
+        };
+        let output_bytes = bounded_output_bytes(&output, output_limit_bytes).map_err(|error| {
             if network_egress_bytes > 0 {
                 error.with_usage(ResourceUsage {
                     wall_clock_ms,
@@ -292,11 +376,11 @@ impl FirstPartyCapabilityHandler for BuiltinFirstPartyTools {
             network_egress_bytes,
             ..ResourceUsage::default()
         };
-        Ok(FirstPartyCapabilityResult::new(output, usage))
+        Ok(FirstPartyCapabilityResult::new(output, usage).with_display_preview(display_preview))
     }
 }
 
-fn bounded_input_size(
+pub(super) fn bounded_input_size(
     capability_id: &str,
     input: &serde_json::Value,
 ) -> Result<(), FirstPartyCapabilityError> {
@@ -312,16 +396,87 @@ fn bounded_input_size(
     Ok(())
 }
 
-fn bounded_output_bytes(output: &serde_json::Value) -> Result<u64, FirstPartyCapabilityError> {
+pub(super) fn bounded_output_bytes(
+    output: &serde_json::Value,
+    max_bytes: u64,
+) -> Result<u64, FirstPartyCapabilityError> {
     let bytes = serde_json::to_vec(output).map_err(|_| input_error())?;
     let bytes = u64::try_from(bytes.len())
         .map_err(|_| FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OutputTooLarge))?;
-    if bytes > FIRST_PARTY_MAX_OUTPUT_BYTES {
+    if bytes > max_bytes {
         return Err(FirstPartyCapabilityError::new(
             RuntimeDispatchErrorKind::OutputTooLarge,
         ));
     }
     Ok(bytes)
+}
+
+/// Treat null sentinels as absent for declared optional fields.
+///
+/// Weaker models (notably quantized local models) routinely populate every
+/// optional parameter with the string `"null"` instead of omitting it. Without
+/// this normalization an optional `"null"` reaches a typed parser (e.g. an IANA
+/// timezone) and aborts an otherwise valid call with `InputEncode`. Required
+/// fields are left untouched so a legitimate `"null"` payload is preserved.
+fn normalize_optional_null_sentinels(request: &mut FirstPartyCapabilityRequest) {
+    let schema_name = request
+        .capability_id
+        .as_str()
+        .strip_prefix("builtin.")
+        .unwrap_or(request.capability_id.as_str())
+        .replace('.', "-");
+    let Some(schema) =
+        resolve_builtin_input_schema_ref(&format!("schemas/builtin/{schema_name}.input.v1.json"))
+    else {
+        return;
+    };
+    let mut required: std::collections::HashSet<String> = schema
+        .get("required")
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(ToString::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(branches) = schema.get("oneOf").and_then(|value| value.as_array()) {
+        for branch in branches {
+            if let Some(values) = branch.get("required").and_then(|value| value.as_array()) {
+                required.extend(
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str().map(ToString::to_string)),
+                );
+            }
+        }
+    }
+    let declared: std::collections::HashSet<&str> = schema
+        .get("properties")
+        .and_then(|value| value.as_object())
+        .map(|properties| properties.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let Some(object) = request.input.as_object_mut() else {
+        return;
+    };
+    object.retain(|key, value| {
+        !(declared.contains(key.as_str())
+            && !required.contains(key)
+            && (value.as_str() == Some("null") || value.is_null())
+            && !preserve_optional_null_sentinel(
+                request.capability_id.as_str(),
+                key.as_str(),
+                value,
+            ))
+    });
+}
+
+fn preserve_optional_null_sentinel(
+    capability_id: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> bool {
+    capability_id == MEMORY_WRITE_CAPABILITY_ID && key == "target" && value.is_null()
 }
 
 fn resource_profile() -> Option<ResourceProfile> {
@@ -346,12 +501,30 @@ fn input_error() -> FirstPartyCapabilityError {
     FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::InputEncode)
 }
 
+async fn run_egress_catching_panic<F, P>(
+    future: F,
+    panic_message: &'static str,
+    on_panic: P,
+) -> Result<Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError>, FirstPartyCapabilityError>
+where
+    F: Future<Output = Result<RuntimeHttpEgressResponse, RuntimeHttpEgressError>>,
+    P: FnOnce() -> FirstPartyCapabilityError,
+{
+    AssertUnwindSafe(future).catch_unwind().await.map_err(|_| {
+        tracing::error!("{panic_message}");
+        on_panic()
+    })
+}
+
 fn operation_error() -> FirstPartyCapabilityError {
     FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::OperationFailed)
 }
 
 fn coding_error(error: CodingCapabilityError) -> FirstPartyCapabilityError {
-    FirstPartyCapabilityError::new(error.kind())
+    match error.safe_summary() {
+        Some(summary) => FirstPartyCapabilityError::with_safe_summary(error.kind(), summary),
+        None => FirstPartyCapabilityError::new(error.kind()),
+    }
 }
 
 fn coding_capability_metadata(capability_id: &str) -> Option<CodingCapabilityMetadata> {

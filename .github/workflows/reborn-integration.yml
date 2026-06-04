@@ -26,6 +26,13 @@ concurrency:
   group: reborn-integration-${{ github.event_name }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
+env:
+  # Tests must never touch the real OS keychain (macOS Keychain auth dialog /
+  # Linux Secret Service). Guarded by src/secrets/keychain.rs::os_keychain_suppressed:
+  # cfg!(test) covers unit tests; this covers integration/e2e that link the
+  # non-cfg(test) library.
+  IRONCLAW_DISABLE_OS_KEYCHAIN: "1"
+
 jobs:
   package-matrix:
     name: Discover Reborn binary crates
@@ -49,20 +56,27 @@ jobs:
             cargo metadata --no-deps --format-version 1 \
               | jq -c '
                   (
-                    .packages[]
-                    | select(.name == "ironclaw_reborn_cli")
-                    | (
-                        [.name]
-                        + [
-                            .dependencies[]
-                            | select(
-                                .source == null
-                                and (.path // "" | contains("/crates/"))
-                                and (.name | startswith("ironclaw_"))
-                              )
-                            | .name
-                          ]
-                      )
+                    (
+                      .packages[]
+                      | select(.name == "ironclaw_reborn_cli")
+                      | (
+                          [.name]
+                          + [
+                              .dependencies[]
+                              | select(
+                                  .source == null
+                                  and (.path // "" | contains("/crates/"))
+                                  and (.name | startswith("ironclaw_"))
+                                )
+                              | .name
+                            ]
+                        )
+                    )
+                    + [
+                        "ironclaw_product_adapters",
+                        "ironclaw_product_workflow",
+                        "ironclaw_slack_v2_adapter"
+                      ]
                   )
                   | unique
                 '
@@ -113,6 +127,8 @@ jobs:
           feature_flags=""
           if [ "${{ matrix.package }}" = "ironclaw_reborn_cli" ]; then
             feature_flags="--features webui-v2-beta"
+          elif [ "${{ matrix.package }}" = "ironclaw_product_adapters" ]; then
+            feature_flags="--features test-support"
           fi
 
           # shellcheck disable=SC2086 # feature_flags intentionally expands to zero or more Cargo args.

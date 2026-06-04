@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     CapabilityGrantId, CapabilityId, ExtensionId, MountView, NetworkPolicy, NetworkTargetPattern,
-    Principal, ResourceCeiling, ResourceProfile, RuntimeCredentialTarget, RuntimeKind,
-    SecretHandle, Timestamp, TrustClass,
+    Principal, ResourceCeiling, ResourceProfile, RuntimeCredentialAccountProviderId,
+    RuntimeCredentialTarget, RuntimeKind, SecretHandle, Timestamp, TrustClass,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -31,6 +31,25 @@ pub enum EffectKind {
     ModifyBudget,
     ExternalWrite,
     Financial,
+}
+
+impl EffectKind {
+    pub fn is_write(self) -> bool {
+        match self {
+            Self::ReadFilesystem | Self::Network | Self::UseSecret | Self::DispatchCapability => {
+                false
+            }
+            Self::WriteFilesystem
+            | Self::DeleteFilesystem
+            | Self::ExecuteCode
+            | Self::SpawnProcess
+            | Self::ModifyExtension
+            | Self::ModifyApproval
+            | Self::ModifyBudget
+            | Self::ExternalWrite
+            | Self::Financial => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -58,9 +77,34 @@ pub struct CapabilityDescriptor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeCredentialRequirement {
     pub handle: SecretHandle,
+    #[serde(default)]
+    pub source: RuntimeCredentialRequirementSource,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_scopes: Vec<String>,
     pub audience: NetworkTargetPattern,
     pub target: RuntimeCredentialTarget,
     pub required: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum RuntimeCredentialRequirementSource {
+    #[default]
+    SecretHandle,
+    ProductAuthAccount {
+        provider: RuntimeCredentialAccountProviderId,
+        #[serde(default)]
+        setup: RuntimeCredentialAccountSetup,
+    },
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeCredentialAccountSetup {
+    #[default]
+    ManualToken,
+    #[serde(rename = "oauth")]
+    OAuth { scopes: Vec<String> },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ironclaw_event_projections::{
     ProjectionCursor, ProjectionReplay, ProjectionScope, ProjectionSnapshot,
 };
-use ironclaw_host_api::{InvocationId, MissionId, ProcessId, ThreadId};
+use ironclaw_host_api::{CapabilityId, InvocationId, MissionId, ProcessId, ThreadId};
 use ironclaw_outbound::{OutboundPushKind, ProjectionUpdateRef};
 use ironclaw_turns::{ReplyTargetBindingRef, TurnActor, TurnRunId, TurnScope};
 use serde::{Deserialize, Serialize};
@@ -131,6 +131,7 @@ pub enum LagReason {
 pub enum ProductProjectionEnvelope {
     ThreadSnapshot(ProjectionSnapshot),
     ThreadUpdates(ProjectionReplay),
+    ThreadLiveUpdate(ThreadLiveProjectionUpdate),
     DeliveryStatus(DeliveryStatusProjectionPayload),
     Debug(DebugProjectionPayload),
 }
@@ -140,6 +141,7 @@ impl ProductProjectionEnvelope {
         match self {
             Self::ThreadSnapshot(snapshot) => snapshot.next_cursor.clone(),
             Self::ThreadUpdates(replay) => replay.next_cursor.clone(),
+            Self::ThreadLiveUpdate(update) => update.cursor.clone(),
             Self::DeliveryStatus(payload) => payload.cursor.clone(),
             Self::Debug(payload) => payload.cursor.clone(),
         }
@@ -149,10 +151,54 @@ impl ProductProjectionEnvelope {
         match self {
             Self::ThreadSnapshot(snapshot) => &snapshot.next_cursor.scope,
             Self::ThreadUpdates(replay) => &replay.next_cursor.scope,
+            Self::ThreadLiveUpdate(update) => &update.cursor.scope,
             Self::DeliveryStatus(payload) => &payload.cursor.scope,
             Self::Debug(payload) => &payload.cursor.scope,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadLiveProjectionUpdate {
+    pub cursor: ProjectionCursor,
+    pub thread_id: ThreadId,
+    pub items: Vec<ThreadLiveProjectionItem>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadLiveProjectionItem {
+    Thinking {
+        id: String,
+        run_id: TurnRunId,
+        body: String,
+    },
+    CapabilityActivity {
+        run_id: TurnRunId,
+        invocation_id: InvocationId,
+        capability_id: CapabilityId,
+    },
+    WorkSummary {
+        id: String,
+        run_id: TurnRunId,
+        phase: ThreadLiveWorkSummaryPhase,
+        body: String,
+    },
+    SkillActivation {
+        id: String,
+        run_id: TurnRunId,
+        skill_names: Vec<String>,
+        feedback: Vec<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadLiveWorkSummaryPhase {
+    Planning,
+    Waiting,
+    Retrying,
+    Context,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

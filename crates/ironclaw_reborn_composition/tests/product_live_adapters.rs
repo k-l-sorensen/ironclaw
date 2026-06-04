@@ -5,9 +5,9 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_host_api::{
     AgentId, CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, EffectKind,
-    ExecutionContext, ExtensionId, GrantConstraints, MountAlias, MountGrant, MountPermissions,
-    MountView, NetworkPolicy, NetworkTargetPattern, Principal, RuntimeKind, TenantId, ThreadId,
-    TrustClass, UserId, VirtualPath,
+    ExecutionContext, ExtensionId, GrantConstraints, InvocationId, MountAlias, MountGrant,
+    MountPermissions, MountView, NetworkPolicy, NetworkTargetPattern, Principal, RuntimeKind,
+    TenantId, ThreadId, TrustClass, UserId, VirtualPath,
 };
 use ironclaw_host_runtime::{
     CapabilitySurfacePolicy, ECHO_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, SHELL_CAPABILITY_ID,
@@ -15,12 +15,13 @@ use ironclaw_host_runtime::{
     VisibleCapabilityRequest as HostVisibleCapabilityRequest,
 };
 use ironclaw_loop_support::{
-    HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
-    HostInputBatch, HostInputEnvelope, HostInputQueue, HostInputQueueError, HostManagedModelError,
-    HostManagedModelErrorKind, HostManagedModelGateway, HostManagedModelRequest,
-    HostManagedModelResponse, LoopCapabilityInputResolver, LoopCapabilityResultWriter,
-    ProductLiveCancellationProbe, RunCancellationFactory, RunCancellationHandle,
-    loop_driver_execution_extension_id, verify_product_live_cancellation_probe,
+    CapabilityResultWrite, HostIdentityContextBuildError, HostIdentityContextCandidate,
+    HostIdentityContextSource, HostInputBatch, HostInputEnvelope, HostInputQueue,
+    HostInputQueueError, HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
+    HostManagedModelRequest, HostManagedModelResponse, JsonSpawnSubagentInputCodec,
+    LoopCapabilityInputResolver, LoopCapabilityResultWriter, ProductLiveCancellationProbe,
+    RunCancellationFactory, RunCancellationHandle, loop_driver_execution_extension_id,
+    verify_product_live_cancellation_probe,
 };
 use ironclaw_reborn::{
     loop_exit_applier::ThreadCheckpointLoopExitEvidencePort,
@@ -28,6 +29,11 @@ use ironclaw_reborn::{
     planned_driver_factory::default_planned_run_profile_resolver,
     runtime::{
         DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, build_product_live_planned_runtime,
+    },
+    subagent::{
+        flavors::StaticSubagentDefinitionResolver,
+        gate_resolution::BoundedSubagentGateResolutionStore,
+        goal_store::InMemoryBoundedSubagentGoalStore,
     },
 };
 use ironclaw_reborn_composition::{
@@ -37,7 +43,7 @@ use ironclaw_reborn_composition::{
     RebornServices, build_reborn_services, capability_allowlist,
     visible_capability_request_for_run,
 };
-use ironclaw_threads::{InMemorySessionThreadService, ThreadScope};
+use ironclaw_threads::{InMemorySessionThreadService, SessionThreadService, ThreadScope};
 use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
 use ironclaw_turns::{
     CheckpointStateStore, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
@@ -50,6 +56,25 @@ use ironclaw_turns::{
         NoOpPolicyGuard, PromptMode, ProviderToolCall, VisibleCapabilityRequest,
     },
 };
+
+async fn write_capability_result_for_test(
+    io: &ProductLiveCapabilityIo,
+    run_context: &LoopRunContext,
+    input_ref: &CapabilityInputRef,
+    capability: &str,
+    output: serde_json::Value,
+) -> Result<LoopResultRef, AgentLoopHostError> {
+    let capability_id = capability_id(capability);
+    io.write_capability_result(CapabilityResultWrite {
+        run_context,
+        input_ref,
+        invocation_id: InvocationId::new(),
+        capability_id: &capability_id,
+        output,
+        display_preview: None,
+    })
+    .await
+}
 
 #[tokio::test]
 async fn capability_io_resolves_staged_inputs_and_materializes_run_scoped_results() {
@@ -65,14 +90,15 @@ async fn capability_io_resolves_staged_inputs_and_materializes_run_scoped_result
         .unwrap();
     assert_eq!(resolved, serde_json::json!({ "text": "hello" }));
 
-    let result_ref = io
-        .write_capability_result(
-            &run_context,
-            &capability_id("demo.echo"),
-            serde_json::json!({ "reply": "hello" }),
-        )
-        .await
-        .unwrap();
+    let result_ref = write_capability_result_for_test(
+        &io,
+        &run_context,
+        &input_ref,
+        "demo.echo",
+        serde_json::json!({ "reply": "hello" }),
+    )
+    .await
+    .unwrap();
 
     assert!(
         result_ref
@@ -91,6 +117,18 @@ async fn capability_io_resolves_staged_inputs_and_materializes_run_scoped_result
         .expect_err("staged input refs should be consumed on successful read");
     io.result_for_ref(&run_context, &result_ref)
         .expect_err("staged result refs should be consumed on successful read");
+
+    io.update_capability_result(
+        &run_context,
+        &result_ref,
+        serde_json::json!({ "reply": "terminal" }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        io.result_for_ref(&run_context, &result_ref).unwrap(),
+        serde_json::json!({ "reply": "terminal" })
+    );
 }
 
 #[tokio::test]
@@ -111,14 +149,15 @@ async fn capability_io_rejects_cross_run_input_and_result_refs() {
         ironclaw_turns::run_profile::AgentLoopHostErrorKind::ScopeMismatch
     );
 
-    let result_ref = io
-        .write_capability_result(
-            &first_run,
-            &capability_id("demo.echo"),
-            serde_json::json!({ "reply": "first" }),
-        )
-        .await
-        .unwrap();
+    let result_ref = write_capability_result_for_test(
+        &io,
+        &first_run,
+        &input_ref,
+        "demo.echo",
+        serde_json::json!({ "reply": "first" }),
+    )
+    .await
+    .unwrap();
     let result_error = io
         .result_for_ref(&second_run, &result_ref)
         .expect_err("cross-run result refs must fail closed");
@@ -139,22 +178,24 @@ async fn capability_io_prunes_refs_for_terminal_runs_without_cross_run_loss() {
     let second_input = io
         .stage_input(&second_run, serde_json::json!({ "text": "second" }))
         .unwrap();
-    let first_result = io
-        .write_capability_result(
-            &first_run,
-            &capability_id("demo.echo"),
-            serde_json::json!({ "reply": "first" }),
-        )
-        .await
-        .unwrap();
-    let second_result = io
-        .write_capability_result(
-            &second_run,
-            &capability_id("demo.echo"),
-            serde_json::json!({ "reply": "second" }),
-        )
-        .await
-        .unwrap();
+    let first_result = write_capability_result_for_test(
+        &io,
+        &first_run,
+        &first_input,
+        "demo.echo",
+        serde_json::json!({ "reply": "first" }),
+    )
+    .await
+    .unwrap();
+    let second_result = write_capability_result_for_test(
+        &io,
+        &second_run,
+        &second_input,
+        "demo.echo",
+        serde_json::json!({ "reply": "second" }),
+    )
+    .await
+    .unwrap();
 
     io.prune_run(&first_run).unwrap();
 
@@ -219,10 +260,15 @@ async fn capability_io_enforces_staging_entry_and_byte_caps() {
     );
 
     let oversized_result = serde_json::json!("x".repeat(4 * 1024 * 1024));
-    let byte_error = ProductLiveCapabilityIo::default()
-        .write_capability_result(&run_context, &capability_id("demo.echo"), oversized_result)
-        .await
-        .expect_err("staging must enforce a serialized-byte cap");
+    let byte_error = write_capability_result_for_test(
+        &ProductLiveCapabilityIo::default(),
+        &run_context,
+        &CapabilityInputRef::new("input:oversized-result").unwrap(),
+        "demo.echo",
+        oversized_result,
+    )
+    .await
+    .expect_err("staging must enforce a serialized-byte cap");
     assert_eq!(
         byte_error.kind,
         ironclaw_turns::run_profile::AgentLoopHostErrorKind::BudgetExceeded
@@ -743,6 +789,12 @@ async fn local_dev_adapter_exposes_skill_install_provider_tool_schema_requires_s
     let io = Arc::new(ProductLiveCapabilityIo::default());
     let capability_id = capability_id(SKILL_INSTALL_CAPABILITY_ID);
     let user_id = UserId::new("user-provider-skill-install").unwrap();
+    let skill_install_effects = vec![
+        EffectKind::ReadFilesystem,
+        EffectKind::WriteFilesystem,
+        EffectKind::DeleteFilesystem,
+        EffectKind::Network,
+    ];
     let adapters = ProductLivePlannedRuntimeAdapters::from_services(
         &services,
         ProductLivePlannedRuntimeAdapterConfig {
@@ -754,15 +806,16 @@ async fn local_dev_adapter_exposes_skill_install_provider_tool_schema_requires_s
                     SurfaceKind::new("agent_loop").unwrap(),
                     CapabilitySurfacePolicy::allow_all(),
                 )
-                .with_grants(grants_for_principal_with_effects(
+                .with_grants(grants_for_principal_with_effects_and_network(
                     Principal::User(user_id),
                     [SKILL_INSTALL_CAPABILITY_ID],
-                    vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
+                    skill_install_effects.clone(),
+                    local_dev_network_policy(),
                 ))
                 .with_provider_trust_for_effects(
                     ExtensionId::new("builtin").unwrap(),
                     EffectiveTrustClass::user_trusted(),
-                    vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
+                    skill_install_effects,
                 ),
             ),
             capability_input_resolver: io.clone(),
@@ -800,13 +853,26 @@ async fn local_dev_adapter_exposes_skill_install_provider_tool_schema_requires_s
         Some(&serde_json::json!("string")),
         "skill_install content input should be advertised as a string"
     );
+    assert_eq!(
+        properties.get("url").and_then(|schema| schema.get("type")),
+        Some(&serde_json::json!("string")),
+        "skill_install URL input should be advertised as a string"
+    );
     assert!(
         tool_definition
             .parameters
-            .get("required")
+            .get("oneOf")
             .and_then(serde_json::Value::as_array)
-            .is_some_and(|required| required.iter().any(|field| field == "content")),
-        "skill_install content input should be required"
+            .is_some_and(|branches| branches.len() == 2
+                && branches.iter().any(|branch| branch
+                    .get("required")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|required| required.iter().any(|field| field == "content")))
+                && branches.iter().any(|branch| branch
+                    .get("required")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|required| required.iter().any(|field| field == "url")))),
+        "skill_install should require either content or url"
     );
 }
 
@@ -1166,7 +1232,7 @@ async fn adapter_bundle_satisfies_product_live_runtime_readiness_gate() {
     let loop_checkpoint_for_evidence: Arc<dyn LoopCheckpointStore> = loop_checkpoint_store.clone();
     let composition = build_product_live_planned_runtime(DefaultPlannedRuntimeParts {
         turn_state,
-        thread_service: Arc::clone(&thread_service),
+        thread_service: Arc::clone(&thread_service) as Arc<dyn SessionThreadService>,
         thread_scope: thread_scope.clone(),
         model_gateway: Arc::new(StubModelGateway),
         checkpoint_state_store: checkpoint_state_store as Arc<dyn CheckpointStateStore>,
@@ -1174,6 +1240,14 @@ async fn adapter_bundle_satisfies_product_live_runtime_readiness_gate() {
         milestone_sink,
         capability_factory: adapters.capability_factory,
         capability_surface_resolver: adapters.capability_surface_resolver,
+        capability_result_writer: adapters.capability_result_writer,
+        subagent_goal_store: Arc::new(InMemoryBoundedSubagentGoalStore::new()),
+        subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+        subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(
+            adapters.capability_input_resolver,
+        )),
+        subagent_spawn_limits: ironclaw_loop_support::SubagentSpawnLimits::default(),
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
             thread_service,
             turn_state_for_evidence,
@@ -1189,6 +1263,7 @@ async fn adapter_bundle_satisfies_product_live_runtime_readiness_gate() {
         model_policy_guard: Some(adapters.model_policy_guard),
         model_budget_accountant: Some(adapters.model_budget_accountant),
         safety_context: Some(adapters.safety_context),
+        turn_event_sink: None,
     })
     .expect("adapter bundle should satisfy the product-live readiness gate");
 
@@ -1460,6 +1535,29 @@ fn grants_for_principal_with_effects_and_mounts<const N: usize>(
     }
 }
 
+fn grants_for_principal_with_effects_and_network<const N: usize>(
+    grantee: Principal,
+    capabilities: [&str; N],
+    allowed_effects: Vec<EffectKind>,
+    network: NetworkPolicy,
+) -> CapabilitySet {
+    CapabilitySet {
+        grants: capabilities
+            .into_iter()
+            .map(|capability| {
+                let mut grant = grant_for_principal_with_effects(
+                    grantee.clone(),
+                    capability,
+                    allowed_effects.clone(),
+                    MountView::default(),
+                );
+                grant.constraints.network = network.clone();
+                grant
+            })
+            .collect(),
+    }
+}
+
 fn grant_for_principal_with_effects(
     grantee: Principal,
     capability: &str,
@@ -1480,6 +1578,18 @@ fn grant_for_principal_with_effects(
             expires_at: None,
             max_invocations: None,
         },
+    }
+}
+
+fn local_dev_network_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        allowed_targets: vec![NetworkTargetPattern {
+            scheme: None,
+            host_pattern: "*".to_string(),
+            port: None,
+        }],
+        deny_private_ip_ranges: true,
+        max_egress_bytes: None,
     }
 }
 
@@ -1547,9 +1657,7 @@ impl LoopCapabilityInputResolver for UnusedCapabilityIo {
 impl LoopCapabilityResultWriter for UnusedCapabilityIo {
     async fn write_capability_result(
         &self,
-        _run_context: &LoopRunContext,
-        _capability_id: &CapabilityId,
-        _output: serde_json::Value,
+        _write: CapabilityResultWrite<'_>,
     ) -> Result<LoopResultRef, AgentLoopHostError> {
         Ok(LoopResultRef::new("result:adapter-test").unwrap())
     }

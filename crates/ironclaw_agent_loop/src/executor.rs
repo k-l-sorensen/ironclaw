@@ -16,6 +16,7 @@ mod mapping;
 mod model;
 mod pipeline;
 mod prompt;
+mod reply_admission;
 mod turn_stop;
 
 use assistant_reply::{AssistantReplyInput, AssistantReplyStage};
@@ -34,7 +35,7 @@ use exit_helpers::{
     cancelled_exit, cancelled_exit_with_reason, cancelled_reason_from_signal, completed_exit,
     exit_id, failed_exit,
 };
-use gates::{GateInput, GateStage};
+use gates::{AwaitDependentRunGateInput, AwaitDependentRunGateStage, GateInput, GateStage};
 #[cfg(test)]
 use input::consume_drainable_inputs;
 use input::{DrainInput, InputStage, InputStep, UserFacingInputDrainMode};
@@ -48,13 +49,15 @@ use mapping::{
 use model::{ModelInput, ModelStage, ModelStep};
 use pipeline::{DefaultExecutorPipeline, ExecutorStage, StageContext};
 use prompt::{PromptInput, PromptStage, PromptStep};
-use turn_stop::{StopInput, StopStage, StopStep};
+use reply_admission::{ReplyAdmissionInput, ReplyAdmissionStage, ReplyAdmissionStep};
+use turn_stop::{StopInput, StopObservationInput, StopObservationStep, StopStage, StopStep};
 
 use async_trait::async_trait;
 use ironclaw_turns::{
     LoopCancelledReasonKind, LoopDiagnosticRef, LoopExit,
     run_profile::{
-        AgentLoopDriverHost, AgentLoopHostErrorKind, LoopInputAckToken, LoopSafeSummary,
+        AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind,
+        AgentLoopHostErrorReasonKind, LoopInputAckToken, LoopSafeSummary,
     },
 };
 
@@ -95,6 +98,7 @@ pub enum AgentLoopExecutorError {
         stage: HostStage,
         kind: AgentLoopHostErrorKind,
         safe_summary: LoopSafeSummary,
+        reason_kind: Option<AgentLoopHostErrorReasonKind>,
         diagnostic_ref: Option<LoopDiagnosticRef>,
     },
     #[error("planner returned a contract violation: {detail}")]
@@ -119,6 +123,25 @@ pub enum HostStage {
     Transcript,
     Checkpoint,
     Input,
+}
+
+fn debug_host_unavailable(stage: HostStage, error: &AgentLoopHostError) {
+    match LoopSafeSummary::new(error.safe_summary.clone()) {
+        Ok(safe_summary) => tracing::debug!(
+            stage = ?stage,
+            kind = ?error.kind,
+            diagnostic_ref = ?error.diagnostic_ref,
+            safe_summary = %safe_summary,
+            "agent loop host call unavailable"
+        ),
+        Err(validation_error) => tracing::debug!(
+            stage = ?stage,
+            kind = ?error.kind,
+            diagnostic_ref = ?error.diagnostic_ref,
+            validation_error = %validation_error,
+            "agent loop host call unavailable with invalid safe summary"
+        ),
+    }
 }
 
 /// Reference executor for the Reborn skeleton loop.
