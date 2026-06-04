@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_threads::{
     AppendAssistantDraftRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
     MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadMessageId,
@@ -522,6 +522,89 @@ async fn completion_evidence_reads_thread_under_the_run_caller_owner() {
     assert!(
         verified,
         "the reply written under owners/<caller> must be found via the run actor's owner"
+    );
+}
+
+#[tokio::test]
+async fn completion_evidence_reads_thread_under_the_run_project_axis() {
+    let thread_service = Arc::new(InMemorySessionThreadService::default());
+    let run_project = ProjectId::new("project:slack").expect("valid");
+    let turn_scope = TurnScope::new(
+        TenantId::new("tenant").expect("valid"),
+        Some(AgentId::new("agent").expect("valid")),
+        Some(run_project.clone()),
+        ThreadId::new("thread").expect("valid"),
+    );
+    let run_thread_scope = ThreadScope {
+        tenant_id: turn_scope.tenant_id.clone(),
+        agent_id: turn_scope.agent_id.clone().expect("agent id"),
+        project_id: Some(run_project),
+        owner_user_id: Some(UserId::new("caller").expect("caller")),
+        mission_id: None,
+    };
+    thread_service
+        .ensure_thread(EnsureThreadRequest {
+            scope: run_thread_scope.clone(),
+            thread_id: Some(turn_scope.thread_id.clone()),
+            created_by_actor_id: "user:caller".to_string(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .expect("thread");
+    let run_id = TurnRunId::new();
+    let draft = thread_service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: run_thread_scope.clone(),
+            thread_id: turn_scope.thread_id.clone(),
+            turn_run_id: run_id.to_string(),
+            content: MessageContent::text("hi"),
+        })
+        .await
+        .expect("draft");
+    thread_service
+        .finalize_assistant_message(
+            &run_thread_scope,
+            &turn_scope.thread_id,
+            draft.message_id,
+            MessageContent::text("hi"),
+        )
+        .await
+        .expect("finalized");
+    let message_ref =
+        LoopMessageRef::new(format!("msg:{}", draft.message_id)).expect("valid message ref");
+
+    let runtime_base_scope = ThreadScope {
+        project_id: None,
+        owner_user_id: Some(UserId::new("operator").expect("operator")),
+        ..run_thread_scope.clone()
+    };
+    let run_state = running_run_state(
+        turn_scope.clone(),
+        run_id,
+        Some(TurnActor::new(UserId::new("caller").expect("caller"))),
+    );
+    let evidence = ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
+        thread_service,
+        Arc::new(StaticTurnStateStore::new(run_state)) as Arc<dyn TurnStateStore>,
+        Arc::new(PanicLoopCheckpointStore),
+        runtime_base_scope,
+    );
+
+    let verified = evidence
+        .verify_completion_refs(CompletionEvidenceRequest {
+            scope: &turn_scope,
+            turn_id: TurnId::new(),
+            run_id,
+            reply_message_refs: &[message_ref],
+            result_refs: &[],
+        })
+        .await
+        .expect("must read the thread under the run project, not the runtime base project");
+
+    assert!(
+        verified,
+        "the reply written under the run project must be found via turn-scope project resolution"
     );
 }
 

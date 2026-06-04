@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -139,6 +140,23 @@ async fn build_slack_events_route_mount_fails_when_runtime_http_egress_unavailab
 }
 
 #[tokio::test]
+async fn build_slack_host_beta_mounts_fails_when_durable_host_state_unavailable() {
+    let (mut runtime, _root) = runtime().await;
+    runtime.clear_local_runtime_for_test();
+
+    let error = match build_slack_host_beta_mounts(&runtime, config()).await {
+        Ok(_) => panic!("Slack host-beta route requires durable host state"),
+        Err(error) => error,
+    };
+
+    assert!(matches!(
+        error,
+        SlackHostBetaBuildError::DurableHostStateUnavailable
+    ));
+    runtime.shutdown().await.expect("runtime shuts down");
+}
+
+#[tokio::test]
 async fn build_slack_events_route_mount_dispatches_signed_event_callback() {
     let (mut runtime, _root) = runtime().await;
     let egress = Arc::new(RecordingRuntimeHttpEgress::default());
@@ -174,19 +192,73 @@ async fn build_slack_events_route_mount_dispatches_signed_event_callback() {
     if let Some(drain) = mount.drain.as_ref() {
         drain.drain().await;
     }
-    let history = wait_for_slack_thread_history(&runtime).await;
+    let history = wait_for_slack_thread_history_with_messages(&runtime, 2).await;
     assert_eq!(history.messages.len(), 2);
     assert_eq!(history.messages[0].content.as_deref(), Some("hello"));
     assert_eq!(history.messages[1].content.as_deref(), Some("ok"));
     assert_eq!(
         history.messages[0].source_binding_id.as_deref(),
         Some(
-            "adapter:8:slack_v2;installation:17:install_host_beta;agent:16:agent:slack-host;project:0:;space:5:THOST;conversation:5:DHOST;topic:0:;"
+            "adapter:8:slack_v2;installation:17:install_host_beta;agent:16:agent:slack-host;project:18:project:slack-host;space:5:THOST;conversation:5:DHOST;topic:0:;"
         )
     );
     wait_for_slack_posted_text(&egress, "ok").await;
 
     runtime.shutdown().await.expect("runtime shuts down");
+}
+
+#[tokio::test]
+async fn duplicate_slack_event_replays_after_runtime_reopen_without_duplicate_reply() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let runtime_root = root.path().join("local-dev");
+    let (mut first_runtime, _first_root) = runtime_at(&runtime_root).await;
+    let first_egress = Arc::new(RecordingRuntimeHttpEgress::default());
+    first_runtime.set_local_runtime_http_egress_for_test(Some(first_egress.clone()));
+    let first_mount = build_slack_events_route_mount(&first_runtime, config())
+        .await
+        .expect("first route builds");
+    let body = dm_event_body_with(
+        "Ev-host-beta-restart-replay",
+        "durable hello",
+        "1710000000.000040",
+    );
+
+    post_signed_slack_event(&first_mount, &body).await;
+    if let Some(drain) = first_mount.drain.as_ref() {
+        drain.drain().await;
+    }
+    wait_for_slack_posted_text(&first_egress, "ok").await;
+    let first_history = wait_for_slack_thread_history_with_messages(&first_runtime, 2).await;
+    assert_eq!(first_history.messages.len(), 2);
+    first_runtime
+        .shutdown()
+        .await
+        .expect("first runtime shuts down");
+
+    let (mut second_runtime, _second_root) = runtime_at(&runtime_root).await;
+    let second_egress = Arc::new(RecordingRuntimeHttpEgress::default());
+    second_runtime.set_local_runtime_http_egress_for_test(Some(second_egress.clone()));
+    let second_mount = build_slack_events_route_mount(&second_runtime, config())
+        .await
+        .expect("second route builds");
+
+    post_signed_slack_event(&second_mount, &body).await;
+    if let Some(drain) = second_mount.drain.as_ref() {
+        drain.drain().await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        second_egress.posted_slack_texts().is_empty(),
+        "duplicate replay after restart must not post a second Slack reply"
+    );
+    let second_history = wait_for_slack_thread_history_with_messages(&second_runtime, 2).await;
+    assert_eq!(second_history.messages.len(), 2);
+
+    second_runtime
+        .shutdown()
+        .await
+        .expect("second runtime shuts down");
 }
 
 #[tokio::test]
@@ -275,7 +347,7 @@ async fn build_slack_host_beta_mounts_pairs_unknown_slack_actor_then_routes_boun
         drain.drain().await;
     }
 
-    let history = wait_for_slack_thread_history(&runtime).await;
+    let history = wait_for_slack_thread_history_with_messages(&runtime, 2).await;
     assert_eq!(history.messages.len(), 2);
     assert_eq!(
         history.messages[0].content.as_deref(),
@@ -439,9 +511,14 @@ async fn post_signed_slack_event(mount: &PublicRouteMount, body: &str) {
 
 async fn runtime() -> (RebornRuntime, tempfile::TempDir) {
     let root = tempfile::tempdir().expect("tempdir");
+    let runtime = runtime_at(root.path().join("local-dev")).await.0;
+    (runtime, root)
+}
+
+async fn runtime_at(root: impl AsRef<Path>) -> (RebornRuntime, ()) {
     let runtime = build_reborn_runtime(
         RebornRuntimeInput::from_services(
-            RebornBuildInput::local_dev(USER, root.path().join("local-dev"))
+            RebornBuildInput::local_dev(USER, root.as_ref().to_path_buf())
                 .with_runtime_policy(local_dev_runtime_policy().expect("local policy")),
         )
         .with_identity(RebornRuntimeIdentity {
@@ -454,16 +531,19 @@ async fn runtime() -> (RebornRuntime, tempfile::TempDir) {
     )
     .await
     .expect("runtime builds");
-    (runtime, root)
+    (runtime, ())
 }
 
-async fn wait_for_slack_thread_history(runtime: &RebornRuntime) -> ironclaw_threads::ThreadHistory {
+async fn wait_for_slack_thread_history_with_messages(
+    runtime: &RebornRuntime,
+    expected_messages: usize,
+) -> ironclaw_threads::ThreadHistory {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     let thread_service = runtime.webui_thread_service();
     let scope = ThreadScope {
         tenant_id: TenantId::new(TENANT).expect("tenant"),
         agent_id: AgentId::new(AGENT).expect("agent"),
-        project_id: None,
+        project_id: Some(ProjectId::new(PROJECT).expect("project")),
         owner_user_id: Some(UserId::new(USER).expect("user")),
         mission_id: None,
     };
@@ -477,19 +557,63 @@ async fn wait_for_slack_thread_history(runtime: &RebornRuntime) -> ironclaw_thre
             .await
             .expect("list Slack-created threads");
         if let Some(thread) = threads.threads.first() {
-            return thread_service
+            let history = thread_service
                 .list_thread_history(ThreadHistoryRequest {
-                    scope,
+                    scope: scope.clone(),
                     thread_id: thread.thread_id.clone(),
                 })
                 .await
                 .expect("read Slack-created thread history");
+            if history.messages.len() >= expected_messages {
+                return history;
+            }
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!("signed Slack event did not create a thread");
+            panic!(
+                "signed Slack event did not create {expected_messages} messages; {}",
+                turn_run_debug_summary(runtime).await
+            );
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+}
+
+async fn turn_run_debug_summary(runtime: &RebornRuntime) -> String {
+    let Some(snapshot) = runtime.turn_persistence_snapshot_for_test().await else {
+        return "turn snapshot unavailable".to_string();
+    };
+    if snapshot.runs.is_empty() {
+        return "turn snapshot has no runs".to_string();
+    }
+    let run_summary = snapshot
+        .runs
+        .iter()
+        .map(|run| {
+            format!(
+                "run={} status={:?} failure={:?} project={:?}",
+                run.run_id,
+                run.status,
+                run.failure,
+                run.scope
+                    .project_id
+                    .as_ref()
+                    .map(|project| project.as_str())
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let event_summary = snapshot
+        .events
+        .iter()
+        .map(|event| {
+            format!(
+                "event_run={} status={:?} kind={:?} reason={:?}",
+                event.run_id, event.status, event.kind, event.sanitized_reason
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!("{run_summary}; events=[{event_summary}]")
 }
 
 fn current_unix_timestamp() -> u64 {

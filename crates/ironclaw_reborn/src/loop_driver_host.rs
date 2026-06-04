@@ -890,11 +890,20 @@ where
     /// owner). An owner-less factory keeps its shared/system slot, so
     /// owner-agnostic flows and runs without an actor (background tasks,
     /// triggers) are unaffected.
-    fn effective_thread_scope(&self, run_context: &LoopRunContext) -> ThreadScope {
-        crate::thread_scope::ThreadScopeResolver::resolve(&self.thread_scope, run_context.actor())
+    fn effective_thread_scope(
+        &self,
+        run_context: &LoopRunContext,
+    ) -> Result<ThreadScope, RebornLoopDriverHostError> {
+        crate::thread_scope::ThreadScopeResolver::resolve_for_run(&self.thread_scope, run_context)
+            .map_err(|error| RebornLoopDriverHostError::ScopeMismatch {
+                reason: error.to_string(),
+            })
     }
 
-    fn build_compaction_ports(&self, run_context: &LoopRunContext) -> Arc<dyn LoopCompactionPort> {
+    fn build_compaction_ports(
+        &self,
+        run_context: &LoopRunContext,
+    ) -> Result<Arc<dyn LoopCompactionPort>, RebornLoopDriverHostError> {
         let direct_system_inference: Arc<dyn SystemInferencePort> =
             Arc::new(ModelGatewayBackedSystemInferencePort::new(
                 Arc::clone(&self.model_gateway),
@@ -907,12 +916,12 @@ where
                 Arc::clone(&self.model_accountant),
                 Arc::clone(&self.model_policy_guard),
             ));
-        default_host_managed_loop_compaction_port(
+        Ok(default_host_managed_loop_compaction_port(
             system_inference,
             Arc::clone(&self.thread_service),
-            self.effective_thread_scope(run_context),
+            self.effective_thread_scope(run_context)?,
             include_str!("../../ironclaw_loop_support/prompts/compaction_summarizer_fresh.md"),
-        )
+        ))
     }
 
     pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
@@ -1165,7 +1174,7 @@ where
     ) -> Result<RebornLoopDriverHost, RebornLoopDriverHostError> {
         validate_claimed_run_context(&request.claimed_run, &request.loop_run_context)?;
         validate_thread_scope(
-            &self.effective_thread_scope(&request.loop_run_context),
+            &self.effective_thread_scope(&request.loop_run_context)?,
             &request.loop_run_context,
         )?;
         let allow_set = Arc::new(
@@ -1189,7 +1198,7 @@ where
         // Resolve the per-caller thread scope once; every thread read/write
         // port below uses it so a logged-in user's turn touches only their
         // own `owners/<user>` subtree.
-        let effective_scope = self.effective_thread_scope(&request.loop_run_context);
+        let effective_scope = self.effective_thread_scope(&request.loop_run_context)?;
         validate_thread_scope(&effective_scope, &request.loop_run_context)?;
 
         let max_messages = self.config.max_messages.max(1);
@@ -1422,7 +1431,7 @@ where
             run_context.clone(),
             Arc::clone(&self.milestone_sink),
         ));
-        let compaction = self.build_compaction_ports(&run_context);
+        let compaction = self.build_compaction_ports(&run_context)?;
         let cancellation_handle = self
             .cancellation_factory
             .handle_for_run(&run_context.scope, run_context.run_id)

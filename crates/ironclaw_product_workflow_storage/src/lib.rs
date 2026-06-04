@@ -5,7 +5,9 @@
     allow(dead_code, unused_imports)
 )]
 
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -14,8 +16,8 @@ use ironclaw_filesystem::LibSqlRootFilesystem;
 #[cfg(feature = "postgres")]
 use ironclaw_filesystem::PostgresRootFilesystem;
 use ironclaw_filesystem::{
-    CasExpectation, Entry, FilesystemError, IndexKey, IndexValue, RecordKind, RecordVersion,
-    RootFilesystem, ScopedFilesystem,
+    CasExpectation, Entry, FilesystemError, FilesystemOperation, Filter, IndexKey, IndexValue,
+    Page, RecordKind, RecordVersion, RootFilesystem, ScopedFilesystem, VersionedEntry,
 };
 use ironclaw_host_api::{ResourceScope, ScopedPath, VirtualPath};
 use ironclaw_product_workflow::{
@@ -26,11 +28,16 @@ use ironclaw_product_workflow::{
 const DEFAULT_IN_FLIGHT_LEASE: Duration = Duration::seconds(60);
 const DEFAULT_LEDGER_ROOT: &str = "/engine/product_workflow/idempotency/actions";
 const ACTION_RECORD_KIND: &str = "product_workflow_action";
+const PRUNE_LEASE_RECORD_KIND: &str = "product_workflow_prune_lease";
+const PRUNE_LEASE_SECONDS: i64 = 30;
 
 struct FilesystemIdempotencyLedger {
     filesystem: Arc<dyn LedgerFilesystem>,
-    root: String,
+    root: LedgerRoot,
     in_flight_lease: Duration,
+    settled_entry_limit: Option<NonZeroUsize>,
+    settled_prune_interval: NonZeroUsize,
+    settled_since_prune: AtomicUsize,
 }
 
 impl FilesystemIdempotencyLedger {
@@ -41,8 +48,11 @@ impl FilesystemIdempotencyLedger {
     fn with_root_lease(filesystem: Arc<dyn RootFilesystem>, in_flight_lease: Duration) -> Self {
         Self {
             filesystem: Arc::new(RootLedgerFilesystem { filesystem }),
-            root: default_ledger_root(),
+            root: LedgerRoot::Root(default_ledger_root()),
             in_flight_lease,
+            settled_entry_limit: None,
+            settled_prune_interval: NonZeroUsize::new(1).expect("non-zero literal"), // safety: static literal is non-zero.
+            settled_since_prune: AtomicUsize::new(0),
         }
     }
 
@@ -53,8 +63,11 @@ impl FilesystemIdempotencyLedger {
     ) -> Self {
         Self {
             filesystem: Arc::new(RootLedgerFilesystem { filesystem }),
-            root: root.as_str().to_string(),
+            root: LedgerRoot::Root(root),
             in_flight_lease,
+            settled_entry_limit: None,
+            settled_prune_interval: NonZeroUsize::new(1).expect("non-zero literal"), // safety: static literal is non-zero.
+            settled_since_prune: AtomicUsize::new(0),
         }
     }
 
@@ -68,8 +81,11 @@ impl FilesystemIdempotencyLedger {
     {
         Self {
             filesystem: Arc::new(ScopedLedgerFilesystem { filesystem, scope }),
-            root: DEFAULT_LEDGER_ROOT.to_string(),
+            root: LedgerRoot::Scoped(default_scoped_ledger_root()),
             in_flight_lease,
+            settled_entry_limit: None,
+            settled_prune_interval: NonZeroUsize::new(1).expect("non-zero literal"), // safety: static literal is non-zero.
+            settled_since_prune: AtomicUsize::new(0),
         }
     }
 
@@ -84,9 +100,23 @@ impl FilesystemIdempotencyLedger {
     {
         Self {
             filesystem: Arc::new(ScopedLedgerFilesystem { filesystem, scope }),
-            root: root.as_str().to_string(),
+            root: LedgerRoot::Scoped(root),
             in_flight_lease,
+            settled_entry_limit: None,
+            settled_prune_interval: NonZeroUsize::new(1).expect("non-zero literal"), // safety: static literal is non-zero.
+            settled_since_prune: AtomicUsize::new(0),
         }
+    }
+
+    fn with_settled_entry_limit(mut self, limit: NonZeroUsize) -> Self {
+        self.settled_entry_limit = Some(limit);
+        self.settled_prune_interval = settled_prune_interval_for(limit);
+        self
+    }
+
+    fn with_settled_prune_interval(mut self, interval: NonZeroUsize) -> Self {
+        self.settled_prune_interval = interval;
+        self
     }
 
     async fn begin_or_replay(
@@ -94,7 +124,7 @@ impl FilesystemIdempotencyLedger {
         fingerprint: ActionFingerprintKey,
         received_at: DateTime<Utc>,
     ) -> Result<IdempotencyDecision, ProductWorkflowError> {
-        let path = action_path(&self.root, &fingerprint);
+        let path = action_path(&self.root, &fingerprint)?;
         let action = ProductInboundAction::begin(fingerprint, received_at);
         match self
             .filesystem
@@ -135,7 +165,7 @@ impl FilesystemIdempotencyLedger {
     }
 
     async fn settle(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
-        let path = action_path(&self.root, &action.fingerprint);
+        let path = action_path(&self.root, &action.fingerprint)?;
         loop {
             let Some((current, version)) = load_action(self.filesystem.as_ref(), &path).await?
             else {
@@ -166,7 +196,17 @@ impl FilesystemIdempotencyLedger {
                 )
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    if self.should_prune_after_settle()
+                        && let Err(error) = self.prune_settled_entries().await
+                    {
+                        tracing::debug!(
+                            error = %error,
+                            "product workflow idempotency ledger failed to prune settled entries"
+                        );
+                    }
+                    return Ok(());
+                }
                 Err(FilesystemError::VersionMismatch { .. }) => continue,
                 Err(error) => return Err(filesystem_error("settle action", error)),
             }
@@ -174,7 +214,7 @@ impl FilesystemIdempotencyLedger {
     }
 
     async fn release(&self, action: ProductInboundAction) -> Result<(), ProductWorkflowError> {
-        let path = action_path(&self.root, &action.fingerprint);
+        let path = action_path(&self.root, &action.fingerprint)?;
         loop {
             let Some((current, version)) = load_action(self.filesystem.as_ref(), &path).await?
             else {
@@ -199,6 +239,122 @@ impl FilesystemIdempotencyLedger {
                 Err(FilesystemError::VersionMismatch { .. }) => continue,
                 Err(error) => return Err(filesystem_error("release action", error)),
             }
+        }
+    }
+
+    async fn prune_settled_entries(&self) -> Result<(), ProductWorkflowError> {
+        let Some(limit) = self.settled_entry_limit else {
+            return Ok(());
+        };
+        let mut settled = self.load_settled_actions().await?;
+        if settled.len() <= limit.get() {
+            return Ok(());
+        }
+        if !self.try_acquire_prune_lease().await? {
+            return Ok(());
+        }
+        settled.sort_by(|left, right| {
+            left.received_at
+                .cmp(&right.received_at)
+                .then_with(|| left.action_id.as_uuid().cmp(&right.action_id.as_uuid()))
+        });
+        let prune_count = settled.len() - limit.get();
+        for action in settled.into_iter().take(prune_count) {
+            self.prune_settled_action_if_current(&action).await?;
+        }
+        Ok(())
+    }
+
+    fn should_prune_after_settle(&self) -> bool {
+        if self.settled_entry_limit.is_none() {
+            return false;
+        }
+        let interval = self.settled_prune_interval.get();
+        self.settled_since_prune
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1)
+            % interval
+            == 0
+    }
+
+    async fn try_acquire_prune_lease(&self) -> Result<bool, ProductWorkflowError> {
+        let path = prune_lease_path(&self.root)?;
+        let entry = prune_lease_entry(Utc::now() + Duration::seconds(PRUNE_LEASE_SECONDS))?;
+        match self
+            .filesystem
+            .put(&path, entry.clone(), CasExpectation::Absent)
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(FilesystemError::VersionMismatch { .. }) => {}
+            Err(error) => return Err(filesystem_error("acquire prune lease", error)),
+        }
+
+        let Some(existing) = self
+            .filesystem
+            .get(&path)
+            .await
+            .map_err(|error| filesystem_error("load prune lease", error))?
+        else {
+            return Ok(false);
+        };
+        if prune_lease_is_fresh(&existing.entry)? {
+            return Ok(false);
+        }
+        match self
+            .filesystem
+            .put(&path, entry, CasExpectation::Version(existing.version))
+            .await
+        {
+            Ok(_) => Ok(true),
+            Err(FilesystemError::VersionMismatch { .. }) => Ok(false),
+            Err(error) => Err(filesystem_error("renew prune lease", error)),
+        }
+    }
+
+    async fn prune_settled_action_if_current(
+        &self,
+        action: &ProductInboundAction,
+    ) -> Result<(), ProductWorkflowError> {
+        let path = action_path(&self.root, &action.fingerprint)?;
+        let Some((current, _version)) = load_action(self.filesystem.as_ref(), &path).await? else {
+            return Ok(());
+        };
+        if current.action_id != action.action_id || !matches!(current.phase, ActionPhase::Settled) {
+            return Ok(());
+        }
+        match self.filesystem.delete(&path).await {
+            Ok(()) | Err(FilesystemError::NotFound { .. }) => Ok(()),
+            Err(error) => Err(filesystem_error("prune settled action", error)),
+        }
+    }
+
+    async fn load_settled_actions(
+        &self,
+    ) -> Result<Vec<ProductInboundAction>, ProductWorkflowError> {
+        let mut actions = Vec::new();
+        let mut offset = 0;
+        loop {
+            let page = Page::new(offset, Page::MAX_LIMIT);
+            let entries = self
+                .filesystem
+                .query(&self.root, &settled_action_filter()?, page)
+                .await
+                .map_err(|error| filesystem_error("query settled actions", error))?;
+            let received = entries.len();
+            for entry in entries {
+                let action: ProductInboundAction = entry
+                    .entry
+                    .parse_json()
+                    .map_err(|error| durable_error("deserialize action", error))?;
+                if matches!(action.phase, ActionPhase::Settled) {
+                    actions.push(action);
+                }
+            }
+            if received < Page::MAX_LIMIT as usize {
+                return Ok(actions);
+            }
+            offset += u64::from(Page::MAX_LIMIT);
         }
     }
 }
@@ -250,6 +406,16 @@ where
             ),
             _filesystem: std::marker::PhantomData,
         }
+    }
+
+    pub fn with_settled_entry_limit(mut self, limit: NonZeroUsize) -> Self {
+        self.inner = self.inner.with_settled_entry_limit(limit);
+        self
+    }
+
+    pub fn with_settled_prune_interval(mut self, interval: NonZeroUsize) -> Self {
+        self.inner = self.inner.with_settled_prune_interval(interval);
+        self
     }
 }
 
@@ -308,6 +474,16 @@ impl RebornLibSqlIdempotencyLedger {
             inner: FilesystemIdempotencyLedger::with_root(filesystem, root, in_flight_lease),
         }
     }
+
+    pub fn with_settled_entry_limit(mut self, limit: NonZeroUsize) -> Self {
+        self.inner = self.inner.with_settled_entry_limit(limit);
+        self
+    }
+
+    pub fn with_settled_prune_interval(mut self, interval: NonZeroUsize) -> Self {
+        self.inner = self.inner.with_settled_prune_interval(interval);
+        self
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -363,6 +539,16 @@ impl RebornPostgresIdempotencyLedger {
             inner: FilesystemIdempotencyLedger::with_root(filesystem, root, in_flight_lease),
         }
     }
+
+    pub fn with_settled_entry_limit(mut self, limit: NonZeroUsize) -> Self {
+        self.inner = self.inner.with_settled_entry_limit(limit);
+        self
+    }
+
+    pub fn with_settled_prune_interval(mut self, interval: NonZeroUsize) -> Self {
+        self.inner = self.inner.with_settled_prune_interval(interval);
+        self
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -389,15 +575,21 @@ impl IdempotencyLedger for RebornPostgresIdempotencyLedger {
 trait LedgerFilesystem: Send + Sync {
     async fn put(
         &self,
-        path: &str,
+        path: &LedgerPath,
         entry: Entry,
         cas: CasExpectation,
     ) -> Result<RecordVersion, FilesystemError>;
 
-    async fn get(
+    async fn get(&self, path: &LedgerPath) -> Result<Option<VersionedEntry>, FilesystemError>;
+
+    async fn query(
         &self,
-        path: &str,
-    ) -> Result<Option<ironclaw_filesystem::VersionedEntry>, FilesystemError>;
+        root: &LedgerRoot,
+        filter: &Filter,
+        page: Page,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError>;
+
+    async fn delete(&self, path: &LedgerPath) -> Result<(), FilesystemError>;
 }
 
 struct RootLedgerFilesystem {
@@ -408,20 +600,40 @@ struct RootLedgerFilesystem {
 impl LedgerFilesystem for RootLedgerFilesystem {
     async fn put(
         &self,
-        path: &str,
+        path: &LedgerPath,
         entry: Entry,
         cas: CasExpectation,
     ) -> Result<RecordVersion, FilesystemError> {
-        let path = VirtualPath::new(path.to_string()).map_err(FilesystemError::from)?;
-        self.filesystem.put(&path, entry, cas).await
+        let LedgerPath::Root(path) = path else {
+            return Err(ledger_path_kind_error(FilesystemOperation::WriteFile));
+        };
+        self.filesystem.put(path, entry, cas).await
     }
 
-    async fn get(
+    async fn get(&self, path: &LedgerPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        let LedgerPath::Root(path) = path else {
+            return Err(ledger_path_kind_error(FilesystemOperation::ReadFile));
+        };
+        self.filesystem.get(path).await
+    }
+
+    async fn query(
         &self,
-        path: &str,
-    ) -> Result<Option<ironclaw_filesystem::VersionedEntry>, FilesystemError> {
-        let path = VirtualPath::new(path.to_string()).map_err(FilesystemError::from)?;
-        self.filesystem.get(&path).await
+        root: &LedgerRoot,
+        filter: &Filter,
+        page: Page,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+        let LedgerRoot::Root(root) = root else {
+            return Err(ledger_path_kind_error(FilesystemOperation::Query));
+        };
+        self.filesystem.query(root, filter, page).await
+    }
+
+    async fn delete(&self, path: &LedgerPath) -> Result<(), FilesystemError> {
+        let LedgerPath::Root(path) = path else {
+            return Err(ledger_path_kind_error(FilesystemOperation::Delete));
+        };
+        self.filesystem.delete(path).await
     }
 }
 
@@ -440,21 +652,64 @@ where
 {
     async fn put(
         &self,
-        path: &str,
+        path: &LedgerPath,
         entry: Entry,
         cas: CasExpectation,
     ) -> Result<RecordVersion, FilesystemError> {
-        let path = ScopedPath::new(path.to_string()).map_err(FilesystemError::from)?;
-        self.filesystem.put(&self.scope, &path, entry, cas).await
+        let LedgerPath::Scoped(path) = path else {
+            return Err(ledger_path_kind_error(FilesystemOperation::WriteFile));
+        };
+        self.filesystem.put(&self.scope, path, entry, cas).await
     }
 
-    async fn get(
-        &self,
-        path: &str,
-    ) -> Result<Option<ironclaw_filesystem::VersionedEntry>, FilesystemError> {
-        let path = ScopedPath::new(path.to_string()).map_err(FilesystemError::from)?;
-        self.filesystem.get(&self.scope, &path).await
+    async fn get(&self, path: &LedgerPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        let LedgerPath::Scoped(path) = path else {
+            return Err(ledger_path_kind_error(FilesystemOperation::ReadFile));
+        };
+        self.filesystem.get(&self.scope, path).await
     }
+
+    async fn query(
+        &self,
+        root: &LedgerRoot,
+        filter: &Filter,
+        page: Page,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+        let LedgerRoot::Scoped(root) = root else {
+            return Err(ledger_path_kind_error(FilesystemOperation::Query));
+        };
+        self.filesystem.query(&self.scope, root, filter, page).await
+    }
+
+    async fn delete(&self, path: &LedgerPath) -> Result<(), FilesystemError> {
+        let LedgerPath::Scoped(path) = path else {
+            return Err(ledger_path_kind_error(FilesystemOperation::Delete));
+        };
+        self.filesystem.delete(&self.scope, path).await
+    }
+}
+
+enum LedgerRoot {
+    Root(VirtualPath),
+    Scoped(ScopedPath),
+}
+
+impl LedgerRoot {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Root(path) => path.as_str(),
+            Self::Scoped(path) => path.as_str(),
+        }
+    }
+}
+
+enum LedgerPath {
+    Root(VirtualPath),
+    Scoped(ScopedPath),
+}
+
+fn settled_prune_interval_for(limit: NonZeroUsize) -> NonZeroUsize {
+    NonZeroUsize::new((limit.get() / 10).max(1)).expect("non-zero derived interval") // safety: max(1) guarantees a non-zero value.
 }
 
 fn transient(reason: impl Into<String>) -> ProductWorkflowError {
@@ -495,7 +750,7 @@ fn expired_received_at(received_at: DateTime<Utc>, lease: Duration) -> DateTime<
 
 async fn load_action(
     filesystem: &dyn LedgerFilesystem,
-    path: &str,
+    path: &LedgerPath,
 ) -> Result<Option<(ProductInboundAction, RecordVersion)>, ProductWorkflowError> {
     let Some(entry) = filesystem
         .get(path)
@@ -550,6 +805,49 @@ fn entry_for_action(action: &ProductInboundAction) -> Result<Entry, ProductWorkf
     Ok(entry)
 }
 
+fn settled_action_filter() -> Result<Filter, ProductWorkflowError> {
+    Ok(Filter::Eq {
+        key: index_key("phase")?,
+        value: text(phase_label(ActionPhase::Settled)),
+    })
+}
+
+fn prune_lease_path(root: &LedgerRoot) -> Result<LedgerPath, ProductWorkflowError> {
+    let path = format!(
+        "{}/_control/prune_lease.json",
+        root.as_str().trim_end_matches('/')
+    );
+    match root {
+        LedgerRoot::Root(_) => VirtualPath::new(path)
+            .map(LedgerPath::Root)
+            .map_err(|error| durable_error("construct prune lease path", error)),
+        LedgerRoot::Scoped(_) => ScopedPath::new(path)
+            .map(LedgerPath::Scoped)
+            .map_err(|error| durable_error("construct prune lease path", error)),
+    }
+}
+
+fn prune_lease_entry(expires_at: DateTime<Utc>) -> Result<Entry, ProductWorkflowError> {
+    let payload = serde_json::json!({
+        "expires_at_ms": expires_at.timestamp_millis(),
+    });
+    let kind = RecordKind::new(PRUNE_LEASE_RECORD_KIND)
+        .map_err(|error| durable_error("construct prune lease record kind", error))?;
+    Entry::record(kind, &payload)
+        .map_err(|error| durable_error("serialize prune lease entry", error))
+}
+
+fn prune_lease_is_fresh(entry: &Entry) -> Result<bool, ProductWorkflowError> {
+    let payload: serde_json::Value = entry
+        .parse_json()
+        .map_err(|error| durable_error("deserialize prune lease", error))?;
+    let expires_at_ms = payload
+        .get("expires_at_ms")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(0);
+    Ok(expires_at_ms > Utc::now().timestamp_millis())
+}
+
 fn index_key(value: &'static str) -> Result<IndexKey, ProductWorkflowError> {
     IndexKey::new(value).map_err(|error| durable_error("construct action index key", error))
 }
@@ -567,21 +865,46 @@ fn phase_label(phase: ActionPhase) -> &'static str {
     }
 }
 
-fn action_path(root: &str, fingerprint: &ActionFingerprintKey) -> String {
-    format!(
+fn action_path(
+    root: &LedgerRoot,
+    fingerprint: &ActionFingerprintKey,
+) -> Result<LedgerPath, ProductWorkflowError> {
+    let path = format!(
         "{}/{}/{}/{}/{}/{}/{}.json",
-        root.trim_end_matches('/'),
+        root.as_str().trim_end_matches('/'),
         hex_component(fingerprint.adapter_id.as_str()),
         hex_component(fingerprint.installation_id.as_str()),
         hex_component(fingerprint.external_actor_ref.kind()),
         hex_component(fingerprint.external_actor_ref.id()),
         hex_component(fingerprint.source_binding_key.as_str()),
         hex_component(fingerprint.external_event_id.as_str())
-    )
+    );
+    match root {
+        LedgerRoot::Root(_) => VirtualPath::new(path)
+            .map(LedgerPath::Root)
+            .map_err(|error| durable_error("construct action path", error)),
+        LedgerRoot::Scoped(_) => ScopedPath::new(path)
+            .map(LedgerPath::Scoped)
+            .map_err(|error| durable_error("construct action path", error)),
+    }
 }
 
-fn default_ledger_root() -> String {
-    DEFAULT_LEDGER_ROOT.to_string()
+fn default_ledger_root() -> VirtualPath {
+    // safety: DEFAULT_LEDGER_ROOT is a static absolute virtual path literal.
+    VirtualPath::new(DEFAULT_LEDGER_ROOT).expect("default ledger root is a valid virtual path")
+}
+
+fn default_scoped_ledger_root() -> ScopedPath {
+    // safety: DEFAULT_LEDGER_ROOT is also valid in the scoped path grammar.
+    ScopedPath::new(DEFAULT_LEDGER_ROOT).expect("default ledger root is a valid scoped path")
+}
+
+fn ledger_path_kind_error(operation: FilesystemOperation) -> FilesystemError {
+    FilesystemError::Backend {
+        path: default_ledger_root(),
+        operation,
+        reason: "ledger path kind did not match filesystem adapter".to_string(),
+    }
 }
 
 fn hex_component(value: &str) -> String {

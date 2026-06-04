@@ -46,6 +46,7 @@ const SLACK_RUN_POLL_JITTER_BUCKETS: u32 = 5;
 pub struct SlackFinalReplyDeliverySettings {
     pub poll_interval: Duration,
     pub max_wait: Duration,
+    pub message_max_wait: Duration,
     pub max_concurrent_deliveries: NonZeroUsize,
 }
 
@@ -54,6 +55,7 @@ impl Default for SlackFinalReplyDeliverySettings {
         Self {
             poll_interval: Duration::from_millis(250),
             max_wait: Duration::from_secs(120),
+            message_max_wait: Duration::from_secs(2),
             max_concurrent_deliveries: NonZeroUsize::new(64).expect("non-zero literal"), // safety: static default literal is non-zero.
         }
     }
@@ -113,7 +115,7 @@ impl SlackFinalReplyDeliveryObserver {
         let (event_kind, payload) = match actionable_state.status {
             TurnStatus::Completed => {
                 let Some(text) = self
-                    .read_latest_assistant_text(&thread_scope, &binding, run_id)
+                    .wait_for_latest_assistant_text(&thread_scope, &binding, run_id)
                     .await?
                 else {
                     tracing::warn!(
@@ -281,6 +283,31 @@ impl SlackFinalReplyDeliveryObserver {
             })
             .await?
             .and_then(|message| message.content))
+    }
+
+    async fn wait_for_latest_assistant_text(
+        &self,
+        thread_scope: &ThreadScope,
+        binding: &ResolvedBinding,
+        run_id: TurnRunId,
+    ) -> Result<Option<String>, SlackFinalReplyDeliveryError> {
+        let start = Instant::now();
+        let mut poll_interval = self.settings.poll_interval;
+        loop {
+            if let Some(text) = self
+                .read_latest_assistant_text(thread_scope, binding, run_id)
+                .await?
+            {
+                return Ok(Some(text));
+            }
+            if start.elapsed() >= self.settings.message_max_wait {
+                return Ok(None);
+            }
+            tokio::time::sleep(jittered_poll_interval(poll_interval, &run_id)).await;
+            poll_interval = poll_interval
+                .saturating_mul(2)
+                .min(MAX_SLACK_RUN_POLL_INTERVAL);
+        }
     }
 }
 

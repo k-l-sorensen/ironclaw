@@ -1,6 +1,8 @@
 #![cfg(any(feature = "libsql", feature = "postgres"))]
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
+use std::num::NonZeroUsize;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 use std::sync::Arc;
 #[cfg(feature = "postgres")]
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -303,6 +305,47 @@ async fn assert_actor_identity_is_part_of_fingerprint_path(
     ));
 }
 
+async fn assert_settled_entry_limit_prunes_oldest(ledger: &dyn IdempotencyLedger, suffix: &str) {
+    let received_at = Utc::now();
+    let oldest = fingerprint(&format!("{suffix}-oldest"));
+    let newest = fingerprint(&format!("{suffix}-newest"));
+
+    let IdempotencyDecision::New(mut oldest_action) = ledger
+        .begin_or_replay(oldest.clone(), received_at)
+        .await
+        .expect("begin oldest")
+    else {
+        panic!("expected new oldest action");
+    };
+    oldest_action.settle(ProductInboundAck::NoOp);
+    ledger.settle(oldest_action).await.expect("settle oldest");
+
+    let IdempotencyDecision::New(mut newest_action) = ledger
+        .begin_or_replay(newest.clone(), received_at + Duration::seconds(1))
+        .await
+        .expect("begin newest")
+    else {
+        panic!("expected new newest action");
+    };
+    newest_action.settle(ProductInboundAck::NoOp);
+    ledger.settle(newest_action).await.expect("settle newest");
+
+    assert!(matches!(
+        ledger
+            .begin_or_replay(oldest, received_at + Duration::seconds(2))
+            .await
+            .expect("oldest was pruned and can reserve again"),
+        IdempotencyDecision::New(_)
+    ));
+    assert!(matches!(
+        ledger
+            .begin_or_replay(newest, received_at + Duration::seconds(2))
+            .await
+            .expect("newest remains available for replay"),
+        IdempotencyDecision::Replay(_)
+    ));
+}
+
 #[tokio::test]
 async fn scoped_filesystem_settled_action_replays() {
     let filesystem = scoped_filesystem();
@@ -329,6 +372,35 @@ async fn scoped_filesystem_in_flight_action_blocks_until_lease_expires() {
     );
 
     assert_in_flight_action_blocks_until_lease_expires(&ledger, "scoped-lease").await;
+}
+
+#[tokio::test]
+async fn scoped_filesystem_duplicate_reservation_contention_serializes() {
+    let filesystem = scoped_filesystem();
+    let first = RebornFilesystemIdempotencyLedger::with_in_flight_lease(
+        Arc::clone(&filesystem),
+        resource_scope("user:scoped-contention"),
+        Duration::seconds(10),
+    );
+    let second = RebornFilesystemIdempotencyLedger::with_in_flight_lease(
+        filesystem,
+        resource_scope("user:scoped-contention"),
+        Duration::seconds(10),
+    );
+
+    assert_duplicate_reservation_contention_serializes(&first, &second, "scoped-contention").await;
+}
+
+#[tokio::test]
+async fn scoped_filesystem_settled_entry_limit_prunes_oldest() {
+    let ledger = RebornFilesystemIdempotencyLedger::with_in_flight_lease(
+        scoped_filesystem(),
+        resource_scope("user:scoped-retention"),
+        Duration::seconds(10),
+    )
+    .with_settled_entry_limit(NonZeroUsize::new(1).expect("non-zero limit"));
+
+    assert_settled_entry_limit_prunes_oldest(&ledger, "scoped-retention").await;
 }
 
 #[cfg(feature = "libsql")]
@@ -384,6 +456,20 @@ async fn libsql_duplicate_reservation_contention_serializes() {
     );
 
     assert_duplicate_reservation_contention_serializes(&first, &second, "libsql-contention").await;
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_settled_entry_limit_prunes_oldest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("workflow-ledger.db");
+    let ledger = RebornLibSqlIdempotencyLedger::with_in_flight_lease(
+        libsql_filesystem(&db_path.display().to_string()).await,
+        Duration::seconds(10),
+    )
+    .with_settled_entry_limit(NonZeroUsize::new(1).expect("non-zero limit"));
+
+    assert_settled_entry_limit_prunes_oldest(&ledger, "libsql-retention").await;
 }
 
 #[cfg(feature = "libsql")]
@@ -502,6 +588,19 @@ async fn postgres_duplicate_reservation_contention_serializes_when_configured() 
         &unique_suffix("postgres-contention"),
     )
     .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_settled_entry_limit_prunes_oldest_when_configured() {
+    let Some(filesystem) = postgres_filesystem().await else {
+        return;
+    };
+    let ledger =
+        RebornPostgresIdempotencyLedger::with_in_flight_lease(filesystem, Duration::seconds(10))
+            .with_settled_entry_limit(NonZeroUsize::new(1).expect("non-zero limit"));
+
+    assert_settled_entry_limit_prunes_oldest(&ledger, &unique_suffix("postgres-retention")).await;
 }
 
 #[cfg(feature = "postgres")]

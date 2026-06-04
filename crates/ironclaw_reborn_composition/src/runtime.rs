@@ -60,9 +60,7 @@ use ironclaw_product_workflow::{
     RunStateApprovalInteractionReadModel,
 };
 use ironclaw_reborn::loop_exit_applier::ThreadCheckpointLoopExitEvidencePort;
-use ironclaw_reborn::milestone_events::{
-    DurableLoopHostMilestoneScope, DurableLoopHostMilestoneSink,
-};
+use ironclaw_reborn::milestone_events::RunScopedDurableLoopHostMilestoneSink;
 use ironclaw_reborn::runtime::{
     DefaultPlannedRuntimeBuildError, DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts,
     build_default_planned_runtime,
@@ -553,6 +551,26 @@ impl RebornRuntime {
         Arc::get_mut(local_runtime)
             .expect("test must mutate local runtime services before cloning the service Arc")
             .runtime_http_egress = runtime_http_egress;
+    }
+
+    #[cfg(all(test, feature = "slack-v2-host-beta"))]
+    pub(crate) fn clear_local_runtime_for_test(&mut self) {
+        self.services.local_runtime = None;
+    }
+
+    #[cfg(all(test, feature = "slack-v2-host-beta"))]
+    pub(crate) async fn turn_persistence_snapshot_for_test(
+        &self,
+    ) -> Option<TurnPersistenceSnapshot> {
+        let local_runtime = self.services.local_runtime.as_ref()?;
+        #[cfg(feature = "libsql")]
+        {
+            local_runtime.turn_state.persistence_snapshot().await.ok()
+        }
+        #[cfg(not(feature = "libsql"))]
+        {
+            Some(local_runtime.turn_state.persistence_snapshot())
+        }
     }
 
     /// Diagnostic id for the no-profile run profile selected by this runtime.
@@ -1380,16 +1398,8 @@ pub async fn build_reborn_runtime(
     ));
     let event_log = Arc::clone(&local_runtime.event_log);
     let audit_log = Arc::clone(&local_runtime.audit_log);
-    let milestone_thread_scope = ThreadScope {
-        owner_user_id: Some(actor_user_id.clone()),
-        ..thread_scope.clone()
-    };
-    let milestone_scope = DurableLoopHostMilestoneScope::from_thread_scope(&milestone_thread_scope)
-        .map_err(|error| RebornRuntimeError::InvalidArgument {
-            reason: error.to_string(),
-        })?;
     let durable_milestone_sink: Arc<dyn LoopHostMilestoneSink> = Arc::new(
-        DurableLoopHostMilestoneSink::new(Arc::clone(&event_log), milestone_scope),
+        RunScopedDurableLoopHostMilestoneSink::new(Arc::clone(&event_log), thread_scope.clone()),
     );
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     let subagent_goal_store = Arc::new(FilesystemSubagentGoalStore::new(Arc::clone(

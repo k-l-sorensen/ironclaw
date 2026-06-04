@@ -184,6 +184,95 @@ impl LoopHostMilestoneSink for DurableLoopHostMilestoneSink {
     }
 }
 
+/// Durable milestone sink that derives per-run owner/project scope after
+/// validating the run against the runtime's canonical base thread scope.
+pub struct RunScopedDurableLoopHostMilestoneSink {
+    event_log: Arc<dyn DurableEventLog>,
+    base_thread_scope: ThreadScope,
+}
+
+impl RunScopedDurableLoopHostMilestoneSink {
+    pub fn new(event_log: Arc<dyn DurableEventLog>, base_thread_scope: ThreadScope) -> Self {
+        Self {
+            event_log,
+            base_thread_scope,
+        }
+    }
+
+    fn thread_scope_for_milestone(
+        &self,
+        milestone: &LoopHostMilestone,
+    ) -> Result<ThreadScope, AgentLoopHostError> {
+        let Some(agent_id) = milestone.scope.agent_id.clone() else {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "loop milestone event scope requires an agent-scoped run",
+            ));
+        };
+        if self.base_thread_scope.tenant_id != milestone.scope.tenant_id
+            || self.base_thread_scope.agent_id != agent_id
+        {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::ScopeMismatch,
+                "loop milestone scope does not match runtime thread scope",
+            ));
+        }
+        if self.base_thread_scope.project_id.is_some()
+            && self.base_thread_scope.project_id != milestone.scope.project_id
+        {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::ScopeMismatch,
+                "loop milestone project does not match runtime thread scope",
+            ));
+        }
+        let Some(actor) = milestone.actor.as_ref() else {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "loop milestone event scope requires a run actor",
+            ));
+        };
+        Ok(ThreadScope {
+            tenant_id: self.base_thread_scope.tenant_id.clone(),
+            agent_id: self.base_thread_scope.agent_id.clone(),
+            project_id: self
+                .base_thread_scope
+                .project_id
+                .clone()
+                .or_else(|| milestone.scope.project_id.clone()),
+            owner_user_id: Some(actor.user_id.clone()),
+            mission_id: self.base_thread_scope.mission_id.clone(),
+        })
+    }
+}
+
+impl std::fmt::Debug for RunScopedDurableLoopHostMilestoneSink {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RunScopedDurableLoopHostMilestoneSink")
+            .field("event_log", &"<durable_event_log>")
+            .field("base_thread_scope", &self.base_thread_scope)
+            .finish()
+    }
+}
+
+#[async_trait]
+impl LoopHostMilestoneSink for RunScopedDurableLoopHostMilestoneSink {
+    async fn publish_loop_milestone(
+        &self,
+        milestone: LoopHostMilestone,
+    ) -> Result<(), AgentLoopHostError> {
+        let thread_scope = self.thread_scope_for_milestone(&milestone)?;
+        let scope = DurableLoopHostMilestoneScope::from_thread_scope_for_run(
+            &thread_scope,
+            milestone.scope.thread_id.clone(),
+            milestone.run_id,
+        )?;
+        DurableLoopHostMilestoneSink::new(Arc::clone(&self.event_log), scope)
+            .publish_loop_milestone(milestone)
+            .await
+    }
+}
+
 impl DurableLoopHostMilestoneSink {
     fn runtime_event_for_milestone(
         &self,
@@ -379,7 +468,7 @@ mod tests {
     };
     use ironclaw_threads::ThreadScope;
     use ironclaw_turns::{
-        CapabilityActivityId, TurnId, TurnScope,
+        CapabilityActivityId, TurnActor, TurnId, TurnScope,
         run_profile::{
             CapabilityFailureKind, HookDecisionSummary, LoopDriverId, LoopHostMilestone,
         },
@@ -426,6 +515,70 @@ mod tests {
         )
         .expect("durable milestone scope requires owner user — fixture supplies one");
         DurableLoopHostMilestoneSink::new(event_log, milestone_scope)
+    }
+
+    #[tokio::test]
+    async fn run_scoped_sink_partitions_events_by_run_project_and_actor() {
+        let event_log = Arc::new(InMemoryDurableEventLog::new());
+        let mut base_scope = fixture_thread_scope();
+        base_scope.project_id = None;
+        base_scope.owner_user_id = Some(UserId::new("user-runtime-owner").unwrap());
+        let sink =
+            RunScopedDurableLoopHostMilestoneSink::new(event_log.clone(), base_scope.clone());
+        let (mut milestone, thread_id, run_id) =
+            fixture_milestone(LoopHostMilestoneKind::ModelStarted {
+                requested_model_profile_id: None,
+            });
+        let actor = UserId::new("user-run-actor").unwrap();
+        milestone.actor = Some(TurnActor::new(actor.clone()));
+
+        sink.publish_loop_milestone(milestone)
+            .await
+            .expect("project-agnostic runtime scope adopts run project and actor");
+
+        let expected_scope = ResourceScope {
+            tenant_id: base_scope.tenant_id,
+            user_id: actor,
+            agent_id: Some(base_scope.agent_id),
+            project_id: Some(ProjectId::new("project-hook-projection").unwrap()),
+            mission_id: None,
+            thread_id: Some(thread_id),
+            invocation_id: InvocationId::from_uuid(run_id.as_uuid()),
+        };
+        let replay = event_log
+            .read_after_cursor(
+                &EventStreamKey::from_scope(&expected_scope),
+                &ReadScope::any(),
+                None,
+                10,
+            )
+            .await
+            .expect("read projected run-scoped event");
+        assert_eq!(replay.entries.len(), 1);
+        assert_eq!(
+            replay.entries[0].record.kind,
+            RuntimeEventKind::ModelStarted
+        );
+    }
+
+    #[tokio::test]
+    async fn run_scoped_sink_rejects_fixed_project_mismatch() {
+        let event_log = Arc::new(InMemoryDurableEventLog::new());
+        let mut base_scope = fixture_thread_scope();
+        base_scope.project_id = Some(ProjectId::new("project-fixed").unwrap());
+        let sink = RunScopedDurableLoopHostMilestoneSink::new(event_log, base_scope);
+        let (mut milestone, _thread_id, _run_id) =
+            fixture_milestone(LoopHostMilestoneKind::ModelStarted {
+                requested_model_profile_id: None,
+            });
+        milestone.actor = Some(TurnActor::new(UserId::new("user-run-actor").unwrap()));
+
+        let error = sink
+            .publish_loop_milestone(milestone)
+            .await
+            .expect_err("fixed runtime project must not be overridden by run milestone");
+
+        assert_eq!(error.kind, AgentLoopHostErrorKind::ScopeMismatch);
     }
 
     #[test]

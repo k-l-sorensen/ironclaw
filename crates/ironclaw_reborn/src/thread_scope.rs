@@ -7,15 +7,15 @@
 //! loop-exit completion-evidence read ([`crate::loop_exit_applier`]).
 //!
 //! [`ThreadScopeResolver::resolve`] is the single definition of that
-//! owner-rewrite rule. Both subsystems call it, so the rule cannot drift
+//! owner/project rewrite rule. Both subsystems call it, so the rule cannot drift
 //! between them — a second hand-rolled copy silently regressing
 //! multi-user isolation is exactly the maintainability hazard this
 //! removes.
 
 use ironclaw_threads::ThreadScope;
-use ironclaw_turns::TurnActor;
+use ironclaw_turns::{TurnActor, TurnScope, run_profile::LoopRunContext};
 
-/// Canonical owner-scoping rule for per-caller thread isolation.
+/// Canonical scoping rule for per-caller and per-project thread isolation.
 pub(crate) struct ThreadScopeResolver;
 
 impl ThreadScopeResolver {
@@ -35,12 +35,59 @@ impl ThreadScopeResolver {
         }
         scope
     }
+
+    pub(crate) fn resolve_for_run(
+        base: &ThreadScope,
+        run_context: &LoopRunContext,
+    ) -> Result<ThreadScope, ThreadScopeResolutionError> {
+        Self::resolve_for_turn_scope(base, &run_context.scope, run_context.actor())
+    }
+
+    pub(crate) fn resolve_for_turn_scope(
+        base: &ThreadScope,
+        turn_scope: &TurnScope,
+        actor: Option<&TurnActor>,
+    ) -> Result<ThreadScope, ThreadScopeResolutionError> {
+        if base.tenant_id != turn_scope.tenant_id
+            || turn_scope.agent_id.as_ref() != Some(&base.agent_id)
+        {
+            return Err(ThreadScopeResolutionError::ScopeMismatch);
+        }
+        if base.project_id.is_some() && base.project_id != turn_scope.project_id {
+            return Err(ThreadScopeResolutionError::ProjectMismatch);
+        }
+        let mut scope = Self::resolve(base, actor);
+        if scope.project_id.is_none() {
+            scope.project_id = turn_scope.project_id.clone();
+        }
+        Ok(scope)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ThreadScopeResolutionError {
+    ScopeMismatch,
+    ProjectMismatch,
+}
+
+impl std::fmt::Display for ThreadScopeResolutionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ScopeMismatch => write!(formatter, "thread scope does not match turn scope"),
+            Self::ProjectMismatch => {
+                write!(
+                    formatter,
+                    "turn project does not match fixed thread scope project"
+                )
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironclaw_host_api::{AgentId, TenantId, UserId};
+    use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId, UserId};
 
     fn scope(owner: Option<&str>) -> ThreadScope {
         ThreadScope {
@@ -54,6 +101,15 @@ mod tests {
 
     fn actor(user: &str) -> TurnActor {
         TurnActor::new(UserId::new(user).expect("user"))
+    }
+
+    fn turn_scope(project_id: Option<&str>) -> TurnScope {
+        TurnScope::new(
+            TenantId::new("tenant").expect("tenant"),
+            Some(AgentId::new("agent").expect("agent")),
+            project_id.map(|project| ProjectId::new(project).expect("project")),
+            ThreadId::new("thread").expect("thread"),
+        )
     }
 
     #[test]
@@ -83,5 +139,40 @@ mod tests {
             resolved.owner_user_id.is_none(),
             "an owner-agnostic base must stay system/shared-scoped"
         );
+    }
+
+    #[test]
+    fn resolve_for_turn_scope_uses_turn_project_axis() {
+        let base = scope(Some("runtime-owner"));
+        let resolved = ThreadScopeResolver::resolve_for_turn_scope(
+            &base,
+            &turn_scope(Some("project-alpha")),
+            Some(&actor("alice")),
+        )
+        .expect("project-agnostic base accepts turn project");
+
+        assert_eq!(
+            resolved.project_id.as_ref().map(|project| project.as_str()),
+            Some("project-alpha")
+        );
+        assert_eq!(
+            resolved.owner_user_id.as_ref().map(|user| user.as_str()),
+            Some("alice")
+        );
+    }
+
+    #[test]
+    fn resolve_for_turn_scope_rejects_fixed_project_mismatch() {
+        let mut base = scope(Some("runtime-owner"));
+        base.project_id = Some(ProjectId::new("project-alpha").expect("project"));
+
+        let error = ThreadScopeResolver::resolve_for_turn_scope(
+            &base,
+            &turn_scope(Some("project-beta")),
+            Some(&actor("alice")),
+        )
+        .expect_err("fixed project base must not be overridden by turn scope");
+
+        assert_eq!(error, ThreadScopeResolutionError::ProjectMismatch);
     }
 }

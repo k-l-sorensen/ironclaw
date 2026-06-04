@@ -62,6 +62,8 @@ const SLACK_SIGNATURE_HEADER: &str = "X-Slack-Signature";
 const SLACK_TIMESTAMP_HEADER: &str = "X-Slack-Request-Timestamp";
 const SLACK_WEBHOOK_WORKFLOW_TIMEOUT: Duration = Duration::from_secs(55);
 const SLACK_MAX_IN_FLIGHT_WEBHOOKS: usize = 64;
+const SLACK_IDEMPOTENCY_LEDGER_SETTLED_LIMIT: usize = 10_000;
+const SLACK_IDEMPOTENCY_LEDGER_PRUNE_INTERVAL: usize = 1_000;
 
 struct NoopSlackDeliverySink;
 
@@ -274,7 +276,7 @@ pub async fn build_slack_events_route_mount_with_actor_user_resolver(
     let scope = ProductInstallationScope::with_default_scope(
         config.tenant_id.clone(),
         config.agent_id.clone(),
-        None,
+        config.project_id.clone(),
     )
     .with_actor_user_resolver(actor_user_resolver, actor_pairings);
     let installation_resolver = StaticProductInstallationResolver::new([(
@@ -291,10 +293,22 @@ pub async fn build_slack_events_route_mount_with_actor_user_resolver(
     let workflow = Arc::new(
         DefaultProductWorkflow::new(
             inbound,
-            Arc::new(RebornFilesystemIdempotencyLedger::new(
-                Arc::clone(&local_runtime.host_state_filesystem),
-                slack_egress_scope(&config),
-            )),
+            Arc::new(
+                RebornFilesystemIdempotencyLedger::new(
+                    Arc::clone(&local_runtime.host_state_filesystem),
+                    slack_egress_scope(&config),
+                )
+                .with_settled_entry_limit(
+                    NonZeroUsize::new(SLACK_IDEMPOTENCY_LEDGER_SETTLED_LIMIT).ok_or_else(|| {
+                        invalid_config("settled_entry_limit", "must be non-zero".to_string())
+                    })?,
+                )
+                .with_settled_prune_interval(
+                    NonZeroUsize::new(SLACK_IDEMPOTENCY_LEDGER_PRUNE_INTERVAL).ok_or_else(
+                        || invalid_config("settled_prune_interval", "must be non-zero".to_string()),
+                    )?,
+                ),
+            ),
             Arc::new(binding.clone()),
         )
         .with_approval_interaction_service(runtime.webui_approval_interaction_service())

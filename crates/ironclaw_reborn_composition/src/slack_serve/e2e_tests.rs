@@ -258,6 +258,7 @@ async fn build_harness_with_actor_user_resolver(
         SlackFinalReplyDeliverySettings {
             poll_interval: Duration::from_millis(1),
             max_wait: Duration::from_secs(2),
+            message_max_wait: Duration::from_millis(250),
             max_concurrent_deliveries: std::num::NonZeroUsize::new(4).expect("nonzero"), // safety: static test literal is non-zero.
         },
     ));
@@ -335,6 +336,28 @@ async fn slack_dm_delivers_final_reply_after_immediate_ack() {
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["channel"], CHANNEL);
     assert_eq!(messages[0]["text"], "hello from reborn");
+}
+
+#[tokio::test]
+async fn slack_dm_waits_for_finalized_assistant_message_after_completed_state() {
+    let harness = build_harness(TurnMode::CompleteAfterState {
+        assistant_text: "delayed final reply".into(),
+        finalize_delay: Duration::from_millis(25),
+    })
+    .await;
+
+    let response = harness
+        .post_event(dm_message("Ev-delayed-final", "hello"))
+        .await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_body(response, "ok").await;
+    harness.drain().await;
+
+    let messages = harness.slack_messages();
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["channel"], CHANNEL);
+    assert_eq!(messages[0]["text"], "delayed final reply");
 }
 
 #[tokio::test]
@@ -439,7 +462,13 @@ async fn slack_approval_reply_resumes_and_delivers_final_reply() {
 
 #[derive(Debug, Clone)]
 enum TurnMode {
-    Complete { assistant_text: String },
+    Complete {
+        assistant_text: String,
+    },
+    CompleteAfterState {
+        assistant_text: String,
+        finalize_delay: Duration,
+    },
     BlockApproval,
 }
 
@@ -527,6 +556,7 @@ impl TurnCoordinator for RecordingTurnCoordinator {
                 })?;
                 TurnStatus::Completed
             }
+            TurnMode::CompleteAfterState { .. } => TurnStatus::Completed,
             TurnMode::BlockApproval => TurnStatus::BlockedApproval,
         };
         let gate_ref = if status == TurnStatus::BlockedApproval {
@@ -544,6 +574,7 @@ impl TurnCoordinator for RecordingTurnCoordinator {
             accepted_message_ref: request.accepted_message_ref.clone(),
             reply_target_binding_ref: request.reply_target_binding_ref.clone(),
         };
+        let submitted_scope = request.scope.clone();
         let run_state = turn_state(
             request.scope,
             request.actor,
@@ -561,6 +592,21 @@ impl TurnCoordinator for RecordingTurnCoordinator {
             state.blocked_run_id = Some(run_id);
         }
         state.runs.insert(run_id, run_state);
+        if let TurnMode::CompleteAfterState {
+            assistant_text,
+            finalize_delay,
+        } = &self.mode
+        {
+            let threads = self.threads.clone();
+            let scope = submitted_scope;
+            let assistant_text = assistant_text.clone();
+            let finalize_delay = *finalize_delay;
+            tokio::spawn(async move {
+                tokio::time::sleep(finalize_delay).await;
+                let _ =
+                    append_final_assistant_message(&threads, &scope, run_id, &assistant_text).await;
+            });
+        }
         Ok(response)
     }
 
@@ -817,6 +863,7 @@ impl RebornUserIdentityLookup for RecordingUserIdentityLookup {
 fn dm_message(event_id: &'static str, text: &'static str) -> &'static str {
     match (event_id, text) {
         ("Ev-final", "hello") => DM_FINAL,
+        ("Ev-delayed-final", "hello") => DM_DELAYED_FINAL,
         ("Ev-approval", "needs approval") => DM_APPROVAL,
         ("Ev-block", "needs approval") => DM_BLOCK,
         ("Ev-approve", "approve") => DM_APPROVE,
@@ -842,6 +889,14 @@ const DM_FINAL: &str = r#"{
   "api_app_id":"A-slack",
   "event_id":"Ev-final",
 	  "event":{"type":"message","channel_type":"im","user":"U123","channel":"D123","text":"hello","ts":"1710000000.000001"}
+	}"#;
+
+const DM_DELAYED_FINAL: &str = r#"{
+  "type":"event_callback",
+  "team_id":"T-A",
+  "api_app_id":"A-slack",
+  "event_id":"Ev-delayed-final",
+	  "event":{"type":"message","channel_type":"im","user":"U123","channel":"D123","text":"hello","ts":"1710000000.000007"}
 	}"#;
 
 const DM_APPROVAL: &str = r#"{

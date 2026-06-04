@@ -233,10 +233,7 @@ where
             return Ok(true);
         }
         let mut thread_scope = match &self.thread_scope {
-            Some(thread_scope) => {
-                ensure_thread_scope_matches_turn_scope(thread_scope, request.scope)?;
-                thread_scope.clone()
-            }
+            Some(thread_scope) => thread_scope.clone(),
             None => thread_scope_from_turn_scope(request.scope)?,
         };
         // Multi-user: the loop host wrote this thread under the run's
@@ -247,7 +244,7 @@ where
         // [`ThreadScopeResolver`], so the two cannot drift. The run-state
         // read (for the actor) only runs when the base scope is
         // owner-scoped; an owner-less applier keeps its shared/system slot.
-        if thread_scope.owner_user_id.is_some() {
+        thread_scope = if thread_scope.owner_user_id.is_some() {
             let run_state = self
                 .turn_state_store
                 .get_run_state(GetRunStateRequest {
@@ -255,11 +252,25 @@ where
                     run_id: request.run_id,
                 })
                 .await?;
-            thread_scope = crate::thread_scope::ThreadScopeResolver::resolve(
+            crate::thread_scope::ThreadScopeResolver::resolve_for_turn_scope(
                 &thread_scope,
+                &request.scope,
                 run_state.actor.as_ref(),
-            );
-        }
+            )
+            .map_err(|error| TurnError::InvalidRequest {
+                reason: error.to_string(),
+            })?
+        } else {
+            crate::thread_scope::ThreadScopeResolver::resolve_for_turn_scope(
+                &thread_scope,
+                &request.scope,
+                None,
+            )
+            .map_err(|error| TurnError::InvalidRequest {
+                reason: error.to_string(),
+            })?
+        };
+        ensure_thread_scope_matches_turn_scope(&thread_scope, request.scope)?;
         let history = self
             .thread_service
             .list_thread_history(ThreadHistoryRequest {
