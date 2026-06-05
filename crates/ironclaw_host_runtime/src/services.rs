@@ -80,10 +80,11 @@ use crate::obligations::{
 use crate::{
     BuiltinObligationHandler, CapabilitySurfaceVersion, DefaultHostRuntime,
     FirstPartyCapabilityRegistry, FirstPartyCapabilityRequest, HostRuntimeError,
-    InvocationServicesResolutionRequest, InvocationServicesResolver, LocalHostProcessPort,
-    LocalInvocationServicesResolver, PlannerError, ProcessObligationLifecycleStore,
-    RuntimeBackendHealth, RuntimeProcessPort, TenantSandboxProcessPort, ToolCallHttpEgress,
-    TurnRunExecutor, TurnRunScheduler, TurnRunSchedulerConfig, plan_capability,
+    HostRuntimeHttpEgressPort, InvocationServicesResolutionRequest, InvocationServicesResolver,
+    LocalHostProcessPort, LocalInvocationServicesResolver, PlannerError,
+    ProcessObligationLifecycleStore, RuntimeBackendHealth, RuntimeProcessPort,
+    RuntimeSecretMaterialStager, RuntimeSecretStageError, TenantSandboxProcessPort,
+    ToolCallHttpEgress, TurnRunExecutor, TurnRunScheduler, TurnRunSchedulerConfig, plan_capability,
 };
 use process_executor::{HostProcessExecutor, RuntimeDispatchProcessExecutor};
 
@@ -177,11 +178,9 @@ pub struct ProductAuthProviderRuntimePorts {
     secret_injection_store: Arc<RuntimeSecretInjectionStore>,
 }
 
-/// Alias for [`ironclaw_host_api::CredentialStageError`].
-///
-/// The shared type lives in `ironclaw_host_api` so that per-extension staging
-/// traits can use it without a dependency on `ironclaw_host_runtime`.
-pub type ProductAuthCredentialStageError = ironclaw_host_api::CredentialStageError;
+/// Alias for [`RuntimeSecretStageError`], which re-exports
+/// [`ironclaw_host_api::CredentialStageError`].
+pub type ProductAuthCredentialStageError = RuntimeSecretStageError;
 
 impl ProductAuthProviderRuntimePorts {
     fn new(
@@ -444,14 +443,39 @@ where
         Arc::clone(&self.registry)
     }
 
+    /// Returns the canonical host-runtime HTTP egress port when configured.
+    pub fn runtime_http_egress(&self) -> Option<Arc<dyn RuntimeHttpEgress>> {
+        runtime_http_egress(&self.runtime_http_egress)
+    }
+
+    /// Returns the canonical host-runtime obligation handler.
+    pub fn obligation_handler(&self) -> Arc<dyn CapabilityObligationHandler> {
+        Arc::new(self.builtin_obligation_handler())
+    }
+
+    /// Returns the canonical host-runtime one-shot secret material stager.
+    pub fn runtime_secret_material_stager(&self) -> RuntimeSecretMaterialStager {
+        RuntimeSecretMaterialStager::new(Arc::clone(&self.secret_injection_store))
+    }
+
+    /// Returns a host-mediated HTTP egress port that owns network-obligation
+    /// authorization and one-shot host-held credential staging.
+    pub fn host_runtime_http_egress_port(&self) -> Option<HostRuntimeHttpEgressPort> {
+        Some(HostRuntimeHttpEgressPort::new(
+            self.runtime_http_egress()?,
+            self.obligation_handler(),
+            self.runtime_secret_material_stager(),
+        ))
+    }
+
     /// Returns the canonical host-runtime egress/obligation ports for
     /// product-auth provider adapters.
     pub fn product_auth_provider_runtime_ports(&self) -> Option<ProductAuthProviderRuntimePorts> {
-        let runtime_http_egress = runtime_http_egress(&self.runtime_http_egress)?;
+        let runtime_http_egress = self.runtime_http_egress()?;
         let secret_store = self.secret_store.clone()?;
         Some(ProductAuthProviderRuntimePorts::new(
             runtime_http_egress,
-            Arc::new(self.builtin_obligation_handler()),
+            self.obligation_handler(),
             secret_store,
             Arc::clone(&self.secret_injection_store),
         ))
@@ -532,15 +556,13 @@ where
         .with_process_cancellation_registry(self.process_services.cancellation_registry())
         .with_runtime_health(runtime_health);
 
+        if let Some(run_state) = &self.run_state {
+            runtime = runtime.with_run_state(Arc::clone(run_state));
+        }
         if let Some(run_state_approval_store) = &self.run_state_approval_store {
             runtime = runtime.with_run_state_approval_store(Arc::clone(run_state_approval_store));
-        } else {
-            if let Some(run_state) = &self.run_state {
-                runtime = runtime.with_run_state(Arc::clone(run_state));
-            }
-            if let Some(approval_requests) = &self.approval_requests {
-                runtime = runtime.with_approval_requests(Arc::clone(approval_requests));
-            }
+        } else if let Some(approval_requests) = &self.approval_requests {
+            runtime = runtime.with_approval_requests(Arc::clone(approval_requests));
         }
         if let Some(capability_leases) = &self.capability_leases {
             runtime = runtime.with_capability_leases(Arc::clone(capability_leases));
