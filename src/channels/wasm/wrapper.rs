@@ -5809,6 +5809,7 @@ impl FeishuEventSessionState {
         }))
     }
 
+    #[cfg(test)]
     fn prune_expired_cache(&mut self) {
         let now = current_unix_millis();
         self.prune_expired_cache_at(now);
