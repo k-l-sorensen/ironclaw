@@ -303,7 +303,7 @@ pub(super) fn skill_summary(
         name: LifecyclePackageId::new(entry.name.clone()).map_err(product_error)?,
         version: entry.version.clone(),
         description: format!("{} [{}]", entry.description, entry.provenance.trust_label()),
-        source: ironclaw_product_workflow::LifecycleSkillSource::Installed,
+        source: ironclaw_product_workflow::LifecycleSkillSource::Registry,
         keywords: Vec::new(),
         tags: Vec::new(),
         requires_skills: Vec::new(),

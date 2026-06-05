@@ -1,5 +1,5 @@
 use ironclaw_host_api::sha256_digest_token;
-use ironclaw_product_workflow::{LifecyclePhase, LifecycleProductPayload};
+use ironclaw_product_workflow::{LifecyclePhase, LifecycleProductPayload, LifecycleSkillSource};
 
 use crate::lifecycle::response_with_payload;
 
@@ -120,6 +120,21 @@ fn unverified_install_requires_acknowledgement() {
 
 #[test]
 fn renderer_includes_tools_and_skills_in_mixed_search() {
+    let skill = skill_summary(&IronHubSkillEntry {
+        name: "reviewer".to_string(),
+        trunk: String::new(),
+        version: "0.2.0".to_string(),
+        description: "review skill".to_string(),
+        provenance: IronHubProvenance::Verified,
+        skill_md: IronHubArtifact {
+            url: "https://hub.ironclaw.com/reviewer/SKILL.md".to_string(),
+            size_bytes: 1,
+            sha256: "c".repeat(64),
+        },
+    })
+    .expect("skill summary");
+    assert_eq!(skill.source, LifecycleSkillSource::Registry);
+
     let response = response_with_payload(
         None,
         LifecyclePhase::Discovered,
@@ -145,21 +160,7 @@ fn renderer_includes_tools_and_skills_in_mixed_search() {
                 })
                 .expect("tool summary"),
             ],
-            skills: vec![
-                skill_summary(&IronHubSkillEntry {
-                    name: "reviewer".to_string(),
-                    trunk: String::new(),
-                    version: "0.2.0".to_string(),
-                    description: "review skill".to_string(),
-                    provenance: IronHubProvenance::Verified,
-                    skill_md: IronHubArtifact {
-                        url: "https://hub.ironclaw.com/reviewer/SKILL.md".to_string(),
-                        size_bytes: 1,
-                        sha256: "c".repeat(64),
-                    },
-                })
-                .expect("skill summary"),
-            ],
+            skills: vec![skill],
         },
     );
 

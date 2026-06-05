@@ -434,6 +434,7 @@ pub enum LifecycleSkillSource {
     System,
     User,
     Installed,
+    Registry,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
