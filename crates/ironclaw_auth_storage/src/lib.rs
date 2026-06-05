@@ -1,7 +1,4 @@
-#![allow(
-    dead_code,
-    reason = "durable product-auth is staged for production/webui composition; clippy can check this crate before those callers are enabled"
-)]
+//! Durable storage adapters for Reborn product-auth contracts.
 
 use std::{
     collections::HashMap,
@@ -36,15 +33,11 @@ mod domain;
 mod flows;
 mod interactions;
 mod paths;
-mod provider;
 #[cfg(test)]
 mod tests;
 
 const MAX_OWNER_SESSION_ROOTS_PER_SURFACE: usize = 1024;
 const MAX_OWNER_RECORDS_PER_ROOT: usize = 1024;
-
-#[cfg(any(feature = "libsql", feature = "postgres"))]
-pub(crate) use provider::UnavailableAuthProviderClient;
 
 /// Durable production implementation of the product-auth ports.
 ///
@@ -73,7 +66,7 @@ pub(crate) use provider::UnavailableAuthProviderClient;
 // completion / account update / cleanup, so the two universes cannot
 // drift. Until that lands, broker-account population stays the caller's
 // responsibility and drift is not policed here.
-pub(crate) struct FilesystemAuthProductServices<F>
+pub struct FilesystemAuthProductServices<F>
 where
     F: RootFilesystem,
 {
@@ -86,10 +79,7 @@ impl<F> FilesystemAuthProductServices<F>
 where
     F: RootFilesystem,
 {
-    pub(crate) fn new(
-        filesystem: Arc<ScopedFilesystem<F>>,
-        secret_store: Arc<dyn SecretStore>,
-    ) -> Self {
+    pub fn new(filesystem: Arc<ScopedFilesystem<F>>, secret_store: Arc<dyn SecretStore>) -> Self {
         Self {
             filesystem,
             secret_store,

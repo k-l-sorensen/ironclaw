@@ -50,6 +50,7 @@ mod llm_key_store;
 mod llm_reload;
 mod local_dev_capability_policy;
 mod local_dev_mounts;
+mod local_dev_product_auth;
 mod local_runtime_profile;
 mod manual_token_flow;
 mod mcp;
@@ -60,7 +61,6 @@ mod oauth_dcr;
 mod oauth_dcr_protocol;
 mod oauth_gate;
 mod oauth_provider_client;
-mod product_auth_durable;
 mod product_auth_providers;
 mod product_auth_runtime_credentials;
 #[cfg(feature = "webui-v2-beta")]

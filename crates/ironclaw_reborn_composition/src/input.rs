@@ -10,6 +10,8 @@ use ironclaw_host_api::runtime_policy::{
 #[cfg(all(test, feature = "slack-v2-host-beta"))]
 use ironclaw_host_runtime::HostRuntimeHttpEgressPort;
 use ironclaw_host_runtime::{SchedulerTurnRunWakeNotifier, TenantSandboxProcessPort};
+#[cfg(test)]
+use ironclaw_network::NetworkHttpEgress;
 use ironclaw_trust::HostTrustPolicy;
 use secrecy::SecretString;
 
@@ -156,6 +158,8 @@ pub struct RebornBuildInput {
     pub(crate) require_wasm_credentials: bool,
     #[cfg(all(test, feature = "slack-v2-host-beta"))]
     pub(crate) host_runtime_http_egress_for_test: Option<Option<HostRuntimeHttpEgressPort>>,
+    #[cfg(test)]
+    pub(crate) network_http_egress_for_test: Option<Arc<dyn NetworkHttpEgress>>,
     pub(crate) product_auth_ports: Option<RebornProductAuthServicePorts>,
     pub(crate) oauth_provider_configs: Vec<OAuthProviderBackendConfig>,
     pub(crate) oauth_dcr_provider_configs: Vec<OAuthDcrProviderBackendConfig>,
@@ -407,6 +411,15 @@ impl RebornBuildInput {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_network_http_egress_for_test(
+        mut self,
+        egress: Arc<dyn NetworkHttpEgress>,
+    ) -> Self {
+        self.network_http_egress_for_test = Some(egress);
+        self
+    }
+
     /// Inject Reborn-native product-auth service ports.
     ///
     /// Production callers should provide durable implementations here. The
@@ -506,6 +519,8 @@ impl RebornBuildInput {
             require_wasm_credentials: false,
             #[cfg(all(test, feature = "slack-v2-host-beta"))]
             host_runtime_http_egress_for_test: None,
+            #[cfg(test)]
+            network_http_egress_for_test: None,
             product_auth_ports: None,
             oauth_provider_configs: Vec::new(),
             oauth_dcr_provider_configs: Vec::new(),

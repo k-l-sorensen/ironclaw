@@ -83,6 +83,7 @@ chrono = "0.4"
 deadpool-postgres = { version = "0.14", optional = true }
 futures = "0.3"
 ironclaw_auth = { path = "../ironclaw_auth" }
+ironclaw_auth_storage = { path = "../ironclaw_auth_storage" }
 ironclaw_common = { path = "../ironclaw_common" }
 ironclaw_capabilities = { path = "../ironclaw_capabilities" }
 ironclaw_approvals = { path = "../ironclaw_approvals" }

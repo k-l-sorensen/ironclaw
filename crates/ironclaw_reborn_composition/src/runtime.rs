@@ -2169,19 +2169,26 @@ mod tests {
     use ironclaw_authorization::CapabilityLeaseStore;
     use ironclaw_events::{EventStreamKey, ReadScope};
     use ironclaw_host_api::{
-        Action, AgentId, ApprovalRequest, ApprovalRequestId, AuditStage, CapabilityId,
-        CorrelationId, EffectKind, InvocationFingerprint, InvocationId, Principal,
-        ResourceEstimate, ResourceScope, TenantId, ThreadId, UserId,
+        Action, AgentId, ApprovalRequest, ApprovalRequestId, AuditStage, CapabilityGrant,
+        CapabilityGrantId, CapabilityId, CapabilitySet, CorrelationId, EffectKind,
+        ExecutionContext, ExtensionId, GrantConstraints, InvocationFingerprint, InvocationId,
+        MountView, NetworkMethod, NetworkPolicy, NetworkScheme, NetworkTargetPattern, Principal,
+        ResourceEstimate, ResourceScope, RuntimeKind, SecretHandle, TenantId, ThreadId, TrustClass,
+        UserId,
         runtime_policy::{
             ApprovalPolicy, AuditMode, DeploymentMode, EffectiveRuntimePolicy,
             FilesystemBackendKind, NetworkMode, ProcessBackendKind, RuntimeProfile, SecretMode,
         },
     };
+    use ironclaw_host_runtime::{RuntimeCapabilityOutcome, RuntimeCapabilityRequest};
     use ironclaw_loop_support::{
         HostManagedModelError, HostManagedModelErrorKind, HostManagedModelGateway,
         HostManagedModelMessageRole, HostManagedModelRequest, HostManagedModelResponse,
         HostSkillContextBuildError, HostSkillContextCandidate, HostSkillContextSource, ModelCost,
         SpawnSubagentMode, SubagentKindId, SubagentThreadKind, SubagentThreadMetadata,
+    };
+    use ironclaw_network::{
+        NetworkHttpEgress, NetworkHttpError, NetworkHttpRequest, NetworkHttpResponse, NetworkUsage,
     };
     use ironclaw_product_adapters::{ProductOutboundPayload, ProductProjectionItem};
     use ironclaw_product_workflow::{
@@ -2198,6 +2205,7 @@ mod tests {
         AppendToolResultReferenceRequest, EnsureThreadRequest, LoadContextMessagesRequest,
         MessageKind, ThreadHistoryRequest, ThreadScope, ToolResultSafeSummary,
     };
+    use ironclaw_trust::{AuthorityCeiling, EffectiveTrustClass, TrustDecision, TrustProvenance};
     use ironclaw_turns::{
         AcceptedMessageRef, AllowAllTurnAdmissionPolicy, BlockedReason, GetRunStateRequest,
         IdempotencyKey, LoopResultRef, ReplyTargetBindingRef, SanitizedCancelReason,
@@ -2213,6 +2221,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use crate::RebornReadinessState;
+    use crate::extension_lifecycle::ExtensionActivationMode;
     use crate::input::RebornBuildInput;
     use crate::runtime_input::{
         PollSettings, RebornRuntimeIdentity, RebornRuntimeInput, TriggerPollerSettings,
@@ -2243,6 +2252,36 @@ mod tests {
     struct RecordingGateway {
         reply: String,
         requests: Arc<StdMutex<Vec<HostManagedModelRequest>>>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct RecordedHttpRequest {
+        method: NetworkMethod,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    #[derive(Debug)]
+    struct RecordingNetworkHttpEgress {
+        response_body: Vec<u8>,
+        requests: StdMutex<Vec<RecordedHttpRequest>>,
+    }
+
+    impl RecordingNetworkHttpEgress {
+        fn new(response_body: impl Into<Vec<u8>>) -> Self {
+            Self {
+                response_body: response_body.into(),
+                requests: StdMutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<RecordedHttpRequest> {
+            self.requests
+                .lock()
+                .expect("recording network requests lock poisoned")
+                .clone()
+        }
     }
 
     #[derive(Debug, Default)]
@@ -2296,6 +2335,34 @@ mod tests {
             Ok(HostManagedModelResponse::assistant_reply(
                 self.reply.clone(),
             ))
+        }
+    }
+
+    #[async_trait]
+    impl NetworkHttpEgress for RecordingNetworkHttpEgress {
+        async fn execute(
+            &self,
+            request: NetworkHttpRequest,
+        ) -> Result<NetworkHttpResponse, NetworkHttpError> {
+            self.requests
+                .lock()
+                .expect("recording network requests lock poisoned")
+                .push(RecordedHttpRequest {
+                    method: request.method,
+                    url: request.url.clone(),
+                    headers: request.headers.clone(),
+                    body: request.body.clone(),
+                });
+            Ok(NetworkHttpResponse {
+                status: 200,
+                headers: Vec::new(),
+                body: self.response_body.clone(),
+                usage: NetworkUsage {
+                    request_bytes: 0,
+                    response_bytes: self.response_body.len() as u64,
+                    resolved_ip: None,
+                },
+            })
         }
     }
 
@@ -4452,12 +4519,17 @@ mod tests {
             reply: "webui lifecycle ok".to_string(),
             requests: Arc::new(StdMutex::new(Vec::new())),
         });
+        let network = Arc::new(RecordingNetworkHttpEgress::new(
+            br#"{"total_count":0,"incomplete_results":false,"items":[]}"#.to_vec(),
+        ));
+        let network_egress: Arc<dyn NetworkHttpEgress> = network.clone();
         let input = RebornRuntimeInput::from_services(
             RebornBuildInput::local_dev(
                 "runtime-webui-credential-owner",
                 root.path().join("local-dev"),
             )
-            .with_runtime_policy(local_dev_runtime_policy()),
+            .with_runtime_policy(local_dev_runtime_policy())
+            .with_network_http_egress_for_test(network_egress),
         )
         .with_identity(RebornRuntimeIdentity {
             tenant_id: "runtime-webui-credential-tenant".to_string(),
@@ -4481,6 +4553,22 @@ mod tests {
         );
         let package_ref =
             LifecyclePackageRef::new(LifecyclePackageKind::Extension, "github").unwrap();
+        let extension_management = runtime
+            .services()
+            .local_runtime
+            .as_ref()
+            .expect("local runtime")
+            .extension_management
+            .as_ref()
+            .expect("extension management");
+        extension_management
+            .install(package_ref.clone())
+            .await
+            .expect("install GitHub extension");
+        extension_management
+            .activate(package_ref.clone(), ExtensionActivationMode::Static)
+            .await
+            .expect("activate GitHub extension");
 
         let first = bundle
             .api
@@ -4505,11 +4593,18 @@ mod tests {
             .credential_ref
             .clone()
             .expect("credential ref");
+        assert_local_dev_github_search_uses_runtime_credential(
+            &runtime,
+            &caller,
+            &network,
+            "ghp_first_token",
+        )
+        .await;
 
         let second = bundle
             .api
             .setup_extension(
-                caller,
+                caller.clone(),
                 package_ref,
                 WebUiSetupExtensionRequest {
                     action: Some("submit".to_string()),
@@ -4530,8 +4625,149 @@ mod tests {
             Some(first_credential_ref.as_str()),
             "reconfigure should rotate the existing account instead of creating a duplicate"
         );
+        assert_local_dev_github_search_uses_runtime_credential(
+            &runtime,
+            &caller,
+            &network,
+            "ghp_second_token",
+        )
+        .await;
 
         runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    async fn assert_local_dev_github_search_uses_runtime_credential(
+        runtime: &super::RebornRuntime,
+        caller: &WebUiAuthenticatedCaller,
+        network: &RecordingNetworkHttpEgress,
+        expected_token: &str,
+    ) {
+        let capability_id = CapabilityId::new("github.search_issues").expect("capability id");
+        let outcome = runtime
+            .services()
+            .host_runtime
+            .as_ref()
+            .expect("host runtime")
+            .invoke_capability(RuntimeCapabilityRequest::new(
+                github_search_context(caller, &capability_id),
+                capability_id.clone(),
+                ResourceEstimate::default(),
+                serde_json::json!({
+                    "repo": "nearai/ironclaw",
+                    "type": "issue",
+                    "limit": 1
+                }),
+                github_search_trust_decision(),
+            ))
+            .await
+            .expect("runtime invocation completes");
+
+        let RuntimeCapabilityOutcome::Completed(completed) = outcome else {
+            panic!("configured GitHub credential should not open auth gate, got {outcome:?}");
+        };
+        assert_eq!(completed.capability_id, capability_id);
+        let requests = network.requests();
+        let last = requests
+            .last()
+            .expect("GitHub capability should perform host HTTP egress");
+        assert_eq!(last.method, NetworkMethod::Get);
+        assert!(
+            last.url
+                .starts_with("https://api.github.com/search/issues?"),
+            "unexpected GitHub search URL: {}",
+            last.url
+        );
+        assert_eq!(
+            last.headers
+                .iter()
+                .find(|(name, _)| name == "authorization"),
+            Some(&(
+                "authorization".to_string(),
+                format!("Bearer {expected_token}")
+            ))
+        );
+    }
+
+    fn github_search_context(
+        caller: &WebUiAuthenticatedCaller,
+        capability_id: &CapabilityId,
+    ) -> ExecutionContext {
+        let extension_id = ExtensionId::new("github").expect("extension id");
+        let invocation_id = InvocationId::new();
+        let scope = ResourceScope {
+            tenant_id: caller.tenant_id.clone(),
+            user_id: caller.user_id.clone(),
+            agent_id: caller.agent_id.clone(),
+            project_id: caller.project_id.clone(),
+            mission_id: None,
+            thread_id: None,
+            invocation_id,
+        };
+        let grant = CapabilityGrant {
+            id: CapabilityGrantId::new(),
+            capability: capability_id.clone(),
+            grantee: Principal::Extension(extension_id.clone()),
+            issued_by: Principal::HostRuntime,
+            constraints: GrantConstraints {
+                allowed_effects: github_search_allowed_effects(),
+                mounts: MountView::new(Vec::new()).expect("empty mounts"),
+                network: github_search_network_policy(),
+                secrets: vec![SecretHandle::new("github_runtime_token").expect("secret handle")],
+                resource_ceiling: None,
+                expires_at: None,
+                max_invocations: None,
+            },
+        };
+        let context = ExecutionContext {
+            invocation_id,
+            correlation_id: CorrelationId::new(),
+            process_id: None,
+            parent_process_id: None,
+            tenant_id: scope.tenant_id.clone(),
+            user_id: scope.user_id.clone(),
+            agent_id: scope.agent_id.clone(),
+            project_id: scope.project_id.clone(),
+            mission_id: None,
+            thread_id: None,
+            extension_id,
+            runtime: RuntimeKind::Wasm,
+            trust: TrustClass::Sandbox,
+            grants: CapabilitySet {
+                grants: vec![grant],
+            },
+            mounts: MountView::new(Vec::new()).expect("empty mounts"),
+            resource_scope: scope,
+        };
+        context.validate().expect("valid GitHub search context");
+        context
+    }
+
+    fn github_search_trust_decision() -> TrustDecision {
+        TrustDecision {
+            effective_trust: EffectiveTrustClass::user_trusted(),
+            authority_ceiling: AuthorityCeiling {
+                allowed_effects: github_search_allowed_effects(),
+                max_resource_ceiling: None,
+            },
+            provenance: TrustProvenance::Default,
+            evaluated_at: Utc::now(),
+        }
+    }
+
+    fn github_search_allowed_effects() -> Vec<EffectKind> {
+        vec![EffectKind::Network, EffectKind::UseSecret]
+    }
+
+    fn github_search_network_policy() -> NetworkPolicy {
+        NetworkPolicy {
+            allowed_targets: vec![NetworkTargetPattern {
+                scheme: Some(NetworkScheme::Https),
+                host_pattern: "api.github.com".to_string(),
+                port: None,
+            }],
+            deny_private_ip_ranges: true,
+            max_egress_bytes: None,
+        }
     }
 
     #[tokio::test]
