@@ -281,17 +281,16 @@ impl RebornLocalExtensionManagementPort {
         package_ref: LifecyclePackageRef,
     ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
         let available = self.catalog.resolve(&package_ref)?;
-        self.install_available_package(available.clone(), false)
-            .await
+        self.install_available_package(available, false).await
     }
 
     pub(crate) async fn install_available_package(
         &self,
-        available: AvailableExtensionPackage,
+        available: &AvailableExtensionPackage,
         force: bool,
     ) -> Result<LifecycleProductResponse, ProductWorkflowError> {
         let package_ref = available.package_ref.clone();
-        let plan = prepare_install(&available)?;
+        let plan = prepare_install(available)?;
         let _operation_guard = self.operation_lock.lock().await;
         if force
             && self
@@ -310,7 +309,7 @@ impl RebornLocalExtensionManagementPort {
         self.register_lifecycle_package(&available.package).await?;
 
         if let Err(error) =
-            materialize_available_extension(self.filesystem.as_ref(), &available).await
+            materialize_available_extension(self.filesystem.as_ref(), available).await
         {
             if let Err(rollback_error) =
                 self.rollback_lifecycle_install(&available.package.id).await
@@ -344,7 +343,7 @@ impl RebornLocalExtensionManagementPort {
             LifecyclePhase::Installed,
             LifecycleProductPayload::ExtensionInstall {
                 installed: true,
-                visible_capability_ids: visible_capability_ids(&available)
+                visible_capability_ids: visible_capability_ids(available)
                     .map(|id| id.as_str().to_string())
                     .collect(),
             },

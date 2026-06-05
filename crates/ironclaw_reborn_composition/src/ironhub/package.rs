@@ -35,12 +35,13 @@ pub(super) fn ironhub_tool_package(
     let package = ExtensionPackage::from_manifest_toml(manifest, root, &manifest_toml)
         .map_err(|error| install_error(error.to_string()))?;
     let package_ref = package_ref(LifecyclePackageKind::Extension, &entry.name)?;
+    let manifest_asset = bytes_asset("manifest.toml", manifest_toml.as_bytes());
     Ok(AvailableExtensionPackage {
         package_ref,
         manifest_toml,
         package,
         assets: vec![
-            bytes_asset("manifest.toml", manifest_toml_bytes(entry).as_slice()),
+            manifest_asset,
             bytes_asset(&format!("wasm/{}_tool.wasm", entry.name), wasm),
             bytes_asset("legacy/capabilities.json", capabilities),
             bytes_asset(
@@ -55,22 +56,18 @@ pub(super) fn ironhub_tool_package(
     })
 }
 
-fn manifest_toml_bytes(entry: &IronHubToolEntry) -> Vec<u8> {
-    generic_tool_manifest(entry).into_bytes()
-}
-
 fn generic_tool_manifest(entry: &IronHubToolEntry) -> String {
     format!(
         r#"schema_version = "reborn.extension_manifest.v2"
-id = "{id}"
-name = "{name}"
-version = "{version}"
-description = "{description}"
+id = {id}
+name = {name}
+version = {version}
+description = {description}
 trust = "third_party"
 
 [runtime]
 kind = "wasm"
-module = "wasm/{id}_tool.wasm"
+module = {module}
 
 [[host_api]]
 id = "ironclaw.capability_provider/v1"
@@ -79,19 +76,23 @@ section = "capability_provider.tools"
 [capability_provider.tools]
 
 [[capability_provider.tools.capabilities]]
-id = "{id}.invoke"
-description = "{description}"
+id = {capability_id}
+description = {description}
 effects = ["dispatch_capability", "network"]
 default_permission = "ask"
 visibility = "model"
-input_schema_ref = "schemas/{id}/invoke.input.v1.json"
-output_schema_ref = "schemas/{id}/raw_output.v1.json"
+input_schema_ref = {input_schema_ref}
+output_schema_ref = {output_schema_ref}
 required_host_ports = ["host.runtime.http_egress"]
 "#,
-        id = toml_escape(&entry.name),
-        name = toml_escape(&entry.name),
-        version = toml_escape(&entry.version),
-        description = toml_escape(&entry.description),
+        id = toml_string(&entry.name),
+        name = toml_string(&entry.name),
+        version = toml_string(&entry.version),
+        description = toml_string(&entry.description),
+        module = toml_string(format!("wasm/{}_tool.wasm", entry.name)),
+        capability_id = toml_string(format!("{}.invoke", entry.name)),
+        input_schema_ref = toml_string(format!("schemas/{}/invoke.input.v1.json", entry.name)),
+        output_schema_ref = toml_string(format!("schemas/{}/raw_output.v1.json", entry.name)),
     )
 }
 
@@ -102,6 +103,48 @@ fn bytes_asset(path: &str, bytes: &[u8]) -> AvailableExtensionAsset {
     }
 }
 
-fn toml_escape(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+fn toml_string(value: impl Into<String>) -> String {
+    toml::Value::String(value.into()).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generic_tool_manifest;
+    use crate::ironhub::model::{IronHubArtifact, IronHubProvenance, IronHubToolEntry};
+
+    #[test]
+    fn generic_tool_manifest_uses_toml_escaping_for_catalog_strings() {
+        let manifest = generic_tool_manifest(&IronHubToolEntry {
+            name: "quote_tool".to_string(),
+            crate_name: "quote_tool".to_string(),
+            version: "0.1.0".to_string(),
+            description: "quote \" slash \\ newline\nok".to_string(),
+            provenance: IronHubProvenance::Official,
+            wasm: IronHubArtifact {
+                url: "https://hub.ironclaw.com/quote_tool.wasm".to_string(),
+                size_bytes: 1,
+                sha256: "a".repeat(64),
+            },
+            capabilities: IronHubArtifact {
+                url: "https://hub.ironclaw.com/quote_tool.capabilities.json".to_string(),
+                size_bytes: 1,
+                sha256: "b".repeat(64),
+            },
+        });
+
+        let parsed: toml::Value = toml::from_str(&manifest).expect("manifest TOML parses");
+        assert_eq!(parsed["id"].as_str(), Some("quote_tool"));
+        assert_eq!(
+            parsed["description"].as_str(),
+            Some("quote \" slash \\ newline\nok")
+        );
+        assert_eq!(
+            parsed["runtime"]["module"].as_str(),
+            Some("wasm/quote_tool_tool.wasm")
+        );
+        assert_eq!(
+            parsed["capability_provider"]["tools"]["capabilities"][0]["id"].as_str(),
+            Some("quote_tool.invoke")
+        );
+    }
 }

@@ -328,7 +328,7 @@ impl IronHubService {
                 let package = ironhub_tool_package(entry, &wasm, &capabilities)?;
                 let mut response = self
                     .extension_management
-                    .install_available_package(package, options.force)
+                    .install_available_package(&package, options.force)
                     .await
                     .map_err(IronHubCommandError::Product)?;
                 response.message = Some(install_message(
@@ -343,20 +343,20 @@ impl IronHubService {
         }
     }
 
-    async fn fetch_manifest_cached(&self) -> Result<IronHubManifest, IronHubCommandError> {
+    async fn fetch_manifest_cached(&self) -> Result<Arc<IronHubManifest>, IronHubCommandError> {
         let now = Instant::now();
         if let Some(hit) = manifest_cache_get(&self.manifest_url, now) {
-            return Ok((*hit).clone());
+            return Ok(hit);
         }
         let fetch_lock = manifest_fetch_lock(&self.manifest_url);
         let _fetch_guard = fetch_lock.lock().await;
         let now = Instant::now();
         if let Some(hit) = manifest_cache_get(&self.manifest_url, now) {
-            return Ok((*hit).clone());
+            return Ok(hit);
         }
         let manifest = Arc::new(self.fetch_manifest().await?);
         manifest_cache_put(&self.manifest_url, Arc::clone(&manifest), now);
-        Ok((*manifest).clone())
+        Ok(manifest)
     }
 
     async fn fetch_manifest(&self) -> Result<IronHubManifest, IronHubCommandError> {
