@@ -7,7 +7,7 @@
 //! gateway handlers, LLM providers, `TurnCoordinator`, or projection internals.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use crate::{
     OpenAiChatChoice, OpenAiChatCompletionId, OpenAiChatCompletionRequest,
@@ -395,8 +395,5 @@ fn content_array_item_text(value: &serde_json::Value) -> Option<String> {
 }
 
 fn unix_timestamp_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or(0)
+    Utc::now().timestamp().try_into().unwrap_or(0)
 }
