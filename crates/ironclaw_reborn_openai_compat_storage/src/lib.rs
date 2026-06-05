@@ -72,10 +72,11 @@ impl FilesystemOpenAiCompatRefStore {
         else {
             return Ok((StoredOpenAiCompatRefState::default(), None));
         };
-        let state = entry
+        let state: StoredOpenAiCompatRefState = entry
             .entry
             .parse_json()
             .map_err(corrupt_mapping("deserialize OpenAI-compatible ref state"))?;
+        state.validate()?;
         Ok((state, Some(entry.version)))
     }
 
@@ -298,6 +299,13 @@ struct StoredOpenAiCompatRefState {
 }
 
 impl StoredOpenAiCompatRefState {
+    fn validate(&self) -> Result<(), OpenAiCompatRefError> {
+        for mapping in &self.mappings {
+            mapping.validate()?;
+        }
+        Ok(())
+    }
+
     fn mapping_by_public_id(
         &self,
         public_id: &OpenAiCompatPublicId,
@@ -339,7 +347,7 @@ fn new_pending_mapping(
         if state.mapping_by_public_id(&public_id).is_some() {
             continue;
         }
-        return OpenAiCompatResourceMapping {
+        let mapping = OpenAiCompatResourceMapping {
             public_id,
             owner: request.owner.clone(),
             surface: request.surface,
@@ -347,10 +355,13 @@ fn new_pending_mapping(
             idempotency_key: request.idempotency_key.clone(),
             binding: OpenAiCompatResourceBinding::Pending,
         };
+        debug_assert!(mapping.validate().is_ok());
+        return mapping;
     }
 }
 
 fn entry_for_state(state: &StoredOpenAiCompatRefState) -> Result<Entry, OpenAiCompatRefError> {
+    state.validate()?;
     let payload = serde_json::to_value(state).map_err(corrupt_mapping(
         "serialize OpenAI-compatible ref state payload",
     ))?;

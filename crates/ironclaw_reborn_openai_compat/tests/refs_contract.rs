@@ -98,6 +98,24 @@ fn ref_mapping_deserialization_revalidates_nested_refs() {
     )
     .expect_err("nested idempotency key must be revalidated");
     assert!(err.to_string().contains("leading or trailing whitespace"));
+
+    let inconsistent = json!({
+        "public_id": {"kind": "chat_completion", "id": "chatcmpl-valid"},
+        "owner": {
+            "tenant_id": "tenant-a",
+            "user_id": "user-a"
+        },
+        "surface": "responses_v1",
+        "request_fingerprint": OpenAiCompatRequestFingerprint::from_body_bytes(b"body"),
+        "binding": {
+            "state": "pending"
+        }
+    });
+    let err = serde_json::from_value::<ironclaw_reborn_openai_compat::OpenAiCompatResourceMapping>(
+        inconsistent,
+    )
+    .expect_err("public ref kind must match the route surface");
+    assert!(err.to_string().contains("mapping is inconsistent"));
 }
 
 #[tokio::test]

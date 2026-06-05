@@ -1,15 +1,17 @@
 use std::sync::Arc;
 
-use ironclaw_filesystem::{CasExpectation, Entry, InMemoryBackend, RootFilesystem};
+use ironclaw_filesystem::{CasExpectation, Entry, InMemoryBackend, RecordKind, RootFilesystem};
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId, VirtualPath};
 use ironclaw_reborn_openai_compat::{
     OpenAiCompatActorScope, OpenAiCompatBindInternalRefs, OpenAiCompatIdempotencyKey,
     OpenAiCompatInternalRefs, OpenAiCompatProductActionRef, OpenAiCompatProjectionRef,
-    OpenAiCompatRefLookup, OpenAiCompatRefOperation, OpenAiCompatRefReservation,
-    OpenAiCompatRefReservationOutcome, OpenAiCompatRefStore, OpenAiCompatRequestFingerprint,
-    OpenAiCompatResourceBinding, OpenAiCompatRouteSurface, OpenAiCompatTurnRunRef,
+    OpenAiCompatPublicId, OpenAiCompatRefLookup, OpenAiCompatRefOperation,
+    OpenAiCompatRefReservation, OpenAiCompatRefReservationOutcome, OpenAiCompatRefStore,
+    OpenAiCompatRequestFingerprint, OpenAiCompatResourceBinding, OpenAiCompatRouteSurface,
+    OpenAiCompatTurnRunRef, OpenAiResponseId,
 };
 use ironclaw_reborn_openai_compat_storage::FilesystemOpenAiCompatRefStore;
+use serde_json::json;
 
 #[tokio::test]
 async fn durable_store_replays_same_idempotency_key_after_reopen() {
@@ -235,6 +237,52 @@ async fn durable_store_rejects_corrupt_persisted_state() {
         ))
         .await
         .expect_err("malformed state should fail closed");
+
+    assert!(matches!(
+        error,
+        ironclaw_reborn_openai_compat::OpenAiCompatRefError::CorruptMapping
+    ));
+}
+
+#[tokio::test]
+async fn durable_store_rejects_inconsistent_persisted_mapping() {
+    let (filesystem, root, store) = test_store("inconsistent");
+    let state_path = VirtualPath::new(format!("{}/state.json", root.as_str()))
+        .expect("valid OpenAI-compatible ref state path");
+    let state = json!({
+        "mappings": [{
+            "public_id": {"kind": "chat_completion", "id": "chatcmpl-valid"},
+            "owner": {
+                "tenant_id": "tenant-a",
+                "user_id": "alice",
+                "agent_id": "agent-a",
+                "project_id": "project-a"
+            },
+            "surface": "responses_api",
+            "request_fingerprint": OpenAiCompatRequestFingerprint::from_body_bytes(b"body"),
+            "binding": {
+                "state": "pending"
+            }
+        }]
+    });
+    let entry = Entry::record(
+        RecordKind::new("openai_compat_ref_state").expect("valid record kind"),
+        &state,
+    )
+    .expect("valid state record");
+    filesystem
+        .put(&state_path, entry, CasExpectation::Absent)
+        .await
+        .expect("write inconsistent state");
+
+    let error = store
+        .lookup_authorized(OpenAiCompatRefLookup::new(
+            actor("tenant-a", "alice"),
+            OpenAiCompatPublicId::Response(OpenAiResponseId::new("resp_unused").expect("id")),
+            OpenAiCompatRefOperation::Retrieve,
+        ))
+        .await
+        .expect_err("inconsistent state should fail closed");
 
     assert!(matches!(
         error,

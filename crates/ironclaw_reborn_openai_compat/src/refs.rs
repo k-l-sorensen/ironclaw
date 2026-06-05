@@ -321,21 +321,58 @@ impl OpenAiCompatResourceBinding {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OpenAiCompatResourceMapping {
     pub public_id: OpenAiCompatPublicId,
     pub owner: OpenAiCompatActorScope,
     pub surface: OpenAiCompatRouteSurface,
     pub request_fingerprint: OpenAiCompatRequestFingerprint,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<OpenAiCompatIdempotencyKey>,
     pub binding: OpenAiCompatResourceBinding,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiCompatResourceMappingFields {
+    public_id: OpenAiCompatPublicId,
+    owner: OpenAiCompatActorScope,
+    surface: OpenAiCompatRouteSurface,
+    request_fingerprint: OpenAiCompatRequestFingerprint,
+    idempotency_key: Option<OpenAiCompatIdempotencyKey>,
+    binding: OpenAiCompatResourceBinding,
+}
+
+impl<'de> Deserialize<'de> for OpenAiCompatResourceMapping {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let fields = OpenAiCompatResourceMappingFields::deserialize(deserializer)?;
+        let mapping = Self {
+            public_id: fields.public_id,
+            owner: fields.owner,
+            surface: fields.surface,
+            request_fingerprint: fields.request_fingerprint,
+            idempotency_key: fields.idempotency_key,
+            binding: fields.binding,
+        };
+        mapping.validate().map_err(serde::de::Error::custom)?;
+        Ok(mapping)
+    }
 }
 
 impl OpenAiCompatResourceMapping {
     pub fn resource_kind(&self) -> OpenAiCompatResourceKind {
         self.public_id.resource_kind()
+    }
+
+    pub fn validate(&self) -> Result<(), OpenAiCompatRefError> {
+        if self.public_id.resource_kind() != self.surface.resource_kind() {
+            return Err(OpenAiCompatRefError::CorruptMapping);
+        }
+        Ok(())
     }
 
     pub fn is_authorized_for(&self, scope: &OpenAiCompatActorScope) -> bool {
@@ -399,6 +436,8 @@ pub enum OpenAiCompatRefOperation {
 pub struct OpenAiCompatRefLookup {
     pub requester: OpenAiCompatActorScope,
     pub public_id: OpenAiCompatPublicId,
+    /// Caller intent for future operation-specific policy/audit. Current lookup
+    /// authorization is owner-scoped and intentionally identical for all values.
     pub operation: OpenAiCompatRefOperation,
 }
 
@@ -492,6 +531,7 @@ impl OpenAiCompatRefStore for InMemoryOpenAiCompatRefStore {
                     .get(public_id)
                     .cloned()
                     .ok_or(OpenAiCompatRefError::CorruptMapping)?;
+                mapping.validate()?;
                 if mapping.request_fingerprint == request.request_fingerprint {
                     return Ok(OpenAiCompatRefReservationOutcome::Replayed(mapping));
                 }
@@ -527,6 +567,7 @@ impl OpenAiCompatRefStore for InMemoryOpenAiCompatRefStore {
         let Some(mapping) = state.by_public_id.get_mut(&request.public_id) else {
             return Ok(None);
         };
+        mapping.validate()?;
         if !mapping.is_authorized_for(&request.owner) {
             return Ok(None);
         }
@@ -544,6 +585,7 @@ impl OpenAiCompatRefStore for InMemoryOpenAiCompatRefStore {
         let Some(mapping) = state.by_public_id.get(&request.public_id) else {
             return Ok(None);
         };
+        mapping.validate()?;
         if !mapping.is_authorized_for(&request.requester) {
             return Ok(None);
         }
@@ -567,15 +609,16 @@ impl InMemoryOpenAiCompatRefStore {
 
 fn new_pending_mapping(request: OpenAiCompatRefReservation) -> OpenAiCompatResourceMapping {
     let public_id = OpenAiCompatPublicId::generate_for(request.surface);
-    debug_assert_eq!(public_id.resource_kind(), request.surface.resource_kind());
-    OpenAiCompatResourceMapping {
+    let mapping = OpenAiCompatResourceMapping {
         public_id,
         owner: request.owner,
         surface: request.surface,
         request_fingerprint: request.request_fingerprint,
         idempotency_key: request.idempotency_key,
         binding: OpenAiCompatResourceBinding::Pending,
-    }
+    };
+    debug_assert!(mapping.validate().is_ok());
+    mapping
 }
 
 fn validate_public_ref(
