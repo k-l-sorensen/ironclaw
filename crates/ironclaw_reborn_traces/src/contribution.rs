@@ -5148,7 +5148,36 @@ fn safe_trace_upload_claim_issuer_url_label(url: &reqwest::Url) -> String {
     format!("{}://{}", url.scheme(), host)
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Test-only, task-scoped override for the remote-request timeout.
+    ///
+    /// The timeout was historically configured for tests by setting the
+    /// process-global `IRONCLAW_TRACE_REMOTE_REQUEST_TIMEOUT_MS` env var via a
+    /// `set_var`/`remove_var` guard. That is a process-global mutation: under
+    /// parallel test execution, the short (e.g. 50ms) value set by one timing
+    /// test leaked into every other test that built a trace HTTP client on
+    /// another thread, causing spurious `operation timed out` failures against
+    /// fast local mock servers (and the reverse: the guard's `remove_var`
+    /// reverting an in-flight request to the 30s default). A task-local
+    /// override is visible only within the awaiting test's own task tree —
+    /// `trace_remote_http_client` is called from the same task that runs the
+    /// submit `.await` — so it is fully isolated across parallel tests with no
+    /// process-global state and no change to production behavior.
+    ///
+    /// CAVEAT: the override only propagates within the awaiting task's tree. If
+    /// a future refactor wraps the HTTP call in `tokio::spawn` (a new task that
+    /// does not inherit task-locals), the spawned request would silently bypass
+    /// this override and fall back to the env/default timeout.
+    static TEST_REMOTE_REQUEST_TIMEOUT_OVERRIDE: Duration;
+}
+
 fn trace_remote_request_timeout() -> Duration {
+    // Test-only, task-scoped override takes precedence (see task-local docs).
+    #[cfg(test)]
+    if let Ok(override_timeout) = TEST_REMOTE_REQUEST_TIMEOUT_OVERRIDE.try_with(|t| *t) {
+        return override_timeout;
+    }
     std::env::var(TRACE_REMOTE_REQUEST_TIMEOUT_ENV)
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
@@ -10936,11 +10965,24 @@ mod tests {
     #[tokio::test]
     async fn policy_aware_submit_uses_bounded_request_timeout() {
         let _token_guard = EnvVarRestore::set("TRACE_COMMONS_TEST_TOKEN", "super-secret-token");
-        let _timeout_guard = EnvVarRestore::set("IRONCLAW_TRACE_REMOTE_REQUEST_TIMEOUT_MS", "50");
+        // The 50ms remote-request timeout is supplied via a task-scoped
+        // override rather than the process-global
+        // `IRONCLAW_TRACE_REMOTE_REQUEST_TIMEOUT_MS` env var, so it cannot leak
+        // into other tests' HTTP clients under parallel execution. See the
+        // `TEST_REMOTE_REQUEST_TIMEOUT_OVERRIDE` task-local docs.
+        // Regression detection is decoupled from a tight wall-clock race: the
+        // mock sleeps 10s (>> the 200ms request timeout) and then returns 200
+        // OK. A submit that HONORS its bounded timeout returns an
+        // `is_timeout()` reqwest error in ~200ms; a submit that IGNORES it
+        // sleeps the full 10s and returns the mock's success body, tripping the
+        // `Ok(Ok(_))` arm below. The outer 30s watchdog exists ONLY to fail a
+        // genuine infinite hang, not to time the request — so it never flakes
+        // under an oversubscribed test runtime where reqwest's timer is merely
+        // delayed by a few seconds.
         let app = axum::Router::new().route(
             "/v1/traces",
             axum::routing::post(|| async {
-                tokio::time::sleep(Duration::from_secs(2)).await;
+                tokio::time::sleep(Duration::from_secs(10)).await;
                 (
                     axum::http::StatusCode::OK,
                     axum::Json(serde_json::json!({
@@ -10972,24 +11014,34 @@ mod tests {
             .expect("redaction should succeed");
         apply_credit_estimate_to_envelope(&mut envelope);
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(1),
-            submit_trace_envelope_to_endpoint_with_policy(
-                &envelope,
-                &endpoint,
-                &StandingTraceContributionPolicy {
-                    enabled: true,
-                    ingestion_endpoint: Some(endpoint.clone()),
-                    bearer_token_env: "TRACE_COMMONS_TEST_TOKEN".to_string(),
-                    ..Default::default()
-                },
-            ),
-        )
-        .await;
+        let result = TEST_REMOTE_REQUEST_TIMEOUT_OVERRIDE
+            .scope(
+                Duration::from_millis(200),
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    submit_trace_envelope_to_endpoint_with_policy(
+                        &envelope,
+                        &endpoint,
+                        &StandingTraceContributionPolicy {
+                            enabled: true,
+                            ingestion_endpoint: Some(endpoint.clone()),
+                            bearer_token_env: "TRACE_COMMONS_TEST_TOKEN".to_string(),
+                            ..Default::default()
+                        },
+                    ),
+                ),
+            )
+            .await;
         let error = match result {
             Ok(Err(error)) => error,
-            Ok(Ok(_)) => panic!("slow trace submission should time out"),
-            Err(_) => panic!("trace submission did not respect the bounded request timeout"),
+            // The submit returned the mock's success body, so it slept the full
+            // 10s instead of honoring the 200ms request timeout.
+            Ok(Ok(_)) => {
+                panic!("slow trace submission should time out via the bounded request timeout")
+            }
+            // The 30s anti-hang watchdog tripped: the submit neither honored
+            // its request timeout nor received the (10s-delayed) response.
+            Err(_) => panic!("trace submission hung past the 30s anti-hang watchdog"),
         };
 
         assert!(
@@ -12272,9 +12324,11 @@ mod tests {
 
     #[test]
     fn device_key_policy_round_trips() {
-        let mut policy = StandingTraceContributionPolicy::default();
-        policy.auth_mode = TraceUploadAuthMode::DeviceKey;
-        policy.device_key_id = Some("sha256:abc".to_string());
+        let policy = StandingTraceContributionPolicy {
+            auth_mode: TraceUploadAuthMode::DeviceKey,
+            device_key_id: Some("sha256:abc".to_string()),
+            ..Default::default()
+        };
         let json = serde_json::to_value(&policy).unwrap();
         assert_eq!(json["auth_mode"], "device_key");
         let back: StandingTraceContributionPolicy = serde_json::from_value(json).unwrap();

@@ -4,6 +4,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const ONBOARD_REQUEST_SCHEMA_VERSION: &str = "trace_commons.onboard_request.v1";
+pub const ONBOARD_RESPONSE_SCHEMA_VERSION: &str = "trace_commons.onboard_response.v1";
 
 #[derive(Debug, Clone, Serialize)]
 pub struct OnboardRequest {

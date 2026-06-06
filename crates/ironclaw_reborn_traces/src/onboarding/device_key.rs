@@ -177,13 +177,18 @@ impl DeviceKeypair {
         })
     }
 
-    /// Atomically move the pending keypair to the tenant-keyed path, recording `tenant_id`.
-    pub fn promote(
-        self,
-        base: &Path,
-        invite_hash: &str,
-        tenant_id: &str,
-    ) -> Result<Self, DeviceKeyError> {
+    /// Write the keypair to the tenant-keyed path, recording `tenant_id`.
+    ///
+    /// The pending file is deliberately **left in place** — it must outlive the
+    /// caller's subsequent policy write so the flow stays retry-safe (spec
+    /// §2.2). If anything between the network success and the policy write
+    /// fails, a retry reloads the same pending key (server idempotency returns
+    /// the original registration) and harmlessly overwrites this tenant file.
+    /// The caller removes the pending file via [`Self::discard_pending`] only
+    /// after the policy write succeeds (the finalize step). The tenant-file
+    /// write itself is atomic (`write_json_file` create_new + rename), so a
+    /// repeated promote is an idempotent overwrite.
+    pub fn promote(self, base: &Path, tenant_id: &str) -> Result<Self, DeviceKeyError> {
         let dest = tenant_path(base, tenant_id);
         let pubkey_bytes: [u8; 32] = self.signing_key.verifying_key().to_bytes();
         let public_key_b64 = base64::engine::general_purpose::STANDARD.encode(pubkey_bytes);
@@ -195,14 +200,6 @@ impl DeviceKeypair {
             &public_key_b64,
             Some(tenant_id),
         )?;
-
-        // Remove the pending file.
-        let pending = pending_path(base, invite_hash);
-        if pending.exists() {
-            std::fs::remove_file(&pending).map_err(|e| DeviceKeyError::Io {
-                reason: format!("remove pending {}: {e}", pending.display()),
-            })?;
-        }
 
         Ok(Self {
             signing_key: self.signing_key,
@@ -320,11 +317,13 @@ mod tests {
     }
 
     #[test]
-    fn promote_moves_pending_to_tenant_path_and_records_tenant() {
+    fn promote_writes_tenant_path_and_keeps_pending() {
         let dir = tmp_dir();
         let kp = DeviceKeypair::load_or_generate_pending(dir.path(), "h1").unwrap();
-        let promoted = kp.promote(dir.path(), "h1", "tenant-a").unwrap();
-        assert!(!dir.path().join("device_keys/pending/h1.json").exists());
+        let promoted = kp.promote(dir.path(), "tenant-a").unwrap();
+        // The pending file MUST survive promote so the flow stays retry-safe
+        // until the caller's policy write succeeds (then discard_pending runs).
+        assert!(dir.path().join("device_keys/pending/h1.json").exists());
         let tenant_file = dir
             .path()
             .join(format!("device_keys/{}.json", tenant_hash("tenant-a")));
@@ -333,10 +332,31 @@ mod tests {
     }
 
     #[test]
+    fn promote_then_discard_removes_pending() {
+        let dir = tmp_dir();
+        let kp = DeviceKeypair::load_or_generate_pending(dir.path(), "h1").unwrap();
+        kp.promote(dir.path(), "tenant-a").unwrap();
+        DeviceKeypair::discard_pending(dir.path(), "h1").unwrap();
+        assert!(!dir.path().join("device_keys/pending/h1.json").exists());
+    }
+
+    #[test]
+    fn promote_is_idempotent_overwrite() {
+        let dir = tmp_dir();
+        let kp = DeviceKeypair::load_or_generate_pending(dir.path(), "h1").unwrap();
+        let first = kp.promote(dir.path(), "tenant-a").unwrap();
+        // A retry reloads the same pending key and promotes again; the tenant
+        // file overwrite is harmless and yields the same device_key_id.
+        let reloaded = DeviceKeypair::load_or_generate_pending(dir.path(), "h1").unwrap();
+        let second = reloaded.promote(dir.path(), "tenant-a").unwrap();
+        assert_eq!(first.device_key_id, second.device_key_id);
+    }
+
+    #[test]
     fn load_for_tenant_finds_promoted_key() {
         let dir = tmp_dir();
         let kp = DeviceKeypair::load_or_generate_pending(dir.path(), "h1").unwrap();
-        let promoted = kp.promote(dir.path(), "h1", "tenant-a").unwrap();
+        let promoted = kp.promote(dir.path(), "tenant-a").unwrap();
         let loaded = DeviceKeypair::load_for_tenant(dir.path(), "tenant-a")
             .unwrap()
             .unwrap();
@@ -355,7 +375,7 @@ mod tests {
     fn self_signed_workload_jwt_has_correct_shape_and_verifies() {
         let dir = tmp_dir();
         let kp = DeviceKeypair::load_or_generate_pending(dir.path(), "h1").unwrap();
-        let kp = kp.promote(dir.path(), "h1", "tenant-a").unwrap();
+        let kp = kp.promote(dir.path(), "tenant-a").unwrap();
         let jwt = kp.sign_workload_jwt("trace-commons-ingest").unwrap();
         let parts: Vec<&str> = jwt.split('.').collect();
         assert_eq!(parts.len(), 3);

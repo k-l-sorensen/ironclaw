@@ -79,11 +79,7 @@ impl ParsedInvite {
             return Err(InviteParseError::MissingCode);
         }
         let host_only = host_only(host_port).to_ascii_lowercase();
-        let loopback = host_only == "localhost"
-            || host_only
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback());
-        if scheme != "https" && !(scheme == "http" && loopback) {
+        if !is_https_or_loopback(scheme, &host_only) {
             return Err(InviteParseError::InsecureScheme);
         }
         Ok(Self {
@@ -104,6 +100,37 @@ impl ParsedInvite {
     }
 }
 
+/// Returns true if `scheme`+`host_only` satisfies the https-or-loopback rule:
+/// HTTPS is always allowed; HTTP is allowed only for loopback hosts.
+/// `host_only` must already be lowercased and bracket-stripped (as produced by
+/// the `host_only` helper below).
+pub(crate) fn is_https_or_loopback(scheme: &str, host_only: &str) -> bool {
+    if scheme == "https" {
+        return true;
+    }
+    if scheme == "http" {
+        let loopback = host_only == "localhost"
+            || host_only
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback());
+        return loopback;
+    }
+    false
+}
+
+/// Given a fully-parsed `reqwest::Url`, return the scheme://host[:port] origin
+/// string in the same format as `ParsedInvite::origin` (brackets preserved for
+/// IPv6, non-default port included). Returns `None` if the URL has no host.
+pub(crate) fn origin_of(url: &reqwest::Url) -> Option<String> {
+    let host = url.host_str()?;
+    let scheme = url.scheme();
+    let host_port = match url.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    };
+    Some(format!("{scheme}://{host_port}"))
+}
+
 /// Extract the bare host (no port, no brackets) from a host[:port] authority.
 /// Handles three shapes:
 ///   - bracketed IPv6 `[::1]` or `[::1]:3917` -> `::1`
@@ -117,7 +144,7 @@ impl ParsedInvite {
 /// the URL parser rejects unbracketed IPv6 authorities and always emits IPv6
 /// hosts bracketed. The bare-IPv6 branch below therefore only ever sees a
 /// portless literal.
-fn host_only(host_port: &str) -> &str {
+pub(crate) fn host_only(host_port: &str) -> &str {
     if let Some(rest) = host_port.strip_prefix('[') {
         // Bracketed IPv6: take everything up to the closing bracket.
         return rest.split(']').next().unwrap_or(rest);
