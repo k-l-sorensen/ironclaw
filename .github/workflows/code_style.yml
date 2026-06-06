@@ -189,7 +189,7 @@ jobs:
       - id: packages
         name: Build package matrix from Reborn crate families
         run: |
-          packages="$(scripts/ci/reborn-package-matrix.sh)"
+          packages="$(scripts/ci/reborn-package-matrix.sh clippy)"
 
           if [ -z "${packages}" ] || [ "${packages}" = "[]" ]; then
             echo "No Reborn workspace crates discovered" >&2
