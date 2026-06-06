@@ -629,6 +629,16 @@ impl Default for ValueMetadata {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TraceUploadAuthMode {
+    /// Operator-minted workload token read from env (legacy/back-compat path).
+    #[default]
+    WorkloadTokenEnv,
+    /// Self-signed workload JWTs using the local device key (agent onboarding path).
+    DeviceKey,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StandingTraceContributionPolicy {
     pub enabled: bool,
@@ -668,6 +678,10 @@ pub struct StandingTraceContributionPolicy {
     pub min_submission_score: f32,
     pub credit_notice_interval_hours: u32,
     pub default_scope: ConsentScope,
+    #[serde(default)]
+    pub auth_mode: TraceUploadAuthMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_key_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -745,6 +759,8 @@ impl Default for StandingTraceContributionPolicy {
             min_submission_score: 0.35,
             credit_notice_interval_hours: 168,
             default_scope: ConsentScope::DebuggingEvaluation,
+            auth_mode: TraceUploadAuthMode::default(),
+            device_key_id: None,
         }
     }
 }
@@ -12239,5 +12255,30 @@ mod tests {
             key.contains(&expected_hash),
             "cache key must include sha256-hashed invite code: {key}"
         );
+    }
+
+    #[test]
+    fn legacy_policy_json_defaults_to_workload_token_env_auth() {
+        // Take the default policy's JSON and strip the two NEW fields to simulate
+        // a pre-upgrade policy file on disk.
+        let mut legacy = serde_json::to_value(StandingTraceContributionPolicy::default()).unwrap();
+        let obj = legacy.as_object_mut().unwrap();
+        obj.remove("auth_mode");
+        obj.remove("device_key_id");
+        let policy: StandingTraceContributionPolicy = serde_json::from_value(legacy).unwrap();
+        assert_eq!(policy.auth_mode, TraceUploadAuthMode::WorkloadTokenEnv);
+        assert!(policy.device_key_id.is_none());
+    }
+
+    #[test]
+    fn device_key_policy_round_trips() {
+        let mut policy = StandingTraceContributionPolicy::default();
+        policy.auth_mode = TraceUploadAuthMode::DeviceKey;
+        policy.device_key_id = Some("sha256:abc".to_string());
+        let json = serde_json::to_value(&policy).unwrap();
+        assert_eq!(json["auth_mode"], "device_key");
+        let back: StandingTraceContributionPolicy = serde_json::from_value(json).unwrap();
+        assert_eq!(back.auth_mode, TraceUploadAuthMode::DeviceKey);
+        assert_eq!(back.device_key_id.as_deref(), Some("sha256:abc"));
     }
 }
