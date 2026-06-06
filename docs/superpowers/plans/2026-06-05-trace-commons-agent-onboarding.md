@@ -90,6 +90,22 @@ mod tests {
         let resp: OnboardResponse = serde_json::from_value(json).unwrap();
         assert_eq!(resp.tenant_id, "tenant-zaki-pilot");
         assert!(resp.contributor_label.is_none());
+        assert!(resp.profile_url.is_none()); // community URLs are optional
+    }
+
+    #[test]
+    fn onboard_response_parses_community_urls_when_present() {
+        let json = serde_json::json!({
+            "schema_version": "trace_commons.onboard_response.v1",
+            "tenant_id": "t", "ingest_url": "https://i.example",
+            "issuer_url": "https://s.example", "audience": "a",
+            "device_key_id": "sha256:x",
+            "community_url": "https://tracecommons.ai",
+            "profile_url": "https://tracecommons.ai/profile",
+            "leaderboard_url": "https://tracecommons.ai/leaderboard",
+        });
+        let resp: OnboardResponse = serde_json::from_value(json).unwrap();
+        assert_eq!(resp.profile_url.as_deref(), Some("https://tracecommons.ai/profile"));
     }
 
     #[test]
@@ -146,6 +162,15 @@ pub struct OnboardResponse {
     pub device_key_id: String,
     #[serde(default)]
     pub contributor_label: Option<String>,
+    /// Optional browser-surface navigation hints (trace-commons-server#137).
+    /// Deployment config, NOT credential material: these never participate in
+    /// issuer trust anchoring; non-HTTPS values are dropped, not fatal.
+    #[serde(default)]
+    pub community_url: Option<String>,
+    #[serde(default)]
+    pub profile_url: Option<String>,
+    #[serde(default)]
+    pub leaderboard_url: Option<String>,
 }
 
 /// Typed error codes from the onboard endpoint. `InviteNotValid` deliberately
@@ -809,6 +834,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn community_urls_pass_through_when_https_and_drop_when_not() {
+        // ok_response + {"profile_url": "https://tracecommons.ai/profile",
+        //                "leaderboard_url": "http://insecure.example"}
+        // → outcome.profile_url = Some(...), outcome.leaderboard_url = None,
+        //   and the onboard still succeeds (nav hints are never fatal).
+        // (Implement with the same mock-issuer builder.)
+    }
+
+    #[tokio::test]
     async fn non_https_ingest_url_rejected() {
         let issuer = spawn_mock_issuer(serde_json::Value::Null, axum::http::StatusCode::OK).await;
         let origin = format!("http://127.0.0.1:{}", issuer.addr.port());
@@ -861,6 +895,11 @@ pub struct OnboardOutcome {
     pub issuer_url: String,
     pub device_key_id: String,
     pub contributor_label: Option<String>,
+    /// Browser navigation hints from the server (trace-commons-server#137).
+    /// Sanitized: each is dropped (None) unless HTTPS — never fatal.
+    pub community_url: Option<String>,
+    pub profile_url: Option<String>,
+    pub leaderboard_url: Option<String>,
 }
 
 #[derive(Debug, Error)]
@@ -946,12 +985,19 @@ pub async fn onboard_at_dir(
     policy.default_scope = ConsentScope::DebuggingEvaluation; // pilot default (verify variant name)
     write_policy_at_dir(dir, &policy)?;
 
+    // Community URLs are navigation hints only: sanitize (HTTPS or drop),
+    // never participate in trust anchoring, never fail the onboard.
+    let sanitize_nav = |u: Option<String>| u.filter(|u| u.starts_with("https://"));
+
     Ok(OnboardOutcome {
         tenant_id: response.tenant_id,
         ingest_url: response.ingest_url,
         issuer_url: invite.origin,
         device_key_id: key.device_key_id,
         contributor_label: response.contributor_label,
+        community_url: sanitize_nav(response.community_url),
+        profile_url: sanitize_nav(response.profile_url),
+        leaderboard_url: sanitize_nav(response.leaderboard_url),
     })
 }
 ```
@@ -1132,6 +1178,9 @@ fn onboard_success_output_contains_no_key_material() {
         issuer_url: "https://issuer.example.com".into(),
         device_key_id: "sha256:abc".into(),
         contributor_label: None,
+        community_url: Some("https://tracecommons.ai".into()),
+        profile_url: Some("https://tracecommons.ai/profile".into()),
+        leaderboard_url: None,
     };
     let out = onboard_success_output(&outcome);
     let s = out.to_string();
@@ -1162,7 +1211,7 @@ Dispatch for onboard: validate via `validate_onboard_input` (returns typed struc
 - `Network` → "Couldn't reach the onboarding server: {reason}. The invite was not consumed; it's safe to retry."
 - `InviteRejected(OnboardRateLimited)` → "The server is rate-limiting onboarding attempts; try again in a few minutes."
 
-Success output (`onboard_success_output`): `{ "enrolled": true, "tenant_id", "ingest_url", "issuer_url", "device_key_id", "consents": {...}, "next_steps": "Traces will be redacted locally and queued; submission requires the score threshold. Opt out anytime with 'ironclaw traces opt-out'." }`.
+Success output (`onboard_success_output`): `{ "enrolled": true, "tenant_id", "ingest_url", "issuer_url", "device_key_id", "consents": {...}, "community_url"?, "profile_url"?, "leaderboard_url"?, "next_steps": "Traces will be redacted locally and queued; submission requires the score threshold. Opt out anytime with 'ironclaw traces opt-out'." }` — include the community/profile/leaderboard URLs only when present on the outcome (already HTTPS-sanitized by the onboarding module) so the agent can point the user at their profile and the leaderboard.
 
 Status dispatch: read the scoped policy via `read_trace_policy_for_scope`, plus queue depth (find the existing queue-status helper the CLI `QueueStatus` subcommand uses in `ironclaw_reborn_cli/src/commands/traces/mod.rs` and call the same `ironclaw_reborn_traces` function). Output: `{ "enrolled": bool, "tenant_id", "auth_mode", "include_message_text", "include_tool_payloads", "queue_depth", "endpoint" }`.
 
@@ -1202,6 +1251,9 @@ mentions an invite code for trace contribution), guide them through enrollment:
    and confirmed=true.
 5. Report the result: tenant joined, where data goes, and that they can check
    with trace_commons_status or opt out with `ironclaw traces opt-out`.
+   If the result includes profile_url / leaderboard_url / community_url,
+   share those links so the user can view their contributor profile and the
+   leaderboard in a browser.
 
 Never call trace_commons_onboard with confirmed=true unless steps 2 and 3
 happened in this conversation. If the tool reports the invite as not valid,

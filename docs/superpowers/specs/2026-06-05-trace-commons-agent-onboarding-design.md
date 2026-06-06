@@ -55,9 +55,20 @@ Response (200):
   "issuer_url": "https://issuer.example.com",
   "audience": "trace-commons-ingest",
   "device_key_id": "sha256:<pubkey-hash>",
-  "contributor_label": "optional operator note"
+  "contributor_label": "optional operator note",
+  "community_url": "https://tracecommons.ai",
+  "profile_url": "https://tracecommons.ai/profile",
+  "leaderboard_url": "https://tracecommons.ai/leaderboard"
 }
 ```
+
+The last three fields are optional browser-surface navigation hints
+(trace-commons-server#137): the agent surfaces them after successful
+onboarding so the user can reach their profile/leaderboard without the client
+hardcoding community deployment details. They are deployment config, not
+credential material — they MUST NOT participate in issuer trust anchoring
+(§2.1), and non-HTTPS values are dropped client-side rather than failing the
+onboard.
 
 Server behavior, in one transaction:
 
@@ -249,7 +260,8 @@ Params: `invite_url: string`, `include_message_text: bool`,
 - Refuses `confirmed: false` with a message instructing the agent to obtain
   explicit user consent first.
 - On success returns enrollment summary (tenant, endpoints, consents,
-  device_key_id) — no key material.
+  device_key_id, and the optional community/profile/leaderboard URLs when the
+  server provides them) — no key material.
 - Maps typed errors to user-facing messages (`InviteNotValid` → "this invite
   link isn't valid — it may have been used already; ask the operator for a
   new one").
@@ -266,7 +278,8 @@ prompts-in-files rule). When the user pastes an invite link the agent:
 3. asks consent question 2: include redacted message text and/or redacted
    tool payloads (yes/no each);
 4. calls `trace_commons_onboard` with `confirmed: true`;
-5. reports the result and how to opt out / adjust later.
+5. reports the result, points the user at their profile/leaderboard URLs when
+   the server provided them, and explains how to opt out / adjust later.
 
 ### 3.3 `trace_commons_status` (companion tool)
 
