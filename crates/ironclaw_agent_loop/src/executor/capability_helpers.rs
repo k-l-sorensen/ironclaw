@@ -5,8 +5,12 @@ use ironclaw_turns::{
     LoopResultRef,
     run_profile::{
         AgentLoopDriverHost, AppendCapabilityResultRef, CapabilityCallCandidate,
-        CapabilityDescriptorView, CapabilityInvocation, CapabilityResultMessage,
-        CapabilitySurfaceVersion, ProviderToolCallReference, VisibleCapabilitySurface,
+        CapabilityDescriptorView, CapabilityFailureDetail, CapabilityInputIssue,
+        CapabilityInputIssueCode, CapabilityInputRepair, CapabilityInvocation,
+        CapabilityRecoveryDetail, CapabilityRecoveryHint, CapabilityResultMessage,
+        CapabilitySurfaceVersion, LoopSafeSummary, ModelVisibleCapabilityError,
+        ProviderToolCallReference, RecoveryConstraints, SameCallRetryConstraint,
+        VisibleCapabilitySurface,
     },
 };
 
@@ -146,8 +150,276 @@ pub(super) async fn append_capability_error_ref(
     call: &CapabilityCallCandidate,
     summary: &CapabilityErrorSummary,
 ) -> Result<(), AgentLoopExecutorError> {
-    append_capability_safe_summary_ref(host, state, call, summary.safe_summary.as_str().to_string())
+    append_capability_safe_summary_ref(host, state, call, capability_error_model_summary(summary))
         .await
+}
+
+fn capability_error_model_summary(summary: &CapabilityErrorSummary) -> String {
+    let Some(model_error) = model_visible_capability_error(summary) else {
+        return summary.safe_summary.as_str().to_string();
+    };
+    render_model_visible_capability_error(&model_error)
+}
+
+fn model_visible_capability_error(
+    summary: &CapabilityErrorSummary,
+) -> Option<ModelVisibleCapabilityError> {
+    let details = summary.detail.clone()?;
+    let recovery = recovery_detail_for_model_error(&details);
+    let recovery_hint = recovery_hint_for_model_error(&details);
+    Some(ModelVisibleCapabilityError {
+        kind: summary.kind.clone(),
+        message: summary.safe_summary.as_str().to_string(),
+        details,
+        constraints: recovery_constraints_for_model_error(summary),
+        recovery,
+        recovery_hint,
+    })
+}
+
+fn recovery_constraints_for_model_error(
+    summary: &CapabilityErrorSummary,
+) -> Option<RecoveryConstraints> {
+    match summary.kind {
+        ironclaw_turns::run_profile::CapabilityFailureKind::InvalidInput => {
+            Some(RecoveryConstraints {
+                same_call_retry: Some(SameCallRetryConstraint::RequiresChangedInput),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn render_model_visible_capability_error(error: &ModelVisibleCapabilityError) -> String {
+    let issues = match &error.details {
+        CapabilityFailureDetail::InvalidInput { issues } => issues,
+        _ => return error.message.clone(),
+    };
+    if issues.is_empty() {
+        return error.message.clone();
+    }
+
+    let mut parts = Vec::new();
+    parts.push(format!("capability failed with {}", error.kind.as_str()));
+    if let Some(retry) = error
+        .constraints
+        .as_ref()
+        .and_then(|constraints| constraints.same_call_retry.as_ref())
+    {
+        parts.push(format!(
+            "same call retry {}",
+            render_same_call_retry_constraint(retry)
+        ));
+    }
+    let mut input_issues = format!("input issues: {}", render_input_issue(&issues[0]));
+    for issue in issues.iter().skip(1).take(2) {
+        input_issues.push_str("; ");
+        input_issues.push_str(&render_input_issue(issue));
+    }
+    if issues.len() > 3 {
+        input_issues.push_str("; more issues omitted");
+    }
+    parts.push(input_issues);
+    if let Some(next_actions) = render_recovery_next_actions(error.recovery.as_ref()) {
+        parts.push(next_actions);
+    }
+    if let Some(recovery_hint) = error.recovery_hint.as_ref() {
+        parts.push(format!(
+            "recovery hint: {}",
+            render_recovery_hint(recovery_hint)
+        ));
+    }
+    parts.push(format!("summary: {}", error.message));
+    render_priority_safe_summary(parts)
+}
+
+fn render_same_call_retry_constraint(constraint: &SameCallRetryConstraint) -> String {
+    match constraint {
+        SameCallRetryConstraint::Allowed => "allowed".to_string(),
+        SameCallRetryConstraint::AllowedAfterDelay { retry_after_ms } => {
+            format!("allowed after {retry_after_ms} ms")
+        }
+        SameCallRetryConstraint::RequiresChangedInput => "requires changed input".to_string(),
+        SameCallRetryConstraint::NotUseful => "not useful".to_string(),
+        SameCallRetryConstraint::Forbidden => "forbidden".to_string(),
+    }
+}
+
+fn render_input_issue(issue: &CapabilityInputIssue) -> String {
+    let mut rendered = format!(
+        "path {} {}",
+        issue.path,
+        capability_input_issue_message(issue.code)
+    );
+    if let Some(expected) = issue.expected.as_ref() {
+        rendered.push_str(" expected ");
+        rendered.push_str(expected);
+    }
+    if let Some(received) = issue.received.as_ref() {
+        rendered.push_str(" received ");
+        rendered.push_str(received);
+    }
+    if let Some(schema_path) = issue.schema_path.as_ref() {
+        rendered.push_str(" at schema ");
+        rendered.push_str(schema_path);
+    }
+    rendered
+}
+
+fn capability_input_issue_message(code: CapabilityInputIssueCode) -> &'static str {
+    match code {
+        CapabilityInputIssueCode::MissingRequired => "is missing a required value",
+        CapabilityInputIssueCode::UnexpectedField => "has an unexpected field",
+        CapabilityInputIssueCode::TypeMismatch => "has the wrong type",
+        CapabilityInputIssueCode::InvalidValue => "has an invalid value",
+    }
+}
+
+fn recovery_detail_for_model_error(
+    details: &CapabilityFailureDetail,
+) -> Option<CapabilityRecoveryDetail> {
+    match details {
+        CapabilityFailureDetail::InvalidInput { issues } if !issues.is_empty() => {
+            Some(CapabilityRecoveryDetail::InvalidInput {
+                repairs: issues.iter().take(3).map(input_repair_for_issue).collect(),
+            })
+        }
+        CapabilityFailureDetail::InvalidInput { .. } => None,
+        _ => None,
+    }
+}
+
+fn input_repair_for_issue(issue: &CapabilityInputIssue) -> CapabilityInputRepair {
+    match issue.code {
+        CapabilityInputIssueCode::MissingRequired => CapabilityInputRepair::ProvideRequiredField {
+            path: issue.path.clone(),
+        },
+        CapabilityInputIssueCode::UnexpectedField => CapabilityInputRepair::RemoveUnexpectedField {
+            path: issue.path.clone(),
+        },
+        CapabilityInputIssueCode::TypeMismatch => CapabilityInputRepair::ChangeType {
+            path: issue.path.clone(),
+            expected: issue.expected.clone(),
+        },
+        CapabilityInputIssueCode::InvalidValue => CapabilityInputRepair::UseAllowedValue {
+            path: issue.path.clone(),
+        },
+    }
+}
+
+fn render_recovery_next_actions(recovery: Option<&CapabilityRecoveryDetail>) -> Option<String> {
+    let repairs = match recovery? {
+        CapabilityRecoveryDetail::InvalidInput { repairs } => repairs,
+        _ => return None,
+    };
+    if repairs.is_empty() {
+        return None;
+    }
+    let mut rendered = format!("next actions: {}", render_input_repair(&repairs[0]));
+    for repair in repairs.iter().skip(1).take(2) {
+        rendered.push_str("; ");
+        rendered.push_str(&render_input_repair(repair));
+    }
+    if repairs.len() > 3 {
+        rendered.push_str("; more actions omitted");
+    }
+    Some(rendered)
+}
+
+fn render_input_repair(repair: &CapabilityInputRepair) -> String {
+    match repair {
+        CapabilityInputRepair::ProvideRequiredField { path } => {
+            format!("provide missing value at {path}")
+        }
+        CapabilityInputRepair::RemoveUnexpectedField { path } => {
+            format!("remove unexpected field at {path}")
+        }
+        CapabilityInputRepair::ChangeType { path, expected } => {
+            if let Some(expected) = expected.as_ref() {
+                format!("change value at {path} to expected type {expected}")
+            } else {
+                format!("change value at {path} to expected type")
+            }
+        }
+        CapabilityInputRepair::UseAllowedValue { path } => {
+            format!("change value at {path} to an allowed value")
+        }
+    }
+}
+
+fn recovery_hint_for_model_error(
+    details: &CapabilityFailureDetail,
+) -> Option<CapabilityRecoveryHint> {
+    match details {
+        CapabilityFailureDetail::InvalidInput { issues } if !issues.is_empty() => {
+            Some(CapabilityRecoveryHint::CorrectArgumentsBeforeRetry)
+        }
+        CapabilityFailureDetail::InvalidInput { .. } => None,
+        _ => None,
+    }
+}
+
+fn render_recovery_hint(hint: &CapabilityRecoveryHint) -> &'static str {
+    match hint {
+        CapabilityRecoveryHint::CorrectArgumentsBeforeRetry => {
+            "Correct the capability arguments and retry only if the action is still safe"
+        }
+    }
+}
+
+fn render_priority_safe_summary(parts: Vec<String>) -> String {
+    let mut rendered = String::new();
+    for part in parts {
+        let candidate = if rendered.is_empty() {
+            part
+        } else {
+            format!("{rendered}. {part}")
+        };
+        if LoopSafeSummary::new(candidate.clone()).is_ok() {
+            rendered = candidate;
+            continue;
+        }
+        if rendered.is_empty() {
+            return truncate_loop_safe_summary(candidate);
+        }
+        if let Some(with_omission) = append_summary_part(&rendered, "more details omitted") {
+            rendered = with_omission;
+        }
+        break;
+    }
+    if rendered.is_empty() {
+        "capability failed".to_string()
+    } else {
+        rendered
+    }
+}
+
+fn append_summary_part(current: &str, part: &str) -> Option<String> {
+    let candidate = if current.is_empty() {
+        part.to_string()
+    } else {
+        format!("{current}. {part}")
+    };
+    LoopSafeSummary::new(candidate.clone()).ok()?;
+    Some(candidate)
+}
+
+fn truncate_loop_safe_summary(mut summary: String) -> String {
+    const ELLIPSIS: &str = "...";
+    if LoopSafeSummary::new(summary.clone()).is_ok() {
+        return summary;
+    }
+
+    let max_len = 512_usize.saturating_sub(ELLIPSIS.len());
+    while summary.len() > max_len || !summary.is_char_boundary(summary.len()) {
+        summary.pop();
+    }
+    summary.push_str(ELLIPSIS);
+    if LoopSafeSummary::new(summary.clone()).is_ok() {
+        summary
+    } else {
+        "capability failed".to_string()
+    }
 }
 
 pub(super) async fn append_capability_safe_summary_ref(

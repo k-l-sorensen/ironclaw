@@ -4,9 +4,9 @@ use async_trait::async_trait;
 use ironclaw_turns::{
     LoopFailureKind, LoopResultRef,
     run_profile::{
-        CapabilityBatchInvocation, CapabilityCallCandidate, CapabilityFailureKind,
-        CapabilityOutcome, CapabilityProgress, CapabilityResultMessage, LoopDriverNoteKind,
-        LoopProgressEvent, VisibleCapabilitySurface,
+        CapabilityBatchInvocation, CapabilityCallCandidate, CapabilityFailure,
+        CapabilityFailureKind, CapabilityOutcome, CapabilityProgress, CapabilityResultMessage,
+        LoopDriverNoteKind, LoopProgressEvent, VisibleCapabilitySurface,
     },
 };
 
@@ -94,10 +94,12 @@ impl ExecutorStage<CapabilityInput> for CapabilityStage {
                 .recent_failure_kinds
                 .push(LoopFailureKind::PolicyDenied);
             let summary = CapabilityErrorSummary {
+                kind: CapabilityFailureKind::PolicyDenied,
                 class: CapabilityErrorClass::PolicyDenied,
                 safe_summary: SanitizedStrategySummary::from_trusted_static(
                     "capability is not visible in the filtered surface",
                 ),
+                detail: None,
                 diagnostic_ref: None,
             };
             match self
@@ -309,6 +311,18 @@ fn capability_failed_summary(
     )
 }
 
+fn failed_capability_error_summary(
+    failure: CapabilityFailure,
+) -> Result<CapabilityErrorSummary, AgentLoopExecutorError> {
+    Ok(CapabilityErrorSummary {
+        kind: failure.error_kind.clone(),
+        class: capability_error_class(&failure.error_kind),
+        safe_summary: capability_failed_summary(&failure.error_kind, failure.safe_summary)?,
+        detail: failure.detail,
+        diagnostic_ref: None,
+    })
+}
+
 fn capability_denied_summary(
     reason_kind: &str,
     safe_summary: String,
@@ -478,11 +492,13 @@ impl CapabilityStage {
                     .recent_failure_kinds
                     .push(LoopFailureKind::PolicyDenied);
                 let summary = CapabilityErrorSummary {
+                    kind: CapabilityFailureKind::PolicyDenied,
                     class: CapabilityErrorClass::PolicyDenied,
                     safe_summary: capability_denied_summary(
                         denied.reason_kind.as_str(),
                         denied.safe_summary,
                     )?,
+                    detail: None,
                     diagnostic_ref: None,
                 };
                 self.handle_capability_error(ctx, state, call, summary, capability_batch)
@@ -495,14 +511,7 @@ impl CapabilityStage {
                 state
                     .recent_failure_kinds
                     .push(capability_failure_kind(&failure.error_kind));
-                let summary = CapabilityErrorSummary {
-                    class: capability_error_class(&failure.error_kind),
-                    safe_summary: capability_failed_summary(
-                        &failure.error_kind,
-                        failure.safe_summary,
-                    )?,
-                    diagnostic_ref: None,
-                };
+                let summary = failed_capability_error_summary(failure)?;
                 self.handle_capability_error(ctx, state, call, summary, capability_batch)
                     .await
             }
@@ -586,14 +595,7 @@ impl CapabilityStage {
                             if failure.error_kind == CapabilityFailureKind::Cancelled {
                                 return self.cancelled_after_checkpoint(ctx, state).await;
                             }
-                            summary = CapabilityErrorSummary {
-                                class: capability_error_class(&failure.error_kind),
-                                safe_summary: capability_failed_summary(
-                                    &failure.error_kind,
-                                    failure.safe_summary,
-                                )?,
-                                diagnostic_ref: None,
-                            };
+                            summary = failed_capability_error_summary(failure)?;
                         }
                         promoted => {
                             return Box::pin(self.handle_capability_outcome(

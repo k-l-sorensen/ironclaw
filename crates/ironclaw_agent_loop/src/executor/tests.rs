@@ -2,13 +2,14 @@ use ironclaw_turns::{
     LoopCancelledReasonKind, LoopCompletionKind, LoopDiagnosticRef, LoopExit, LoopFailureKind,
     LoopGateRef, LoopResultRef, TurnRunId,
     run_profile::{
-        AgentLoopHostError, AgentLoopHostErrorKind, CapabilityCallCandidate, CapabilityFailureKind,
-        CapabilityInputRef, CapabilityOutcome, CapabilityResultMessage, LoopCancelReasonKind,
-        LoopCheckpointKind, LoopCompactionError, LoopCompactionOutcome, LoopCompactionResponse,
-        LoopContextCompactionKind, LoopContextCompactionMetadata, LoopInput, LoopInputAckToken,
-        LoopInputBatch, LoopInputCursor, LoopInterruptKind, LoopProcessRef, LoopRunInfoPort,
-        LoopSafeSummary, LoopSummaryArtifactId, ParentLoopOutput, ProcessHandleSummary,
-        ProviderToolCallReplay, VisibleCapabilityRequest,
+        AgentLoopHostError, AgentLoopHostErrorKind, CapabilityCallCandidate,
+        CapabilityFailureDetail, CapabilityFailureKind, CapabilityInputIssue,
+        CapabilityInputIssueCode, CapabilityInputRef, CapabilityOutcome, CapabilityResultMessage,
+        LoopCancelReasonKind, LoopCheckpointKind, LoopCompactionError, LoopCompactionOutcome,
+        LoopCompactionResponse, LoopContextCompactionKind, LoopContextCompactionMetadata,
+        LoopInput, LoopInputAckToken, LoopInputBatch, LoopInputCursor, LoopInterruptKind,
+        LoopProcessRef, LoopRunInfoPort, LoopSafeSummary, LoopSummaryArtifactId, ParentLoopOutput,
+        ProcessHandleSummary, ProviderToolCallReplay, VisibleCapabilityRequest,
     },
 };
 
@@ -2216,6 +2217,7 @@ async fn retry_uses_single_call_invocation() {
                     ironclaw_turns::run_profile::CapabilityFailure {
                         error_kind,
                         safe_summary: "temporary failure".to_string(),
+                        detail: None,
                     },
                 )],
                 stopped_on_suspension: false,
@@ -2514,6 +2516,7 @@ async fn model_visible_provider_tool_failures_append_failure_tool_result_for_rep
                     ironclaw_turns::run_profile::CapabilityFailure {
                         error_kind,
                         safe_summary: safe_summary.to_string(),
+                        detail: None,
                     },
                 )],
                 stopped_on_suspension: false,
@@ -2561,6 +2564,7 @@ async fn model_visible_provider_tool_failures_append_failure_tool_result_for_rep
                 ironclaw_turns::run_profile::CapabilityFailure {
                     error_kind: CapabilityFailureKind::OutputTooLarge,
                     safe_summary: long_summary,
+                    detail: None,
                 },
             )],
             stopped_on_suspension: false,
@@ -2580,5 +2584,88 @@ async fn model_visible_provider_tool_failures_append_failure_tool_result_for_rep
         appended[0]
             .safe_summary
             .starts_with("capability failed with output_too_large: ")
+    );
+}
+
+#[tokio::test]
+async fn provider_tool_failure_detail_is_rendered_for_model_recovery() {
+    let host = MockHost::new(vec![provider_calls_response(), reply_response()])
+        .with_batch_outcomes(vec![ironclaw_turns::run_profile::CapabilityBatchOutcome {
+            outcomes: vec![CapabilityOutcome::Failed(
+                ironclaw_turns::run_profile::CapabilityFailure {
+                    error_kind: CapabilityFailureKind::InvalidInput,
+                    safe_summary:
+                        "provider arguments failed schema validation at instance path root against schema path required"
+                            .to_string(),
+                    detail: Some(CapabilityFailureDetail::InvalidInput {
+                        issues: vec![CapabilityInputIssue {
+                            path: "file_path".to_string(),
+                            code: CapabilityInputIssueCode::MissingRequired,
+                            expected: Some("required field".to_string()),
+                            received: None,
+                            schema_path: Some("required".to_string()),
+                        }],
+                    }),
+                },
+            )],
+            stopped_on_suspension: false,
+        }]);
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    let appended = host.appended_result_refs();
+    assert_eq!(appended.len(), 1);
+    assert_eq!(
+        appended[0].safe_summary,
+        "capability failed with invalid_input. same call retry requires changed input. input issues: path file_path is missing a required value expected required field at schema required. next actions: provide missing value at file_path. recovery hint: Correct the capability arguments and retry only if the action is still safe. summary: capability failed with invalid_input: provider arguments failed schema validation at instance path root against schema path required"
+    );
+}
+
+#[tokio::test]
+async fn provider_tool_failure_recovery_detail_survives_long_failure_summary() {
+    let host = MockHost::new(vec![provider_calls_response(), reply_response()])
+        .with_batch_outcomes(vec![ironclaw_turns::run_profile::CapabilityBatchOutcome {
+            outcomes: vec![CapabilityOutcome::Failed(
+                ironclaw_turns::run_profile::CapabilityFailure {
+                    error_kind: CapabilityFailureKind::InvalidInput,
+                    safe_summary: "schema validation ".repeat(24),
+                    detail: Some(CapabilityFailureDetail::InvalidInput {
+                        issues: vec![CapabilityInputIssue {
+                            path: "file_path".to_string(),
+                            code: CapabilityInputIssueCode::MissingRequired,
+                            expected: Some("required field".to_string()),
+                            received: None,
+                            schema_path: Some("required".to_string()),
+                        }],
+                    }),
+                },
+            )],
+            stopped_on_suspension: false,
+        }]);
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await
+        .expect("execute");
+
+    let appended = host.appended_result_refs();
+    assert_eq!(appended.len(), 1);
+    assert!(appended[0].safe_summary.len() <= 512);
+    assert!(
+        appended[0]
+            .safe_summary
+            .contains("next actions: provide missing value at file_path")
+    );
+    assert!(
+        appended[0]
+            .safe_summary
+            .contains("recovery hint: Correct the capability arguments")
     );
 }

@@ -1548,6 +1548,97 @@ impl<'de> Deserialize<'de> for CapabilityDeniedReasonKind {
 pub struct CapabilityFailure {
     pub error_kind: CapabilityFailureKind,
     pub safe_summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<CapabilityFailureDetail>,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapabilityFailureDetail {
+    InvalidInput { issues: Vec<CapabilityInputIssue> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelVisibleCapabilityError {
+    pub kind: CapabilityFailureKind,
+    pub message: String,
+    pub details: CapabilityFailureDetail,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub constraints: Option<RecoveryConstraints>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<CapabilityRecoveryDetail>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_hint: Option<CapabilityRecoveryHint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecoveryConstraints {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub same_call_retry: Option<SameCallRetryConstraint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SameCallRetryConstraint {
+    Allowed,
+    AllowedAfterDelay { retry_after_ms: u64 },
+    RequiresChangedInput,
+    NotUseful,
+    Forbidden,
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapabilityRecoveryDetail {
+    InvalidInput { repairs: Vec<CapabilityInputRepair> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CapabilityInputRepair {
+    ProvideRequiredField {
+        path: String,
+    },
+    RemoveUnexpectedField {
+        path: String,
+    },
+    ChangeType {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        expected: Option<String>,
+    },
+    UseAllowedValue {
+        path: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityRecoveryHint {
+    CorrectArgumentsBeforeRetry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapabilityInputIssue {
+    pub path: String,
+    pub code: CapabilityInputIssueCode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub received: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilityInputIssueCode {
+    MissingRequired,
+    UnexpectedField,
+    TypeMismatch,
+    InvalidValue,
 }
 
 #[non_exhaustive]
@@ -2165,5 +2256,61 @@ mod tests {
             .expect_err("unknown provider tool must fail closed");
 
         assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
+    }
+
+    #[test]
+    fn model_visible_capability_error_serializes_recovery_observation_fields() {
+        let error = ModelVisibleCapabilityError {
+            kind: CapabilityFailureKind::InvalidInput,
+            message: "provider arguments failed schema validation".to_string(),
+            details: CapabilityFailureDetail::InvalidInput {
+                issues: vec![CapabilityInputIssue {
+                    path: "file_path".to_string(),
+                    code: CapabilityInputIssueCode::MissingRequired,
+                    expected: Some("required field".to_string()),
+                    received: None,
+                    schema_path: Some("required".to_string()),
+                }],
+            },
+            constraints: Some(RecoveryConstraints {
+                same_call_retry: Some(SameCallRetryConstraint::RequiresChangedInput),
+            }),
+            recovery: Some(CapabilityRecoveryDetail::InvalidInput {
+                repairs: vec![CapabilityInputRepair::ProvideRequiredField {
+                    path: "file_path".to_string(),
+                }],
+            }),
+            recovery_hint: Some(CapabilityRecoveryHint::CorrectArgumentsBeforeRetry),
+        };
+
+        assert_eq!(
+            serde_json::to_value(error).expect("serialize"),
+            serde_json::json!({
+                "kind": "invalid_input",
+                "message": "provider arguments failed schema validation",
+                "details": {
+                    "kind": "invalid_input",
+                    "issues": [{
+                        "path": "file_path",
+                        "code": "missing_required",
+                        "expected": "required field",
+                        "schema_path": "required"
+                    }]
+                },
+                "constraints": {
+                    "same_call_retry": {
+                        "kind": "requires_changed_input"
+                    }
+                },
+                "recovery": {
+                    "kind": "invalid_input",
+                    "repairs": [{
+                        "kind": "provide_required_field",
+                        "path": "file_path"
+                    }]
+                },
+                "recovery_hint": "correct_arguments_before_retry"
+            })
+        );
     }
 }

@@ -35,7 +35,8 @@ mod provider_validation;
 mod surface_snapshot;
 
 use self::provider_input::{
-    normalize_provider_arguments, prepare_provider_arguments, schema_contains_external_ref,
+    normalize_provider_arguments, prepare_provider_arguments,
+    prepare_provider_arguments_with_detail, schema_contains_external_ref,
 };
 use self::provider_validation::{
     PROVIDER_TOOL_NAME_MAX_BYTES, validate_provider_arguments, validate_provider_tool_call,
@@ -916,6 +917,7 @@ impl HostRuntimeLoopCapabilityPort {
                 return Ok(CapabilityOutcome::Failed(CapabilityFailure {
                     error_kind: CapabilityFailureKind::InvalidInput,
                     safe_summary: error.safe_summary,
+                    detail: None,
                 }));
             }
             Err(error) => return Err(error),
@@ -1214,25 +1216,26 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
             .input_resolver
             .resolve_capability_input(&self.run_context, &request.input_ref)
             .await?;
-        let input = match prepare_provider_arguments(
+        let input = match prepare_provider_arguments_with_detail(
             &input,
             &capability.parameters_schema,
             "capability input",
         ) {
             Ok(input) => input,
             Err(error)
-                if error.kind == AgentLoopHostErrorKind::InvalidInvocation
+                if error.error.kind == AgentLoopHostErrorKind::InvalidInvocation
                     && is_provider_tool_call_input_ref(&request.input_ref) =>
             {
                 let result = Ok(CapabilityOutcome::Failed(CapabilityFailure {
                     error_kind: CapabilityFailureKind::InvalidInput,
-                    safe_summary: error.safe_summary,
+                    safe_summary: error.error.safe_summary,
+                    detail: error.detail,
                 }));
                 guard.commit();
                 self.record_loop_completed(&idempotency_key, result.clone())?;
                 return result;
             }
-            Err(error) => return Err(error),
+            Err(error) => return Err(error.error),
         };
         let input = host_runtime_input_for_capability(&request.capability_id, input)?;
         let invocation_context = invocation_context_from_visible(
@@ -1794,6 +1797,7 @@ async fn runtime_outcome_to_loop(
                     unknown.message,
                     "capability invocation returned an unknown outcome",
                 ),
+                detail: None,
             })
         }
     })
@@ -1854,6 +1858,7 @@ fn runtime_failure_to_loop(
                     &failure,
                     "capability invocation failed",
                 ),
+                detail: None,
             }))
         }
     }
@@ -1875,6 +1880,7 @@ fn runtime_model_visible_failure_to_loop(
     Ok(CapabilityOutcome::Failed(CapabilityFailure {
         error_kind: model_visible_runtime_failure_kind_to_loop(failure.kind)?,
         safe_summary: runtime_failure_safe_summary(&failure, "capability invocation failed"),
+        detail: None,
     }))
 }
 
@@ -2017,6 +2023,7 @@ fn host_runtime_error(error: HostRuntimeError) -> AgentLoopHostError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ironclaw_turns::run_profile::{CapabilityFailureDetail, CapabilityInputIssueCode};
     mod runtime_lifecycle_tests;
 
     use std::{
@@ -2737,6 +2744,38 @@ mod tests {
     }
 
     #[test]
+    fn provider_argument_detail_captures_bounded_required_field_issues() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "owner": { "type": "string" },
+                "repo": { "type": "string" },
+                "pr_number": { "type": "integer", "minimum": 1 }
+            },
+            "required": ["owner", "repo", "pr_number"]
+        });
+
+        let error = prepare_provider_arguments_with_detail(
+            &serde_json::json!({ "owner": "nearai" }),
+            &schema,
+            "provider arguments",
+        )
+        .expect_err("missing required fields should fail before dispatch");
+
+        let Some(CapabilityFailureDetail::InvalidInput { issues }) = error.detail else {
+            panic!("expected invalid input detail");
+        };
+        assert!(issues.len() <= 3);
+        assert!(
+            issues.iter().any(|issue| issue.path == "repo"
+                && issue.code == CapabilityInputIssueCode::MissingRequired)
+        );
+        assert!(issues.iter().any(|issue| issue.path == "pr_number"
+            && issue.code == CapabilityInputIssueCode::MissingRequired));
+    }
+
+    #[test]
     fn provider_argument_preparation_rejects_unresolved_ref_schema() {
         let schema = serde_json::json!({
             "$ref": "schemas/demo/echo.input.v1.json"
@@ -3022,6 +3061,75 @@ mod tests {
     }
 
     #[test]
+    fn provider_argument_detail_names_unexpected_fields() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "owner": { "type": "string" },
+                "repo": { "type": "string" },
+                "pr_number": { "type": "integer" }
+            },
+            "required": ["owner", "repo", "pr_number"]
+        });
+
+        let error = prepare_provider_arguments_with_detail(
+            &serde_json::json!({
+                "owner": "nearai",
+                "repo": "ironclaw",
+                "pr_number": 4286,
+                "number": 4286
+            }),
+            &schema,
+            "provider arguments",
+        )
+        .expect_err("additional properties should fail before dispatch");
+
+        let Some(CapabilityFailureDetail::InvalidInput { issues }) = error.detail else {
+            panic!("expected invalid input detail");
+        };
+        assert!(issues.iter().any(|issue| {
+            issue.path == "number" && issue.code == CapabilityInputIssueCode::UnexpectedField
+        }));
+    }
+
+    #[test]
+    fn provider_argument_detail_avoids_overconfident_unexpected_field_for_rich_object_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "patternProperties": {
+                "^known_": { "type": "string" }
+            },
+            "properties": {
+                "owner": { "type": "string" }
+            }
+        });
+
+        let error = prepare_provider_arguments_with_detail(
+            &serde_json::json!({
+                "owner": "nearai",
+                "unknown": "value"
+            }),
+            &schema,
+            "provider arguments",
+        )
+        .expect_err("additional properties should fail before dispatch");
+
+        let Some(CapabilityFailureDetail::InvalidInput { issues }) = error.detail else {
+            panic!("expected invalid input detail");
+        };
+        assert!(issues.iter().any(|issue| {
+            issue.path == "root" && issue.code == CapabilityInputIssueCode::InvalidValue
+        }));
+        assert!(
+            !issues
+                .iter()
+                .any(|issue| issue.code == CapabilityInputIssueCode::UnexpectedField)
+        );
+    }
+
+    #[test]
     fn provider_argument_preparation_validates_composed_object_schema_after_normalization() {
         let schema = serde_json::json!({
             "type": "object",
@@ -3083,6 +3191,40 @@ mod tests {
         assert_eq!(error.kind, AgentLoopHostErrorKind::InvalidInvocation);
         assert!(!error.safe_summary.contains("secret"));
         assert!(!error.safe_summary.contains("api_key"));
+    }
+
+    #[test]
+    fn provider_argument_detail_sanitizes_sensitive_path_markers() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "client_secret_token": {
+                    "type": "string",
+                    "pattern": "^ok$"
+                }
+            }
+        });
+
+        let error = prepare_provider_arguments_with_detail(
+            &serde_json::json!({ "client_secret_token": "not ok" }),
+            &schema,
+            "provider arguments",
+        )
+        .expect_err("schema failure should remain a model-visible invocation error");
+
+        let Some(CapabilityFailureDetail::InvalidInput { issues }) = error.detail else {
+            panic!("expected invalid input detail");
+        };
+        assert_eq!(issues.len(), 1);
+        assert!(!issues[0].path.contains("secret"));
+        assert!(!issues[0].path.contains("token"));
+        assert!(
+            !issues[0]
+                .schema_path
+                .as_deref()
+                .unwrap_or_default()
+                .contains("secret")
+        );
     }
 
     /// Regression for Gemini review comment: a plain string that starts with
@@ -3752,7 +3894,8 @@ mod tests {
                 outcome,
                 CapabilityOutcome::Failed(CapabilityFailure {
                     error_kind: CapabilityFailureKind::InvalidInput,
-                    safe_summary
+                    safe_summary,
+                    ..
                 }) if safe_summary == expected_summary
             ));
         }
@@ -3910,7 +4053,8 @@ mod tests {
             outcome,
             CapabilityOutcome::Failed(CapabilityFailure {
                 error_kind: CapabilityFailureKind::InvalidInput,
-                safe_summary
+                safe_summary,
+                ..
             }) if safe_summary == "capability_info target is not on the visible surface"
         ));
         assert!(
@@ -3972,7 +4116,8 @@ mod tests {
             outcome,
             CapabilityOutcome::Failed(CapabilityFailure {
                 error_kind: CapabilityFailureKind::InvalidInput,
-                safe_summary
+                safe_summary,
+                ..
             }) if safe_summary == "capability_info target is not on the visible surface"
         ));
         assert!(
@@ -4049,7 +4194,8 @@ mod tests {
             outcome,
             CapabilityOutcome::Failed(CapabilityFailure {
                 error_kind: CapabilityFailureKind::InvalidInput,
-                safe_summary
+                safe_summary,
+                ..
             }) if safe_summary == "capability_info target is not on the visible surface"
         ));
         assert!(
@@ -4604,13 +4750,17 @@ mod tests {
             .await
             .expect("schema-invalid provider calls should produce a capability failure");
 
-        assert!(matches!(
-            outcome,
-            CapabilityOutcome::Failed(CapabilityFailure {
-                error_kind: CapabilityFailureKind::InvalidInput,
-                safe_summary
-            }) if safe_summary.contains("schema validation")
-        ));
+        let CapabilityOutcome::Failed(failure) = outcome else {
+            panic!("expected failed capability outcome");
+        };
+        assert_eq!(failure.error_kind, CapabilityFailureKind::InvalidInput);
+        assert!(failure.safe_summary.contains("schema validation"));
+        let Some(CapabilityFailureDetail::InvalidInput { issues }) = failure.detail else {
+            panic!("expected invalid input detail");
+        };
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].path, "message");
+        assert_eq!(issues[0].code, CapabilityInputIssueCode::MissingRequired);
         assert!(
             runtime.take_requests().is_empty(),
             "schema-invalid provider input must not reach the runtime"

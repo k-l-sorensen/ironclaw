@@ -9,7 +9,10 @@
 //! sanitization happens at the host port.
 
 use async_trait::async_trait;
-use ironclaw_turns::{LoopDiagnosticRef, LoopFailureKind, run_profile::LoopSafeSummary};
+use ironclaw_turns::{
+    LoopDiagnosticRef, LoopFailureKind,
+    run_profile::{CapabilityFailureDetail, CapabilityFailureKind, LoopSafeSummary},
+};
 
 use crate::state::{LoopExecutionState, RecoveryAttemptClass, RecoveryStrategyState};
 
@@ -83,8 +86,10 @@ impl<'de> serde::Deserialize<'de> for SanitizedStrategySummary {
 /// strategy code runs.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CapabilityErrorSummary {
+    pub(crate) kind: CapabilityFailureKind,
     pub(crate) class: CapabilityErrorClass,
     pub(crate) safe_summary: SanitizedStrategySummary,
+    pub(crate) detail: Option<CapabilityFailureDetail>,
     pub(crate) diagnostic_ref: Option<LoopDiagnosticRef>,
 }
 
@@ -560,8 +565,10 @@ mod tests {
     #[test]
     fn capability_error_summary_round_trips() {
         let summary = CapabilityErrorSummary {
+            kind: CapabilityFailureKind::Transient,
             class: CapabilityErrorClass::Transient,
             safe_summary: SanitizedStrategySummary::new("upstream timed out").expect("valid"),
+            detail: None,
             diagnostic_ref: Some(LoopDiagnosticRef::new("diag:cap-1").expect("valid")),
         };
         let value = serde_json::to_value(&summary).expect("serialize");
@@ -722,11 +729,11 @@ mod tests {
             AgentLoopDriverDescriptor, RunProfileId, RunProfileVersion, TurnId, TurnRunId,
             TurnScope,
             run_profile::{
-                CancellationPolicy, CapabilitySurfaceProfileId, CheckpointPolicy,
-                CheckpointSchemaId, ConcurrencyClass, ContextProfileId, LoopDriverId,
-                LoopRunContext, ModelProfileId, RedactedRunProfileProvenance, ResolvedRunProfile,
-                ResourceBudgetPolicy, ResourceBudgetTier, RunClassId, RunProfileFingerprint,
-                RuntimeProfileConstraints, SchedulingClass, SteeringPolicy,
+                CancellationPolicy, CapabilityFailureKind, CapabilitySurfaceProfileId,
+                CheckpointPolicy, CheckpointSchemaId, ConcurrencyClass, ContextProfileId,
+                LoopDriverId, LoopRunContext, ModelProfileId, RedactedRunProfileProvenance,
+                ResolvedRunProfile, ResourceBudgetPolicy, ResourceBudgetTier, RunClassId,
+                RunProfileFingerprint, RuntimeProfileConstraints, SchedulingClass, SteeringPolicy,
             },
         };
 
@@ -834,9 +841,23 @@ mod tests {
 
         fn cap_err(class: CapabilityErrorClass) -> CapabilityErrorSummary {
             CapabilityErrorSummary {
+                kind: capability_failure_kind_for_test(class),
                 class,
                 safe_summary: SanitizedStrategySummary::from_trusted_static("test"),
+                detail: None,
                 diagnostic_ref: None,
+            }
+        }
+
+        fn capability_failure_kind_for_test(class: CapabilityErrorClass) -> CapabilityFailureKind {
+            match class {
+                CapabilityErrorClass::Transient => CapabilityFailureKind::Transient,
+                CapabilityErrorClass::Permanent => CapabilityFailureKind::Permanent,
+                CapabilityErrorClass::InputInvalid => CapabilityFailureKind::InvalidInput,
+                CapabilityErrorClass::OperationFailed => CapabilityFailureKind::OperationFailed,
+                CapabilityErrorClass::PolicyDenied => CapabilityFailureKind::PolicyDenied,
+                CapabilityErrorClass::Unavailable => CapabilityFailureKind::Unavailable,
+                CapabilityErrorClass::Internal => CapabilityFailureKind::Internal,
             }
         }
 
