@@ -22,14 +22,16 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::SinkExt;
 use futures::stream::Stream;
 use ironclaw_product_workflow::{
-    LifecyclePackageKind, LifecyclePackageRef, LlmConfigSnapshot, LlmModelsResult, LlmProbeRequest,
-    LlmProbeResult, ProductWorkflowError, ProjectionCursor, RebornCancelRunResponse,
-    RebornConnectableChannelListResponse, RebornCreateThreadResponse,
-    RebornExtensionActionResponse, RebornExtensionListResponse, RebornExtensionRegistryResponse,
-    RebornListAutomationsResponse, RebornListThreadsResponse, RebornResolveGateResponse,
-    RebornServicesApi, RebornServicesError, RebornServicesErrorCode, RebornServicesErrorKind,
-    RebornSetupExtensionResponse, RebornStreamEventsRequest, RebornSubmitTurnResponse,
-    RebornTimelineRequest, RebornTimelineResponse, SetActiveLlmRequest, UpsertLlmProviderRequest,
+    CodexLoginStart, LifecyclePackageKind, LifecyclePackageRef, LlmConfigSnapshot, LlmModelsResult,
+    LlmProbeRequest, LlmProbeResult, NearAiLoginRequest, NearAiLoginStart,
+    NearAiWalletLoginRequest, NearAiWalletLoginResult, ProductWorkflowError, ProjectionCursor,
+    RebornCancelRunResponse, RebornConnectableChannelListResponse, RebornCreateThreadResponse,
+    RebornDeleteThreadRequest, RebornDeleteThreadResponse, RebornExtensionActionResponse,
+    RebornExtensionListResponse, RebornExtensionRegistryResponse, RebornListAutomationsResponse,
+    RebornListThreadsResponse, RebornResolveGateResponse, RebornServicesApi, RebornServicesError,
+    RebornServicesErrorCode, RebornServicesErrorKind, RebornSetupExtensionResponse,
+    RebornStreamEventsRequest, RebornSubmitTurnResponse, RebornTimelineRequest,
+    RebornTimelineResponse, SetActiveLlmRequest, UpsertLlmProviderRequest,
     WebUiAuthenticatedCaller, WebUiCancelRunRequest, WebUiCreateThreadRequest,
     WebUiInboundValidationCode, WebUiInboundValidationError, WebUiListAutomationsRequest,
     WebUiListThreadsRequest, WebUiResolveGateRequest, WebUiSendMessageRequest,
@@ -51,6 +53,19 @@ pub async fn create_thread(
     Json(body): Json<WebUiCreateThreadRequest>,
 ) -> Result<Json<RebornCreateThreadResponse>, WebUiV2HttpError> {
     let response = state.services().create_thread(caller, body).await?;
+    Ok(Json(response))
+}
+
+/// `DELETE /api/webchat/v2/threads/{thread_id}`
+pub async fn delete_thread(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Path(thread_id): Path<String>,
+) -> Result<Json<RebornDeleteThreadResponse>, WebUiV2HttpError> {
+    let response = state
+        .services()
+        .delete_thread(caller, RebornDeleteThreadRequest { thread_id })
+        .await?;
     Ok(Json(response))
 }
 
@@ -601,6 +616,45 @@ pub async fn list_llm_models(
     Json(body): Json<LlmProbeRequest>,
 ) -> Result<Json<LlmModelsResult>, WebUiV2HttpError> {
     let response = state.services().list_llm_models(caller, body).await?;
+    Ok(Json(response))
+}
+
+/// `POST /api/webchat/v2/llm/nearai/login`
+pub async fn start_nearai_login(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Json(body): Json<NearAiLoginRequest>,
+) -> Result<Json<NearAiLoginStart>, WebUiV2HttpError> {
+    let response = state.services().start_nearai_login(caller, body).await?;
+    Ok(Json(response))
+}
+
+/// `POST /api/webchat/v2/llm/nearai/wallet`
+///
+/// Completes a NEAR AI wallet (NEP-413) login from a browser-signed message:
+/// relays the signature to NEAR AI, stores the session token, and makes NEAR AI
+/// active.
+pub async fn complete_nearai_wallet_login(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Json(body): Json<NearAiWalletLoginRequest>,
+) -> Result<Json<NearAiWalletLoginResult>, WebUiV2HttpError> {
+    let response = state
+        .services()
+        .complete_nearai_wallet_login(caller, body)
+        .await?;
+    Ok(Json(response))
+}
+
+/// `POST /api/webchat/v2/llm/codex/login`
+///
+/// Begins an OpenAI Codex device-code login. Takes no body — returns the user
+/// code + verification URL to display; a background task completes the flow.
+pub async fn start_codex_login(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+) -> Result<Json<CodexLoginStart>, WebUiV2HttpError> {
+    let response = state.services().start_codex_login(caller).await?;
     Ok(Json(response))
 }
 

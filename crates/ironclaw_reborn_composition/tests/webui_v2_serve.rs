@@ -21,12 +21,13 @@ use http_body_util::BodyExt;
 use ironclaw_host_api::{AgentId, NetworkMethod, ProjectId, TenantId, ThreadId, UserId};
 use ironclaw_product_workflow::{
     LifecyclePackageRef, LifecyclePhase, RebornCancelRunResponse, RebornCreateThreadResponse,
-    RebornExtensionActionResponse, RebornExtensionListResponse, RebornExtensionRegistryResponse,
-    RebornGetRunStateRequest, RebornGetRunStateResponse, RebornListAutomationsResponse,
-    RebornListThreadsResponse, RebornResolveGateResponse, RebornServicesApi, RebornServicesError,
-    RebornServicesErrorCode, RebornServicesErrorKind, RebornSetupExtensionResponse,
-    RebornStreamEventsRequest, RebornStreamEventsResponse, RebornSubmitTurnResponse,
-    RebornTimelineRequest, RebornTimelineResponse, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
+    RebornDeleteThreadRequest, RebornDeleteThreadResponse, RebornExtensionActionResponse,
+    RebornExtensionListResponse, RebornExtensionRegistryResponse, RebornGetRunStateRequest,
+    RebornGetRunStateResponse, RebornListAutomationsResponse, RebornListThreadsResponse,
+    RebornResolveGateResponse, RebornServicesApi, RebornServicesError, RebornServicesErrorCode,
+    RebornServicesErrorKind, RebornSetupExtensionResponse, RebornStreamEventsRequest,
+    RebornStreamEventsResponse, RebornSubmitTurnResponse, RebornTimelineRequest,
+    RebornTimelineResponse, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
     WebUiCreateThreadRequest, WebUiListAutomationsRequest, WebUiListThreadsRequest,
     WebUiResolveGateRequest, WebUiSendMessageRequest, WebUiSetupExtensionRequest,
 };
@@ -58,7 +59,7 @@ impl WebuiAuthenticator for OnlyValidToken {
         }
     }
 
-    fn allows_operator_llm_config(&self) -> bool {
+    fn allows_operator_webui_config(&self) -> bool {
         true
     }
 }
@@ -290,6 +291,17 @@ impl RebornServicesApi for StubServices {
             resolved_run_profile_id: RunProfileId::default_profile().as_str().to_string(),
             resolved_run_profile_version: RunProfileVersion::new(1).as_u64(),
             event_cursor: EventCursor(1),
+        })
+    }
+
+    async fn delete_thread(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: RebornDeleteThreadRequest,
+    ) -> Result<RebornDeleteThreadResponse, RebornServicesError> {
+        Ok(RebornDeleteThreadResponse {
+            thread_id: ThreadId::new(request.thread_id).expect("thread id"),
+            deleted: true,
         })
     }
 
@@ -1193,6 +1205,32 @@ async fn list_threads_returns_facade_response_with_empty_default() {
 }
 
 #[tokio::test]
+async fn delete_thread_route_returns_facade_ack() {
+    let (app, _services) = build_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/webchat/v2/threads/thread-x")
+                .header(header::AUTHORIZATION, format!("Bearer {VALID_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = read_body_string(response).await;
+    assert!(
+        body.contains("\"thread_id\":\"thread-x\""),
+        "delete_thread body should carry the deleted thread id, got: {body}",
+    );
+    assert!(
+        body.contains("\"deleted\":true"),
+        "delete_thread body should acknowledge deletion, got: {body}",
+    );
+}
+
+#[tokio::test]
 async fn setup_extension_returns_lifecycle_projection_via_facade() {
     let (app, _services) = build_app();
     let response = app
@@ -1358,6 +1396,9 @@ async fn llm_config_routes_are_not_mounted_for_multi_user_authenticator() {
         (Method::POST, "/api/webchat/v2/llm/active"),
         (Method::POST, "/api/webchat/v2/llm/test-connection"),
         (Method::POST, "/api/webchat/v2/llm/list-models"),
+        (Method::POST, "/api/webchat/v2/llm/nearai/login"),
+        (Method::POST, "/api/webchat/v2/llm/nearai/wallet"),
+        (Method::POST, "/api/webchat/v2/llm/codex/login"),
     ] {
         let mut builder = Request::builder()
             .method(method.clone())

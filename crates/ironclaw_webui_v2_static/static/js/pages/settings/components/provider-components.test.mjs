@@ -76,6 +76,15 @@ function collectScalars(root) {
   return scalars;
 }
 
+function collectTemplateText(root) {
+  const text = [];
+  visit(root, (node) => {
+    if (!Array.isArray(node.strings)) return;
+    text.push(...node.strings);
+  });
+  return text.join("");
+}
+
 function valueAfter(rendered, fragment) {
   const index = rendered.strings.findIndex((part) => part.includes(fragment));
   assert.notEqual(index, -1, `expected template fragment ${fragment}`);
@@ -157,6 +166,7 @@ function renderProviderManagement({ providers, activeProviderId = "nearai", sear
     Icon: "Icon",
     ProviderCard,
     ProviderDialog: "ProviderDialog",
+    ProviderLoginStatus: "ProviderLoginStatus",
     SettingsSearchEmpty: "SettingsSearchEmpty",
     globalThis: {},
     groupProvidersByStatus,
@@ -164,6 +174,13 @@ function renderProviderManagement({ providers, activeProviderId = "nearai", sear
     useProviderManagementActions: useProviderManagementActionsStub({
       providers,
       activeProviderId,
+    }),
+    useProviderLogin: () => ({
+      codexBusy: false,
+      nearaiBusy: false,
+      startCodex: () => {},
+      startNearai: () => {},
+      startNearaiWallet: () => {},
     }),
     useT: () => (key) => key,
   };
@@ -215,6 +232,29 @@ function createReactStateStub(state) {
   };
 }
 
+function createReactMenuStateStub(state) {
+  return {
+    useEffect: (fn, deps) => {
+      if (depsChanged(state.effectDeps, deps)) {
+        state.effectDeps = deps ? Array.from(deps) : deps;
+        fn();
+      }
+    },
+    useRef: () => ({ current: null }),
+    useState: (initial) => {
+      if (!Object.hasOwn(state, "open")) {
+        state.open = typeof initial === "function" ? initial() : initial;
+      }
+      return [
+        state.open,
+        (next) => {
+          state.open = typeof next === "function" ? next(state.open) : next;
+        },
+      ];
+    },
+  };
+}
+
 function createProviderCardHarness() {
   const state = {};
   const context = {
@@ -227,6 +267,7 @@ function createProviderCardHarness() {
     globalThis: {},
     html,
     isProviderConfigured: (provider) => provider.configured !== false,
+    providerAcceptsApiKey: (provider) => provider.accepts_api_key !== false,
     providerDisplayModel: (provider) => provider.default_model || "model",
     providerEffectiveBaseUrl: (provider) => provider.base_url || "https://example.com/v1",
     providerMissingReason: (provider) => provider.missing || "api_key",
@@ -249,6 +290,54 @@ function createProviderCardHarness() {
         onUse: () => {},
         onConfigure: () => {},
         onDelete: () => {},
+        onNearaiLogin: () => {},
+        onNearaiWallet: () => {},
+        onCodexLogin: () => {},
+        loginBusy: false,
+        ...props,
+      }),
+  };
+}
+
+function createNearAiSetupMenuHarness() {
+  const state = {};
+  const calls = [];
+  const context = {
+    Button: "Button",
+    Icon: "Icon",
+    React: createReactMenuStateStub(state),
+    document: {
+      addEventListener: (type, handler) => {
+        state.listeners ??= {};
+        state.listeners[type] = handler;
+      },
+      removeEventListener: (type, handler) => {
+        if (state.listeners?.[type] === handler) delete state.listeners[type];
+      },
+    },
+    globalThis: {},
+    html,
+  };
+
+  vm.runInNewContext(
+    sourceForTest("../../onboarding/onboarding-page.js", ["NearAiSetupMenu"]),
+    context
+  );
+
+  return {
+    calls,
+    state,
+    render: (props = {}) =>
+      context.globalThis.__testExports.NearAiSetupMenu({
+        provider: builtinProvider("nearai", { adapter: "nearai" }),
+        isBusy: false,
+        login: {
+          nearaiBusy: false,
+          startNearai: (provider) => calls.push(["sso", provider]),
+          startNearaiWallet: () => calls.push(["wallet"]),
+        },
+        t: (key) => key,
+        onSetUp: (provider) => calls.push(["configure", provider.id]),
         ...props,
       }),
   };
@@ -379,4 +468,129 @@ test("ProviderCard actions keep existing callbacks without toggling disclosure",
   componentProps(deleteButton, "Button").onClick();
   assert.deepEqual(calls.at(-1), ["delete", "local"]);
   assert.equal(harness.state.expanded, true);
+});
+
+test("ProviderCard renders login actions instead of generic use for login providers", () => {
+  const calls = [];
+  const harness = createProviderCardHarness();
+
+  let rendered = harness.render({
+    activeProviderId: "openai",
+    onConfigure: (provider) => calls.push(["configure", provider.id]),
+    provider: builtinProvider("nearai", { adapter: "nearai", has_api_key: false }),
+  });
+  let labels = collectScalars(rendered);
+  let templateText = collectTemplateText(rendered);
+  assert.ok(labels.includes("onboarding.nearWallet"));
+  assert.ok(labels.includes("llm.addApiKey"));
+  assert.ok(templateText.includes("GitHub"));
+  assert.ok(templateText.includes("Google"));
+  assert.ok(!labels.includes("llm.use"));
+  const addKeyButton = findComponentNodes(rendered, "Button").find((node) => {
+    const scalars = collectScalars(node);
+    return scalars.includes("llm.addApiKey") && !scalars.includes("onboarding.nearWallet");
+  });
+  assert.ok(addKeyButton, "expected NEAR API key action");
+  componentProps(addKeyButton, "Button").onClick();
+  assert.deepEqual(calls, [["configure", "nearai"]]);
+
+  rendered = harness.render({
+    activeProviderId: "openai",
+    provider: builtinProvider("openai_codex"),
+  });
+  labels = collectScalars(rendered);
+  templateText = collectTemplateText(rendered);
+  assert.ok(labels.includes("onboarding.codexSignIn"));
+  assert.ok(!labels.includes("llm.use"));
+});
+
+test("ProviderCard renders generic use action for NEAR when an API key is configured", () => {
+  const calls = [];
+  const harness = createProviderCardHarness();
+  harness.state.expanded = true;
+
+  const rendered = harness.render({
+    activeProviderId: "openai",
+    onUse: (provider) => calls.push(["use", provider.id]),
+    provider: builtinProvider("nearai", {
+      adapter: "nearai",
+      has_api_key: true,
+    }),
+  });
+  const labels = collectScalars(rendered);
+  const templateText = collectTemplateText(rendered);
+
+  assert.ok(labels.includes("llm.use"));
+  assert.ok(labels.includes("llm.configure"));
+  assert.ok(!labels.includes("llm.addApiKey"));
+  assert.ok(!labels.includes("onboarding.nearWallet"));
+  assert.ok(!templateText.includes("GitHub"));
+
+  firstButtonProps(rendered).onClick();
+  assert.deepEqual(calls, [["use", "nearai"]]);
+});
+
+test("NearAiSetupMenu keeps NEAR onboarding SSO choices behind setup dropdown", () => {
+  const harness = createNearAiSetupMenuHarness();
+
+  let rendered = harness.render();
+  assert.equal(valueAfter(rendered, "aria-expanded="), "false");
+  assert.equal(firstButtonProps(rendered).disabled, false);
+  let labels = collectScalars(rendered);
+  assert.ok(labels.includes("onboarding.setUp"));
+  assert.ok(!labels.includes("llm.addApiKey"));
+  assert.ok(!labels.includes("onboarding.nearWallet"));
+  assert.ok(!labels.includes("GitHub"));
+
+  firstButtonProps(rendered).onClick();
+  assert.equal(harness.state.open, true);
+
+  rendered = harness.render();
+  assert.equal(valueAfter(rendered, "aria-expanded="), "true");
+  assert.equal(typeof harness.state.listeners.keydown, "function");
+  labels = collectScalars(rendered);
+  assert.ok(labels.includes("llm.addApiKey"));
+  assert.ok(labels.includes("onboarding.nearWallet"));
+  assert.ok(labels.includes("GitHub"));
+  assert.ok(labels.includes("Google"));
+
+  deepValuesAfter(rendered, "onClick=")[1]();
+  assert.deepEqual(harness.calls, [["configure", "nearai"]]);
+  assert.equal(harness.state.open, false);
+
+  firstButtonProps(harness.render()).onClick();
+  rendered = harness.render();
+  deepValuesAfter(rendered, "onClick=")[3]();
+  assert.deepEqual(harness.calls.at(-1), ["sso", "github"]);
+});
+
+test("NearAiSetupMenu disables setup trigger while setup or login is busy", () => {
+  const harness = createNearAiSetupMenuHarness();
+
+  assert.equal(firstButtonProps(harness.render({ isBusy: true })).disabled, true);
+  assert.equal(
+    firstButtonProps(
+      harness.render({
+        login: {
+          nearaiBusy: true,
+          startNearai: () => {},
+          startNearaiWallet: () => {},
+        },
+      })
+    ).disabled,
+    true
+  );
+});
+
+test("NearAiSetupMenu closes the setup dropdown on Escape", () => {
+  const harness = createNearAiSetupMenuHarness();
+
+  firstButtonProps(harness.render()).onClick();
+  harness.render();
+
+  harness.state.listeners.keydown({ key: "Enter" });
+  assert.equal(harness.state.open, true);
+
+  harness.state.listeners.keydown({ key: "Escape" });
+  assert.equal(harness.state.open, false);
 });

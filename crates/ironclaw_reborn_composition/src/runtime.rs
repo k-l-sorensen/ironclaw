@@ -84,7 +84,7 @@ use ironclaw_turns::{
 };
 
 use crate::default_system_prompt::DefaultSystemPromptIdentitySource;
-use crate::factory::{LocalDevRootFilesystem, LocalDevTurnStateStore};
+use crate::factory::{LocalDevRootFilesystem, LocalDevTurnStateStore, builtin_extension_registry};
 use crate::local_dev_capability_policy::local_dev_capability_policy;
 use crate::projection::{RebornProjectionServices, build_reborn_projection_services};
 use crate::runtime_input::{
@@ -94,9 +94,10 @@ use crate::runtime_input::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::trigger_poller::TenantScopedTrustedTriggerFireAuthorizer;
 use crate::trigger_poller::{
-    ConversationContentRefMaterializer, LocalTriggerTurnSnapshotSource, SnapshotActiveRunLookup,
-    TRIGGER_POLLER_SHUTDOWN_TIMEOUT, TriggerPollerCompositionDeps, TriggerPollerRuntimeHandle,
-    TriggerTurnSnapshotSource, spawn_trigger_poller,
+    AccessCheckerTriggerFireAuthorizer, ConversationContentRefMaterializer,
+    LocalTriggerTurnSnapshotSource, SnapshotActiveRunLookup, TRIGGER_POLLER_SHUTDOWN_TIMEOUT,
+    TriggerPollerCompositionDeps, TriggerPollerRuntimeHandle, TriggerTurnSnapshotSource,
+    spawn_trigger_poller,
 };
 use crate::{
     RebornBuildError, RebornCompositionProfile, RebornProductAuthServices, RebornServices,
@@ -275,10 +276,11 @@ async fn build_trigger_poller_services(
     turn_coordinator: Arc<dyn TurnCoordinator>,
     thread_service: Arc<dyn SessionThreadService>,
     authorizer_config: TriggerPollerAuthorizerConfig,
+    access_checker: Option<Arc<dyn crate::runtime_input::TriggerFireAccessChecker>>,
     tenant_id: TenantId,
     default_agent_id: AgentId,
 ) -> Result<TriggerPollerServices, RebornRuntimeError> {
-    let authorizer = build_trigger_fire_authorizer(authorizer_config, tenant_id)?;
+    let authorizer = build_trigger_fire_authorizer(authorizer_config, access_checker, tenant_id)?;
     #[cfg(any(feature = "libsql", feature = "postgres"))]
     {
         let conversations = local_runtime
@@ -338,7 +340,8 @@ async fn build_trigger_poller_services(
 
 fn trigger_poller_authorization_required_error() -> RebornRuntimeError {
     RebornRuntimeError::InvalidArgument {
-        reason: "trigger poller cannot be enabled until fire-time creator authorization is backed by the real agent/project membership source of truth".to_string(),
+        reason: "trigger poller cannot be enabled without a fire-time creator access checker"
+            .to_string(),
     }
 }
 
@@ -346,19 +349,21 @@ fn trigger_poller_authorization_required_error() -> RebornRuntimeError {
 /// already decided to enable the poller.
 fn validate_trigger_poller_authorization(
     trigger_poller: &TriggerPollerSettings,
+    access_checker: Option<&Arc<dyn crate::runtime_input::TriggerFireAccessChecker>>,
 ) -> Result<(), RebornRuntimeError> {
     debug_assert!(trigger_poller.enabled);
     match trigger_poller.authorizer {
         #[cfg(any(test, feature = "test-support"))]
         TriggerPollerAuthorizerConfig::TenantScopedPlaceholderForTest => Ok(()),
-        TriggerPollerAuthorizerConfig::CreatorMembershipRequired => {
-            Err(trigger_poller_authorization_required_error())
-        }
+        TriggerPollerAuthorizerConfig::CreatorAccessRequired => access_checker
+            .map(|_| ())
+            .ok_or_else(trigger_poller_authorization_required_error),
     }
 }
 
 fn build_trigger_fire_authorizer(
     authorizer_config: TriggerPollerAuthorizerConfig,
+    access_checker: Option<Arc<dyn crate::runtime_input::TriggerFireAccessChecker>>,
     tenant_id: TenantId,
 ) -> Result<Arc<dyn crate::trigger_poller_trusted_submit::TriggerFireAuthorizer>, RebornRuntimeError>
 {
@@ -369,9 +374,12 @@ fn build_trigger_fire_authorizer(
         TriggerPollerAuthorizerConfig::TenantScopedPlaceholderForTest => Ok(Arc::new(
             TenantScopedTrustedTriggerFireAuthorizer::new(tenant_id),
         )),
-        TriggerPollerAuthorizerConfig::CreatorMembershipRequired => {
-            Err(trigger_poller_authorization_required_error())
-        }
+        TriggerPollerAuthorizerConfig::CreatorAccessRequired => access_checker
+            .map(|checker| {
+                Arc::new(AccessCheckerTriggerFireAuthorizer::new(checker))
+                    as Arc<dyn crate::trigger_poller_trusted_submit::TriggerFireAuthorizer>
+            })
+            .ok_or_else(trigger_poller_authorization_required_error),
     }
 }
 
@@ -551,6 +559,114 @@ fn approval_turn_locator_unavailable() -> ironclaw_product_workflow::ProductWork
     }
 }
 
+/// Fold legacy pre-#4381 WebUI `user_identities` rows into the canonical
+/// identity store. The old store wrote those rows into the same libSQL
+/// substrate; reading that SQL table is a substrate-level concern handled
+/// here in the host layer (not the identity crate), then each row is bound
+/// into the filesystem-backed store so an existing SSO user keeps their
+/// `UserId` across upgrade. Idempotent (bind re-points to the same user) and
+/// a no-op when the legacy table is absent (fresh installs).
+#[cfg(feature = "webui-v2-beta")]
+async fn fold_legacy_webui_identities<R>(
+    db: &libsql::Database,
+    tenant_id: &TenantId,
+    store: &R,
+) -> Result<(), ironclaw_reborn_identity::RebornIdentityError>
+where
+    R: ironclaw_reborn_identity::RebornIdentityResolver + ?Sized,
+{
+    use ironclaw_reborn_identity::{
+        ExternalSubjectId, ProviderKind, RebornIdentityError, ResolveExternalIdentity, SurfaceKind,
+    };
+
+    fn backend(error: libsql::Error) -> RebornIdentityError {
+        RebornIdentityError::Backend(error.to_string())
+    }
+    fn invalid_key(error: ironclaw_reborn_identity::IdentityKeyError) -> RebornIdentityError {
+        RebornIdentityError::Backend(error.to_string())
+    }
+
+    let conn = db.connect().map_err(backend)?;
+    // Scope the existence-check cursor so it is dropped (read lock released)
+    // before any write; a lingering open cursor would block the
+    // filesystem-backed writes below with `database is locked`.
+    let legacy_table_exists = {
+        let mut table = conn
+            .query(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'user_identities'",
+                (),
+            )
+            .await
+            .map_err(backend)?;
+        table.next().await.map_err(backend)?.is_some()
+    };
+    if !legacy_table_exists {
+        return Ok(());
+    }
+
+    // Drain the read cursor fully BEFORE writing: the store's writes go
+    // through a different libSQL connection on the same file, and an open
+    // read cursor here would block them with `database is locked`.
+    //
+    // Carry the verified-email fields too: the legacy WebUI store recorded
+    // `email` / `email_verified`, and dropping them on migration would leave
+    // the canonical verified-email index unseeded. A migrated Google user
+    // would keep their id for the same provider/subject, but a later GitHub
+    // login with the same verified email would find no index and mint a
+    // second user — a permanent split. `adopt_migrated_identity` preserves
+    // both the user id and the verified-email linkage.
+    //
+    // This intentionally GRANDFATHERS each row's `email_verified` as recorded
+    // under the policy in force when the row was written; the one-time fold
+    // does NOT re-validate the legacy email against the CURRENT operator
+    // allowlist. That is safe because admission is enforced per login, not
+    // per index: every live SSO login is gated by `WebuiUserDirectory` against
+    // the current allowed-email-domains BEFORE the resolver is consulted, so a
+    // grandfathered index for a domain the operator has since removed is never
+    // reached (the login is rejected at admission). Re-gating the migration on
+    // the current allowlist would need the allowlist plumbed into this
+    // substrate-level fold; admission already bounds exploitability, so the
+    // migration faithfully preserves prior verified-email links instead.
+    let mut legacy = Vec::new();
+    let mut rows = conn
+        .query(
+            "SELECT provider, provider_user_id, user_id, email, email_verified \
+             FROM user_identities",
+            (),
+        )
+        .await
+        .map_err(backend)?;
+    while let Some(row) = rows.next().await.map_err(backend)? {
+        let provider: String = row.get(0).map_err(backend)?;
+        let subject: String = row.get(1).map_err(backend)?;
+        let user: String = row.get(2).map_err(backend)?;
+        let email: Option<String> = row.get(3).map_err(backend)?;
+        // Legacy column is an INTEGER (0/1); read as i64 so a NULL or odd
+        // encoding fails loud rather than silently coercing to unverified.
+        let email_verified: i64 = row.get(4).map_err(backend)?;
+        legacy.push((provider, subject, user, email, email_verified != 0));
+    }
+    drop(rows);
+    drop(conn);
+
+    for (provider, subject, user, email, email_verified) in legacy {
+        let identity = ResolveExternalIdentity {
+            tenant_id: tenant_id.clone(),
+            surface_kind: SurfaceKind::Oauth,
+            provider_kind: ProviderKind::new(provider).map_err(invalid_key)?,
+            provider_instance_id: None,
+            external_subject_id: ExternalSubjectId::new(subject).map_err(invalid_key)?,
+            email,
+            email_verified,
+            display_name: None,
+        };
+        let user_id = UserId::new(user)
+            .map_err(|error| RebornIdentityError::InvalidUserId(error.to_string()))?;
+        store.adopt_migrated_identity(identity, &user_id).await?;
+    }
+    Ok(())
+}
+
 impl RebornRuntime {
     /// Snapshot of the substrate facades produced by `build_reborn_services`.
     /// Exposed for diagnostics / readiness reporting; **not** for traffic.
@@ -563,6 +679,42 @@ impl RebornRuntime {
     #[cfg(feature = "root-llm-provider")]
     pub(crate) fn webui_boot_config(&self) -> Option<&ironclaw_reborn_config::RebornBootConfig> {
         self.boot.as_ref()
+    }
+
+    /// The runtime's NEAR AI session manager, when an LLM seam is wired. The
+    /// LLM-config service uses it so a completed NEAR AI login applies to the
+    /// live provider on reload.
+    #[cfg(feature = "root-llm-provider")]
+    pub(crate) fn webui_llm_session(&self) -> Option<Arc<ironclaw_llm::SessionManager>> {
+        self.llm_reload
+            .as_ref()
+            .map(|parts| Arc::clone(&parts.session))
+    }
+
+    /// Shared NEAR AI login-state store. The authenticated start endpoint
+    /// issues states and the public callback consumes them.
+    #[cfg(feature = "root-llm-provider")]
+    pub(crate) fn webui_nearai_login_states(
+        &self,
+    ) -> Option<Arc<crate::llm_config_service::NearAiLoginStateStore>> {
+        self.llm_reload
+            .as_ref()
+            .map(|parts| Arc::clone(&parts.nearai_login_states))
+    }
+
+    /// Public NEAR AI login callback mount for the host ingress to merge via
+    /// [`crate::webui_serve::WebuiServeConfig::with_public_route_mount`]. Built
+    /// from the runtime's private session/reload/boot so those stay internal.
+    /// `None` when no LLM seam or boot config was wired.
+    #[cfg(all(feature = "root-llm-provider", feature = "webui-v2-beta"))]
+    pub fn nearai_login_callback_mount(&self) -> Option<crate::webui_serve::PublicRouteMount> {
+        let boot = self.boot.clone()?;
+        let session = self.webui_llm_session()?;
+        let reload = self.webui_llm_reload_trigger()?;
+        let states = self.webui_nearai_login_states()?;
+        Some(crate::nearai_login_serve::nearai_login_callback_mount(
+            session, reload, boot, states,
+        ))
     }
 
     /// Live LLM-provider reload trigger for the settings service. Returns the
@@ -619,6 +771,50 @@ impl RebornRuntime {
         &self,
     ) -> Option<Arc<dyn ironclaw_conversations::ConversationActorPairingService>> {
         self.trigger_conversation_pairing.as_ref().map(Arc::clone)
+    }
+
+    /// Open the canonical Reborn identity resolver on the runtime's existing
+    /// local-dev libSQL substrate handle, running the store's idempotent
+    /// schema migrations plus the one-time legacy WebUI identity fold under
+    /// `tenant_id`. Rides the same `reborn-local-dev.db` handle the runtime
+    /// already owns rather than opening a second handle to that file (the
+    /// host filesystem abstraction owns the substrate, not the caller).
+    /// Returns `None` when the runtime was built without a local-runtime
+    /// substrate (production-shape profiles not yet wired), so callers fail
+    /// closed.
+    #[cfg(feature = "webui-v2-beta")]
+    pub async fn open_reborn_identity_resolver(
+        &self,
+        tenant_id: &TenantId,
+    ) -> Option<
+        Result<
+            Arc<dyn ironclaw_reborn_identity::RebornIdentityResolver>,
+            ironclaw_reborn_identity::RebornIdentityError,
+        >,
+    > {
+        let local = self.services.local_runtime.as_ref()?;
+        // Build the store on the host scoped filesystem (same substrate
+        // boundary as every other durable store), scoped by the runtime-owner
+        // caller identity. Data is partitioned by tenant in the record path.
+        let store = ironclaw_reborn_identity::FilesystemRebornIdentityStore::new(
+            Arc::clone(&local.identity_filesystem),
+            self.thread_scope.tenant_id.clone(),
+            self.actor_user_id.clone(),
+            self.thread_scope.agent_id.clone(),
+            self.thread_scope.project_id.clone(),
+        );
+        // One-time legacy fold: the pre-#4381 WebUI store wrote `user_identities`
+        // rows into the same libSQL substrate. Reading that SQL table is a
+        // substrate-level concern, so it lives here in the host layer (not the
+        // identity crate) and binds each row into the filesystem-backed store.
+        if let Err(err) =
+            fold_legacy_webui_identities(&local.identity_substrate_db, tenant_id, &store).await
+        {
+            return Some(Err(err));
+        }
+        Some(Ok(
+            Arc::new(store) as Arc<dyn ironclaw_reborn_identity::RebornIdentityResolver>
+        ))
     }
 
     pub(crate) fn webui_thread_service(&self) -> Arc<dyn SessionThreadService> {
@@ -1305,11 +1501,13 @@ pub async fn build_reborn_runtime(
         boot,
         runner,
         trigger_poller,
+        trigger_fire_access_checker,
         poll,
         identity,
         default_project_id,
         regex_skill_activation_enabled,
         skill_context_source: configured_skill_context_source,
+        hooks: hooks_config,
         budget_defaults,
         budget_event_observer,
         #[cfg(any(test, feature = "test-support"))]
@@ -1402,18 +1600,33 @@ pub async fn build_reborn_runtime(
     // 3. The test override wins over the production gateway when set;
     //    the LLM-derived cost table is kept regardless so the
     //    accountant can fire against a stub gateway too.
-    #[cfg(any(test, feature = "test-support"))]
-    let test_model_gateway_override = model_gateway_override;
-    #[cfg(feature = "root-llm-provider")]
-    let (production_gateway, llm_cost_table, llm_reload) =
-        build_production_model_gateway(llm).await?;
-    #[cfg(not(feature = "root-llm-provider"))]
-    let (production_gateway, llm_cost_table) = build_production_model_gateway()?;
-
-    #[cfg(any(test, feature = "test-support"))]
-    let model_gateway = test_model_gateway_override.unwrap_or(production_gateway);
-    #[cfg(not(any(test, feature = "test-support")))]
-    let model_gateway = production_gateway;
+    // 3. A test gateway override short-circuits the production build entirely:
+    //    building a real gateway only to discard it wastes startup work (and, on
+    //    the cold-boot path, an LLM session manager), which made
+    //    timeout-sensitive tests flaky. When no override is set, build normally.
+    #[cfg(all(feature = "root-llm-provider", any(test, feature = "test-support")))]
+    let (model_gateway, llm_cost_table, llm_reload) = match model_gateway_override {
+        Some(override_gateway) => (override_gateway, None, None),
+        None => build_production_model_gateway(llm).await?,
+    };
+    #[cfg(all(
+        feature = "root-llm-provider",
+        not(any(test, feature = "test-support"))
+    ))]
+    let (model_gateway, llm_cost_table, llm_reload) = build_production_model_gateway(llm).await?;
+    #[cfg(all(
+        not(feature = "root-llm-provider"),
+        any(test, feature = "test-support")
+    ))]
+    let (model_gateway, llm_cost_table) = match model_gateway_override {
+        Some(override_gateway) => (override_gateway, None),
+        None => build_production_model_gateway()?,
+    };
+    #[cfg(all(
+        not(feature = "root-llm-provider"),
+        not(any(test, feature = "test-support"))
+    ))]
+    let (model_gateway, llm_cost_table) = build_production_model_gateway()?;
 
     // Resolved cost table is either: the LLM-policy-derived table (real
     // LLM wired), a test override (so tests can drive deterministic
@@ -1562,6 +1775,40 @@ pub async fn build_reborn_runtime(
     let capability_input_resolver = local_dev_capabilities.capability_input_resolver;
     let capability_result_writer = local_dev_capabilities.capability_result_writer;
     let model_gateway = local_dev_capabilities.model_gateway;
+    // Hook framework activation (#3934 + third-party projection), gated behind
+    // the typed `HooksActivationConfig` carried in `RebornRuntimeInput` (master
+    // flag default OFF; third-party sub-flag also default OFF). The env vars
+    // (`HOOKS_ENABLED`, `HOOKS_THIRD_PARTY_ENABLED`) are resolved ONCE at the
+    // edge that builds the input (the CLI / ingress adapter); this composition
+    // root consumes the typed config and never reads the environment itself.
+    //
+    // Hook-only projection containment: third-party `[[hooks]]` are discovered
+    // and projected into a `HookProjectionRegistry` that carries ONLY hook
+    // metadata (no `ExtensionRegistry`, no `ExtensionPackage`) and reaches ONLY
+    // this hook factory, not the capability catalog or surface resolver.
+    let hook_dispatcher_builder_factory = {
+        let third_party_input = crate::hooks::ThirdPartyDiscoveryInput {
+            filesystem: local_runtime.extension_filesystem.as_ref(),
+            tenant_id: &validated_identity.tenant_id,
+        };
+        let projection_registry = crate::hooks::build_hook_projection_registry(
+            builtin_extension_registry()?,
+            Some(third_party_input),
+            hooks_config,
+        )
+        .await
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("hook projection registry assembly failed: {error}"),
+        })?;
+        crate::hooks::build_hook_dispatcher_builder_factory_for_tenant(
+            hooks_config,
+            &projection_registry,
+            &validated_identity.tenant_id,
+        )
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("hook framework activation failed: {error}"),
+        })?
+    };
 
     let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {
         turn_state: Arc::clone(&turn_state_store),
@@ -1610,7 +1857,9 @@ pub async fn build_reborn_runtime(
         model_policy_guard: None,
         model_budget_accountant,
         safety_context: None,
+        hook_security_audit_sink: Some(Arc::new(ironclaw_events::TracingSecurityAuditSink)),
         turn_event_sink: None,
+        hook_dispatcher_builder_factory,
     })?;
     let default_resolved_run_profile = composition
         .run_profile_resolver
@@ -1709,12 +1958,16 @@ pub async fn build_reborn_runtime(
         Arc<dyn ironclaw_conversations::ConversationActorPairingService>,
     >;
     if trigger_poller.enabled {
-        validate_trigger_poller_authorization(&trigger_poller)?;
+        validate_trigger_poller_authorization(
+            &trigger_poller,
+            trigger_fire_access_checker.as_ref(),
+        )?;
         let trigger_poller_services = build_trigger_poller_services(
             local_runtime,
             Arc::clone(&planned_turn_coordinator),
             Arc::clone(&thread_service),
             trigger_poller.authorizer,
+            trigger_fire_access_checker.clone(),
             thread_scope.tenant_id.clone(),
             validated_identity.agent_id.clone(),
         )
@@ -2010,6 +2263,11 @@ async fn build_production_model_gateway(
     ),
     RebornRuntimeError,
 > {
+    // Even with no LLM configured at boot we build a real swappable gateway
+    // around a placeholder provider (which errors until swapped) plus a reload
+    // handle. That way the FIRST configuration made through the settings UI
+    // hot-swaps the placeholder into a working provider without a restart —
+    // otherwise a cold boot would wire a dead stub with no reload seam.
     match llm {
         Some(cfg) => {
             let LlmGatewayBundle {
@@ -2019,7 +2277,16 @@ async fn build_production_model_gateway(
             } = build_llm_gateway(cfg).await?;
             Ok((gateway, Some(policy.build_cost_table()), Some(reload)))
         }
-        None => Ok((build_stub_gateway(), None, None)),
+        None => {
+            let LlmGatewayBundle {
+                gateway, reload, ..
+            } = build_placeholder_llm_gateway().await?;
+            // No cost table for the placeholder: there is no real model to cost,
+            // and a synthetic table would gate budgets against a model that
+            // isn't actually in use. The budget cost table is (re)derived when a
+            // real provider is configured + the binary restarts.
+            Ok((gateway, None, Some(reload)))
+        }
     }
 }
 
@@ -2055,22 +2322,44 @@ struct LlmGatewayBundle {
 pub(crate) struct RebornLlmReloadParts {
     pub(crate) reload_handle: Arc<ironclaw_llm::LlmReloadHandle>,
     pub(crate) session: Arc<ironclaw_llm::SessionManager>,
+    pub(crate) nearai_login_states: Arc<crate::llm_config_service::NearAiLoginStateStore>,
 }
 
 #[cfg(feature = "root-llm-provider")]
 async fn build_llm_gateway(llm: ResolvedRebornLlm) -> Result<LlmGatewayBundle, RebornRuntimeError> {
-    use ironclaw_llm::{LlmProvider, LlmReloadHandle, SwappableLlmProvider};
-    use ironclaw_reborn::model_gateway::{LlmModelProfilePolicy, LlmProviderModelGateway};
-    use ironclaw_turns::run_profile::ModelProfileId;
-
     let model = llm.model().to_string();
     let session = ironclaw_llm::create_session_manager(llm.config.session.clone()).await;
     let raw = ironclaw_llm::build_static_provider_chain(&llm.config, Arc::clone(&session))
         .await
         .map_err(|error| RebornRuntimeError::LlmProvider(error.to_string()))?;
+    wrap_swappable_gateway(raw, Some(model), session)
+}
 
-    // Wrap in a swappable provider and keep its reload handle so settings
-    // changes can hot-swap the inner backend live.
+/// Cold-boot gateway: no LLM configured yet. Wraps a placeholder provider (which
+/// errors until swapped) so the model-gateway + reload seam exist from the
+/// start; the first configuration applied through the settings UI swaps the
+/// placeholder for a real provider chain with no restart.
+#[cfg(feature = "root-llm-provider")]
+async fn build_placeholder_llm_gateway() -> Result<LlmGatewayBundle, RebornRuntimeError> {
+    let session =
+        ironclaw_llm::create_session_manager(ironclaw_llm::SessionConfig::default()).await;
+    let raw: Arc<dyn ironclaw_llm::LlmProvider> = Arc::new(PlaceholderLlmProvider);
+    wrap_swappable_gateway(raw, None, session)
+}
+
+/// Wrap a raw provider in a [`SwappableLlmProvider`] + reload handle and build
+/// the model gateway. Shared by the real and placeholder boot paths so both get
+/// an identical live-reload seam.
+#[cfg(feature = "root-llm-provider")]
+fn wrap_swappable_gateway(
+    raw: Arc<dyn ironclaw_llm::LlmProvider>,
+    model: Option<String>,
+    session: Arc<ironclaw_llm::SessionManager>,
+) -> Result<LlmGatewayBundle, RebornRuntimeError> {
+    use ironclaw_llm::{LlmProvider, LlmReloadHandle, SwappableLlmProvider};
+    use ironclaw_reborn::model_gateway::{LlmModelProfilePolicy, LlmProviderModelGateway};
+    use ironclaw_turns::run_profile::ModelProfileId;
+
     let swappable = Arc::new(SwappableLlmProvider::new(raw));
     let reload_handle = Arc::new(LlmReloadHandle::new(Arc::clone(&swappable), None));
     let provider: Arc<dyn LlmProvider> = swappable;
@@ -2078,7 +2367,7 @@ async fn build_llm_gateway(llm: ResolvedRebornLlm) -> Result<LlmGatewayBundle, R
     let model_profile_id = ModelProfileId::new("interactive_model").map_err(|reason| {
         RebornRuntimeError::LlmProvider(format!("invalid interactive model profile id: {reason}"))
     })?;
-    let policy = LlmModelProfilePolicy::new().allow_model_profile(model_profile_id, Some(model));
+    let policy = LlmModelProfilePolicy::new().allow_model_profile(model_profile_id, model);
     let gateway = LlmProviderModelGateway::new(provider, policy.clone());
     Ok(LlmGatewayBundle {
         gateway: Arc::new(gateway),
@@ -2086,10 +2375,56 @@ async fn build_llm_gateway(llm: ResolvedRebornLlm) -> Result<LlmGatewayBundle, R
         reload: RebornLlmReloadParts {
             reload_handle,
             session,
+            nearai_login_states: Arc::new(crate::llm_config_service::NearAiLoginStateStore::new()),
         },
     })
 }
 
+/// Stand-in provider used before any LLM is configured. Every call fails with a
+/// clear, user-safe message; it exists only so the gateway/reload seam is live
+/// from a cold boot and the first configuration can swap it out.
+#[cfg(feature = "root-llm-provider")]
+#[derive(Debug)]
+struct PlaceholderLlmProvider;
+
+#[cfg(feature = "root-llm-provider")]
+#[async_trait::async_trait]
+impl ironclaw_llm::LlmProvider for PlaceholderLlmProvider {
+    fn model_name(&self) -> &str {
+        "unconfigured"
+    }
+
+    fn cost_per_token(&self) -> (rust_decimal::Decimal, rust_decimal::Decimal) {
+        (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO)
+    }
+
+    async fn complete(
+        &self,
+        _request: ironclaw_llm::CompletionRequest,
+    ) -> Result<ironclaw_llm::CompletionResponse, ironclaw_llm::LlmError> {
+        Err(placeholder_unconfigured_error())
+    }
+
+    async fn complete_with_tools(
+        &self,
+        _request: ironclaw_llm::ToolCompletionRequest,
+    ) -> Result<ironclaw_llm::ToolCompletionResponse, ironclaw_llm::LlmError> {
+        Err(placeholder_unconfigured_error())
+    }
+}
+
+#[cfg(feature = "root-llm-provider")]
+fn placeholder_unconfigured_error() -> ironclaw_llm::LlmError {
+    ironclaw_llm::LlmError::RequestFailed {
+        provider: "unconfigured".to_string(),
+        reason: "no LLM provider is configured yet; choose one in Settings → Inference".to_string(),
+    }
+}
+
+// Only the substrate-only build (no `root-llm-provider`) still wires a dead
+// stub gateway. With the LLM provider compiled in, a cold boot uses a
+// placeholder-backed swappable gateway instead (see `build_placeholder_llm_gateway`).
+#[cfg(not(feature = "root-llm-provider"))]
 fn build_stub_gateway() -> Arc<dyn ironclaw_loop_support::HostManagedModelGateway> {
     use async_trait::async_trait;
     use ironclaw_loop_support::{
@@ -2224,7 +2559,9 @@ mod tests {
     use crate::extension_lifecycle::ExtensionActivationMode;
     use crate::input::RebornBuildInput;
     use crate::runtime_input::{
-        PollSettings, RebornRuntimeIdentity, RebornRuntimeInput, TriggerPollerSettings,
+        PollSettings, RebornRuntimeIdentity, RebornRuntimeInput, TriggerFireAccessCheck,
+        TriggerFireAccessChecker, TriggerFireAccessDecision, TriggerFireAccessError,
+        TriggerPollerSettings,
     };
     use crate::webui::build_webui_services;
 
@@ -2233,6 +2570,8 @@ mod tests {
         TRUSTED_LAPTOP_ACCESS_AUDIT_STATUS, TRUSTED_LAPTOP_ACCESS_AUDIT_TARGET,
         build_reborn_runtime,
     };
+
+    const RUNTIME_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
     fn local_dev_runtime_policy() -> EffectiveRuntimePolicy {
         EffectiveRuntimePolicy {
@@ -2306,9 +2645,22 @@ mod tests {
         candidates: Vec<HostSkillContextCandidate>,
     }
 
+    #[derive(Debug)]
+    struct AllowingTriggerFireAccessChecker;
+
     impl StaticSkillContextSource {
         fn new(candidates: Vec<HostSkillContextCandidate>) -> Self {
             Self { candidates }
+        }
+    }
+
+    #[async_trait]
+    impl TriggerFireAccessChecker for AllowingTriggerFireAccessChecker {
+        async fn check_trigger_fire_access(
+            &self,
+            _request: TriggerFireAccessCheck,
+        ) -> Result<TriggerFireAccessDecision, TriggerFireAccessError> {
+            Ok(TriggerFireAccessDecision::Allowed)
         }
     }
 
@@ -2882,15 +3234,50 @@ mod tests {
                     .await
                     .expect("unexpected runtime shutdown");
                 panic!(
-                    "creator-membership-required setting must not enable trigger poller without real membership backend"
+                    "creator-access-required setting must not enable trigger poller without an access checker"
                 );
             }
             Err(err) => err,
         };
 
         assert!(
-            matches!(err, super::RebornRuntimeError::InvalidArgument { reason } if reason.contains("fire-time creator authorization"))
+            matches!(err, super::RebornRuntimeError::InvalidArgument { reason } if reason.contains("fire-time creator access checker"))
         );
+    }
+
+    #[tokio::test]
+    async fn local_dev_runtime_accepts_trigger_poller_with_creator_access_checker() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let gateway = Arc::new(RecordingGateway {
+            reply: "trigger auth supplied".to_string(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::local_dev(
+                "runtime-trigger-auth-supplied-owner",
+                root.path().join("local-dev"),
+            )
+            .with_runtime_policy(local_dev_runtime_policy()),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-trigger-auth-supplied-tenant".to_string(),
+            agent_id: "runtime-trigger-auth-supplied-agent".to_string(),
+            source_binding_id: "runtime-trigger-auth-supplied-source".to_string(),
+            reply_target_binding_id: "runtime-trigger-auth-supplied-reply".to_string(),
+        })
+        .with_trigger_poller_settings(TriggerPollerSettings::enabled())
+        .with_trigger_fire_access_checker(Arc::new(AllowingTriggerFireAccessChecker))
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input)
+            .await
+            .expect("runtime builds with creator access checker");
+
+        assert!(runtime.services().readiness.workers.turn_runner);
+        assert!(runtime.services().readiness.workers.trigger_poller);
+
+        runtime.shutdown().await.expect("runtime shutdown");
     }
 
     #[tokio::test]
@@ -3054,7 +3441,7 @@ mod tests {
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "ping"),
         )
         .await
@@ -3092,7 +3479,7 @@ mod tests {
         })
         .with_poll_settings(PollSettings {
             interval: Duration::from_millis(10),
-            max_total: Duration::from_secs(3),
+            max_total: RUNTIME_SEND_TIMEOUT,
         })
         .with_model_gateway_override(gateway);
 
@@ -3119,7 +3506,7 @@ mod tests {
         );
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "ping"),
         )
         .await
@@ -3314,7 +3701,7 @@ mod tests {
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "ping"),
         )
         .await
@@ -3362,7 +3749,7 @@ mod tests {
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "use echo tool"),
         )
         .await
@@ -3474,7 +3861,7 @@ mod tests {
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "review this"),
         )
         .await
@@ -3559,7 +3946,7 @@ mod tests {
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "review this"),
         )
         .await
@@ -3654,7 +4041,7 @@ mod tests {
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "/system-helper and /local-helper"),
         )
         .await
@@ -3844,7 +4231,7 @@ mod tests {
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "/code-review this PR"),
         )
         .await
@@ -3908,7 +4295,7 @@ mod tests {
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let result = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.execute_skill_message(&conversation, "$marker-helper"),
         )
         .await
@@ -4088,7 +4475,7 @@ mod tests {
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "hello with no matching skill"),
         )
         .await
@@ -4134,14 +4521,14 @@ mod tests {
         })
         .with_poll_settings(PollSettings {
             interval: Duration::from_millis(10),
-            max_total: Duration::from_secs(3),
+            max_total: RUNTIME_SEND_TIMEOUT,
         })
         .with_model_gateway_override(gateway_for_runtime);
 
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
         let conversation = runtime.new_conversation().await.expect("conversation");
         let reply = tokio::time::timeout(
-            Duration::from_secs(3),
+            RUNTIME_SEND_TIMEOUT,
             runtime.send_user_message(&conversation, "list workspace"),
         )
         .await
@@ -4349,7 +4736,7 @@ mod tests {
             )
             .await
             .expect("google setup extension lifecycle projection");
-        assert_eq!(google_setup.secrets.len(), 1);
+        assert_eq!(google_setup.secrets.len(), 2);
         let google_oauth_setups = google_setup
             .secrets
             .iter()
@@ -4373,10 +4760,10 @@ mod tests {
                 .iter()
                 .map(|(_, scopes)| scopes.clone())
                 .collect::<Vec<_>>(),
-            vec![vec![
-                GOOGLE_CALENDAR_READONLY_SCOPE.to_string(),
-                GOOGLE_CALENDAR_EVENTS_SCOPE.to_string(),
-            ]]
+            vec![
+                vec![GOOGLE_CALENDAR_READONLY_SCOPE.to_string()],
+                vec![GOOGLE_CALENDAR_EVENTS_SCOPE.to_string()],
+            ]
         );
         let google_setup_json =
             serde_json::to_value(&google_setup.secrets[0]).expect("serialize setup secret");
@@ -4460,6 +4847,199 @@ mod tests {
             .expect("route response");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[cfg(feature = "webui-v2-beta")]
+    #[tokio::test]
+    async fn open_reborn_identity_resolver_migrates_legacy_webui_identities_through_runtime() {
+        use ironclaw_reborn_identity::{
+            ExternalSubjectId, ProviderKind, ResolveExternalIdentity, SurfaceKind,
+        };
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let gateway = Arc::new(RecordingGateway {
+            reply: "unused".to_string(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::local_dev("runtime-identity-owner", root.path().join("local-dev"))
+                .with_runtime_policy(local_dev_runtime_policy()),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-identity-tenant".to_string(),
+            agent_id: "runtime-identity-agent".to_string(),
+            source_binding_id: "runtime-identity-source".to_string(),
+            reply_target_binding_id: "runtime-identity-reply".to_string(),
+        })
+        .with_poll_settings(PollSettings {
+            interval: Duration::from_millis(10),
+            max_total: Duration::from_secs(3),
+        })
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+        let tenant = TenantId::new("runtime-identity-tenant").expect("tenant");
+
+        // Seed a legacy pre-#4381 WebUI identity into the SAME substrate DB the
+        // runtime owns, exactly as the old store wrote it.
+        let substrate = Arc::clone(
+            &runtime
+                .services
+                .local_runtime
+                .as_ref()
+                .expect("local runtime substrate")
+                .identity_substrate_db,
+        );
+        let seed = substrate.connect().expect("substrate connection");
+        seed.execute_batch(
+            "CREATE TABLE user_identities (\
+                 provider TEXT NOT NULL, provider_user_id TEXT NOT NULL, \
+                 user_id TEXT NOT NULL, email TEXT, email_verified INTEGER NOT NULL, \
+                 created_at TEXT NOT NULL, \
+                 PRIMARY KEY (provider, provider_user_id));",
+        )
+        .await
+        .expect("seed legacy schema");
+        seed.execute(
+            "INSERT INTO user_identities \
+                 (provider, provider_user_id, user_id, email, email_verified, created_at) \
+                 VALUES ('google', 'g-legacy', 'legacy-runtime-user', 'legacy@x.com', 1, \
+                     '2026-01-01T00:00:00Z')",
+            (),
+        )
+        .await
+        .expect("seed legacy identity");
+        // Drop the raw seed connection before the fold runs: production never
+        // holds a second raw handle on the substrate, and an idle extra
+        // connection here would contend with the filesystem-backed writes.
+        drop(seed);
+
+        // The production accessor `serve` relies on: it opens the resolver on
+        // the runtime-owned substrate handle and runs the legacy fold, so the
+        // returning legacy user must resolve to their original UserId rather
+        // than being re-minted.
+        let resolver = runtime
+            .open_reborn_identity_resolver(&tenant)
+            .await
+            .expect("runtime carries a local-runtime substrate")
+            .expect("resolver opens");
+        let resolved = resolver
+            .resolve_or_create(ResolveExternalIdentity {
+                tenant_id: tenant.clone(),
+                surface_kind: SurfaceKind::Oauth,
+                provider_kind: ProviderKind::new("google").expect("provider"),
+                provider_instance_id: None,
+                external_subject_id: ExternalSubjectId::new("g-legacy").expect("subject"),
+                email: Some("legacy@x.com".to_string()),
+                email_verified: true,
+                display_name: None,
+            })
+            .await
+            .expect("resolve");
+        assert_eq!(
+            resolved.as_str(),
+            "legacy-runtime-user",
+            "a returning legacy SSO user keeps their UserId through the runtime accessor"
+        );
+
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[cfg(feature = "webui-v2-beta")]
+    #[tokio::test]
+    async fn open_reborn_identity_resolver_migrates_legacy_verified_email_linking() {
+        use ironclaw_reborn_identity::{
+            ExternalSubjectId, ProviderKind, ResolveExternalIdentity, SurfaceKind,
+        };
+
+        let root = tempfile::tempdir().expect("tempdir");
+        let gateway = Arc::new(RecordingGateway {
+            reply: "unused".to_string(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::local_dev(
+                "runtime-identity-link-owner",
+                root.path().join("local-dev"),
+            )
+            .with_runtime_policy(local_dev_runtime_policy()),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-identity-link-tenant".to_string(),
+            agent_id: "runtime-identity-link-agent".to_string(),
+            source_binding_id: "runtime-identity-link-source".to_string(),
+            reply_target_binding_id: "runtime-identity-link-reply".to_string(),
+        })
+        .with_poll_settings(PollSettings {
+            interval: Duration::from_millis(10),
+            max_total: Duration::from_secs(3),
+        })
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+        let tenant = TenantId::new("runtime-identity-link-tenant").expect("tenant");
+
+        // Seed a legacy pre-#4381 WebUI Google identity with a VERIFIED email.
+        let substrate = Arc::clone(
+            &runtime
+                .services
+                .local_runtime
+                .as_ref()
+                .expect("local runtime substrate")
+                .identity_substrate_db,
+        );
+        let seed = substrate.connect().expect("substrate connection");
+        seed.execute_batch(
+            "CREATE TABLE user_identities (\
+                 provider TEXT NOT NULL, provider_user_id TEXT NOT NULL, \
+                 user_id TEXT NOT NULL, email TEXT, email_verified INTEGER NOT NULL, \
+                 created_at TEXT NOT NULL, \
+                 PRIMARY KEY (provider, provider_user_id));",
+        )
+        .await
+        .expect("seed legacy schema");
+        seed.execute(
+            "INSERT INTO user_identities \
+                 (provider, provider_user_id, user_id, email, email_verified, created_at) \
+                 VALUES ('google', 'g-legacy', 'legacy-link-user', 'shared@x.com', 1, \
+                     '2026-01-01T00:00:00Z')",
+            (),
+        )
+        .await
+        .expect("seed legacy identity");
+        drop(seed);
+
+        // The fold must seed the canonical verified-email index from the
+        // migrated row's verified email — not just preserve the per-subject id.
+        let resolver = runtime
+            .open_reborn_identity_resolver(&tenant)
+            .await
+            .expect("runtime carries a local-runtime substrate")
+            .expect("resolver opens");
+
+        // The upgrade case: a LATER login through a DIFFERENT OAuth provider
+        // with the SAME verified email must link to the migrated user instead
+        // of minting a second one.
+        let via_github = resolver
+            .resolve_or_create(ResolveExternalIdentity {
+                tenant_id: tenant.clone(),
+                surface_kind: SurfaceKind::Oauth,
+                provider_kind: ProviderKind::new("github").expect("provider"),
+                provider_instance_id: None,
+                external_subject_id: ExternalSubjectId::new("gh-new").expect("subject"),
+                email: Some("shared@x.com".to_string()),
+                email_verified: true,
+                display_name: None,
+            })
+            .await
+            .expect("resolve");
+        assert_eq!(
+            via_github.as_str(),
+            "legacy-link-user",
+            "a migrated verified legacy email must link a later different-provider login"
+        );
+
         runtime.shutdown().await.expect("runtime shutdown");
     }
 
