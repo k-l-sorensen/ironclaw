@@ -16,9 +16,6 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<OpenAiChatCompletionResponse>, OpenAiCompatHttpError> {
-    let Some(workflow) = state.chat_completions() else {
-        return Err(OpenAiCompatHttpError::not_wired());
-    };
     let Some(Extension(caller)) = caller else {
         return Err(OpenAiCompatHttpError::from_kind(
             401,
@@ -26,6 +23,9 @@ pub async fn chat_completions(
             crate::OpenAiCompatErrorKind::Authentication,
             None,
         ));
+    };
+    let Some(workflow) = state.chat_completions() else {
+        return Err(OpenAiCompatHttpError::not_wired());
     };
     let idempotency_key = idempotency_key_from_headers(&headers)?;
     workflow

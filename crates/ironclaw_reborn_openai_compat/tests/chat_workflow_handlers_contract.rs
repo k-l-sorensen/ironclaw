@@ -209,6 +209,30 @@ async fn chat_completion_deferred_busy_ack_returns_429() {
 }
 
 #[tokio::test]
+async fn chat_completion_idempotency_retries_after_busy_without_500() {
+    let workflow = Arc::new(FixedAckWorkflow::new(deferred_busy_ack()));
+    let router = test_router(workflow.clone(), Arc::new(StaticChatWaiter::text("unused")));
+    let body = json!({
+        "model": "gpt-reborn",
+        "messages": [{"role": "user", "content": "hello"}]
+    });
+
+    let first = router
+        .clone()
+        .oneshot(chat_request(body.clone(), Some("busy-key")))
+        .await
+        .expect("first response");
+    let retry = router
+        .oneshot(chat_request(body, Some("busy-key")))
+        .await
+        .expect("retry response");
+
+    assert_eq!(first.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(retry.status(), http::StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(workflow.seen_count(), 2);
+}
+
+#[tokio::test]
 async fn chat_completion_binding_required_rejection_returns_404() {
     let workflow = Arc::new(FixedAckWorkflow::new(rejected_ack(
         ProductRejectionKind::BindingRequired,

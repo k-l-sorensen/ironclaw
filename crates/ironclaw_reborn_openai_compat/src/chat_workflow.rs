@@ -143,27 +143,22 @@ impl OpenAiChatCompletionsWorkflow {
                 let OpenAiCompatPublicId::ChatCompletion(public_id) = mapping.public_id else {
                     return Err(OpenAiCompatHttpError::internal());
                 };
-                let envelope =
-                    self.chat_product_envelope(&caller, &public_id, user_message_payload)?;
-                let ack = self.product_workflow.submit_inbound(envelope).await?;
-                let accepted_ack = accepted_ack_from_ack(ack)?;
-                let _ = self
-                    .ref_store
-                    .record_accepted_ack(OpenAiCompatRecordAcceptedAck::new(
-                        caller.scope().clone(),
-                        OpenAiCompatPublicId::ChatCompletion(public_id.clone()),
-                        accepted_ack.clone(),
-                    ))
+                let accepted_ack = self
+                    .submit_chat_and_record_ack(&caller, &public_id, user_message_payload)
                     .await?;
                 (public_id, accepted_ack, created_at)
             }
             OpenAiCompatRefReservationOutcome::Replayed(mapping) => {
                 let created_at = mapping.created_at;
-                let accepted_ack = mapping
-                    .accepted_ack
-                    .ok_or_else(OpenAiCompatHttpError::internal)?;
                 let OpenAiCompatPublicId::ChatCompletion(public_id) = mapping.public_id else {
                     return Err(OpenAiCompatHttpError::internal());
+                };
+                let accepted_ack = match mapping.accepted_ack {
+                    Some(accepted_ack) => accepted_ack,
+                    None => {
+                        self.submit_chat_and_record_ack(&caller, &public_id, user_message_payload)
+                            .await?
+                    }
                 };
                 (public_id, accepted_ack, created_at)
             }
@@ -236,6 +231,26 @@ impl OpenAiChatCompletionsWorkflow {
             }],
             usage: wait_result.usage,
         })
+    }
+
+    async fn submit_chat_and_record_ack(
+        &self,
+        caller: &OpenAiCompatAuthenticatedCaller,
+        public_id: &OpenAiChatCompletionId,
+        user_message_payload: UserMessagePayload,
+    ) -> Result<ProductInboundAck, OpenAiCompatHttpError> {
+        let envelope = self.chat_product_envelope(caller, public_id, user_message_payload)?;
+        let ack = self.product_workflow.submit_inbound(envelope).await?;
+        let accepted_ack = accepted_ack_from_ack(ack)?;
+        self.ref_store
+            .record_accepted_ack(OpenAiCompatRecordAcceptedAck::new(
+                caller.scope().clone(),
+                OpenAiCompatPublicId::ChatCompletion(public_id.clone()),
+                accepted_ack.clone(),
+            ))
+            .await?
+            .ok_or_else(OpenAiCompatHttpError::internal)?;
+        Ok(accepted_ack)
     }
 
     fn chat_product_envelope(

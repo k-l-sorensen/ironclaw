@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -541,6 +541,20 @@ struct IdempotencyIndexKey {
     key: OpenAiCompatIdempotencyKey,
 }
 
+impl InMemoryOpenAiCompatRefStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock_state(
+        &self,
+    ) -> Result<MutexGuard<'_, InMemoryOpenAiCompatRefState>, OpenAiCompatRefError> {
+        self.state
+            .lock()
+            .map_err(|_| OpenAiCompatRefError::StoreUnavailable)
+    }
+}
+
 #[async_trait]
 impl OpenAiCompatRefStore for InMemoryOpenAiCompatRefStore {
     async fn reserve(
@@ -638,24 +652,9 @@ impl OpenAiCompatRefStore for InMemoryOpenAiCompatRefStore {
     }
 }
 
-impl InMemoryOpenAiCompatRefStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn lock_state(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, InMemoryOpenAiCompatRefState>, OpenAiCompatRefError> {
-        self.state
-            .lock()
-            .map_err(|_| OpenAiCompatRefError::StoreUnavailable)
-    }
-}
-
 fn new_pending_mapping(request: OpenAiCompatRefReservation) -> OpenAiCompatResourceMapping {
-    let public_id = OpenAiCompatPublicId::generate_for(request.surface);
     let mapping = OpenAiCompatResourceMapping {
-        public_id,
+        public_id: OpenAiCompatPublicId::generate_for(request.surface),
         owner: request.owner,
         surface: request.surface,
         request_fingerprint: request.request_fingerprint,

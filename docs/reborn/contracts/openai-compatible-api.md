@@ -1,8 +1,7 @@
 # Reborn OpenAI-Compatible API Contract
 
 **Status:** contract, identity, and non-streaming Chat Completions workflow
-slices (#4442, #4443, #4444)
-**Parent:** #3283
+slices (#4442, #4443, #4444)**Parent:** #3283
 **Crates:** `crates/ironclaw_reborn_openai_compat`,
 `crates/ironclaw_reborn_openai_compat_storage`
 
@@ -20,7 +19,6 @@ vocabulary. `POST /v1/chat/completions` can submit non-streaming user-message
 requests through ProductWorkflow when host composition injects the workflow
 state. Responses routes, retrieve, cancel, and SSE translation remain
 fail-closed.
-
 ## Route Surface
 
 | Route | Method | Effect path | Streaming |
@@ -92,7 +90,6 @@ The route:
 - Preserves model-produced tool-call output shape in the response, while
   treating client-supplied tools as model-only hints rather than executable
   Reborn capabilities.
-
 ## Error Shape
 
 Errors serialize as:

@@ -15,11 +15,11 @@ use ironclaw_filesystem::{
 };
 use ironclaw_host_api::VirtualPath;
 use ironclaw_reborn_openai_compat::{
-    OpenAiCompatActorScope, OpenAiCompatBindInternalRefs, OpenAiCompatIdempotencyConflict,
-    OpenAiCompatIdempotencyKey, OpenAiCompatPublicId, OpenAiCompatRecordAcceptedAck,
-    OpenAiCompatRefError, OpenAiCompatRefLookup, OpenAiCompatRefReservation,
-    OpenAiCompatRefReservationOutcome, OpenAiCompatRefStore, OpenAiCompatResourceBinding,
-    OpenAiCompatResourceMapping, OpenAiCompatRouteSurface,
+    OpenAiCompatActorScope, OpenAiCompatBindInternalRefs, OpenAiCompatIdempotencyKey,
+    OpenAiCompatPublicId, OpenAiCompatRecordAcceptedAck, OpenAiCompatRefError,
+    OpenAiCompatRefLookup, OpenAiCompatRefReservation, OpenAiCompatRefReservationOutcome,
+    OpenAiCompatRefStore, OpenAiCompatResourceBinding, OpenAiCompatResourceMapping,
+    OpenAiCompatRouteSurface,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -176,6 +176,116 @@ impl FilesystemOpenAiCompatRefStore {
             let _ = self.filesystem.delete(&path).await;
         }
     }
+
+    async fn reserve_with_cas(
+        &self,
+        request: OpenAiCompatRefReservation,
+    ) -> Result<OpenAiCompatRefReservationOutcome, OpenAiCompatRefError> {
+        for _ in 0..=self.cas_retries {
+            if let Some(key) = request.idempotency_key.as_ref() {
+                let index_path =
+                    self.idempotency_index_path(&request.owner, request.surface, key)?;
+                if let Some(index) = self.load_idempotency_index(&index_path).await? {
+                    if !index.matches_request(&request.owner, request.surface, key) {
+                        return Err(OpenAiCompatRefError::CorruptMapping);
+                    }
+                    let mapping = self.load_required_mapping(&index.public_id).await?;
+                    if !index.matches_mapping(&mapping) {
+                        return Err(OpenAiCompatRefError::CorruptMapping);
+                    }
+                    if mapping.request_fingerprint == request.request_fingerprint {
+                        return Ok(OpenAiCompatRefReservationOutcome::Replayed(mapping));
+                    }
+                    return Ok(OpenAiCompatRefReservationOutcome::Conflict(
+                        ironclaw_reborn_openai_compat::OpenAiCompatIdempotencyConflict {
+                            surface: request.surface,
+                        },
+                    ));
+                }
+
+                let mapping = new_pending_mapping(&request);
+                match self.put_mapping(&mapping, CasExpectation::Absent).await {
+                    Ok(()) => {}
+                    Err(SaveRecordError::CasConflict) => continue,
+                    Err(SaveRecordError::Ref(error)) => return Err(error),
+                }
+                let index = StoredOpenAiCompatIdempotencyIndex {
+                    owner: request.owner.clone(),
+                    surface: request.surface,
+                    key: key.clone(),
+                    public_id: mapping.public_id.clone(),
+                };
+                match self.put_idempotency_index(&index_path, &index).await {
+                    Ok(()) => return Ok(OpenAiCompatRefReservationOutcome::Created(mapping)),
+                    Err(SaveRecordError::CasConflict) => {
+                        self.delete_mapping_best_effort(&mapping.public_id).await;
+                        continue;
+                    }
+                    Err(SaveRecordError::Ref(error)) => return Err(error),
+                }
+            }
+
+            let mapping = new_pending_mapping(&request);
+            match self.put_mapping(&mapping, CasExpectation::Absent).await {
+                Ok(()) => return Ok(OpenAiCompatRefReservationOutcome::Created(mapping)),
+                Err(SaveRecordError::CasConflict) => continue,
+                Err(SaveRecordError::Ref(error)) => return Err(error),
+            }
+        }
+        Err(OpenAiCompatRefError::StoreUnavailable)
+    }
+
+    async fn bind_with_cas(
+        &self,
+        request: OpenAiCompatBindInternalRefs,
+    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
+        for _ in 0..=self.cas_retries {
+            let Some((mut mapping, version)) = self.load_mapping_entry(&request.public_id).await?
+            else {
+                return Ok(None);
+            };
+            if !mapping.is_authorized_for(&request.owner) {
+                return Ok(None);
+            }
+            mapping.binding = OpenAiCompatResourceBinding::Bound {
+                internal_refs: request.internal_refs.clone(),
+            };
+            match self
+                .put_mapping(&mapping, CasExpectation::Version(version))
+                .await
+            {
+                Ok(()) => return Ok(Some(mapping)),
+                Err(SaveRecordError::CasConflict) => continue,
+                Err(SaveRecordError::Ref(error)) => return Err(error),
+            }
+        }
+        Err(OpenAiCompatRefError::StoreUnavailable)
+    }
+
+    async fn record_accepted_ack_with_cas(
+        &self,
+        request: OpenAiCompatRecordAcceptedAck,
+    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
+        for _ in 0..=self.cas_retries {
+            let Some((mut mapping, version)) = self.load_mapping_entry(&request.public_id).await?
+            else {
+                return Ok(None);
+            };
+            if !mapping.is_authorized_for(&request.owner) {
+                return Ok(None);
+            }
+            mapping.accepted_ack = Some(request.accepted_ack.clone());
+            match self
+                .put_mapping(&mapping, CasExpectation::Version(version))
+                .await
+            {
+                Ok(()) => return Ok(Some(mapping)),
+                Err(SaveRecordError::CasConflict) => continue,
+                Err(SaveRecordError::Ref(error)) => return Err(error),
+            }
+        }
+        Err(OpenAiCompatRefError::StoreUnavailable)
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -221,7 +331,6 @@ impl OpenAiCompatRefStore for RebornLibSqlOpenAiCompatRefStore {
     ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
         self.inner.record_accepted_ack(request).await
     }
-
     async fn lookup_authorized(
         &self,
         request: OpenAiCompatRefLookup,
@@ -316,132 +425,6 @@ impl OpenAiCompatRefStore for FilesystemOpenAiCompatRefStore {
             return Ok(None);
         }
         Ok(Some(mapping))
-    }
-}
-
-impl FilesystemOpenAiCompatRefStore {
-    async fn reserve_with_cas(
-        &self,
-        request: OpenAiCompatRefReservation,
-    ) -> Result<OpenAiCompatRefReservationOutcome, OpenAiCompatRefError> {
-        if let Some(key) = request.idempotency_key.clone() {
-            return self.reserve_with_idempotency(request, key).await;
-        }
-
-        for _ in 0..self.cas_retries {
-            let mapping = new_pending_mapping(&request);
-            match self.put_mapping(&mapping, CasExpectation::Absent).await {
-                Ok(()) => return Ok(OpenAiCompatRefReservationOutcome::Created(mapping)),
-                Err(SaveRecordError::CasConflict) => continue,
-                Err(SaveRecordError::Ref(error)) => return Err(error),
-            }
-        }
-        Err(OpenAiCompatRefError::StoreUnavailable)
-    }
-
-    async fn reserve_with_idempotency(
-        &self,
-        request: OpenAiCompatRefReservation,
-        key: OpenAiCompatIdempotencyKey,
-    ) -> Result<OpenAiCompatRefReservationOutcome, OpenAiCompatRefError> {
-        let index_path = self.idempotency_index_path(&request.owner, request.surface, &key)?;
-        for _ in 0..self.cas_retries {
-            if let Some(index) = self.load_idempotency_index(&index_path).await? {
-                if !index.matches_request(&request.owner, request.surface, &key) {
-                    return Err(OpenAiCompatRefError::CorruptMapping);
-                }
-                let mapping = self.load_required_mapping(&index.public_id).await?;
-                if !index.matches_mapping(&mapping) {
-                    return Err(OpenAiCompatRefError::CorruptMapping);
-                }
-                if mapping.request_fingerprint == request.request_fingerprint {
-                    return Ok(OpenAiCompatRefReservationOutcome::Replayed(mapping));
-                }
-                return Ok(OpenAiCompatRefReservationOutcome::Conflict(
-                    OpenAiCompatIdempotencyConflict {
-                        surface: request.surface,
-                    },
-                ));
-            }
-
-            let mapping = new_pending_mapping(&request);
-            match self.put_mapping(&mapping, CasExpectation::Absent).await {
-                Ok(()) => {}
-                Err(SaveRecordError::CasConflict) => continue,
-                Err(SaveRecordError::Ref(error)) => return Err(error),
-            }
-
-            let index = StoredOpenAiCompatIdempotencyIndex {
-                owner: request.owner.clone(),
-                surface: request.surface,
-                key: key.clone(),
-                public_id: mapping.public_id.clone(),
-            };
-            match self.put_idempotency_index(&index_path, &index).await {
-                Ok(()) => return Ok(OpenAiCompatRefReservationOutcome::Created(mapping)),
-                Err(SaveRecordError::CasConflict) => {
-                    self.delete_mapping_best_effort(&mapping.public_id).await;
-                    continue;
-                }
-                Err(SaveRecordError::Ref(error)) => {
-                    self.delete_mapping_best_effort(&mapping.public_id).await;
-                    return Err(error);
-                }
-            }
-        }
-        Err(OpenAiCompatRefError::StoreUnavailable)
-    }
-
-    async fn bind_with_cas(
-        &self,
-        request: OpenAiCompatBindInternalRefs,
-    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
-        for _ in 0..self.cas_retries {
-            let Some((mut mapping, version)) = self.load_mapping_entry(&request.public_id).await?
-            else {
-                return Ok(None);
-            };
-            if !mapping.is_authorized_for(&request.owner) {
-                return Ok(None);
-            }
-            mapping.binding = OpenAiCompatResourceBinding::Bound {
-                internal_refs: request.internal_refs.clone(),
-            };
-            match self
-                .put_mapping(&mapping, CasExpectation::Version(version))
-                .await
-            {
-                Ok(()) => return Ok(Some(mapping)),
-                Err(SaveRecordError::CasConflict) => continue,
-                Err(SaveRecordError::Ref(error)) => return Err(error),
-            }
-        }
-        Err(OpenAiCompatRefError::StoreUnavailable)
-    }
-
-    async fn record_accepted_ack_with_cas(
-        &self,
-        request: OpenAiCompatRecordAcceptedAck,
-    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
-        for _ in 0..self.cas_retries {
-            let Some((mut mapping, version)) = self.load_mapping_entry(&request.public_id).await?
-            else {
-                return Ok(None);
-            };
-            if !mapping.is_authorized_for(&request.owner) {
-                return Ok(None);
-            }
-            mapping.accepted_ack = Some(request.accepted_ack.clone());
-            match self
-                .put_mapping(&mapping, CasExpectation::Version(version))
-                .await
-            {
-                Ok(()) => return Ok(Some(mapping)),
-                Err(SaveRecordError::CasConflict) => continue,
-                Err(SaveRecordError::Ref(error)) => return Err(error),
-            }
-        }
-        Err(OpenAiCompatRefError::StoreUnavailable)
     }
 }
 
