@@ -52,9 +52,9 @@ Completions slice:
   the underlying product turn.
 - The requested public model string is carried as a composition/policy hint for
   the waiter; do not inject it into the user transcript text.
-- Client-supplied `tools` are model hints only. They are serialized into the
-  product message context but must not execute as Reborn capabilities from this
-  crate.
+- Client-supplied `tools` and `tool_choice` are model hints only. They are
+  forwarded on the waiter request as model-only metadata and must not execute as
+  Reborn capabilities from this crate.
 - The route requires a verified `OpenAiCompatAuthenticatedCaller` extension
   minted by host auth middleware. Do not mint auth evidence in this crate's
   production feature set.

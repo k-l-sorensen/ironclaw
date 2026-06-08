@@ -12,7 +12,7 @@ use std::time::Duration;
 use crate::{
     OpenAiChatChoice, OpenAiChatCompletionId, OpenAiChatCompletionRequest,
     OpenAiChatCompletionResponse, OpenAiChatFinishReason, OpenAiChatMessage, OpenAiChatMessageRole,
-    OpenAiChatToolCall, OpenAiCompatActorScope, OpenAiCompatBindInternalRefs,
+    OpenAiChatTool, OpenAiChatToolCall, OpenAiCompatActorScope, OpenAiCompatBindInternalRefs,
     OpenAiCompatHttpError, OpenAiCompatIdempotencyKey, OpenAiCompatInternalRefs,
     OpenAiCompatPublicId, OpenAiCompatRefReservation, OpenAiCompatRefReservationOutcome,
     OpenAiCompatRefStore, OpenAiCompatRequestFingerprint, OpenAiCompatRouteSurface, OpenAiUsage,
@@ -121,6 +121,9 @@ impl OpenAiChatCompletionsWorkflow {
             )));
         }
 
+        let user_message_payload = chat_user_message_payload(&request)?;
+        let model_only_tools = OpenAiChatModelOnlyTools::from_request(&request);
+
         let request_fingerprint = OpenAiCompatRequestFingerprint::from_body_bytes(raw_body);
         let reservation = self
             .ref_store
@@ -144,7 +147,7 @@ impl OpenAiChatCompletionsWorkflow {
             return Err(OpenAiCompatHttpError::internal());
         };
 
-        let envelope = self.chat_product_envelope(&caller, &public_id, &request)?;
+        let envelope = self.chat_product_envelope(&caller, &public_id, user_message_payload)?;
         let ack = self.product_workflow.submit_inbound(envelope).await?;
         let accepted_ack = accepted_ack_from_ack(ack)?;
         let wait_request = OpenAiChatCompletionWaitRequest {
@@ -152,6 +155,7 @@ impl OpenAiChatCompletionsWorkflow {
             actor_scope: caller.scope().clone(),
             accepted_ack,
             requested_model: request.model.clone(),
+            model_only_tools,
         };
 
         let wait_result = tokio::time::timeout(
@@ -203,7 +207,7 @@ impl OpenAiChatCompletionsWorkflow {
         &self,
         caller: &OpenAiCompatAuthenticatedCaller,
         public_id: &OpenAiChatCompletionId,
-        request: &OpenAiChatCompletionRequest,
+        user_message_payload: UserMessagePayload,
     ) -> Result<ProductInboundEnvelope, OpenAiCompatHttpError> {
         let context = TrustedInboundContext::from_verified_evidence(
             self.adapter_id.clone(),
@@ -224,17 +228,13 @@ impl OpenAiChatCompletionsWorkflow {
                 None,
                 None,
             )?,
-            ProductInboundPayload::UserMessage(UserMessagePayload::new(
-                chat_messages_to_product_text(request)?,
-                vec![],
-                ProductTriggerReason::DirectChat,
-            )?),
+            ProductInboundPayload::UserMessage(user_message_payload),
         )?;
         ProductInboundEnvelope::from_trusted_parse(context, parsed).map_err(Into::into)
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct OpenAiChatCompletionWaitRequest {
     pub public_id: OpenAiChatCompletionId,
     pub actor_scope: OpenAiCompatActorScope,
@@ -244,6 +244,28 @@ pub struct OpenAiChatCompletionWaitRequest {
     /// This is a composition/policy hint for the completion waiter and must not
     /// be mixed into the user transcript text by this route crate.
     pub requested_model: String,
+    /// Client-supplied OpenAI tool declarations for model planning only.
+    ///
+    /// These declarations must not execute as Reborn capabilities from this
+    /// route crate. Composition may translate them into provider model hints.
+    pub model_only_tools: Option<OpenAiChatModelOnlyTools>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenAiChatModelOnlyTools {
+    pub tools: Vec<OpenAiChatTool>,
+    pub tool_choice: Option<serde_json::Value>,
+}
+
+impl OpenAiChatModelOnlyTools {
+    fn from_request(request: &OpenAiChatCompletionRequest) -> Option<Self> {
+        let tools = request.tools.clone().unwrap_or_default();
+        let tool_choice = request.tool_choice.clone();
+        if tools.is_empty() && tool_choice.is_none() {
+            return None;
+        }
+        Some(Self { tools, tool_choice })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -360,14 +382,17 @@ fn chat_messages_to_product_text(
             lines.push(format!("tool_call_id: {tool_call_id}"));
         }
     }
-    if request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
-    {
-        lines.push("client_tools: model_hint_only".to_string());
-    }
     Ok(lines.join("\n"))
+}
+
+fn chat_user_message_payload(
+    request: &OpenAiChatCompletionRequest,
+) -> Result<UserMessagePayload, OpenAiCompatHttpError> {
+    Ok(UserMessagePayload::new(
+        chat_messages_to_product_text(request)?,
+        vec![],
+        ProductTriggerReason::DirectChat,
+    )?)
 }
 
 fn content_value_to_text(content: Option<&serde_json::Value>) -> String {

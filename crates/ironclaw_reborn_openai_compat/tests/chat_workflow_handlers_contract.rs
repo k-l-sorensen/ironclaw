@@ -109,6 +109,42 @@ async fn chat_completion_idempotency_replays_same_id_and_conflicts_on_different_
 }
 
 #[tokio::test]
+async fn invalid_chat_completion_does_not_reserve_idempotency_key() {
+    let workflow = Arc::new(FakeProductWorkflow::new());
+    let waiter = Arc::new(StaticChatWaiter::text("ok"));
+    let router = test_router(workflow.clone(), waiter);
+
+    let invalid = router
+        .clone()
+        .oneshot(chat_request(
+            json!({
+                "model": "gpt-reborn",
+                "messages": []
+            }),
+            Some("retry-key"),
+        ))
+        .await
+        .expect("invalid response");
+
+    assert_eq!(invalid.status(), http::StatusCode::BAD_REQUEST);
+    assert_eq!(workflow.accepted_count(), 0);
+
+    let valid = router
+        .oneshot(chat_request(
+            json!({
+                "model": "gpt-reborn",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            Some("retry-key"),
+        ))
+        .await
+        .expect("valid response");
+
+    assert_eq!(valid.status(), http::StatusCode::OK);
+    assert_eq!(workflow.accepted_count(), 1);
+}
+
+#[tokio::test]
 async fn wired_chat_completion_requires_authenticated_caller_before_product_workflow() {
     let workflow = Arc::new(FakeProductWorkflow::new());
     let service = OpenAiChatCompletionsWorkflow::new(
@@ -282,6 +318,54 @@ async fn requested_model_is_forwarded_as_waiter_hint() {
     assert_eq!(response.status(), http::StatusCode::OK);
     let wait_request = waiter.last_request();
     assert_eq!(wait_request.requested_model, "gpt-reborn-model-hint");
+}
+
+#[tokio::test]
+async fn client_tools_are_forwarded_as_model_only_waiter_metadata() {
+    let workflow = Arc::new(FakeProductWorkflow::new());
+    let waiter = Arc::new(RecordingChatWaiter::new(
+        OpenAiChatCompletionProjection::text("ok"),
+    ));
+    let router = test_router(workflow.clone(), waiter.clone());
+
+    let response = router
+        .oneshot(chat_request(
+            json!({
+                "model": "gpt-reborn",
+                "messages": [{"role": "user", "content": "hello"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "lookup_order",
+                        "description": "Look up an order",
+                        "parameters": {"type": "object"},
+                        "strict": true
+                    }
+                }],
+                "tool_choice": {"type": "function", "function": {"name": "lookup_order"}}
+            }),
+            None,
+        ))
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), http::StatusCode::OK);
+    let wait_request = waiter.last_request();
+    let model_only_tools = wait_request
+        .model_only_tools
+        .expect("model-only tools forwarded");
+    assert_eq!(model_only_tools.tools.len(), 1);
+    assert_eq!(model_only_tools.tools[0].function.name, "lookup_order");
+    assert_eq!(
+        model_only_tools.tool_choice,
+        Some(json!({"type": "function", "function": {"name": "lookup_order"}}))
+    );
+
+    let envelopes = workflow.accepted_envelopes();
+    assert_eq!(envelopes.len(), 1);
+    let rendered = serde_json::to_string(envelopes[0].payload()).expect("payload json");
+    assert!(rendered.contains("user: hello"));
+    assert!(!rendered.contains("lookup_order"));
 }
 
 fn test_router(
