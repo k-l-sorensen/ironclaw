@@ -26,6 +26,7 @@ mod github_copilot;
 pub(crate) mod github_copilot_auth;
 pub mod host;
 pub mod nearai_chat;
+pub mod normalizing;
 pub mod openai_codex_provider;
 pub(crate) mod openai_codex_session;
 mod provider;
@@ -74,6 +75,7 @@ pub use host::{
     SharedSessionSecrets,
 };
 pub use nearai_chat::{DEFAULT_MODEL, ModelInfo, NearAiChatProvider, default_models};
+pub use normalizing::NormalizingProvider;
 pub use openai_codex_provider::OpenAiCodexProvider;
 pub use openai_codex_session::{DeviceCodeStart, OpenAiCodexSessionManager};
 pub use provider::sanitize_tool_messages;
@@ -877,12 +879,20 @@ async fn build_provider_chain_components_with_options(
     session: Arc<SessionManager>,
     include_standalone_cheap: bool,
 ) -> Result<ProviderChainComponents, LlmError> {
-    let llm: Arc<dyn LlmProvider> = if config.backend == "openai_codex" {
+    let raw: Arc<dyn LlmProvider> = if config.backend == "openai_codex" {
         create_openai_codex_provider(config).await?
     } else {
         create_llm_provider(config, session.clone()).await?
     };
-    tracing::debug!("LLM provider initialized: {}", llm.model_name());
+    tracing::debug!("LLM provider initialized: {}", raw.model_name());
+
+    // 0. Normalize — Layer 3 shape-invariant decorator. Sits at the innermost
+    // position so every downstream decorator (retry, smart routing, failover,
+    // circuit breaker, cache, recording) observes a canonical
+    // `ToolCompletionResponse` regardless of which provider produced it.
+    // Closes RC1/M1 (Bedrock dropping tool calls on `FinishReason::Unknown`)
+    // universally rather than per-provider.
+    let llm: Arc<dyn LlmProvider> = Arc::new(NormalizingProvider::new(raw));
 
     // 1. Retry — uses top-level LlmConfig fields (resolved from LLM_* env vars
     // with fallback to NEARAI_* for backward compatibility).
@@ -909,6 +919,9 @@ async fn build_provider_chain_components_with_options(
                     config.backend
                 ),
             })?;
+        // Normalize the cheap provider at the innermost position too, mirroring
+        // the primary chain — every cheap-path decorator must see canonical shape.
+        let cheap: Arc<dyn LlmProvider> = Arc::new(NormalizingProvider::new(cheap));
         let cheap: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
             Arc::new(RetryProvider::new(cheap, retry_config.clone()))
         } else {
@@ -950,6 +963,8 @@ async fn build_provider_chain_components_with_options(
             fallback = %fallback.model_name(),
             "LLM failover enabled"
         );
+        // Normalize the fallback raw provider at the innermost position too.
+        let fallback: Arc<dyn LlmProvider> = Arc::new(NormalizingProvider::new(fallback));
         let fallback: Arc<dyn LlmProvider> = if retry_config.max_retries > 0 {
             Arc::new(RetryProvider::new(fallback, retry_config.clone()))
         } else {
@@ -1000,9 +1015,12 @@ async fn build_provider_chain_components_with_options(
         llm
     };
 
-    // Standalone cheap LLM for heartbeat/evaluation (not part of the chain)
+    // Standalone cheap LLM for heartbeat/evaluation (not part of the chain).
+    // Normalize at innermost position too — callers that bypass the main chain
+    // (heartbeat, evaluation) still benefit from shape-invariant tool_calls.
     let cheap_llm = if include_standalone_cheap {
         create_cheap_llm_provider(config, session)?
+            .map(|p| Arc::new(NormalizingProvider::new(p)) as Arc<dyn LlmProvider>)
     } else {
         None
     };
