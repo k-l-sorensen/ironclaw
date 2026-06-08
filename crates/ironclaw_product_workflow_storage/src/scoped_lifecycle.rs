@@ -129,6 +129,16 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
                 )
                 .await;
             }
+            if matches!(error, FilesystemError::VersionMismatch { .. }) && existing.is_none() {
+                return Err(match self.package_path_state(&path).await? {
+                    PackagePathState::Occupied => scoped_lifecycle_invalid_request(
+                        "scoped lifecycle installation package already exists for ownership",
+                    ),
+                    PackagePathState::Absent | PackagePathState::Tombstone(_) => {
+                        scoped_lifecycle_transient("scoped lifecycle installation write conflict")
+                    }
+                });
+            }
             return Err(match error {
                 FilesystemError::VersionMismatch { .. } => {
                     scoped_lifecycle_transient("scoped lifecycle installation write conflict")
