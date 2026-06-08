@@ -24,10 +24,11 @@ use ironclaw_product_workflow::{
     RebornDeleteThreadRequest, RebornDeleteThreadResponse, RebornExtensionActionResponse,
     RebornExtensionListResponse, RebornExtensionRegistryResponse, RebornGetRunStateRequest,
     RebornGetRunStateResponse, RebornListAutomationsResponse, RebornListThreadsResponse,
+    RebornOutboundDeliveryTargetListResponse, RebornOutboundPreferencesResponse,
     RebornResolveGateResponse, RebornServicesApi, RebornServicesError, RebornServicesErrorCode,
-    RebornServicesErrorKind, RebornSetupExtensionResponse, RebornStreamEventsRequest,
-    RebornStreamEventsResponse, RebornSubmitTurnResponse, RebornTimelineRequest,
-    RebornTimelineResponse, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
+    RebornServicesErrorKind, RebornSetOutboundPreferencesRequest, RebornSetupExtensionResponse,
+    RebornStreamEventsRequest, RebornStreamEventsResponse, RebornSubmitTurnResponse,
+    RebornTimelineRequest, RebornTimelineResponse, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
     WebUiCreateThreadRequest, WebUiListAutomationsRequest, WebUiListThreadsRequest,
     WebUiResolveGateRequest, WebUiSendMessageRequest, WebUiSetupExtensionRequest,
 };
@@ -43,6 +44,17 @@ use tower::ServiceExt;
 const TENANT: &str = "tenant-alpha";
 const USER: &str = "user-alpha";
 const VALID_TOKEN: &str = "valid-bearer-token";
+
+fn service_unavailable_error(retryable: bool) -> RebornServicesError {
+    RebornServicesError {
+        code: RebornServicesErrorCode::Unavailable,
+        kind: RebornServicesErrorKind::ServiceUnavailable,
+        status_code: 503,
+        retryable,
+        field: None,
+        validation_code: None,
+    }
+}
 
 // ─── stubs ────────────────────────────────────────────────────────────
 
@@ -408,6 +420,28 @@ impl RebornServicesApi for StubServices {
         })
     }
 
+    async fn get_outbound_preferences(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+    ) -> Result<RebornOutboundPreferencesResponse, RebornServicesError> {
+        Ok(RebornOutboundPreferencesResponse::default())
+    }
+
+    async fn set_outbound_preferences(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _request: RebornSetOutboundPreferencesRequest,
+    ) -> Result<RebornOutboundPreferencesResponse, RebornServicesError> {
+        Err(service_unavailable_error(false))
+    }
+
+    async fn list_outbound_delivery_targets(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+    ) -> Result<RebornOutboundDeliveryTargetListResponse, RebornServicesError> {
+        Err(service_unavailable_error(false))
+    }
+
     async fn list_extensions(
         &self,
         _caller: WebUiAuthenticatedCaller,
@@ -571,6 +605,52 @@ async fn bearer_happy_path_dispatches_to_facade_with_host_tenant() {
         Some(PROJECT),
         "auth middleware must stamp trusted default project_id onto the caller",
     );
+}
+
+#[tokio::test]
+async fn session_endpoint_reports_operator_capability_for_operator_authenticator() {
+    let (app, _services) = build_app();
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/webchat/v2/session")
+                .header(header::AUTHORIZATION, format!("Bearer {VALID_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&read_body_string(response).await).expect("session json");
+    assert_eq!(body["tenant_id"], TENANT);
+    assert_eq!(body["user_id"], USER);
+    assert_eq!(body["capabilities"]["operator_webui_config"], true);
+}
+
+#[tokio::test]
+async fn session_endpoint_reports_no_operator_capability_for_multi_user_authenticator() {
+    let (app, _services) = build_app_with_authenticator(Arc::new(MultiUserToken));
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/webchat/v2/session")
+                .header(header::AUTHORIZATION, format!("Bearer {VALID_TOKEN}"))
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: serde_json::Value =
+        serde_json::from_str(&read_body_string(response).await).expect("session json");
+    assert_eq!(body["tenant_id"], TENANT);
+    assert_eq!(body["user_id"], USER);
+    assert_eq!(body["capabilities"]["operator_webui_config"], false);
 }
 
 #[tokio::test]
