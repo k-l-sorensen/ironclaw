@@ -13,9 +13,9 @@ use ironclaw_filesystem::{
 use ironclaw_host_api::{TenantId, VirtualPath};
 use ironclaw_product_workflow::{
     DeleteScopedLifecycleInstallationRequest, LifecyclePackageRef, ProductWorkflowError,
-    ScopedLifecycleInstallation, ScopedLifecycleInstallationId, ScopedLifecycleInstallationStore,
-    ScopedLifecycleOwnership, UpsertScopedLifecycleInstallationRequest,
-    lifecycle_package_kind_label,
+    ScopedLifecycleActor, ScopedLifecycleInstallation, ScopedLifecycleInstallationId,
+    ScopedLifecycleInstallationStore, ScopedLifecycleOwnership,
+    UpsertScopedLifecycleInstallationRequest, lifecycle_package_kind_label,
 };
 
 const DEFAULT_SCOPED_LIFECYCLE_ROOT: &str = "/engine/product_workflow/scoped_lifecycle";
@@ -154,10 +154,17 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
         &self,
         request: DeleteScopedLifecycleInstallationRequest,
     ) -> Result<(), ProductWorkflowError> {
+        let reservation_path = scoped_lifecycle_installation_id_path(
+            &self.root,
+            &request.tenant_id,
+            &request.installation_id,
+        )?;
         let Some(existing) = self
             .load_installation(&request.tenant_id, &request.installation_id)
             .await?
         else {
+            self.tombstone_installation_id_reservation_for_actor(&reservation_path, &request.actor)
+                .await?;
             return Ok(());
         };
         if !existing.installation.can_be_mutated_by(&request.actor) {
@@ -180,11 +187,6 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
                 }
                 error => scoped_lifecycle_filesystem_error("mark installation deleted", error),
             })?;
-        let reservation_path = scoped_lifecycle_installation_id_path(
-            &self.root,
-            &request.tenant_id,
-            &request.installation_id,
-        )?;
         self.tombstone_installation_id_reservation_if_current(
             &reservation_path,
             &existing.installation,
@@ -281,10 +283,39 @@ impl FilesystemScopedLifecycleInstallationStore {
         if !reservation.matches_installation(installation) {
             return Ok(());
         }
+        self.tombstone_installation_id_reservation(path, &reservation, version)
+            .await?;
+        Ok(())
+    }
+
+    async fn tombstone_installation_id_reservation_for_actor(
+        &self,
+        path: &VirtualPath,
+        actor: &ScopedLifecycleActor,
+    ) -> Result<(), ProductWorkflowError> {
+        let InstallationIdState::Reserved(reservation, version) =
+            self.installation_id_state(path).await?
+        else {
+            return Ok(());
+        };
+        if !reservation.ownership.can_be_mutated_by(actor) {
+            return Err(ProductWorkflowError::BindingAccessDenied);
+        }
+        self.tombstone_installation_id_reservation(path, &reservation, version)
+            .await?;
+        Ok(())
+    }
+
+    async fn tombstone_installation_id_reservation(
+        &self,
+        path: &VirtualPath,
+        reservation: &ScopedLifecycleInstallationIdReservation,
+        version: RecordVersion,
+    ) -> Result<(), ProductWorkflowError> {
         self.filesystem
             .put(
                 path,
-                tombstone_entry_for_installation_id_reservation(&reservation)?,
+                tombstone_entry_for_installation_id_reservation(reservation)?,
                 CasExpectation::Version(version),
             )
             .await
@@ -891,6 +922,8 @@ fn hex_component(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use chrono::{Duration, Utc};
     use ironclaw_filesystem::{DirEntry, FileStat, FilesystemOperation, Filter, Page};
     use ironclaw_host_api::UserId;
@@ -903,6 +936,7 @@ mod tests {
 
     struct CapturingFilesystem {
         entry: Mutex<Option<VersionedEntry>>,
+        entries: Mutex<HashMap<String, VersionedEntry>>,
         put_error: Mutex<Option<FilesystemError>>,
         observed_cas: Mutex<Vec<CasExpectation>>,
         delete_count: Mutex<usize>,
@@ -912,6 +946,22 @@ mod tests {
         fn new(entry: Option<VersionedEntry>) -> Self {
             Self {
                 entry: Mutex::new(entry),
+                entries: Mutex::new(HashMap::new()),
+                put_error: Mutex::new(None),
+                observed_cas: Mutex::new(Vec::new()),
+                delete_count: Mutex::new(0),
+            }
+        }
+
+        fn with_entries(entries: Vec<VersionedEntry>) -> Self {
+            Self {
+                entry: Mutex::new(None),
+                entries: Mutex::new(
+                    entries
+                        .into_iter()
+                        .map(|entry| (entry.path.as_str().to_string(), entry))
+                        .collect(),
+                ),
                 put_error: Mutex::new(None),
                 observed_cas: Mutex::new(Vec::new()),
                 delete_count: Mutex::new(0),
@@ -921,6 +971,7 @@ mod tests {
         fn with_put_error(entry: Option<VersionedEntry>, error: FilesystemError) -> Self {
             Self {
                 entry: Mutex::new(entry),
+                entries: Mutex::new(HashMap::new()),
                 put_error: Mutex::new(Some(error)),
                 observed_cas: Mutex::new(Vec::new()),
                 delete_count: Mutex::new(0),
@@ -934,30 +985,43 @@ mod tests {
         async fn delete_count(&self) -> usize {
             *self.delete_count.lock().await
         }
+
+        async fn stored_entry(&self, path: &VirtualPath) -> Option<VersionedEntry> {
+            self.entries.lock().await.get(path.as_str()).cloned()
+        }
     }
 
     #[async_trait]
     impl RootFilesystem for CapturingFilesystem {
         async fn put(
             &self,
-            _path: &VirtualPath,
-            _entry: Entry,
+            path: &VirtualPath,
+            entry: Entry,
             cas: CasExpectation,
         ) -> Result<RecordVersion, FilesystemError> {
             self.observed_cas.lock().await.push(cas);
             if let Some(error) = self.put_error.lock().await.take() {
                 return Err(error);
             }
-            Ok(match cas {
+            let version = match cas {
                 CasExpectation::Version(version) => version.next(),
                 CasExpectation::Absent | CasExpectation::Any => RecordVersion::from_backend(1),
-            })
+            };
+            self.entries.lock().await.insert(
+                path.as_str().to_string(),
+                VersionedEntry {
+                    path: path.clone(),
+                    entry,
+                    version,
+                },
+            );
+            Ok(version)
         }
 
-        async fn get(
-            &self,
-            _path: &VirtualPath,
-        ) -> Result<Option<VersionedEntry>, FilesystemError> {
+        async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+            if let Some(entry) = self.entries.lock().await.get(path.as_str()).cloned() {
+                return Ok(Some(entry));
+            }
             Ok(self.entry.lock().await.clone())
         }
 
@@ -1094,6 +1158,64 @@ mod tests {
                 CasExpectation::Version(version)
             ]
         );
+        assert_eq!(filesystem.delete_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn delete_retries_cleanup_live_reservation_when_package_is_already_tombstoned() {
+        let admin = admin_actor();
+        let existing = ScopedLifecycleInstallation::admin_shared(
+            install_id(),
+            package("github"),
+            admin.clone(),
+            Utc::now(),
+        )
+        .expect("admin shared install");
+        let version = RecordVersion::from_backend(7);
+        let root = test_root();
+        let reservation = ScopedLifecycleInstallationIdReservation::new(&existing);
+        let reservation_path = scoped_lifecycle_installation_id_path(
+            &root,
+            existing.tenant_id(),
+            &existing.installation_id,
+        )
+        .expect("reservation path");
+        let package_path =
+            scoped_lifecycle_installation_path(&root, &existing).expect("package path");
+        let filesystem = Arc::new(CapturingFilesystem::with_entries(vec![
+            VersionedEntry {
+                path: reservation_path.clone(),
+                entry: entry_for_installation_id_reservation(&reservation)
+                    .expect("reservation entry"),
+                version,
+            },
+            VersionedEntry {
+                path: package_path,
+                entry: tombstone_entry_for_scoped_lifecycle_installation(&existing)
+                    .expect("package tombstone"),
+                version,
+            },
+        ]));
+        let store = FilesystemScopedLifecycleInstallationStore::with_root(filesystem.clone(), root);
+
+        store
+            .delete_installation(DeleteScopedLifecycleInstallationRequest {
+                actor: admin,
+                tenant_id: existing.tenant_id().clone(),
+                installation_id: existing.installation_id.clone(),
+            })
+            .await
+            .expect("delete cleans live reservation retry");
+
+        assert_eq!(
+            filesystem.observed_cas().await,
+            vec![CasExpectation::Version(version)]
+        );
+        let stored = filesystem
+            .stored_entry(&reservation_path)
+            .await
+            .expect("reservation tombstone stored");
+        assert!(is_installation_id_tombstone(&stored.entry));
         assert_eq!(filesystem.delete_count().await, 0);
     }
 
