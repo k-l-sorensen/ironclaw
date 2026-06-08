@@ -203,7 +203,8 @@ impl OpenAiChatCompletionsWorkflow {
 
         let wait_result = tokio::time::timeout(
             self.wait_timeout,
-            self.completion_waiter.wait_for_chat_completion(wait_request),
+            self.completion_waiter
+                .wait_for_chat_completion(wait_request),
         )
         .await
         .map_err(|_| {
@@ -308,7 +309,10 @@ impl OpenAiChatCompletionsWorkflow {
                 (mapping, accepted_ack)
             }
             OpenAiCompatRefReservationOutcome::Replayed(mapping) => {
-                let accepted_ack = mapping.accepted_ack.clone().unwrap_or(ProductInboundAck::NoOp);
+                let accepted_ack = mapping
+                    .accepted_ack
+                    .clone()
+                    .unwrap_or(ProductInboundAck::NoOp);
                 (mapping, accepted_ack)
             }
             OpenAiCompatRefReservationOutcome::Conflict(_) => {
