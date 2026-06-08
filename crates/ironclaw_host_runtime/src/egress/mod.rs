@@ -21,6 +21,11 @@ const NO_EXPOSURE_SENSITIVE_HEADER_DENIED_CODE: &str = "no_exposure_sensitive_he
 const NO_EXPOSURE_MANUAL_CREDENTIALS_DENIED_CODE: &str = "no_exposure_manual_credentials_denied";
 const NO_EXPOSURE_REQUEST_LEAK_BLOCKED_CODE: &str = "no_exposure_request_leak_blocked";
 const NO_EXPOSURE_RESPONSE_LEAK_BLOCKED_CODE: &str = "no_exposure_response_leak_blocked";
+const CREDENTIAL_CHANNEL_DIRECT_LEASE_DENIED_CODE: &str = "credential_channel_direct_lease_denied";
+const CREDENTIAL_CHANNEL_CAPABILITY_MISMATCH_CODE: &str = "credential_channel_capability_mismatch";
+const CREDENTIAL_CHANNEL_UNAVAILABLE_CODE: &str = "credential_channel_unavailable";
+const CREDENTIAL_CHANNEL_BACKEND_UNAVAILABLE_CODE: &str = "credential_channel_backend_unavailable";
+const CREDENTIAL_CHANNEL_TARGET_INVALID_CODE: &str = "credential_channel_target_invalid";
 
 pub use host_port::{
     HostRuntimeCredentialMaterial, HostRuntimeHttpEgressPort, HostRuntimeHttpEgressRequest,
@@ -195,6 +200,29 @@ impl<N, S> HostHttpEgressService<N, S> {
             .with_scope(scope.clone()),
         );
     }
+
+    fn record_credential_channel_block(
+        &self,
+        error: &RuntimeHttpEgressError,
+        scope: &ResourceScope,
+        capability_id: &CapabilityId,
+    ) {
+        let Some(code) = credential_channel_audit_code(error) else {
+            return;
+        };
+        let Some(sink) = &self.security_audit_sink else {
+            return;
+        };
+        sink.record(
+            SecurityAuditEvent::new(
+                SecurityBoundary::CredentialChannel,
+                SecurityDecision::Blocked,
+                code,
+            )
+            .with_capability_id(capability_id.clone())
+            .with_scope(scope.clone()),
+        );
+    }
 }
 
 #[async_trait]
@@ -214,6 +242,7 @@ where
             Ok(response) => Ok(response),
             Err(error) => {
                 self.record_no_exposure_block(error.as_ref(), &scope, &capability_id);
+                self.record_credential_channel_block(error.as_ref(), &scope, &capability_id);
                 if error.should_discard_staged_policy() {
                     self.discard_staged_policy(&scope, &capability_id);
                 }
@@ -243,6 +272,7 @@ where
             Ok(response) => Ok(response),
             Err(error) => {
                 self.record_no_exposure_block(error.as_ref(), &scope, &capability_id);
+                self.record_credential_channel_block(error.as_ref(), &scope, &capability_id);
                 if error.should_discard_staged_policy() {
                     self.discard_staged_policy(&scope, &capability_id);
                 }
@@ -316,6 +346,41 @@ fn no_exposure_audit_code(error: &RuntimeHttpEgressError) -> Option<&'static str
         }
         RuntimeHttpEgressError::Response { reason, .. } if reason == "response_leak_blocked" => {
             Some(NO_EXPOSURE_RESPONSE_LEAK_BLOCKED_CODE)
+        }
+        _ => None,
+    }
+}
+
+fn credential_channel_audit_code(error: &RuntimeHttpEgressError) -> Option<&'static str> {
+    let RuntimeHttpEgressError::Credential { reason } = error else {
+        return None;
+    };
+    match reason.as_str() {
+        "direct secret-store leases are unavailable for production runtime egress" => {
+            Some(CREDENTIAL_CHANNEL_DIRECT_LEASE_DENIED_CODE)
+        }
+        "staged credential capability does not match request capability" => {
+            Some(CREDENTIAL_CHANNEL_CAPABILITY_MISMATCH_CODE)
+        }
+        "required credential is unavailable"
+        | "credential is unavailable"
+        | "credential lease is unavailable"
+        | "credential lease was already used"
+        | "credential lease was revoked"
+        | "credential expired" => Some(CREDENTIAL_CHANNEL_UNAVAILABLE_CODE),
+        "runtime credential injection store unavailable"
+        | "credential store is misconfigured"
+        | "credential store unavailable" => Some(CREDENTIAL_CHANNEL_BACKEND_UNAVAILABLE_CODE),
+        "credential injection target is invalid"
+        | "credential injection header value is invalid"
+        | "credential injection path placeholder is invalid"
+        | "credential injection path value is invalid"
+        | "credential injection path placeholder requires HTTPS"
+        | "credential injection target URL has no path segments"
+        | "credential injection path placeholder was not found"
+        | "credential injection path placeholder must appear exactly once"
+        | "credential injection target URL is invalid" => {
+            Some(CREDENTIAL_CHANNEL_TARGET_INVALID_CODE)
         }
         _ => None,
     }
