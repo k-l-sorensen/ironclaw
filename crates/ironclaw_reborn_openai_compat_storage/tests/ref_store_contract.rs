@@ -12,6 +12,7 @@ use ironclaw_reborn_openai_compat::{
 };
 use ironclaw_reborn_openai_compat_storage::FilesystemOpenAiCompatRefStore;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 #[tokio::test]
 async fn durable_store_replays_same_idempotency_key_after_reopen() {
@@ -331,6 +332,122 @@ async fn durable_store_rejects_inconsistent_persisted_mapping() {
     ));
 }
 
+#[tokio::test]
+async fn durable_store_rejects_wrong_record_kind_for_persisted_mapping() {
+    let (filesystem, root, store) = test_store("wrong-mapping-kind");
+    let created = expect_created(
+        store
+            .reserve(reservation("tenant-a", "alice", "key", b"body"))
+            .await,
+    );
+    let record_path = public_id_record_path(&root, &created.public_id);
+    let payload = serde_json::to_value(&created).expect("mapping payload");
+    let entry = Entry::record(
+        RecordKind::new("wrong_openai_compat_mapping").expect("valid record kind"),
+        &payload,
+    )
+    .expect("wrong-kind mapping record");
+    filesystem
+        .put(&record_path, entry, CasExpectation::Any)
+        .await
+        .expect("overwrite mapping with wrong kind");
+
+    let error = store
+        .lookup_authorized(OpenAiCompatRefLookup::new(
+            actor("tenant-a", "alice"),
+            created.public_id,
+            OpenAiCompatRefOperation::Retrieve,
+        ))
+        .await
+        .expect_err("wrong mapping kind should fail closed");
+
+    assert!(matches!(
+        error,
+        ironclaw_reborn_openai_compat::OpenAiCompatRefError::CorruptMapping
+    ));
+}
+
+#[tokio::test]
+async fn durable_store_rejects_wrong_record_kind_for_idempotency_index() {
+    let (filesystem, root, store) = test_store("wrong-index-kind");
+    let request = reservation("tenant-a", "alice", "same-key", b"same body");
+    let created = expect_created(store.reserve(request.clone()).await);
+    let owner = actor("tenant-a", "alice");
+    let key = OpenAiCompatIdempotencyKey::new("same-key").expect("valid key");
+    let index_path =
+        idempotency_index_record_path(&root, &owner, OpenAiCompatRouteSurface::ResponsesApi, &key);
+    let payload = json!({
+        "owner": owner,
+        "surface": "responses_api",
+        "key": key,
+        "public_id": created.public_id,
+    });
+    let entry = Entry::record(
+        RecordKind::new("wrong_openai_compat_idempotency_index").expect("valid record kind"),
+        &payload,
+    )
+    .expect("wrong-kind idempotency index");
+    filesystem
+        .put(&index_path, entry, CasExpectation::Any)
+        .await
+        .expect("overwrite index with wrong kind");
+
+    let error = store
+        .reserve(request)
+        .await
+        .expect_err("wrong idempotency index kind should fail closed");
+
+    assert!(matches!(
+        error,
+        ironclaw_reborn_openai_compat::OpenAiCompatRefError::CorruptMapping
+    ));
+}
+
+#[tokio::test]
+async fn durable_store_rejects_idempotency_index_pointing_to_other_actor_mapping() {
+    let (filesystem, root, store) = test_store("stale-index");
+    let alice_request = reservation("tenant-a", "alice", "same-key", b"same body");
+    let _alice = expect_created(store.reserve(alice_request.clone()).await);
+    let bob = expect_created(
+        store
+            .reserve(reservation("tenant-a", "bob", "bob-key", b"same body"))
+            .await,
+    );
+    let alice = actor("tenant-a", "alice");
+    let alice_key = OpenAiCompatIdempotencyKey::new("same-key").expect("valid key");
+    let index_path = idempotency_index_record_path(
+        &root,
+        &alice,
+        OpenAiCompatRouteSurface::ResponsesApi,
+        &alice_key,
+    );
+    let payload = json!({
+        "owner": alice,
+        "surface": "responses_api",
+        "key": alice_key,
+        "public_id": bob.public_id,
+    });
+    let entry = Entry::record(
+        RecordKind::new("openai_compat_idempotency_index").expect("valid record kind"),
+        &payload,
+    )
+    .expect("stale idempotency index");
+    filesystem
+        .put(&index_path, entry, CasExpectation::Any)
+        .await
+        .expect("overwrite index with stale pointer");
+
+    let error = store
+        .reserve(alice_request)
+        .await
+        .expect_err("stale idempotency index should fail closed");
+
+    assert!(matches!(
+        error,
+        ironclaw_reborn_openai_compat::OpenAiCompatRefError::CorruptMapping
+    ));
+}
+
 fn test_store(
     suffix: &str,
 ) -> (
@@ -358,6 +475,39 @@ fn public_id_record_path(root: &VirtualPath, public_id: &OpenAiCompatPublicId) -
         root.as_str()
     ))
     .expect("valid public id record path")
+}
+
+fn idempotency_index_record_path(
+    root: &VirtualPath,
+    owner: &OpenAiCompatActorScope,
+    surface: OpenAiCompatRouteSurface,
+    key: &OpenAiCompatIdempotencyKey,
+) -> VirtualPath {
+    #[derive(serde::Serialize)]
+    struct DigestInput {
+        owner: OpenAiCompatActorScope,
+        surface: OpenAiCompatRouteSurface,
+        key: OpenAiCompatIdempotencyKey,
+    }
+
+    let digest = hex::encode(Sha256::digest(
+        serde_json::to_vec(&DigestInput {
+            owner: owner.clone(),
+            surface,
+            key: key.clone(),
+        })
+        .expect("idempotency index digest payload"),
+    ));
+    let surface_dir = match surface {
+        OpenAiCompatRouteSurface::ChatCompletions => "chat_completions",
+        OpenAiCompatRouteSurface::ResponsesApi => "responses_api",
+        OpenAiCompatRouteSurface::ResponsesV1 => "responses_v1",
+    };
+    VirtualPath::new(format!(
+        "{}/by_idempotency/{surface_dir}/{digest}.json",
+        root.as_str()
+    ))
+    .expect("valid idempotency index record path")
 }
 
 fn reservation(

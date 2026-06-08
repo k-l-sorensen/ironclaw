@@ -86,6 +86,7 @@ impl FilesystemOpenAiCompatRefStore {
         else {
             return Ok(None);
         };
+        ensure_entry_kind(&entry.entry, MAPPING_RECORD_KIND)?;
         let mapping: OpenAiCompatResourceMapping = entry
             .entry
             .parse_json()
@@ -138,6 +139,7 @@ impl FilesystemOpenAiCompatRefStore {
         else {
             return Ok(None);
         };
+        ensure_entry_kind(&entry.entry, IDEMPOTENCY_INDEX_RECORD_KIND)?;
         let index: StoredOpenAiCompatIdempotencyIndex = entry.entry.parse_json().map_err(
             corrupt_mapping("deserialize OpenAI-compatible idempotency index"),
         )?;
@@ -326,6 +328,9 @@ impl FilesystemOpenAiCompatRefStore {
                     return Err(OpenAiCompatRefError::CorruptMapping);
                 }
                 let mapping = self.load_required_mapping(&index.public_id).await?;
+                if !index.matches_mapping(&mapping) {
+                    return Err(OpenAiCompatRefError::CorruptMapping);
+                }
                 if mapping.request_fingerprint == request.request_fingerprint {
                     return Ok(OpenAiCompatRefReservationOutcome::Replayed(mapping));
                 }
@@ -427,6 +432,13 @@ impl StoredOpenAiCompatIdempotencyIndex {
         key: &OpenAiCompatIdempotencyKey,
     ) -> bool {
         &self.owner == owner && self.surface == surface && &self.key == key
+    }
+
+    fn matches_mapping(&self, mapping: &OpenAiCompatResourceMapping) -> bool {
+        mapping.public_id == self.public_id
+            && mapping.owner == self.owner
+            && mapping.surface == self.surface
+            && mapping.idempotency_key.as_ref() == Some(&self.key)
     }
 }
 
@@ -531,6 +543,17 @@ fn surface_dir(surface: OpenAiCompatRouteSurface) -> &'static str {
 fn child_path(root: &VirtualPath, child: &str) -> Result<VirtualPath, OpenAiCompatRefError> {
     VirtualPath::new(format!("{}/{}", root.as_str().trim_end_matches('/'), child))
         .map_err(|_| OpenAiCompatRefError::StoreUnavailable)
+}
+
+fn ensure_entry_kind(entry: &Entry, expected: &str) -> Result<(), OpenAiCompatRefError> {
+    if entry
+        .kind
+        .as_ref()
+        .is_some_and(|kind| kind.as_str() == expected)
+    {
+        return Ok(());
+    }
+    Err(OpenAiCompatRefError::CorruptMapping)
 }
 
 fn default_ref_root() -> VirtualPath {
