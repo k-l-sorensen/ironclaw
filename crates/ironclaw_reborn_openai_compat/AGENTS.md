@@ -14,7 +14,6 @@
 - Feature-gated axum route fragments for host composition to mount.
 - The non-streaming Chat Completions adapter into ProductWorkflow when host
   composition injects the workflow state.
-
 ## Do Not Move In Here
 
 - Listener binding or `axum::serve`.

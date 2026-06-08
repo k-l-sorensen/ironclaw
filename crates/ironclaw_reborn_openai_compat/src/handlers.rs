@@ -3,6 +3,8 @@ use axum::body::Bytes;
 use axum::extract::{Extension, Path, State};
 use axum::http::HeaderMap;
 
+const MAX_IDEMPOTENCY_KEY_LEN: usize = 256;
+
 use crate::{
     OpenAiChatCompletionResponse, OpenAiCompatAuthenticatedCaller, OpenAiCompatHttpError,
     OpenAiCompatIdempotencyKey, OpenAiCompatRouteSurface, OpenAiCompatRouterState,
@@ -15,9 +17,6 @@ pub async fn chat_completions(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<OpenAiChatCompletionResponse>, OpenAiCompatHttpError> {
-    let Some(workflow) = state.chat_completions() else {
-        return Err(OpenAiCompatHttpError::not_wired());
-    };
     let Some(Extension(caller)) = caller else {
         return Err(OpenAiCompatHttpError::from_kind(
             401,
@@ -25,6 +24,9 @@ pub async fn chat_completions(
             crate::OpenAiCompatErrorKind::Authentication,
             None,
         ));
+    };
+    let Some(workflow) = state.chat_completions() else {
+        return Err(OpenAiCompatHttpError::not_wired());
     };
     let idempotency_key = idempotency_key_from_headers(&headers)?;
     workflow
@@ -171,6 +173,11 @@ fn idempotency_key_from_headers(
     let value = value
         .to_str()
         .map_err(|_| OpenAiCompatHttpError::invalid_request(Some("idempotency_key".to_string())))?;
+    if value.len() > MAX_IDEMPOTENCY_KEY_LEN || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(OpenAiCompatHttpError::invalid_request(Some(
+            "idempotency_key".to_string(),
+        )));
+    }
     OpenAiCompatIdempotencyKey::new(value)
         .map(Some)
         .map_err(|_| OpenAiCompatHttpError::invalid_request(Some("idempotency_key".to_string())))

@@ -2,14 +2,12 @@
 
 Reborn-native OpenAI-compatible API contract surface for #3283 / #4442 /
 #4443 / #4444.
-
 ## Boundary
 
 This crate is a product/API route surface, not a host runtime:
 
 - It may define DTOs, route descriptors, sanitized error envelopes, and
-  feature-gated axum route fragments for host composition.
-- It must not bind sockets, call `axum::serve`, read v1 gateway state, or proxy
+  feature-gated axum route fragments for host composition.- It must not bind sockets, call `axum::serve`, read v1 gateway state, or proxy
   directly to `ironclaw_llm`.
 - Host composition owns listener binding, bearer/session auth, CORS/origin,
   body/rate limits, mounting, audit, and product workflow wiring.
@@ -61,31 +59,6 @@ Completions slice:
 - This crate still must not call v1 gateway handlers, `ironclaw_llm`,
   `TurnCoordinator`, projection internals, listener APIs, secrets, DBs, or the
   host runtime directly.
-
-## Route Surface
-
-The descriptor table covers:
-
-- `POST /v1/chat/completions`
-- `POST /api/v1/responses`
-- `POST /v1/responses`
-- `GET /api/v1/responses/{response_id}`
-- `GET /v1/responses/{response_id}`
-- `POST /api/v1/responses/{response_id}/cancel`
-- `POST /v1/responses/{response_id}/cancel`
-
-All routes require bearer auth and authenticated caller scope. Create routes
-are declared as SSE-capable because the OpenAI-compatible request body may set
-`stream: true`; non-streaming behavior is still handled by the same route.
-
-## Router Wiring
-
-The `openai-compat-beta` feature exposes an axum router and handlers. The
-default `openai_compat_router()` returns sanitized `501` errors for all route
-families. `openai_compat_router_with_state(...)` may wire the non-streaming
-Chat Completions workflow; Responses create/retrieve/cancel and streaming Chat
-Completions still return fail-closed sanitized errors until their own slices
-land.
 
 ## DTO Policy
 

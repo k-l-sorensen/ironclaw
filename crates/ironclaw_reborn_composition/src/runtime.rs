@@ -2564,6 +2564,17 @@ mod tests {
 
     const RUNTIME_SEND_TIMEOUT: Duration = Duration::from_secs(10);
 
+    async fn stop_turn_runner_worker_for_manual_state_test(runtime: &super::RebornRuntime) {
+        runtime.worker_cancel.cancel();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !runtime.worker_handle.is_finished() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("turn-runner worker should stop before manual turn-state test");
+    }
+
     fn local_dev_runtime_policy() -> EffectiveRuntimePolicy {
         EffectiveRuntimePolicy {
             deployment: DeploymentMode::LocalSingleUser,
@@ -3476,6 +3487,7 @@ mod tests {
         .with_model_gateway_override(gateway);
 
         let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+        stop_turn_runner_worker_for_manual_state_test(&runtime).await;
         let conversation = runtime.new_conversation().await.expect("conversation");
         let parent_scope = runtime.turn_scope_for(&conversation.0);
         let actor = TurnActor::new(runtime.actor_user_id.clone());
@@ -3764,7 +3776,7 @@ mod tests {
             requests: Arc::clone(&requests),
         });
         let skill_source = Arc::new(StaticSkillContextSource::new(vec![
-            HostSkillContextCandidate::new(
+            HostSkillContextCandidate::loaded(
                 skill_md(
                     "review-helper",
                     "review helper description",
@@ -3849,7 +3861,7 @@ mod tests {
             requests: Arc::clone(&requests),
         });
         let skill_source = Arc::new(StaticSkillContextSource::new(vec![
-            HostSkillContextCandidate::new(
+            HostSkillContextCandidate::loaded(
                 skill_md(
                     "configured-helper",
                     "configured helper description",
@@ -4787,7 +4799,10 @@ mod tests {
     async fn webui_route_rejects_list_automations_without_agent_binding() {
         use axum::body::Body;
         use axum::http::{Request, StatusCode};
-        use ironclaw_webui_v2::{WebUiV2State, webui_v2_router};
+        use ironclaw_webui_v2::{
+            DEFAULT_SSE_MAX_CONCURRENT_PER_CALLER, WebUiV2Capabilities, WebUiV2State,
+            webui_v2_router,
+        };
         use tower::ServiceExt;
 
         let root = tempfile::tempdir().expect("tempdir");
@@ -4823,8 +4838,12 @@ mod tests {
             None,
             None,
         );
-        let router = webui_v2_router(WebUiV2State::new(bundle.api))
-            .layer(axum::Extension(caller_without_agent));
+        let router = webui_v2_router(WebUiV2State::new(
+            bundle.api,
+            WebUiV2Capabilities::default(),
+            DEFAULT_SSE_MAX_CONCURRENT_PER_CALLER,
+        ))
+        .layer(axum::Extension(caller_without_agent));
 
         let response = router
             .oneshot(
@@ -5588,7 +5607,7 @@ mod tests {
             .expect("webui-recorded skill context should load");
         let combined_skill_context = selected
             .iter()
-            .map(|candidate| candidate.skill_md.as_deref().unwrap_or(""))
+            .map(|candidate| candidate.loaded_skill_md().unwrap_or(""))
             .collect::<Vec<_>>()
             .join("\n");
         assert_eq!(selected.len(), 1);

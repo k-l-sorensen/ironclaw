@@ -30,6 +30,8 @@ use ironclaw_product_adapters::{
 use ironclaw_turns::TurnRunId;
 
 const DEFAULT_RESPONSES_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_BIND_INTERNAL_REFS_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_RESPONSES_INPUT_ITEMS: usize = 1_000;
 const OPENAI_COMPAT_ADAPTER_ID: &str = "openai_compat";
 const OPENAI_COMPAT_INSTALLATION_ID: &str = "openai_compat_default";
 const OPENAI_COMPAT_ACTOR_KIND: &str = "openai_compat_user";
@@ -238,14 +240,26 @@ impl OpenAiResponsesWorkflow {
         public_id: OpenAiResponseId,
         internal_refs: OpenAiCompatInternalRefs,
     ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatHttpError> {
-        self.ref_store
-            .bind_internal_refs(OpenAiCompatBindInternalRefs::new(
-                owner,
-                OpenAiCompatPublicId::Response(public_id),
-                internal_refs,
-            ))
-            .await
-            .map_err(Into::into)
+        match tokio::time::timeout(
+            DEFAULT_BIND_INTERNAL_REFS_TIMEOUT,
+            self.ref_store
+                .bind_internal_refs(OpenAiCompatBindInternalRefs::new(
+                    owner,
+                    OpenAiCompatPublicId::Response(public_id.clone()),
+                    internal_refs,
+                )),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(Into::into),
+            Err(_) => {
+                tracing::warn!(
+                    public_id = public_id.as_str(),
+                    "bind_internal_refs timed out; continuing without binding"
+                );
+                Ok(None)
+            }
+        }
     }
 
     fn response_product_envelope(
@@ -378,36 +392,46 @@ fn validate_responses_request(
 }
 
 fn accepted_ack_from_ack(
-    ack: ProductInboundAck,
+    mut ack: ProductInboundAck,
 ) -> Result<ProductInboundAck, OpenAiCompatHttpError> {
-    match ack {
-        ProductInboundAck::Accepted { .. } => Ok(ack),
-        ProductInboundAck::Duplicate { prior } => accepted_ack_from_ack(*prior),
-        ProductInboundAck::DeferredBusy { .. } => Err(OpenAiCompatHttpError::from_kind(
-            429,
-            true,
-            crate::OpenAiCompatErrorKind::RateLimited,
-            None,
-        )),
-        ProductInboundAck::Rejected(rejection) => Err(error_from_rejection(rejection)),
-        ProductInboundAck::CommandResult { .. } | ProductInboundAck::NoOp => {
-            Err(OpenAiCompatHttpError::internal())
+    loop {
+        match ack {
+            ProductInboundAck::Accepted { .. } => return Ok(ack),
+            ProductInboundAck::Duplicate { prior } => ack = *prior,
+            ProductInboundAck::DeferredBusy { .. } => {
+                return Err(OpenAiCompatHttpError::from_kind(
+                    429,
+                    true,
+                    crate::OpenAiCompatErrorKind::RateLimited,
+                    None,
+                ));
+            }
+            ProductInboundAck::Rejected(rejection) => return Err(error_from_rejection(rejection)),
+            ProductInboundAck::CommandResult { .. } | ProductInboundAck::NoOp => {
+                return Err(OpenAiCompatHttpError::internal());
+            }
         }
     }
 }
 
-fn accepted_cancel_ack_from_ack(ack: ProductInboundAck) -> Result<(), OpenAiCompatHttpError> {
-    match ack {
-        ProductInboundAck::Accepted { .. } | ProductInboundAck::CommandResult { .. } => Ok(()),
-        ProductInboundAck::Duplicate { prior } => accepted_cancel_ack_from_ack(*prior),
-        ProductInboundAck::DeferredBusy { .. } => Err(OpenAiCompatHttpError::from_kind(
-            429,
-            true,
-            crate::OpenAiCompatErrorKind::RateLimited,
-            None,
-        )),
-        ProductInboundAck::Rejected(rejection) => Err(error_from_rejection(rejection)),
-        ProductInboundAck::NoOp => Err(OpenAiCompatHttpError::internal()),
+fn accepted_cancel_ack_from_ack(mut ack: ProductInboundAck) -> Result<(), OpenAiCompatHttpError> {
+    loop {
+        match ack {
+            ProductInboundAck::Accepted { .. } | ProductInboundAck::CommandResult { .. } => {
+                return Ok(());
+            }
+            ProductInboundAck::Duplicate { prior } => ack = *prior,
+            ProductInboundAck::DeferredBusy { .. } => {
+                return Err(OpenAiCompatHttpError::from_kind(
+                    429,
+                    true,
+                    crate::OpenAiCompatErrorKind::RateLimited,
+                    None,
+                ));
+            }
+            ProductInboundAck::Rejected(rejection) => return Err(error_from_rejection(rejection)),
+            ProductInboundAck::NoOp => return Err(OpenAiCompatHttpError::internal()),
+        }
     }
 }
 
@@ -439,19 +463,27 @@ fn error_from_rejection(rejection: ProductRejection) -> OpenAiCompatHttpError {
 fn internal_refs_from_ack(
     ack: &ProductInboundAck,
 ) -> Result<OpenAiCompatInternalRefs, OpenAiCompatHttpError> {
-    match ack {
-        ProductInboundAck::Accepted {
-            accepted_message_ref,
-            submitted_run_id,
-        } => Ok(
-            OpenAiCompatInternalRefs::new(OpenAiCompatProductActionRef::new(format!(
-                "accepted:{}",
-                accepted_message_ref.as_str()
-            ))?)
-            .with_turn_run_ref(OpenAiCompatTurnRunRef::new(submitted_run_id.to_string())?),
-        ),
-        ProductInboundAck::Duplicate { prior } => internal_refs_from_ack(prior),
-        _ => Err(OpenAiCompatHttpError::internal()),
+    let mut ack = ack;
+    loop {
+        match ack {
+            ProductInboundAck::Accepted {
+                accepted_message_ref,
+                submitted_run_id,
+            } => {
+                return Ok(
+                    OpenAiCompatInternalRefs::new(OpenAiCompatProductActionRef::new(format!(
+                        "accepted:{}",
+                        accepted_message_ref.as_str()
+                    ))?)
+                    .with_turn_run_ref(OpenAiCompatTurnRunRef::new(submitted_run_id.to_string())?),
+                );
+            }
+            ProductInboundAck::Duplicate { prior } => ack = prior,
+            ProductInboundAck::DeferredBusy { .. }
+            | ProductInboundAck::Rejected(_)
+            | ProductInboundAck::CommandResult { .. }
+            | ProductInboundAck::NoOp => return Err(OpenAiCompatHttpError::internal()),
+        }
     }
 }
 
@@ -507,12 +539,17 @@ fn responses_input_to_product_text(
         .as_ref()
         .filter(|value| !value.is_empty())
     {
-        lines.push(format!("instructions: {instructions}"));
+        lines.push(format!(
+            "instructions: {}",
+            sanitize_product_text_segment(instructions)
+        ));
     }
     match &request.input {
-        OpenAiResponsesInput::Text(text) => lines.push(format!("user: {text}")),
+        OpenAiResponsesInput::Text(text) => {
+            lines.push(format!("user: {}", sanitize_product_text_segment(text)));
+        }
         OpenAiResponsesInput::Items(items) => {
-            if items.is_empty() {
+            if items.is_empty() || items.len() > MAX_RESPONSES_INPUT_ITEMS {
                 return Err(OpenAiCompatHttpError::invalid_request(Some(
                     "input".to_string(),
                 )));
@@ -539,16 +576,30 @@ fn response_input_item_to_text(item: &OpenAiResponsesInputItem) -> String {
                 content_value_to_text(content)
             )
         }
-        OpenAiResponsesInputItem::FunctionCall { name, .. } => {
-            format!("function_call: {name}")
+        OpenAiResponsesInputItem::FunctionCall {
+            call_id,
+            name,
+            arguments,
+        } => {
+            format!(
+                "function_call:{}:{}: {}",
+                sanitize_product_text_segment(call_id),
+                sanitize_product_text_segment(name),
+                sanitize_product_text_segment(arguments)
+            )
         }
         OpenAiResponsesInputItem::FunctionCallOutput { call_id, output } => {
             format!(
-                "function_call_output:{call_id}: {}",
+                "function_call_output:{}: {}",
+                sanitize_product_text_segment(call_id),
                 content_value_to_text(output)
             )
         }
     }
+}
+
+fn sanitize_product_text_segment(value: &str) -> String {
+    value.replace(['\n', '\r'], " ")
 }
 
 fn response_role_name(role: OpenAiResponsesMessageRole) -> &'static str {
@@ -562,12 +613,12 @@ fn response_role_name(role: OpenAiResponsesMessageRole) -> &'static str {
 
 fn content_value_to_text(content: &serde_json::Value) -> String {
     match content {
-        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::String(text) => sanitize_product_text_segment(text),
         serde_json::Value::Array(items) => items
             .iter()
             .filter_map(content_array_item_text)
             .collect::<Vec<_>>()
-            .join("\n"),
+            .join(" "),
         value if !value.is_null() => "[non_text_content]".to_string(),
         _ => String::new(),
     }
@@ -579,7 +630,7 @@ fn content_array_item_text(value: &serde_json::Value) -> Option<String> {
         Some("text" | "input_text" | "output_text") => object
             .get("text")
             .and_then(serde_json::Value::as_str)
-            .map(str::to_string),
+            .map(sanitize_product_text_segment),
         _ => Some("[non_text_content]".to_string()),
     }
 }

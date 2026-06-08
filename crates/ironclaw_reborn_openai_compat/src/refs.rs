@@ -1,8 +1,10 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use ironclaw_host_api::{AgentId, ProjectId, TenantId, UserId};
+use ironclaw_product_adapters::ProductInboundAck;
 use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -320,8 +322,11 @@ pub struct OpenAiCompatResourceMapping {
     pub owner: OpenAiCompatActorScope,
     pub surface: OpenAiCompatRouteSurface,
     pub request_fingerprint: OpenAiCompatRequestFingerprint,
+    pub created_at: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub idempotency_key: Option<OpenAiCompatIdempotencyKey>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_ack: Option<ProductInboundAck>,
     pub binding: OpenAiCompatResourceBinding,
 }
 
@@ -332,7 +337,11 @@ struct OpenAiCompatResourceMappingFields {
     owner: OpenAiCompatActorScope,
     surface: OpenAiCompatRouteSurface,
     request_fingerprint: OpenAiCompatRequestFingerprint,
+    #[serde(default)]
+    created_at: Option<u64>,
     idempotency_key: Option<OpenAiCompatIdempotencyKey>,
+    #[serde(default)]
+    accepted_ack: Option<ProductInboundAck>,
     binding: OpenAiCompatResourceBinding,
 }
 
@@ -347,7 +356,9 @@ impl<'de> Deserialize<'de> for OpenAiCompatResourceMapping {
             owner: fields.owner,
             surface: fields.surface,
             request_fingerprint: fields.request_fingerprint,
+            created_at: fields.created_at.unwrap_or_else(unix_timestamp_now),
             idempotency_key: fields.idempotency_key,
+            accepted_ack: fields.accepted_ack,
             binding: fields.binding,
         };
         mapping.validate().map_err(serde::de::Error::custom)?;
@@ -468,6 +479,27 @@ impl OpenAiCompatBindInternalRefs {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAiCompatRecordAcceptedAck {
+    pub owner: OpenAiCompatActorScope,
+    pub public_id: OpenAiCompatPublicId,
+    pub accepted_ack: ProductInboundAck,
+}
+
+impl OpenAiCompatRecordAcceptedAck {
+    pub fn new(
+        owner: OpenAiCompatActorScope,
+        public_id: OpenAiCompatPublicId,
+        accepted_ack: ProductInboundAck,
+    ) -> Self {
+        Self {
+            owner,
+            public_id,
+            accepted_ack,
+        }
+    }
+}
+
 #[async_trait]
 pub trait OpenAiCompatRefStore: Send + Sync {
     async fn reserve(
@@ -478,6 +510,11 @@ pub trait OpenAiCompatRefStore: Send + Sync {
     async fn bind_internal_refs(
         &self,
         request: OpenAiCompatBindInternalRefs,
+    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError>;
+
+    async fn record_accepted_ack(
+        &self,
+        request: OpenAiCompatRecordAcceptedAck,
     ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError>;
 
     async fn lookup_authorized(
@@ -502,6 +539,20 @@ struct IdempotencyIndexKey {
     owner: OpenAiCompatActorScope,
     surface: OpenAiCompatRouteSurface,
     key: OpenAiCompatIdempotencyKey,
+}
+
+impl InMemoryOpenAiCompatRefStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn lock_state(
+        &self,
+    ) -> Result<MutexGuard<'_, InMemoryOpenAiCompatRefState>, OpenAiCompatRefError> {
+        self.state
+            .lock()
+            .map_err(|_| OpenAiCompatRefError::StoreUnavailable)
+    }
 }
 
 #[async_trait]
@@ -569,6 +620,22 @@ impl OpenAiCompatRefStore for InMemoryOpenAiCompatRefStore {
         Ok(Some(mapping.clone()))
     }
 
+    async fn record_accepted_ack(
+        &self,
+        request: OpenAiCompatRecordAcceptedAck,
+    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
+        let mut state = self.lock_state()?;
+        let Some(mapping) = state.by_public_id.get_mut(&request.public_id) else {
+            return Ok(None);
+        };
+        mapping.validate()?;
+        if !mapping.is_authorized_for(&request.owner) {
+            return Ok(None);
+        }
+        mapping.accepted_ack = Some(request.accepted_ack);
+        Ok(Some(mapping.clone()))
+    }
+
     async fn lookup_authorized(
         &self,
         request: OpenAiCompatRefLookup,
@@ -585,32 +652,23 @@ impl OpenAiCompatRefStore for InMemoryOpenAiCompatRefStore {
     }
 }
 
-impl InMemoryOpenAiCompatRefStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    fn lock_state(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, InMemoryOpenAiCompatRefState>, OpenAiCompatRefError> {
-        self.state
-            .lock()
-            .map_err(|_| OpenAiCompatRefError::StoreUnavailable)
-    }
-}
-
 fn new_pending_mapping(request: OpenAiCompatRefReservation) -> OpenAiCompatResourceMapping {
-    let public_id = OpenAiCompatPublicId::generate_for(request.surface);
     let mapping = OpenAiCompatResourceMapping {
-        public_id,
+        public_id: OpenAiCompatPublicId::generate_for(request.surface),
         owner: request.owner,
         surface: request.surface,
         request_fingerprint: request.request_fingerprint,
+        created_at: unix_timestamp_now(),
         idempotency_key: request.idempotency_key,
+        accepted_ack: None,
         binding: OpenAiCompatResourceBinding::Pending,
     };
     debug_assert!(mapping.validate().is_ok());
     mapping
+}
+
+fn unix_timestamp_now() -> u64 {
+    Utc::now().timestamp().try_into().unwrap_or(0)
 }
 
 fn validate_public_ref(
