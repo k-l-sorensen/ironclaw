@@ -266,7 +266,10 @@ impl OpenAiResponsesWorkflow {
                 (mapping, accepted_ack)
             }
             OpenAiCompatRefReservationOutcome::Replayed(mapping) => {
-                let accepted_ack = mapping.accepted_ack.clone().unwrap_or(ProductInboundAck::NoOp);
+                let accepted_ack = mapping
+                    .accepted_ack
+                    .clone()
+                    .unwrap_or(ProductInboundAck::NoOp);
                 (mapping, accepted_ack)
             }
             OpenAiCompatRefReservationOutcome::Conflict(_) => {
