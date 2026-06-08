@@ -56,11 +56,11 @@ pub use refs::{
     InMemoryOpenAiCompatRefStore, OpenAiChatCompletionId, OpenAiCompatActorScope,
     OpenAiCompatBindInternalRefs, OpenAiCompatIdempotencyConflict, OpenAiCompatIdempotencyKey,
     OpenAiCompatInternalRefs, OpenAiCompatProductActionRef, OpenAiCompatProjectionRef,
-    OpenAiCompatPublicId, OpenAiCompatRefError, OpenAiCompatRefLookup, OpenAiCompatRefOperation,
-    OpenAiCompatRefReservation, OpenAiCompatRefReservationOutcome, OpenAiCompatRefStore,
-    OpenAiCompatRequestFingerprint, OpenAiCompatResourceBinding, OpenAiCompatResourceKind,
-    OpenAiCompatResourceMapping, OpenAiCompatRouteSurface, OpenAiCompatTurnRunRef,
-    OpenAiResponseId,
+    OpenAiCompatPublicId, OpenAiCompatRecordAcceptedAck, OpenAiCompatRefError,
+    OpenAiCompatRefLookup, OpenAiCompatRefOperation, OpenAiCompatRefReservation,
+    OpenAiCompatRefReservationOutcome, OpenAiCompatRefStore, OpenAiCompatRequestFingerprint,
+    OpenAiCompatResourceBinding, OpenAiCompatResourceKind, OpenAiCompatResourceMapping,
+    OpenAiCompatRouteSurface, OpenAiCompatTurnRunRef, OpenAiResponseId,
 };
 pub use responses::{
     OpenAiResponseErrorObject, OpenAiResponseObject, OpenAiResponseOutputItem,
