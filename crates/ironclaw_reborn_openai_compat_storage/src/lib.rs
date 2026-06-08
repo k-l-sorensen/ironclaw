@@ -15,9 +15,10 @@ use ironclaw_filesystem::{
 use ironclaw_host_api::VirtualPath;
 use ironclaw_reborn_openai_compat::{
     OpenAiCompatActorScope, OpenAiCompatBindInternalRefs, OpenAiCompatIdempotencyConflict,
-    OpenAiCompatIdempotencyKey, OpenAiCompatPublicId, OpenAiCompatRefError, OpenAiCompatRefLookup,
-    OpenAiCompatRefReservation, OpenAiCompatRefReservationOutcome, OpenAiCompatRefStore,
-    OpenAiCompatResourceBinding, OpenAiCompatResourceMapping, OpenAiCompatRouteSurface,
+    OpenAiCompatIdempotencyKey, OpenAiCompatPublicId, OpenAiCompatRecordAcceptedAck,
+    OpenAiCompatRefError, OpenAiCompatRefLookup, OpenAiCompatRefReservation,
+    OpenAiCompatRefReservationOutcome, OpenAiCompatRefStore, OpenAiCompatResourceBinding,
+    OpenAiCompatResourceMapping, OpenAiCompatRouteSurface,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -213,6 +214,13 @@ impl OpenAiCompatRefStore for RebornLibSqlOpenAiCompatRefStore {
         self.inner.bind_internal_refs(request).await
     }
 
+    async fn record_accepted_ack(
+        &self,
+        request: OpenAiCompatRecordAcceptedAck,
+    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
+        self.inner.record_accepted_ack(request).await
+    }
+
     async fn lookup_authorized(
         &self,
         request: OpenAiCompatRefLookup,
@@ -258,6 +266,13 @@ impl OpenAiCompatRefStore for RebornPostgresOpenAiCompatRefStore {
         self.inner.bind_internal_refs(request).await
     }
 
+    async fn record_accepted_ack(
+        &self,
+        request: OpenAiCompatRecordAcceptedAck,
+    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
+        self.inner.record_accepted_ack(request).await
+    }
+
     async fn lookup_authorized(
         &self,
         request: OpenAiCompatRefLookup,
@@ -280,6 +295,13 @@ impl OpenAiCompatRefStore for FilesystemOpenAiCompatRefStore {
         request: OpenAiCompatBindInternalRefs,
     ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
         self.bind_with_cas(request).await
+    }
+
+    async fn record_accepted_ack(
+        &self,
+        request: OpenAiCompatRecordAcceptedAck,
+    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
+        self.record_accepted_ack_with_cas(request).await
     }
 
     async fn lookup_authorized(
@@ -395,6 +417,31 @@ impl FilesystemOpenAiCompatRefStore {
         }
         Err(OpenAiCompatRefError::StoreUnavailable)
     }
+
+    async fn record_accepted_ack_with_cas(
+        &self,
+        request: OpenAiCompatRecordAcceptedAck,
+    ) -> Result<Option<OpenAiCompatResourceMapping>, OpenAiCompatRefError> {
+        for _ in 0..self.cas_retries {
+            let Some((mut mapping, version)) = self.load_mapping_entry(&request.public_id).await?
+            else {
+                return Ok(None);
+            };
+            if !mapping.is_authorized_for(&request.owner) {
+                return Ok(None);
+            }
+            mapping.accepted_ack = Some(request.accepted_ack.clone());
+            match self
+                .put_mapping(&mapping, CasExpectation::Version(version))
+                .await
+            {
+                Ok(()) => return Ok(Some(mapping)),
+                Err(SaveRecordError::CasConflict) => continue,
+                Err(SaveRecordError::Ref(error)) => return Err(error),
+            }
+        }
+        Err(OpenAiCompatRefError::StoreUnavailable)
+    }
 }
 
 enum SaveRecordError {
@@ -448,7 +495,9 @@ fn new_pending_mapping(request: &OpenAiCompatRefReservation) -> OpenAiCompatReso
         owner: request.owner.clone(),
         surface: request.surface,
         request_fingerprint: request.request_fingerprint.clone(),
+        created_at: chrono::Utc::now().timestamp().try_into().unwrap_or(0),
         idempotency_key: request.idempotency_key.clone(),
+        accepted_ack: None,
         binding: OpenAiCompatResourceBinding::Pending,
     };
     debug_assert!(mapping.validate().is_ok());
