@@ -19,6 +19,8 @@ mod handlers;
 mod refs;
 mod responses;
 #[cfg(feature = "openai-compat-beta")]
+mod responses_workflow;
+#[cfg(feature = "openai-compat-beta")]
 mod router;
 
 pub use chat::{
@@ -67,6 +69,11 @@ pub use responses::{
     OpenAiResponseOutputItemStatus, OpenAiResponseStatus, OpenAiResponseUsage,
     OpenAiResponsesCreateRequest, OpenAiResponsesInput, OpenAiResponsesInputItem,
     OpenAiResponsesMessageRole,
+};
+#[cfg(feature = "openai-compat-beta")]
+pub use responses_workflow::{
+    OpenAiResponseProjection, OpenAiResponseReadRequest, OpenAiResponseWaitRequest,
+    OpenAiResponsesProjectionReader, OpenAiResponsesWorkflow,
 };
 #[cfg(feature = "openai-compat-beta")]
 pub use router::{OpenAiCompatRouterState, openai_compat_router, openai_compat_router_with_state};

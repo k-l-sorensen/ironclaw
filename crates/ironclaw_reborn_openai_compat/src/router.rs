@@ -3,7 +3,6 @@ use std::sync::Arc;
 use axum::Router;
 use axum::routing::{get, post};
 
-use crate::OpenAiChatCompletionsWorkflow;
 use crate::descriptors::{
     OPENAI_COMPAT_PATTERN_CHAT_COMPLETIONS, OPENAI_COMPAT_PATTERN_RESPONSES_API_CREATE,
     OPENAI_COMPAT_PATTERN_RESPONSES_API_ITEM, OPENAI_COMPAT_PATTERN_RESPONSES_API_ITEM_CANCEL,
@@ -11,10 +10,12 @@ use crate::descriptors::{
     OPENAI_COMPAT_PATTERN_RESPONSES_V1_ITEM_CANCEL,
 };
 use crate::handlers;
+use crate::{OpenAiChatCompletionsWorkflow, OpenAiResponsesWorkflow};
 
 #[derive(Clone, Default)]
 pub struct OpenAiCompatRouterState {
     chat_completions: Option<Arc<OpenAiChatCompletionsWorkflow>>,
+    responses: Option<Arc<OpenAiResponsesWorkflow>>,
 }
 
 impl OpenAiCompatRouterState {
@@ -23,13 +24,32 @@ impl OpenAiCompatRouterState {
     }
 
     pub fn with_chat_completions(chat_completions: Arc<OpenAiChatCompletionsWorkflow>) -> Self {
-        Self {
-            chat_completions: Some(chat_completions),
-        }
+        Self::default().with_chat_completions_workflow(chat_completions)
+    }
+
+    pub fn with_responses(responses: Arc<OpenAiResponsesWorkflow>) -> Self {
+        Self::default().with_responses_workflow(responses)
+    }
+
+    pub fn with_chat_completions_workflow(
+        mut self,
+        chat_completions: Arc<OpenAiChatCompletionsWorkflow>,
+    ) -> Self {
+        self.chat_completions = Some(chat_completions);
+        self
+    }
+
+    pub fn with_responses_workflow(mut self, responses: Arc<OpenAiResponsesWorkflow>) -> Self {
+        self.responses = Some(responses);
+        self
     }
 
     pub(crate) fn chat_completions(&self) -> Option<Arc<OpenAiChatCompletionsWorkflow>> {
         self.chat_completions.clone()
+    }
+
+    pub(crate) fn responses(&self) -> Option<Arc<OpenAiResponsesWorkflow>> {
+        self.responses.clone()
     }
 }
 
