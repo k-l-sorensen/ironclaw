@@ -12,14 +12,18 @@ use ironclaw_filesystem::{
 };
 use ironclaw_host_api::{TenantId, VirtualPath};
 use ironclaw_product_workflow::{
-    DeleteScopedLifecycleInstallationRequest, ProductWorkflowError, ScopedLifecycleInstallation,
-    ScopedLifecycleInstallationId, ScopedLifecycleInstallationStore, ScopedLifecycleOwnership,
-    UpsertScopedLifecycleInstallationRequest, lifecycle_package_kind_label,
+    DeleteScopedLifecycleInstallationRequest, LifecyclePackageRef, ProductWorkflowError,
+    ScopedLifecycleInstallation, ScopedLifecycleInstallationId, ScopedLifecycleInstallationStore,
+    ScopedLifecycleOwnership, UpsertScopedLifecycleInstallationRequest,
+    lifecycle_package_kind_label,
 };
 
 const DEFAULT_SCOPED_LIFECYCLE_ROOT: &str = "/engine/product_workflow/scoped_lifecycle";
 const SCOPED_LIFECYCLE_RECORD_KIND: &str = "scoped_lifecycle_installation";
 const SCOPED_LIFECYCLE_TOMBSTONE_RECORD_KIND: &str = "scoped_lifecycle_tombstone";
+const SCOPED_LIFECYCLE_ID_RESERVATION_RECORD_KIND: &str = "scoped_lifecycle_installation_id";
+const SCOPED_LIFECYCLE_ID_TOMBSTONE_RECORD_KIND: &str =
+    "scoped_lifecycle_installation_id_tombstone";
 
 pub struct FilesystemScopedLifecycleInstallationStore {
     filesystem: Arc<dyn RootFilesystem>,
@@ -80,31 +84,58 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
             || scoped_lifecycle_installation_path(&self.root, &installation),
             |existing| Ok(existing.path.clone()),
         )?;
-        let cas = match existing.as_ref() {
-            Some(existing) => CasExpectation::Version(existing.version),
-            None => match self.package_path_state(&path).await? {
-                PackagePathState::Absent => CasExpectation::Absent,
-                PackagePathState::Tombstone(version) => CasExpectation::Version(version),
-                PackagePathState::Occupied => {
-                    return Err(scoped_lifecycle_invalid_request(
-                        "scoped lifecycle installation package already exists for ownership",
-                    ));
-                }
-            },
+        let (cas, reserved_id_version) = match existing.as_ref() {
+            Some(existing) => (CasExpectation::Version(existing.version), None),
+            None => {
+                let cas = match self.package_path_state(&path).await? {
+                    PackagePathState::Absent => CasExpectation::Absent,
+                    PackagePathState::Tombstone(version) => CasExpectation::Version(version),
+                    PackagePathState::Occupied => {
+                        return Err(scoped_lifecycle_invalid_request(
+                            "scoped lifecycle installation package already exists for ownership",
+                        ));
+                    }
+                };
+                let reservation_path = scoped_lifecycle_installation_id_path(
+                    &self.root,
+                    installation.tenant_id(),
+                    &installation.installation_id,
+                )?;
+                let reserved_id_version = self
+                    .reserve_installation_id(&reservation_path, &installation)
+                    .await?;
+                (cas, reserved_id_version)
+            }
         };
-        self.filesystem
+        let reservation_path = scoped_lifecycle_installation_id_path(
+            &self.root,
+            installation.tenant_id(),
+            &installation.installation_id,
+        )?;
+        let write_result = self
+            .filesystem
             .put(
                 &path,
                 entry_for_scoped_lifecycle_installation(&installation)?,
                 cas,
             )
-            .await
-            .map_err(|error| match error {
+            .await;
+        if let Err(error) = write_result {
+            if let Some(version) = reserved_id_version {
+                self.tombstone_installation_id_reservation_best_effort(
+                    &reservation_path,
+                    &installation,
+                    version,
+                )
+                .await;
+            }
+            return Err(match error {
                 FilesystemError::VersionMismatch { .. } => {
                     scoped_lifecycle_transient("scoped lifecycle installation write conflict")
                 }
                 error => scoped_lifecycle_filesystem_error("upsert installation", error),
-            })?;
+            });
+        }
         Ok(())
     }
 
@@ -177,6 +208,74 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
 }
 
 impl FilesystemScopedLifecycleInstallationStore {
+    async fn reserve_installation_id(
+        &self,
+        path: &VirtualPath,
+        installation: &ScopedLifecycleInstallation,
+    ) -> Result<Option<RecordVersion>, ProductWorkflowError> {
+        let reservation = ScopedLifecycleInstallationIdReservation::new(installation);
+        let cas = match self.installation_id_state(path).await? {
+            InstallationIdState::Absent => CasExpectation::Absent,
+            InstallationIdState::Tombstone(version) => CasExpectation::Version(version),
+            InstallationIdState::Reserved(existing) => {
+                if existing.matches_installation(installation) {
+                    return Ok(None);
+                }
+                return Err(scoped_lifecycle_invalid_request(
+                    "scoped lifecycle installation id already exists",
+                ));
+            }
+        };
+        self.filesystem
+            .put(
+                path,
+                entry_for_installation_id_reservation(&reservation)?,
+                cas,
+            )
+            .await
+            .map(Some)
+            .map_err(|error| match error {
+                FilesystemError::VersionMismatch { .. } => scoped_lifecycle_invalid_request(
+                    "scoped lifecycle installation id already exists",
+                ),
+                error => scoped_lifecycle_filesystem_error("reserve installation id", error),
+            })
+    }
+
+    async fn tombstone_installation_id_reservation_best_effort(
+        &self,
+        path: &VirtualPath,
+        installation: &ScopedLifecycleInstallation,
+        version: RecordVersion,
+    ) {
+        let reservation = ScopedLifecycleInstallationIdReservation::new(installation);
+        let Ok(entry) = tombstone_entry_for_installation_id_reservation(&reservation) else {
+            return;
+        };
+        let _ = self
+            .filesystem
+            .put(path, entry, CasExpectation::Version(version))
+            .await;
+    }
+
+    async fn installation_id_state(
+        &self,
+        path: &VirtualPath,
+    ) -> Result<InstallationIdState, ProductWorkflowError> {
+        let Some(entry) =
+            self.filesystem.get(path).await.map_err(|error| {
+                scoped_lifecycle_filesystem_error("load installation id", error)
+            })?
+        else {
+            return Ok(InstallationIdState::Absent);
+        };
+        if is_installation_id_tombstone(&entry.entry) {
+            return Ok(InstallationIdState::Tombstone(entry.version));
+        }
+        let reservation = parse_installation_id_reservation(entry.entry)?;
+        Ok(InstallationIdState::Reserved(reservation))
+    }
+
     async fn package_path_state(
         &self,
         path: &VirtualPath,
@@ -200,11 +299,40 @@ impl FilesystemScopedLifecycleInstallationStore {
         tenant_id: &TenantId,
         installation_id: &ScopedLifecycleInstallationId,
     ) -> Result<Option<VersionedScopedLifecycleInstallation>, ProductWorkflowError> {
-        Ok(self
-            .list_versioned_installations(tenant_id)
-            .await?
-            .into_iter()
-            .find(|loaded| loaded.installation.installation_id == *installation_id))
+        let reservation_path =
+            scoped_lifecycle_installation_id_path(&self.root, tenant_id, installation_id)?;
+        let Some(reservation_entry) = self
+            .filesystem
+            .get(&reservation_path)
+            .await
+            .map_err(|error| scoped_lifecycle_filesystem_error("load installation id", error))?
+        else {
+            return Ok(None);
+        };
+        if is_installation_id_tombstone(&reservation_entry.entry) {
+            return Ok(None);
+        }
+        let reservation = parse_installation_id_reservation(reservation_entry.entry)?;
+        let package_path =
+            scoped_lifecycle_installation_path_for_reservation(&self.root, &reservation)?;
+        let Some(package_entry) = self
+            .filesystem
+            .get(&package_path)
+            .await
+            .map_err(|error| scoped_lifecycle_filesystem_error("load installation", error))?
+        else {
+            return Ok(None);
+        };
+        if is_scoped_lifecycle_tombstone(&package_entry.entry) {
+            return Ok(None);
+        }
+        let loaded = parse_versioned_scoped_lifecycle_installation(package_entry)?;
+        if loaded.installation.installation_id != *installation_id {
+            return Err(scoped_lifecycle_transient(
+                "scoped lifecycle installation id reservation mismatch",
+            ));
+        }
+        Ok(Some(loaded))
     }
 
     async fn list_versioned_installations(
@@ -247,10 +375,39 @@ enum PackagePathState {
     Occupied,
 }
 
+enum InstallationIdState {
+    Absent,
+    Tombstone(RecordVersion),
+    Reserved(ScopedLifecycleInstallationIdReservation),
+}
+
 struct VersionedScopedLifecycleInstallation {
     path: VirtualPath,
     installation: ScopedLifecycleInstallation,
     version: RecordVersion,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct ScopedLifecycleInstallationIdReservation {
+    installation_id: ScopedLifecycleInstallationId,
+    package_ref: LifecyclePackageRef,
+    ownership: ScopedLifecycleOwnership,
+}
+
+impl ScopedLifecycleInstallationIdReservation {
+    fn new(installation: &ScopedLifecycleInstallation) -> Self {
+        Self {
+            installation_id: installation.installation_id.clone(),
+            package_ref: installation.package_ref.clone(),
+            ownership: installation.ownership.clone(),
+        }
+    }
+
+    fn matches_installation(&self, installation: &ScopedLifecycleInstallation) -> bool {
+        self.installation_id == installation.installation_id
+            && self.package_ref == installation.package_ref
+            && self.ownership == installation.ownership
+    }
 }
 
 #[cfg(feature = "libsql")]
@@ -379,6 +536,58 @@ fn tombstone_entry_for_scoped_lifecycle_installation(
     entry_for_scoped_lifecycle_record(installation, SCOPED_LIFECYCLE_TOMBSTONE_RECORD_KIND)
 }
 
+fn entry_for_installation_id_reservation(
+    reservation: &ScopedLifecycleInstallationIdReservation,
+) -> Result<Entry, ProductWorkflowError> {
+    entry_for_installation_id_reservation_record(
+        reservation,
+        SCOPED_LIFECYCLE_ID_RESERVATION_RECORD_KIND,
+    )
+}
+
+fn tombstone_entry_for_installation_id_reservation(
+    reservation: &ScopedLifecycleInstallationIdReservation,
+) -> Result<Entry, ProductWorkflowError> {
+    entry_for_installation_id_reservation_record(
+        reservation,
+        SCOPED_LIFECYCLE_ID_TOMBSTONE_RECORD_KIND,
+    )
+}
+
+fn entry_for_installation_id_reservation_record(
+    reservation: &ScopedLifecycleInstallationIdReservation,
+    record_kind: &'static str,
+) -> Result<Entry, ProductWorkflowError> {
+    let payload = serde_json::json!({
+        "installation_id": reservation.installation_id,
+        "package_ref": reservation.package_ref,
+        "ownership": reservation.ownership,
+    });
+    let kind = RecordKind::new(record_kind).map_err(|error| {
+        scoped_lifecycle_durable_error("construct scoped lifecycle id record kind", error)
+    })?;
+    let entry = Entry::record(kind, &payload)
+        .map_err(|error| scoped_lifecycle_durable_error("serialize installation id entry", error))?
+        .with_indexed(
+            index_key("tenant_id")?,
+            text(reservation.ownership.tenant_id().as_str()),
+        )
+        .with_indexed(
+            index_key("installation_id")?,
+            text(reservation.installation_id.as_str()),
+        )
+        .with_indexed(
+            index_key("package_kind")?,
+            text(lifecycle_package_kind_label(reservation.package_ref.kind)),
+        )
+        .with_indexed(
+            index_key("package_id")?,
+            text(reservation.package_ref.id.as_str()),
+        )
+        .with_indexed(index_key("ownership")?, text(reservation.ownership.label()));
+    Ok(entry)
+}
+
 fn entry_for_scoped_lifecycle_record(
     installation: &ScopedLifecycleInstallation,
     record_kind: &'static str,
@@ -426,6 +635,48 @@ fn is_scoped_lifecycle_tombstone(entry: &Entry) -> bool {
         .kind
         .as_ref()
         .is_some_and(|kind| kind.as_str() == SCOPED_LIFECYCLE_TOMBSTONE_RECORD_KIND)
+}
+
+fn is_installation_id_tombstone(entry: &Entry) -> bool {
+    entry
+        .kind
+        .as_ref()
+        .is_some_and(|kind| kind.as_str() == SCOPED_LIFECYCLE_ID_TOMBSTONE_RECORD_KIND)
+}
+
+fn parse_installation_id_reservation(
+    entry: Entry,
+) -> Result<ScopedLifecycleInstallationIdReservation, ProductWorkflowError> {
+    let payload = entry
+        .parse_json::<serde_json::Value>()
+        .map_err(|error| scoped_lifecycle_durable_error("deserialize installation id", error))?;
+    let installation_id = serde_json::from_value(reservation_field(&payload, "installation_id")?)
+        .map_err(|error| {
+        scoped_lifecycle_durable_error("deserialize installation id", error)
+    })?;
+    let package_ref =
+        serde_json::from_value(reservation_field(&payload, "package_ref")?).map_err(|error| {
+            scoped_lifecycle_durable_error("deserialize installation id package", error)
+        })?;
+    let ownership =
+        serde_json::from_value(reservation_field(&payload, "ownership")?).map_err(|error| {
+            scoped_lifecycle_durable_error("deserialize installation id ownership", error)
+        })?;
+    Ok(ScopedLifecycleInstallationIdReservation {
+        installation_id,
+        package_ref,
+        ownership,
+    })
+}
+
+fn reservation_field(
+    payload: &serde_json::Value,
+    field: &'static str,
+) -> Result<serde_json::Value, ProductWorkflowError> {
+    payload
+        .get(field)
+        .cloned()
+        .ok_or_else(|| scoped_lifecycle_transient(format!("scoped lifecycle missing {field}")))
 }
 
 fn parse_scoped_lifecycle_installation(
@@ -496,16 +747,57 @@ fn scoped_lifecycle_installation_path(
     root: &VirtualPath,
     installation: &ScopedLifecycleInstallation,
 ) -> Result<VirtualPath, ProductWorkflowError> {
+    scoped_lifecycle_installation_path_for_parts(
+        root,
+        installation.tenant_id(),
+        &installation.ownership,
+        &installation.package_ref,
+    )
+}
+
+fn scoped_lifecycle_installation_path_for_reservation(
+    root: &VirtualPath,
+    reservation: &ScopedLifecycleInstallationIdReservation,
+) -> Result<VirtualPath, ProductWorkflowError> {
+    scoped_lifecycle_installation_path_for_parts(
+        root,
+        reservation.ownership.tenant_id(),
+        &reservation.ownership,
+        &reservation.package_ref,
+    )
+}
+
+fn scoped_lifecycle_installation_path_for_parts(
+    root: &VirtualPath,
+    tenant_id: &TenantId,
+    ownership: &ScopedLifecycleOwnership,
+    package_ref: &LifecyclePackageRef,
+) -> Result<VirtualPath, ProductWorkflowError> {
     let path = format!(
         "{}/{}/{}/{}.json",
-        scoped_lifecycle_tenant_installations_path(root, installation.tenant_id())?.as_str(),
-        ownership_path_component(&installation.ownership),
-        lifecycle_package_kind_label(installation.package_ref.kind),
-        hex_component(installation.package_ref.id.as_str())
+        scoped_lifecycle_tenant_installations_path(root, tenant_id)?.as_str(),
+        ownership_path_component(ownership),
+        lifecycle_package_kind_label(package_ref.kind),
+        hex_component(package_ref.id.as_str())
     );
     VirtualPath::new(path).map_err(|error| {
         scoped_lifecycle_durable_error("construct scoped lifecycle installation path", error)
     })
+}
+
+fn scoped_lifecycle_installation_id_path(
+    root: &VirtualPath,
+    tenant_id: &TenantId,
+    installation_id: &ScopedLifecycleInstallationId,
+) -> Result<VirtualPath, ProductWorkflowError> {
+    let path = format!(
+        "{}/tenants/{}/installation_ids/{}.json",
+        root.as_str().trim_end_matches('/'),
+        hex_component(tenant_id.as_str()),
+        hex_component(installation_id.as_str())
+    );
+    VirtualPath::new(path)
+        .map_err(|error| scoped_lifecycle_durable_error("construct installation id path", error))
 }
 
 fn ownership_path_component(ownership: &ScopedLifecycleOwnership) -> String {
@@ -693,7 +985,7 @@ mod tests {
 
         assert_eq!(
             filesystem.observed_cas().await,
-            vec![CasExpectation::Absent]
+            vec![CasExpectation::Absent, CasExpectation::Absent]
         );
     }
 

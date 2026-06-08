@@ -393,6 +393,56 @@ async fn assert_scoped_lifecycle_store_resolves_shared_and_private_after_reopen(
         ProductWorkflowError::InvalidBindingRequest { .. }
     ));
 
+    let duplicate_installation_id = scoped_install_id(suffix, "private-duplicate-installation-id");
+    let duplicate_id_left = ScopedLifecycleInstallation::user_private(
+        duplicate_installation_id.clone(),
+        package_ref("mail"),
+        other_user.clone(),
+        now,
+    );
+    let duplicate_id_right = ScopedLifecycleInstallation::user_private(
+        duplicate_installation_id.clone(),
+        package_ref("drive"),
+        other_user.clone(),
+        now,
+    );
+    let (duplicate_id_left_result, duplicate_id_right_result) = tokio::join!(
+        store.upsert_installation(UpsertScopedLifecycleInstallationRequest {
+            actor: other_user.clone(),
+            installation: duplicate_id_left,
+        }),
+        reopened.upsert_installation(UpsertScopedLifecycleInstallationRequest {
+            actor: other_user.clone(),
+            installation: duplicate_id_right,
+        }),
+    );
+    let duplicate_id_results = [&duplicate_id_left_result, &duplicate_id_right_result];
+    assert_eq!(
+        duplicate_id_results
+            .iter()
+            .filter(|result| result.is_ok())
+            .count(),
+        1
+    );
+    assert_eq!(
+        duplicate_id_results
+            .iter()
+            .filter(|result| matches!(
+                result,
+                Err(ProductWorkflowError::InvalidBindingRequest { .. })
+            ))
+            .count(),
+        1
+    );
+    store
+        .delete_installation(DeleteScopedLifecycleInstallationRequest {
+            actor: other_user.clone(),
+            tenant_id: tenant.clone(),
+            installation_id: duplicate_installation_id,
+        })
+        .await
+        .expect("delete duplicate installation id winner");
+
     let concurrent_left_id = scoped_install_id(suffix, "private-calendar-left");
     let concurrent_right_id = scoped_install_id(suffix, "private-calendar-right");
     let concurrent_left = ScopedLifecycleInstallation::user_private(
