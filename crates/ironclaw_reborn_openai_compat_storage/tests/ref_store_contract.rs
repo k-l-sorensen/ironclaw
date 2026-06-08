@@ -374,12 +374,8 @@ async fn durable_store_rejects_wrong_record_kind_for_idempotency_index() {
     let created = expect_created(store.reserve(request.clone()).await);
     let owner = actor("tenant-a", "alice");
     let key = OpenAiCompatIdempotencyKey::new("same-key").expect("valid key");
-    let index_path = idempotency_index_record_path(
-        &root,
-        &owner,
-        OpenAiCompatRouteSurface::ResponsesApi,
-        &key,
-    );
+    let index_path =
+        idempotency_index_record_path(&root, &owner, OpenAiCompatRouteSurface::ResponsesApi, &key);
     let payload = json!({
         "owner": owner,
         "surface": "responses_api",

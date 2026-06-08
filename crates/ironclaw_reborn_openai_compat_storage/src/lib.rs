@@ -546,7 +546,11 @@ fn child_path(root: &VirtualPath, child: &str) -> Result<VirtualPath, OpenAiComp
 }
 
 fn ensure_entry_kind(entry: &Entry, expected: &str) -> Result<(), OpenAiCompatRefError> {
-    if entry.kind.as_ref().is_some_and(|kind| kind.as_str() == expected) {
+    if entry
+        .kind
+        .as_ref()
+        .is_some_and(|kind| kind.as_str() == expected)
+    {
         return Ok(());
     }
     Err(OpenAiCompatRefError::CorruptMapping)
