@@ -119,7 +119,8 @@ fn chat_sse_stream(
                     }
                     for envelope in envelopes {
                         after_cursor = Some(envelope.projection_cursor().clone());
-                        match text_from_payload(envelope.payload()) {
+                        let payload = envelope.payload();
+                        match text_from_payload(payload) {
                             PayloadText::None => {}
                             PayloadText::Update(text) => match state.delta_for(text) {
                                 Ok(Some(delta)) => yield Ok(chat_text_delta_event(&public_id, created, &model, delta)),
@@ -140,6 +141,18 @@ fn chat_sse_stream(
                                 }
                                 yield Ok(chat_finish_event(&public_id, created, &model));
                                 yield Ok(Event::default().data("[DONE]"));
+                                return;
+                            }
+                        }
+                        match terminal_status_from_payload(payload) {
+                            TerminalStatus::None => {}
+                            TerminalStatus::Completed => {
+                                yield Ok(chat_finish_event(&public_id, created, &model));
+                                yield Ok(Event::default().data("[DONE]"));
+                                return;
+                            }
+                            TerminalStatus::Failed | TerminalStatus::Cancelled => {
+                                yield Ok(openai_error_event(OpenAiCompatHttpError::internal()));
                                 return;
                             }
                         }
@@ -188,21 +201,16 @@ fn response_sse_stream(
                     }
                     for envelope in envelopes {
                         after_cursor = Some(envelope.projection_cursor().clone());
-                        match text_from_payload(envelope.payload()) {
+                        let payload = envelope.payload();
+                        match text_from_payload(payload) {
                             PayloadText::None => {}
                             PayloadText::Update(text) => match state.delta_for(text) {
                                 Ok(Some(delta)) => {
-                                    yield Ok(response_event(
-                                        "response.output_text.delta",
-                                        json!({
-                                            "type": "response.output_text.delta",
-                                            "sequence_number": sequence_number,
-                                            "response_id": public_id.as_str(),
-                                            "item_id": item_id,
-                                            "output_index": 0,
-                                            "content_index": 0,
-                                            "delta": delta,
-                                        }),
+                                    yield Ok(response_text_delta_event(
+                                        &public_id,
+                                        &item_id,
+                                        sequence_number,
+                                        delta,
                                     ));
                                     sequence_number += 1;
                                 }
@@ -215,17 +223,11 @@ fn response_sse_stream(
                             PayloadText::Final(text) => {
                                 match state.delta_for(text) {
                                     Ok(Some(delta)) => {
-                                        yield Ok(response_event(
-                                            "response.output_text.delta",
-                                            json!({
-                                                "type": "response.output_text.delta",
-                                                "sequence_number": sequence_number,
-                                                "response_id": public_id.as_str(),
-                                                "item_id": item_id,
-                                                "output_index": 0,
-                                                "content_index": 0,
-                                                "delta": delta,
-                                            }),
+                                        yield Ok(response_text_delta_event(
+                                            &public_id,
+                                            &item_id,
+                                            sequence_number,
+                                            delta,
                                         ));
                                         sequence_number += 1;
                                     }
@@ -235,32 +237,57 @@ fn response_sse_stream(
                                         return;
                                     }
                                 }
-                                let completed_text = state.text().to_string();
-                                yield Ok(response_event(
-                                    "response.output_text.done",
-                                    json!({
-                                        "type": "response.output_text.done",
-                                        "sequence_number": sequence_number,
-                                        "item_id": item_id,
-                                        "output_index": 0,
-                                        "content_index": 0,
-                                        "text": completed_text,
-                                    }),
-                                ));
+                                yield Ok(response_text_done_event(&item_id, sequence_number, state.text()));
                                 sequence_number += 1;
-                                yield Ok(response_event(
+                                yield Ok(response_terminal_event(
                                     "response.completed",
-                                    json!({
-                                        "type": "response.completed",
-                                        "sequence_number": sequence_number,
-                                        "response": response_object(
-                                            public_id.clone(),
-                                            created,
-                                            model.clone(),
-                                            OpenAiResponseStatus::Completed,
-                                            state.text(),
-                                        ),
-                                    }),
+                                    sequence_number,
+                                    public_id.clone(),
+                                    created,
+                                    model.clone(),
+                                    OpenAiResponseStatus::Completed,
+                                    state.text(),
+                                ));
+                                return;
+                            }
+                        }
+                        match terminal_status_from_payload(payload) {
+                            TerminalStatus::None => {}
+                            TerminalStatus::Completed => {
+                                yield Ok(response_text_done_event(&item_id, sequence_number, state.text()));
+                                sequence_number += 1;
+                                yield Ok(response_terminal_event(
+                                    "response.completed",
+                                    sequence_number,
+                                    public_id.clone(),
+                                    created,
+                                    model.clone(),
+                                    OpenAiResponseStatus::Completed,
+                                    state.text(),
+                                ));
+                                return;
+                            }
+                            TerminalStatus::Failed => {
+                                yield Ok(response_terminal_event(
+                                    "response.failed",
+                                    sequence_number,
+                                    public_id.clone(),
+                                    created,
+                                    model.clone(),
+                                    OpenAiResponseStatus::Failed,
+                                    state.text(),
+                                ));
+                                return;
+                            }
+                            TerminalStatus::Cancelled => {
+                                yield Ok(response_terminal_event(
+                                    "response.cancelled",
+                                    sequence_number,
+                                    public_id.clone(),
+                                    created,
+                                    model.clone(),
+                                    OpenAiResponseStatus::Cancelled,
+                                    state.text(),
                                 ));
                                 return;
                             }
@@ -301,6 +328,39 @@ impl TextDeltaState {
     fn text(&self) -> &str {
         &self.text
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalStatus {
+    None,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+fn terminal_status_from_payload(payload: &ProductOutboundPayload) -> TerminalStatus {
+    match payload {
+        ProductOutboundPayload::ProjectionSnapshot { state }
+        | ProductOutboundPayload::ProjectionUpdate { state } => terminal_status_from_state(state),
+        _ => TerminalStatus::None,
+    }
+}
+
+fn terminal_status_from_state(state: &ProductProjectionState) -> TerminalStatus {
+    state
+        .items
+        .iter()
+        .rev()
+        .find_map(|item| match item {
+            ProductProjectionItem::RunStatus { status, .. } => match status.as_str() {
+                "completed" => Some(TerminalStatus::Completed),
+                "failed" | "killed" => Some(TerminalStatus::Failed),
+                "cancelled" => Some(TerminalStatus::Cancelled),
+                _ => None,
+            },
+            _ => None,
+        })
+        .unwrap_or(TerminalStatus::None)
 }
 
 enum PayloadText<'a> {
@@ -377,6 +437,59 @@ fn chat_finish_event(public_id: &OpenAiChatCompletionId, created: u64, model: &s
 
 fn chat_chunk_event(chunk: OpenAiChatCompletionChunk) -> Event {
     data_event(None, &chunk)
+}
+
+fn response_text_delta_event(
+    public_id: &OpenAiResponseId,
+    item_id: &str,
+    sequence_number: u64,
+    delta: String,
+) -> Event {
+    response_event(
+        "response.output_text.delta",
+        json!({
+            "type": "response.output_text.delta",
+            "sequence_number": sequence_number,
+            "response_id": public_id.as_str(),
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "delta": delta,
+        }),
+    )
+}
+
+fn response_text_done_event(item_id: &str, sequence_number: u64, text: &str) -> Event {
+    response_event(
+        "response.output_text.done",
+        json!({
+            "type": "response.output_text.done",
+            "sequence_number": sequence_number,
+            "item_id": item_id,
+            "output_index": 0,
+            "content_index": 0,
+            "text": text,
+        }),
+    )
+}
+
+fn response_terminal_event(
+    event_name: &'static str,
+    sequence_number: u64,
+    public_id: OpenAiResponseId,
+    created: u64,
+    model: String,
+    status: OpenAiResponseStatus,
+    text: &str,
+) -> Event {
+    response_event(
+        event_name,
+        json!({
+            "type": event_name,
+            "sequence_number": sequence_number,
+            "response": response_object(public_id, created, model, status, text),
+        }),
+    )
 }
 
 fn response_event(event_name: &'static str, payload: serde_json::Value) -> Event {
