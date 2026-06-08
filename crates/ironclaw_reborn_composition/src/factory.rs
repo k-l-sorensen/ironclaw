@@ -1381,7 +1381,7 @@ async fn build_local_dev_root_filesystem(
         "local-dev: /memory is backed by InMemoryBackend; memory documents are ephemeral and will be lost on restart"
     );
     tracing::warn!(
-        "local-dev: /tenants is backed by InMemoryBackend in no-libsql builds; configured extension credentials are ephemeral and will be lost on restart"
+        "local-dev: scoped secret storage is backed by InMemoryBackend in no-libsql builds; configured extension credentials are ephemeral and will be lost on restart"
     );
     let mut composite = CompositeRootFilesystem::new();
     mount_local_dev_tenant_state_root(&mut composite, Arc::new(InMemoryBackend::new()))?;
