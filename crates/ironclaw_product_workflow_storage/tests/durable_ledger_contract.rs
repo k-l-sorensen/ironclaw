@@ -15,13 +15,20 @@ use ironclaw_product_adapters::{
     AdapterInstallationId, ExternalActorRef, ExternalEventId, ProductAdapterId, ProductInboundAck,
 };
 use ironclaw_product_workflow::{
-    ActionFingerprintKey, IdempotencyDecision, IdempotencyLedger, ProductInboundAction,
-    ProductWorkflowError, SourceBindingKey,
+    ActionFingerprintKey, DeleteScopedLifecycleInstallationRequest, IdempotencyDecision,
+    IdempotencyLedger, LifecyclePackageKind, LifecyclePackageRef, ProductInboundAction,
+    ProductWorkflowError, ScopedLifecycleActor, ScopedLifecycleInstallation,
+    ScopedLifecycleInstallationId, ScopedLifecycleInstallationStore, ScopedLifecycleSubject,
+    SourceBindingKey, UpsertScopedLifecycleInstallationRequest,
 };
 #[cfg(feature = "libsql")]
-use ironclaw_product_workflow_storage::RebornLibSqlIdempotencyLedger;
+use ironclaw_product_workflow_storage::{
+    RebornLibSqlIdempotencyLedger, RebornLibSqlScopedLifecycleInstallationStore,
+};
 #[cfg(feature = "postgres")]
-use ironclaw_product_workflow_storage::RebornPostgresIdempotencyLedger;
+use ironclaw_product_workflow_storage::{
+    RebornPostgresIdempotencyLedger, RebornPostgresScopedLifecycleInstallationStore,
+};
 
 fn fingerprint(suffix: &str) -> ActionFingerprintKey {
     fingerprint_for_actor(suffix, "user1")
@@ -43,6 +50,13 @@ fn custom_root(suffix: &str) -> VirtualPath {
         "/engine/product_workflow/idempotency/test_roots/{suffix}"
     ))
     .expect("valid custom ledger root")
+}
+
+fn scoped_lifecycle_root(suffix: &str) -> VirtualPath {
+    VirtualPath::new(format!(
+        "/engine/product_workflow/scoped_lifecycle/test_roots/{suffix}"
+    ))
+    .expect("valid scoped lifecycle root")
 }
 
 #[cfg(feature = "postgres")]
@@ -275,6 +289,164 @@ async fn assert_actor_identity_is_part_of_fingerprint_path(
     ));
 }
 
+async fn assert_scoped_lifecycle_store_resolves_shared_and_private_after_reopen(
+    store: &dyn ScopedLifecycleInstallationStore,
+    reopened: &dyn ScopedLifecycleInstallationStore,
+    suffix: &str,
+) {
+    let tenant =
+        ironclaw_host_api::TenantId::new(format!("tenant-{suffix}")).expect("valid tenant");
+    let admin = ScopedLifecycleActor::admin(
+        tenant.clone(),
+        ironclaw_host_api::UserId::new("admin-alpha").expect("valid admin"),
+    );
+    let user = ScopedLifecycleActor::user(
+        tenant.clone(),
+        ironclaw_host_api::UserId::new("user-alpha").expect("valid user"),
+    );
+    let other_user = ScopedLifecycleActor::user(
+        tenant.clone(),
+        ironclaw_host_api::UserId::new("user-beta").expect("valid user"),
+    );
+    let other_admin = ScopedLifecycleActor::admin(
+        tenant.clone(),
+        ironclaw_host_api::UserId::new("admin-beta").expect("valid admin"),
+    );
+
+    let now = Utc::now();
+    let shared_github = ScopedLifecycleInstallation::admin_shared(
+        scoped_install_id(suffix, "shared-github"),
+        package_ref("github"),
+        admin.clone(),
+        now,
+    )
+    .expect("admin shared install");
+    let private_github = ScopedLifecycleInstallation::user_private(
+        scoped_install_id(suffix, "private-github"),
+        package_ref("github"),
+        user.clone(),
+        now,
+    );
+    let private_notion = ScopedLifecycleInstallation::user_private(
+        scoped_install_id(suffix, "private-notion"),
+        package_ref("notion"),
+        user.clone(),
+        now,
+    );
+
+    store
+        .upsert_installation(UpsertScopedLifecycleInstallationRequest {
+            actor: admin.clone(),
+            installation: shared_github.clone(),
+        })
+        .await
+        .expect("upsert shared");
+    store
+        .upsert_installation(UpsertScopedLifecycleInstallationRequest {
+            actor: user.clone(),
+            installation: private_github.clone(),
+        })
+        .await
+        .expect("upsert private override");
+    store
+        .upsert_installation(UpsertScopedLifecycleInstallationRequest {
+            actor: user.clone(),
+            installation: private_notion.clone(),
+        })
+        .await
+        .expect("upsert private notion");
+
+    let overwrite_as_user = store
+        .upsert_installation(UpsertScopedLifecycleInstallationRequest {
+            actor: user.clone(),
+            installation: shared_github.clone(),
+        })
+        .await
+        .expect_err("user cannot overwrite admin shared installation");
+    assert_eq!(overwrite_as_user, ProductWorkflowError::BindingAccessDenied);
+
+    let delete_as_user = store
+        .delete_installation(DeleteScopedLifecycleInstallationRequest {
+            actor: user.clone(),
+            tenant_id: tenant.clone(),
+            installation_id: shared_github.installation_id.clone(),
+        })
+        .await
+        .expect_err("user cannot delete admin shared installation");
+    assert_eq!(delete_as_user, ProductWorkflowError::BindingAccessDenied);
+
+    let mut misattributed_update = shared_github.clone();
+    misattributed_update.updated_by = other_admin;
+    let audit_mismatch = store
+        .upsert_installation(UpsertScopedLifecycleInstallationRequest {
+            actor: admin.clone(),
+            installation: misattributed_update,
+        })
+        .await
+        .expect_err("store rejects mismatched update actor");
+    assert!(matches!(
+        audit_mismatch,
+        ProductWorkflowError::InvalidBindingRequest { .. }
+    ));
+
+    let mut changed_package = shared_github.clone();
+    changed_package.package_ref = package_ref("notion");
+    changed_package.updated_by = admin.clone();
+    let identity_change = store
+        .upsert_installation(UpsertScopedLifecycleInstallationRequest {
+            actor: admin,
+            installation: changed_package,
+        })
+        .await
+        .expect_err("store rejects immutable update identity change");
+    assert!(matches!(
+        identity_change,
+        ProductWorkflowError::InvalidBindingRequest { .. }
+    ));
+
+    let reopened_effective = reopened
+        .list_effective_installations(ScopedLifecycleSubject::new(
+            tenant.clone(),
+            user.user_id.clone(),
+        ))
+        .await
+        .expect("effective after reopen");
+    assert_eq!(
+        ids(&reopened_effective.installations),
+        vec![
+            private_github.installation_id.as_str().to_string(),
+            private_notion.installation_id.as_str().to_string(),
+        ]
+    );
+
+    let other_effective = reopened
+        .list_effective_installations(ScopedLifecycleSubject::new(
+            tenant,
+            other_user.user_id.clone(),
+        ))
+        .await
+        .expect("other user effective");
+    assert_eq!(
+        ids(&other_effective.installations),
+        vec![shared_github.installation_id.as_str().to_string()]
+    );
+}
+
+fn scoped_install_id(suffix: &str, label: &str) -> ScopedLifecycleInstallationId {
+    ScopedLifecycleInstallationId::new(format!("{label}-{suffix}")).expect("valid install id")
+}
+
+fn package_ref(id: &str) -> LifecyclePackageRef {
+    LifecyclePackageRef::new(LifecyclePackageKind::Extension, id).expect("valid package")
+}
+
+fn ids(installations: &[ScopedLifecycleInstallation]) -> Vec<String> {
+    installations
+        .iter()
+        .map(|installation| installation.installation_id.as_str().to_string())
+        .collect()
+}
+
 #[cfg(feature = "libsql")]
 #[tokio::test]
 async fn libsql_settled_action_survives_reopen_and_replays() {
@@ -379,6 +551,30 @@ async fn libsql_actor_identity_is_part_of_fingerprint_path() {
     let ledger = RebornLibSqlIdempotencyLedger::new(libsql_filesystem(&db_path).await);
 
     assert_actor_identity_is_part_of_fingerprint_path(&ledger, "libsql-actor-isolation").await;
+}
+
+#[cfg(feature = "libsql")]
+#[tokio::test]
+async fn libsql_scoped_lifecycle_store_resolves_shared_and_private_after_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db_path = dir.path().join("workflow-ledger.db");
+    let db_path = db_path.display().to_string();
+    let root = scoped_lifecycle_root("libsql-scoped");
+    let store = RebornLibSqlScopedLifecycleInstallationStore::with_root(
+        libsql_filesystem(&db_path).await,
+        root.clone(),
+    );
+    let reopened = RebornLibSqlScopedLifecycleInstallationStore::with_root(
+        libsql_filesystem(&db_path).await,
+        root,
+    );
+
+    assert_scoped_lifecycle_store_resolves_shared_and_private_after_reopen(
+        &store,
+        &reopened,
+        "libsql-scoped",
+    )
+    .await;
 }
 
 #[cfg(feature = "postgres")]
@@ -508,6 +704,27 @@ async fn postgres_actor_identity_is_part_of_fingerprint_path_when_configured() {
     assert_actor_identity_is_part_of_fingerprint_path(
         &ledger,
         &unique_suffix("postgres-actor-isolation"),
+    )
+    .await;
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test]
+async fn postgres_scoped_lifecycle_store_resolves_shared_and_private_after_reopen_when_configured()
+{
+    let Some(filesystem) = postgres_filesystem().await else {
+        return;
+    };
+    let suffix = unique_suffix("postgres-scoped");
+    let root = scoped_lifecycle_root(&suffix);
+    let store = RebornPostgresScopedLifecycleInstallationStore::with_root(
+        Arc::clone(&filesystem),
+        root.clone(),
+    );
+    let reopened = RebornPostgresScopedLifecycleInstallationStore::with_root(filesystem, root);
+
+    assert_scoped_lifecycle_store_resolves_shared_and_private_after_reopen(
+        &store, &reopened, &suffix,
     )
     .await;
 }
