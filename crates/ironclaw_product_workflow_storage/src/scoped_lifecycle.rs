@@ -19,6 +19,7 @@ use ironclaw_product_workflow::{
 
 const DEFAULT_SCOPED_LIFECYCLE_ROOT: &str = "/engine/product_workflow/scoped_lifecycle";
 const SCOPED_LIFECYCLE_RECORD_KIND: &str = "scoped_lifecycle_installation";
+const SCOPED_LIFECYCLE_TOMBSTONE_RECORD_KIND: &str = "scoped_lifecycle_tombstone";
 
 pub struct FilesystemScopedLifecycleInstallationStore {
     filesystem: Arc<dyn RootFilesystem>,
@@ -79,11 +80,18 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
             || scoped_lifecycle_installation_path(&self.root, &installation),
             |existing| Ok(existing.path.clone()),
         )?;
-        let cas = existing
-            .as_ref()
-            .map_or(CasExpectation::Absent, |existing| {
-                CasExpectation::Version(existing.version)
-            });
+        let cas = match existing.as_ref() {
+            Some(existing) => CasExpectation::Version(existing.version),
+            None => match self.package_path_state(&path).await? {
+                PackagePathState::Absent => CasExpectation::Absent,
+                PackagePathState::Tombstone(version) => CasExpectation::Version(version),
+                PackagePathState::Occupied => {
+                    return Err(scoped_lifecycle_invalid_request(
+                        "scoped lifecycle installation package already exists for ownership",
+                    ));
+                }
+            },
+        };
         self.filesystem
             .put(
                 &path,
@@ -93,13 +101,7 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
             .await
             .map_err(|error| match error {
                 FilesystemError::VersionMismatch { .. } => {
-                    if existing.is_none() {
-                        scoped_lifecycle_invalid_request(
-                            "scoped lifecycle installation package already exists for ownership",
-                        )
-                    } else {
-                        scoped_lifecycle_transient("scoped lifecycle installation write conflict")
-                    }
+                    scoped_lifecycle_transient("scoped lifecycle installation write conflict")
                 }
                 error => scoped_lifecycle_filesystem_error("upsert installation", error),
             })?;
@@ -137,7 +139,7 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
         self.filesystem
             .put(
                 &existing.path,
-                entry_for_scoped_lifecycle_installation(&tombstone)?,
+                tombstone_entry_for_scoped_lifecycle_installation(&tombstone)?,
                 CasExpectation::Version(existing.version),
             )
             .await
@@ -147,13 +149,7 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
                 }
                 error => scoped_lifecycle_filesystem_error("mark installation deleted", error),
             })?;
-        match self.filesystem.delete(&existing.path).await {
-            Ok(()) | Err(FilesystemError::NotFound { .. }) => Ok(()),
-            Err(error) => Err(scoped_lifecycle_filesystem_error(
-                "delete installation",
-                error,
-            )),
-        }
+        Ok(())
     }
 
     async fn list_installations(
@@ -181,6 +177,24 @@ impl ScopedLifecycleInstallationStore for FilesystemScopedLifecycleInstallationS
 }
 
 impl FilesystemScopedLifecycleInstallationStore {
+    async fn package_path_state(
+        &self,
+        path: &VirtualPath,
+    ) -> Result<PackagePathState, ProductWorkflowError> {
+        let Some(entry) = self
+            .filesystem
+            .get(path)
+            .await
+            .map_err(|error| scoped_lifecycle_filesystem_error("load package path", error))?
+        else {
+            return Ok(PackagePathState::Absent);
+        };
+        if is_scoped_lifecycle_tombstone(&entry.entry) {
+            return Ok(PackagePathState::Tombstone(entry.version));
+        }
+        Ok(PackagePathState::Occupied)
+    }
+
     async fn load_installation(
         &self,
         tenant_id: &TenantId,
@@ -208,6 +222,9 @@ impl FilesystemScopedLifecycleInstallationStore {
                 .map_err(|error| scoped_lifecycle_filesystem_error("list installations", error))?;
             let entry_count = entries.len();
             for entry in entries {
+                if is_scoped_lifecycle_tombstone(&entry.entry) {
+                    continue;
+                }
                 let loaded = parse_versioned_scoped_lifecycle_installation(entry)?;
                 if loaded.installation.tenant_id() == tenant_id {
                     installations.push(loaded);
@@ -222,6 +239,12 @@ impl FilesystemScopedLifecycleInstallationStore {
         }
         Ok(installations)
     }
+}
+
+enum PackagePathState {
+    Absent,
+    Tombstone(RecordVersion),
+    Occupied,
 }
 
 struct VersionedScopedLifecycleInstallation {
@@ -347,9 +370,22 @@ fn default_scoped_lifecycle_root() -> VirtualPath {
 fn entry_for_scoped_lifecycle_installation(
     installation: &ScopedLifecycleInstallation,
 ) -> Result<Entry, ProductWorkflowError> {
+    entry_for_scoped_lifecycle_record(installation, SCOPED_LIFECYCLE_RECORD_KIND)
+}
+
+fn tombstone_entry_for_scoped_lifecycle_installation(
+    installation: &ScopedLifecycleInstallation,
+) -> Result<Entry, ProductWorkflowError> {
+    entry_for_scoped_lifecycle_record(installation, SCOPED_LIFECYCLE_TOMBSTONE_RECORD_KIND)
+}
+
+fn entry_for_scoped_lifecycle_record(
+    installation: &ScopedLifecycleInstallation,
+    record_kind: &'static str,
+) -> Result<Entry, ProductWorkflowError> {
     let payload = serde_json::to_value(installation)
         .map_err(|error| scoped_lifecycle_durable_error("serialize installation", error))?;
-    let kind = RecordKind::new(SCOPED_LIFECYCLE_RECORD_KIND).map_err(|error| {
+    let kind = RecordKind::new(record_kind).map_err(|error| {
         scoped_lifecycle_durable_error("construct scoped lifecycle record kind", error)
     })?;
     let entry = Entry::record(kind, &payload)
@@ -383,6 +419,13 @@ fn entry_for_scoped_lifecycle_installation(
             IndexValue::I64(installation.updated_at.timestamp_millis()),
         );
     Ok(entry)
+}
+
+fn is_scoped_lifecycle_tombstone(entry: &Entry) -> bool {
+    entry
+        .kind
+        .as_ref()
+        .is_some_and(|kind| kind.as_str() == SCOPED_LIFECYCLE_TOMBSTONE_RECORD_KIND)
 }
 
 fn parse_scoped_lifecycle_installation(
@@ -694,7 +737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn delete_uses_version_cas_before_removing_installation() {
+    async fn delete_uses_version_cas_without_physical_delete() {
         let admin = admin_actor();
         let existing = ScopedLifecycleInstallation::admin_shared(
             install_id(),
@@ -727,7 +770,7 @@ mod tests {
             filesystem.observed_cas().await,
             vec![CasExpectation::Version(version)]
         );
-        assert_eq!(filesystem.delete_count().await, 1);
+        assert_eq!(filesystem.delete_count().await, 0);
     }
 
     #[tokio::test]

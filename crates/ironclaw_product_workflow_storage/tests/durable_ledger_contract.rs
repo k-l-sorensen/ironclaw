@@ -448,6 +448,28 @@ async fn assert_scoped_lifecycle_store_resolves_shared_and_private_after_reopen(
         })
         .await
         .expect("delete concurrent package winner");
+    let replacement_calendar_id = scoped_install_id(suffix, "private-calendar-replacement");
+    let replacement_calendar = ScopedLifecycleInstallation::user_private(
+        replacement_calendar_id.clone(),
+        package_ref("calendar"),
+        other_user.clone(),
+        now,
+    );
+    store
+        .upsert_installation(UpsertScopedLifecycleInstallationRequest {
+            actor: other_user.clone(),
+            installation: replacement_calendar,
+        })
+        .await
+        .expect("recreate package after tombstone delete");
+    store
+        .delete_installation(DeleteScopedLifecycleInstallationRequest {
+            actor: other_user.clone(),
+            tenant_id: tenant.clone(),
+            installation_id: replacement_calendar_id,
+        })
+        .await
+        .expect("delete replacement package");
 
     let overwrite_as_user = store
         .upsert_installation(UpsertScopedLifecycleInstallationRequest {
