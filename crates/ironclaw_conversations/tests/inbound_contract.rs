@@ -70,6 +70,40 @@ async fn paired_actor_without_binding_creates_thread_binding_message_and_submits
 }
 
 #[tokio::test]
+async fn untrusted_inbound_uses_untrusted_binding_resolution_and_preserves_requested_scope_hints() {
+    let services = InMemoryConversationServices::default();
+    services
+        .pair_external_actor(
+            tenant(),
+            telegram(),
+            default_installation(),
+            external_actor("telegram-user-1"),
+            user("alice"),
+        )
+        .await;
+    let binding = UntrustedOnlyBindingService::new(services.clone());
+    let coordinator = Arc::new(RecordingTurnCoordinator::default());
+    let inbound = InboundTurnService::new(binding.clone(), services.clone(), coordinator);
+
+    inbound
+        .handle_inbound_turn(inbound_request(
+            telegram(),
+            external_actor("telegram-user-1"),
+            external_conversation("chat-untrusted-path", None),
+            "telegram-event-untrusted-path",
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(binding.untrusted_calls(), 1);
+    assert_eq!(binding.trusted_calls(), 0);
+    let resolve_requests = binding.resolve_requests();
+    assert_eq!(resolve_requests.len(), 1);
+    assert_eq!(resolve_requests[0].requested_agent_id, Some(agent()));
+    assert_eq!(resolve_requests[0].requested_project_id, Some(project()));
+}
+
+#[tokio::test]
 async fn unpaired_external_actor_returns_binding_required_before_message_or_turn_submission() {
     let services = InMemoryConversationServices::default();
     let coordinator = Arc::new(RecordingTurnCoordinator::default());
@@ -185,6 +219,7 @@ async fn trusted_scope_is_persisted_on_first_bind() {
             ),
             Some(AgentId::new("agent-alpha").unwrap()),
             Some(ProjectId::new("project-alpha").unwrap()),
+            None,
         )
         .await
         .expect("first bind");
@@ -192,6 +227,7 @@ async fn trusted_scope_is_persisted_on_first_bind() {
         first.turn_scope.agent_id.as_ref().map(AgentId::as_str),
         Some("agent-alpha")
     );
+    assert!(!first.turn_scope.has_explicit_thread_owner());
 
     let second = services
         .resolve_or_create_binding_with_trusted_scope(
@@ -203,6 +239,7 @@ async fn trusted_scope_is_persisted_on_first_bind() {
             ),
             Some(AgentId::new("agent-beta").unwrap()),
             Some(ProjectId::new("project-beta").unwrap()),
+            None,
         )
         .await
         .expect("existing bind");
@@ -213,6 +250,65 @@ async fn trusted_scope_is_persisted_on_first_bind() {
     assert_eq!(
         second.turn_scope.project_id.as_ref().map(ProjectId::as_str),
         Some("project-alpha")
+    );
+    assert!(!second.turn_scope.has_explicit_thread_owner());
+}
+
+#[tokio::test]
+async fn trusted_owner_is_persisted_on_first_bind() {
+    let services = InMemoryConversationServices::default();
+    services
+        .pair_external_actor(
+            tenant(),
+            telegram(),
+            default_installation(),
+            external_actor("telegram-user-1"),
+            user("alice"),
+        )
+        .await;
+
+    let first = services
+        .resolve_or_create_binding_with_trusted_scope(
+            resolve_request(
+                telegram(),
+                external_actor("telegram-user-1"),
+                external_conversation("chat-trusted-owner", None),
+                "telegram-event-trusted-owner-1",
+            ),
+            Some(AgentId::new("agent-alpha").unwrap()),
+            Some(ProjectId::new("project-alpha").unwrap()),
+            Some(user("owner-alpha")),
+        )
+        .await
+        .expect("first bind");
+    assert_eq!(
+        first
+            .turn_scope
+            .explicit_owner_user_id()
+            .map(UserId::as_str),
+        Some("owner-alpha")
+    );
+
+    let second = services
+        .resolve_or_create_binding_with_trusted_scope(
+            resolve_request(
+                telegram(),
+                external_actor("telegram-user-1"),
+                external_conversation("chat-trusted-owner", None),
+                "telegram-event-trusted-owner-2",
+            ),
+            Some(AgentId::new("agent-alpha").unwrap()),
+            Some(ProjectId::new("project-alpha").unwrap()),
+            Some(user("owner-beta")),
+        )
+        .await
+        .expect("existing bind");
+    assert_eq!(
+        second
+            .turn_scope
+            .explicit_owner_user_id()
+            .map(UserId::as_str),
+        Some("owner-alpha")
     );
 }
 
@@ -266,6 +362,7 @@ async fn trusted_scope_rejects_existing_unscoped_binding() {
             trusted_shared,
             Some(AgentId::new("agent-alpha").unwrap()),
             Some(ProjectId::new("project-alpha").unwrap()),
+            None,
         )
         .await
         .expect_err("trusted scope must not reinterpret legacy bindings");
@@ -284,6 +381,56 @@ async fn trusted_scope_rejects_existing_unscoped_binding() {
         .await
         .expect_err("rejected trusted resolve must not widen route access");
     assert!(matches!(err, InboundTurnError::AccessDenied { .. }));
+}
+
+#[tokio::test]
+async fn trusted_owner_backfills_legacy_shared_binding() {
+    let services = InMemoryConversationServices::default();
+    services
+        .pair_external_actor(
+            tenant(),
+            telegram(),
+            default_installation(),
+            external_actor("telegram-user-1"),
+            user("alice"),
+        )
+        .await;
+
+    let legacy = services
+        .resolve_or_create_binding(resolve_request(
+            telegram(),
+            external_actor("telegram-user-1"),
+            external_conversation("chat-legacy-owner", None),
+            "telegram-event-legacy-owner-unscoped",
+        ))
+        .await
+        .expect("legacy unscoped bind");
+    assert!(!legacy.turn_scope.has_explicit_thread_owner());
+
+    let mut trusted_owner_shared = resolve_request(
+        telegram(),
+        external_actor("telegram-user-1"),
+        external_conversation("chat-legacy-owner", None),
+        "telegram-event-legacy-owner-backfill",
+    );
+    trusted_owner_shared.route_kind = ConversationRouteKind::Shared;
+    let migrated = services
+        .resolve_or_create_binding_with_trusted_scope(
+            trusted_owner_shared,
+            None,
+            None,
+            Some(user("owner-alpha")),
+        )
+        .await
+        .expect("trusted owner should backfill legacy shared binding");
+
+    assert_eq!(
+        migrated
+            .turn_scope
+            .explicit_owner_user_id()
+            .map(UserId::as_str),
+        Some("owner-alpha")
+    );
 }
 
 #[tokio::test]
@@ -1163,6 +1310,49 @@ async fn permanent_turn_error_does_not_rotate_submit_idempotency_key() {
         coordinator.submissions()[0].idempotency_key,
         coordinator.submissions()[1].idempotency_key,
         "permanent turn errors should keep the original submit idempotency key for replay"
+    );
+}
+
+#[tokio::test]
+async fn capacity_exceeded_does_not_rotate_submit_idempotency_key() {
+    let services = InMemoryConversationServices::default();
+    services
+        .pair_external_actor(
+            tenant(),
+            telegram(),
+            default_installation(),
+            external_actor("telegram-user-1"),
+            user("alice"),
+        )
+        .await;
+    let coordinator = Arc::new(CapacityFailureTurnCoordinator::default());
+    let inbound = InboundTurnService::new(services.clone(), services.clone(), coordinator.clone());
+    let request = inbound_request(
+        telegram(),
+        external_actor("telegram-user-1"),
+        external_conversation("chat-1", None),
+        "telegram-event-capacity-error",
+    );
+
+    let first = inbound
+        .handle_inbound_turn(request.clone())
+        .await
+        .unwrap_err();
+    let second = inbound.handle_inbound_turn(request).await.unwrap_err();
+
+    assert!(matches!(
+        first,
+        InboundTurnError::TurnSubmissionFailed { .. }
+    ));
+    assert!(matches!(
+        second,
+        InboundTurnError::TurnSubmissionFailed { .. }
+    ));
+    assert_eq!(coordinator.submissions().len(), 2);
+    assert_eq!(
+        coordinator.submissions()[0].idempotency_key,
+        coordinator.submissions()[1].idempotency_key,
+        "capacity errors should keep the original submit idempotency key for replay"
     );
 }
 
@@ -2691,6 +2881,7 @@ impl ConversationBindingService for DriftBindingService {
         request: ironclaw_conversations::ResolveConversationRequest,
         _trusted_agent_id: Option<AgentId>,
         _trusted_project_id: Option<ProjectId>,
+        _trusted_owner_user_id: Option<UserId>,
     ) -> Result<ConversationBindingResolution, InboundTurnError> {
         self.resolve_or_create_binding(request).await
     }
@@ -2714,6 +2905,81 @@ impl ConversationBindingService for DriftBindingService {
         _request: ValidateReplyTargetRequest,
     ) -> Result<ReplyTargetBinding, InboundTurnError> {
         unimplemented!("not used by inbound facade tests")
+    }
+}
+
+#[derive(Clone)]
+struct UntrustedOnlyBindingService {
+    inner: InMemoryConversationServices,
+    resolve_requests: Arc<Mutex<Vec<ironclaw_conversations::ResolveConversationRequest>>>,
+    untrusted_calls: Arc<Mutex<usize>>,
+    trusted_calls: Arc<Mutex<usize>>,
+}
+
+impl UntrustedOnlyBindingService {
+    fn new(inner: InMemoryConversationServices) -> Self {
+        Self {
+            inner,
+            resolve_requests: Arc::new(Mutex::new(Vec::new())),
+            untrusted_calls: Arc::new(Mutex::new(0)),
+            trusted_calls: Arc::new(Mutex::new(0)),
+        }
+    }
+
+    fn untrusted_calls(&self) -> usize {
+        *self.untrusted_calls.lock().unwrap()
+    }
+
+    fn trusted_calls(&self) -> usize {
+        *self.trusted_calls.lock().unwrap()
+    }
+
+    fn resolve_requests(&self) -> Vec<ironclaw_conversations::ResolveConversationRequest> {
+        self.resolve_requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl ConversationBindingService for UntrustedOnlyBindingService {
+    async fn resolve_or_create_binding(
+        &self,
+        request: ironclaw_conversations::ResolveConversationRequest,
+    ) -> Result<ConversationBindingResolution, InboundTurnError> {
+        *self.untrusted_calls.lock().unwrap() += 1;
+        self.resolve_requests.lock().unwrap().push(request.clone());
+        self.inner.resolve_or_create_binding(request).await
+    }
+
+    async fn resolve_or_create_binding_with_trusted_scope(
+        &self,
+        _request: ironclaw_conversations::ResolveConversationRequest,
+        _trusted_agent_id: Option<AgentId>,
+        _trusted_project_id: Option<ProjectId>,
+        _trusted_owner_user_id: Option<UserId>,
+    ) -> Result<ConversationBindingResolution, InboundTurnError> {
+        *self.trusted_calls.lock().unwrap() += 1;
+        panic!("untrusted inbound must not call trusted resolver path")
+    }
+
+    async fn lookup_binding(
+        &self,
+        request: ironclaw_conversations::ResolveConversationRequest,
+    ) -> Result<ConversationBindingResolution, InboundTurnError> {
+        self.inner.lookup_binding(request).await
+    }
+
+    async fn link_conversation_to_thread(
+        &self,
+        request: LinkConversationRequest,
+    ) -> Result<LinkedConversationBinding, InboundTurnError> {
+        self.inner.link_conversation_to_thread(request).await
+    }
+
+    async fn validate_reply_target(
+        &self,
+        request: ValidateReplyTargetRequest,
+    ) -> Result<ReplyTargetBinding, InboundTurnError> {
+        self.inner.validate_reply_target(request).await
     }
 }
 
@@ -2743,6 +3009,11 @@ struct PermanentFailureTurnCoordinator {
     submissions: Mutex<Vec<SubmitTurnRequest>>,
 }
 
+#[derive(Default)]
+struct CapacityFailureTurnCoordinator {
+    submissions: Mutex<Vec<SubmitTurnRequest>>,
+}
+
 impl BusyFirstUniqueKeyCoordinator {
     fn submissions(&self) -> Vec<SubmitTurnRequest> {
         self.submissions.lock().unwrap().clone()
@@ -2761,8 +3032,18 @@ impl PermanentFailureTurnCoordinator {
     }
 }
 
+impl CapacityFailureTurnCoordinator {
+    fn submissions(&self) -> Vec<SubmitTurnRequest> {
+        self.submissions.lock().unwrap().clone()
+    }
+}
+
 #[async_trait]
 impl TurnCoordinator for PermanentFailureTurnCoordinator {
+    async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        Ok(TurnRunId::new())
+    }
+
     async fn submit_turn(
         &self,
         request: SubmitTurnRequest,
@@ -2790,7 +3071,44 @@ impl TurnCoordinator for PermanentFailureTurnCoordinator {
 }
 
 #[async_trait]
+impl TurnCoordinator for CapacityFailureTurnCoordinator {
+    async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        Ok(TurnRunId::new())
+    }
+
+    async fn submit_turn(
+        &self,
+        request: SubmitTurnRequest,
+    ) -> Result<SubmitTurnResponse, TurnError> {
+        self.submissions.lock().unwrap().push(request);
+        Err(TurnError::capacity_exceeded(
+            ironclaw_turns::TurnCapacityResource::SubmitTurn,
+            1,
+        ))
+    }
+
+    async fn resume_turn(
+        &self,
+        _request: ResumeTurnRequest,
+    ) -> Result<ResumeTurnResponse, TurnError> {
+        unimplemented!("not used by inbound facade tests")
+    }
+
+    async fn cancel_run(&self, _request: CancelRunRequest) -> Result<CancelRunResponse, TurnError> {
+        unimplemented!("not used by inbound facade tests")
+    }
+
+    async fn get_run_state(&self, _request: GetRunStateRequest) -> Result<TurnRunState, TurnError> {
+        unimplemented!("not used by inbound facade tests")
+    }
+}
+
+#[async_trait]
 impl TurnCoordinator for BusyFirstUniqueKeyCoordinator {
+    async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        Ok(TurnRunId::new())
+    }
+
     async fn submit_turn(
         &self,
         request: SubmitTurnRequest,
@@ -2825,6 +3143,10 @@ impl TurnCoordinator for BusyFirstUniqueKeyCoordinator {
 
 #[async_trait]
 impl TurnCoordinator for FailFirstTurnCoordinator {
+    async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        Ok(TurnRunId::new())
+    }
+
     async fn submit_turn(
         &self,
         request: SubmitTurnRequest,
@@ -2857,6 +3179,10 @@ impl TurnCoordinator for FailFirstTurnCoordinator {
 
 #[async_trait]
 impl TurnCoordinator for RecordingTurnCoordinator {
+    async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        Ok(TurnRunId::new())
+    }
+
     async fn submit_turn(
         &self,
         request: SubmitTurnRequest,

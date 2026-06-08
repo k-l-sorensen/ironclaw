@@ -7,9 +7,10 @@
 //! All three are model-visible; the agent-facing guidance lives in the
 //! prompt_doc_ref files (prompts/builtin/trace-commons-{onboard,status,credits}.md).
 
-use std::sync::Arc;
+use std::{panic::AssertUnwindSafe, sync::Arc};
 
 use async_trait::async_trait;
+use futures_util::FutureExt as _;
 use ironclaw_extensions::{CapabilityManifest, ExtensionError};
 use ironclaw_host_api::{
     CapabilityId, EffectKind, NetworkMethod, NetworkPolicy, PermissionMode, ResourceEstimate,
@@ -169,15 +170,20 @@ impl OnboardingHttpSink for HostEgressOnboardingSink {
             network_policy: NetworkPolicy::default(),
             credential_injections: Vec::new(),
             response_body_limit: Some(ONBOARD_MAX_RESPONSE_BODY),
+            // The onboarding response is parsed inline, never persisted to a
+            // mount, so no save target is requested (matches http::dispatch's
+            // `HttpSaveMode::Disabled` path).
+            save_body_to: None,
             timeout_ms: Some(ONBOARD_TIMEOUT_MS),
         };
         let egress = self.egress.clone();
-        let response = tokio::task::spawn_blocking(move || egress.execute(request))
+        // Catch a panic in the egress future so a faulty transport cannot abort
+        // the onboarding task; map it to a sanitized network error.
+        let response = AssertUnwindSafe(async move { egress.execute(request).await })
+            .catch_unwind()
             .await
-            .map_err(|error| {
-                if error.is_panic() {
-                    tracing::error!("trace_commons onboarding egress worker panicked");
-                }
+            .map_err(|_| {
+                tracing::error!("trace_commons onboarding egress future panicked");
                 OnboardError::Network {
                     reason: "onboarding egress worker failed".to_string(),
                 }
@@ -196,9 +202,10 @@ fn map_egress_error(error: RuntimeHttpEgressError) -> OnboardError {
     use ironclaw_host_api::RuntimeHttpEgressReasonCode as Code;
     let reason = error.stable_runtime_reason().to_string();
     match error.reason_code() {
-        Code::CredentialUnavailable | Code::RequestDenied | Code::NetworkError => {
-            OnboardError::Network { reason }
-        }
+        Code::CredentialUnavailable
+        | Code::RequestDenied
+        | Code::PolicyDenied
+        | Code::NetworkError => OnboardError::Network { reason },
         Code::ResponseError | Code::ResponseBodyLimitExceeded => {
             OnboardError::MalformedResponse { reason }
         }
@@ -459,8 +466,11 @@ mod tests {
             services: InvocationServices {
                 filesystem: Arc::new(LocalFilesystem::new()),
                 runtime_http_egress: None,
+                tool_call_http_egress: None,
                 process: Arc::new(NoopProcessPort),
                 secret_store: None,
+                audit_sink: None,
+                unsafe_raw_diagnostics_allowed: false,
             },
             input,
         }

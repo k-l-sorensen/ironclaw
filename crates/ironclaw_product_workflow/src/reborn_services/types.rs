@@ -1,5 +1,4 @@
 use chrono::{DateTime, Utc};
-use ironclaw_common::ExtensionName;
 use ironclaw_host_api::ThreadId;
 use ironclaw_product_adapters::{ProductOutboundEnvelope, ProjectionCursor};
 use ironclaw_threads::{SessionThreadRecord, SummaryArtifact, ThreadMessageRecord};
@@ -7,11 +6,67 @@ use ironclaw_turns::{
     AcceptedMessageRef, CancelRunResponse, EventCursor, GateRef, ResumeTurnResponse,
     SanitizedFailure, TurnCheckpointId, TurnRunId, TurnRunState, TurnStatus,
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+
+use crate::{
+    LifecyclePackageRef, LifecyclePhase, LifecycleProductPayload, LifecycleReadinessBlocker,
+};
+
+const OUTBOUND_DELIVERY_TARGET_ID_MAX_BYTES: usize = 512;
+const OUTBOUND_DELIVERY_CHANNEL_MAX_BYTES: usize = 128;
+const OUTBOUND_DELIVERY_DISPLAY_NAME_MAX_BYTES: usize = 256;
+const OUTBOUND_DELIVERY_DESCRIPTION_MAX_BYTES: usize = 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornConnectableChannelListResponse {
+    pub channels: Vec<RebornConnectableChannelInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornConnectableChannelInfo {
+    pub channel: String,
+    pub display_name: String,
+    pub strategy: RebornChannelConnectStrategy,
+    pub action: RebornChannelConnectAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command_aliases: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornChannelConnectStrategy {
+    InboundProofCode,
+    AdminManagedChannels,
+    WebGeneratedCode,
+    QrCode,
+    OAuth,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornChannelConnectAction {
+    pub title: String,
+    pub instructions: String,
+    #[serde(rename = "input_placeholder", alias = "code_placeholder")]
+    pub input_placeholder: String,
+    pub submit_label: String,
+    pub success_message: String,
+    pub error_message: String,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebornCreateThreadResponse {
     pub thread: SessionThreadRecord,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornDeleteThreadRequest {
+    pub thread_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornDeleteThreadResponse {
+    pub thread_id: ThreadId,
+    pub deleted: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,19 +245,701 @@ pub struct RebornListThreadsResponse {
     pub next_cursor: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RebornSetupExtensionStatus {
-    /// Concrete extension lifecycle is not yet wired into the native
-    /// Reborn surface. v2 callers receive this so the route inventory
-    /// is complete without coupling to v1's onboarding controller.
-    NotImplemented,
+/// Bounded browser projection for caller-scoped automations.
+///
+/// The beta API currently returns one capped page without a cursor. Future
+/// pagination can extend this response with an optional cursor without changing
+/// the source-tagged automation rows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornListAutomationsResponse {
+    pub automations: Vec<RebornAutomationInfo>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RebornSetupExtensionResponse {
-    pub extension_name: ExtensionName,
-    pub status: RebornSetupExtensionStatus,
+pub struct RebornOutboundPreferencesResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub payload: Option<serde_json::Value>,
+    pub final_reply_target: Option<RebornOutboundDeliveryTargetSummary>,
+    #[serde(default)]
+    pub default_modality: RebornOutboundDeliveryModality,
+}
+
+impl Default for RebornOutboundPreferencesResponse {
+    fn default() -> Self {
+        Self {
+            final_reply_target: None,
+            default_modality: RebornOutboundDeliveryModality::Text,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornOutboundDeliveryTargetListResponse {
+    pub targets: Vec<RebornOutboundDeliveryTargetOption>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornOutboundDeliveryTargetOption {
+    pub target: RebornOutboundDeliveryTargetSummary,
+    pub capabilities: RebornOutboundDeliveryTargetCapabilities,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "UncheckedRebornOutboundDeliveryTargetSummary")]
+pub struct RebornOutboundDeliveryTargetSummary {
+    pub target_id: RebornOutboundDeliveryTargetId,
+    pub channel: RebornOutboundDeliveryTargetChannel,
+    pub display_name: RebornOutboundDeliveryTargetDisplayName,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<RebornOutboundDeliveryTargetDescription>,
+}
+
+impl RebornOutboundDeliveryTargetSummary {
+    pub fn new(
+        target_id: RebornOutboundDeliveryTargetId,
+        channel: impl Into<String>,
+        display_name: impl Into<String>,
+        description: Option<String>,
+    ) -> Result<Self, String> {
+        Ok(Self {
+            target_id,
+            channel: RebornOutboundDeliveryTargetChannel::new(channel)?,
+            display_name: RebornOutboundDeliveryTargetDisplayName::new(display_name)?,
+            description: description
+                .map(RebornOutboundDeliveryTargetDescription::new)
+                .transpose()?,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+struct UncheckedRebornOutboundDeliveryTargetSummary {
+    target_id: RebornOutboundDeliveryTargetId,
+    channel: String,
+    display_name: String,
+    #[serde(default)]
+    description: Option<String>,
+}
+
+impl TryFrom<UncheckedRebornOutboundDeliveryTargetSummary> for RebornOutboundDeliveryTargetSummary {
+    type Error = String;
+
+    fn try_from(value: UncheckedRebornOutboundDeliveryTargetSummary) -> Result<Self, Self::Error> {
+        Self::new(
+            value.target_id,
+            value.channel,
+            value.display_name,
+            value.description,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct RebornOutboundDeliveryTargetChannel(String);
+
+impl RebornOutboundDeliveryTargetChannel {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        validate_outbound_delivery_display_field(
+            "outbound delivery channel",
+            &value,
+            OUTBOUND_DELIVERY_CHANNEL_MAX_BYTES,
+            true,
+        )?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for RebornOutboundDeliveryTargetChannel {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for RebornOutboundDeliveryTargetChannel {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for RebornOutboundDeliveryTargetChannel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<RebornOutboundDeliveryTargetChannel> for String {
+    fn from(value: RebornOutboundDeliveryTargetChannel) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct RebornOutboundDeliveryTargetDisplayName(String);
+
+impl RebornOutboundDeliveryTargetDisplayName {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        validate_outbound_delivery_display_field(
+            "outbound delivery display name",
+            &value,
+            OUTBOUND_DELIVERY_DISPLAY_NAME_MAX_BYTES,
+            true,
+        )?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for RebornOutboundDeliveryTargetDisplayName {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for RebornOutboundDeliveryTargetDisplayName {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for RebornOutboundDeliveryTargetDisplayName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<RebornOutboundDeliveryTargetDisplayName> for String {
+    fn from(value: RebornOutboundDeliveryTargetDisplayName) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct RebornOutboundDeliveryTargetDescription(String);
+
+impl RebornOutboundDeliveryTargetDescription {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        validate_outbound_delivery_display_field(
+            "outbound delivery description",
+            &value,
+            OUTBOUND_DELIVERY_DESCRIPTION_MAX_BYTES,
+            false,
+        )?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<String> for RebornOutboundDeliveryTargetDescription {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for RebornOutboundDeliveryTargetDescription {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for RebornOutboundDeliveryTargetDescription {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<RebornOutboundDeliveryTargetDescription> for String {
+    fn from(value: RebornOutboundDeliveryTargetDescription) -> Self {
+        value.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornOutboundDeliveryTargetCapabilities {
+    pub final_replies: bool,
+    pub gate_prompts: bool,
+    pub auth_prompts: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornOutboundDeliveryModality {
+    #[default]
+    Text,
+}
+
+/// Client-safe opaque outbound delivery target id.
+///
+/// Must be non-empty, at most 512 bytes, and free of leading/trailing
+/// whitespace, control characters, and unsafe invisible Unicode formatting
+/// characters.
+///
+/// Composition resolves this id to an adapter-owned reply target before writing
+/// outbound preferences.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "String")]
+pub struct RebornOutboundDeliveryTargetId(String);
+
+impl RebornOutboundDeliveryTargetId {
+    pub fn new(value: impl Into<String>) -> Result<Self, String> {
+        let value = value.into();
+        Self::validate(&value)?;
+        Ok(Self(value))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    fn validate(value: &str) -> Result<(), String> {
+        validate_outbound_delivery_display_field(
+            "outbound delivery target id",
+            value,
+            OUTBOUND_DELIVERY_TARGET_ID_MAX_BYTES,
+            true,
+        )
+    }
+}
+
+impl TryFrom<String> for RebornOutboundDeliveryTargetId {
+    type Error = String;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for RebornOutboundDeliveryTargetId {
+    fn as_ref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl std::fmt::Display for RebornOutboundDeliveryTargetId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl From<RebornOutboundDeliveryTargetId> for String {
+    fn from(value: RebornOutboundDeliveryTargetId) -> Self {
+        value.0
+    }
+}
+
+fn validate_outbound_delivery_display_field(
+    field_name: &str,
+    value: &str,
+    max_bytes: usize,
+    require_non_empty: bool,
+) -> Result<(), String> {
+    if require_non_empty && value.trim().is_empty() {
+        return Err(format!("{field_name} must not be empty"));
+    }
+    if value.len() > max_bytes {
+        return Err(format!("{field_name} must be at most {max_bytes} bytes"));
+    }
+    if value.trim() != value {
+        return Err(format!(
+            "{field_name} must not contain leading or trailing whitespace"
+        ));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(format!("{field_name} must not contain control characters"));
+    }
+    if has_unsafe_unicode_format_character(value) {
+        return Err(format!(
+            "{field_name} must not contain unsafe Unicode formatting characters"
+        ));
+    }
+    if has_line_or_paragraph_separator(value) {
+        return Err(format!(
+            "{field_name} must not contain line or paragraph separators"
+        ));
+    }
+    Ok(())
+}
+
+fn has_unsafe_unicode_format_character(value: &str) -> bool {
+    value.chars().any(|c| {
+        matches!(
+            c,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{00ad}'
+                | '\u{034f}'
+                | '\u{180e}'
+                | '\u{200b}'..='\u{200d}'
+                | '\u{2060}'
+                | '\u{feff}'
+        )
+    })
+}
+
+fn has_line_or_paragraph_separator(value: &str) -> bool {
+    value.chars().any(|c| matches!(c, '\u{2028}' | '\u{2029}'))
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornSetOutboundPreferencesRequest {
+    /// `Some(id)` sets the final-reply target; `None` clears it.
+    ///
+    /// The field defaults to `None` when omitted, so clients that want to leave
+    /// an existing value unchanged must use the read endpoint instead of
+    /// submitting a partial update without this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_reply_target_id: Option<RebornOutboundDeliveryTargetId>,
+}
+
+/// Allowlisted terminal status exposed by automation list projections.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornAutomationRunStatus {
+    Ok,
+    Error,
+}
+
+/// Allowlisted browser-visible state for automation list projections.
+///
+/// Unknown runtime states are collapsed to `unknown` so the browser DTO stays
+/// typed without surfacing raw backend strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornAutomationState {
+    Active,
+    Scheduled,
+    Paused,
+    Disabled,
+    Inactive,
+    Completed,
+    Unknown,
+}
+
+impl<'de> Deserialize<'de> for RebornAutomationState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct RebornAutomationStateVisitor;
+
+        impl<'de> de::Visitor<'de> for RebornAutomationStateVisitor {
+            type Value = RebornAutomationState;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a snake_case automation state string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(match value {
+                    "active" => RebornAutomationState::Active,
+                    "scheduled" => RebornAutomationState::Scheduled,
+                    "paused" => RebornAutomationState::Paused,
+                    "disabled" => RebornAutomationState::Disabled,
+                    "inactive" => RebornAutomationState::Inactive,
+                    "completed" => RebornAutomationState::Completed,
+                    "unknown" => RebornAutomationState::Unknown,
+                    _ => RebornAutomationState::Unknown,
+                })
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                self.visit_str(&value)
+            }
+        }
+
+        deserializer.deserialize_str(RebornAutomationStateVisitor)
+    }
+}
+
+/// Browser-safe automation row returned by the WebUI facade.
+///
+/// This deliberately exposes source, state, run timestamps, and sanitized
+/// status only; trigger repository internals remain behind the product facade.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornAutomationInfo {
+    pub automation_id: String,
+    pub name: String,
+    pub source: RebornAutomationSource,
+    pub state: RebornAutomationState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_run_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_run_at: Option<DateTime<Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_status: Option<RebornAutomationRunStatus>,
+    #[serde(default)]
+    pub is_active: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<DateTime<Utc>>,
+}
+
+/// Source discriminator for automation rows.
+///
+/// WebUI v2 exposes only user-facing schedules. The wire tag remains
+/// source-discriminated so future sources can be added without overloading the
+/// schedule fields or advertising unsupported sources early.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RebornAutomationSource {
+    Schedule { cron: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornExtensionListResponse {
+    pub extensions: Vec<RebornExtensionInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornSkillListResponse {
+    pub skills: Vec<RebornSkillInfo>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornSkillContentResponse {
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornSkillSearchResponse {
+    #[serde(default)]
+    pub catalog: Vec<serde_json::Value>,
+    #[serde(default)]
+    pub installed: Vec<RebornSkillInfo>,
+    #[serde(default)]
+    pub registry_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornSkillActionResponse {
+    pub success: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornSkillInfo {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub trust: RebornSkillTrustLevel,
+    pub source: RebornSkillSourceKind,
+    pub source_kind: RebornSkillSourceKind,
+    #[serde(default)]
+    pub keywords: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_source_url: Option<String>,
+    #[serde(default)]
+    pub has_requirements: bool,
+    #[serde(default)]
+    pub has_scripts: bool,
+    #[serde(default)]
+    pub can_edit: bool,
+    #[serde(default)]
+    pub can_delete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornSkillTrustLevel {
+    Trusted,
+    Installed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornSkillSourceKind {
+    User,
+    Installed,
+    Workspace,
+    System,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornExtensionRegistryResponse {
+    pub entries: Vec<RebornExtensionRegistryEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornExtensionRegistryEntry {
+    pub package_ref: LifecyclePackageRef,
+    pub display_name: String,
+    pub kind: String,
+    pub description: String,
+    pub installed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub keywords: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornExtensionInfo {
+    pub package_ref: LifecyclePackageRef,
+    pub display_name: String,
+    pub kind: String,
+    pub description: String,
+    pub authenticated: bool,
+    pub active: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+    pub needs_setup: bool,
+    pub has_auth: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activation_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding_state: Option<RebornExtensionOnboardingState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding: Option<RebornExtensionOnboardingPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornExtensionActionResponse {
+    pub success: bool,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activated: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub awaiting_token: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding_state: Option<RebornExtensionOnboardingState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding: Option<RebornExtensionOnboardingPayload>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornExtensionOnboardingState {
+    AuthRequired,
+    SetupRequired,
+    Installed,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornExtensionOnboardingPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_instructions: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_next_step: Option<String>,
+}
+
+/// WebUI v2 setup projection for extension lifecycle.
+///
+/// This intentionally uses the v2 `phase`/`blockers` lifecycle contract and
+/// omits the legacy `status` field from the earlier unimplemented route shape.
+/// The live browser consumer still uses the v1 setup route, so this v2 contract
+/// can become lifecycle-native before it has compatibility consumers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornSetupExtensionResponse {
+    pub package_ref: LifecyclePackageRef,
+    pub phase: LifecyclePhase,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blockers: Vec<LifecycleReadinessBlocker>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<LifecycleProductPayload>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<RebornExtensionSetupSecret>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<RebornExtensionSetupField>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub onboarding: Option<RebornExtensionOnboardingPayload>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornExtensionSetupSecret {
+    pub name: String,
+    pub provider: String,
+    pub prompt: String,
+    pub optional: bool,
+    pub provided: bool,
+    pub setup: RebornExtensionCredentialSetup,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ref: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RebornExtensionCredentialSetup {
+    ManualToken,
+    #[serde(rename = "oauth")]
+    OAuth {
+        account_label: String,
+        scopes: Vec<String>,
+        invocation_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornExtensionSetupField {
+    pub name: String,
+    pub prompt: String,
+    pub optional: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
 }

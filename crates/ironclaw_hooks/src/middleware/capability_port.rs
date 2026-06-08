@@ -132,7 +132,7 @@ impl HookedLoopCapabilityPort {
         self
     }
 
-    async fn hook_context(
+    pub(crate) async fn hook_context(
         &self,
         invocation: &CapabilityInvocation,
         provider: Option<ironclaw_host_api::ExtensionId>,
@@ -504,6 +504,7 @@ impl HookedLoopCapabilityPort {
                 match self.gate_ref_factory.mint_auth_ref(reason.as_str()).await {
                     Ok(gate_ref) => Some(CapabilityOutcome::AuthRequired {
                         gate_ref,
+                        credential_requirements: Vec::new(),
                         safe_summary: reason.as_str().to_string(),
                     }),
                     Err(_) => Some(fail_closed_gate_ref_unavailable(reason.as_str())),
@@ -547,10 +548,40 @@ fn serialized_len(value: &serde_json::Value) -> Result<u64, serde_json::Error> {
     Ok(writer.0)
 }
 
-/// Stable digest of capability arguments for hook context. The middleware
-/// hashes the input-ref's underlying value so two invocations with identical
-/// arguments produce the same digest, enabling repetition / rate-cap logic
-/// without exposing raw arguments to hook code.
+/// Stable digest of capability invocation identity for hook context. The
+/// middleware hashes the `(capability_id, input_ref)` pair so two
+/// invocations with the same capability id and the same input ref produce
+/// the same digest, enabling repetition / rate-cap logic without exposing
+/// raw arguments to hook code. The digest is over input-ref identity, not
+/// over the resolved argument content the input-ref points at — two
+/// distinct refs that happen to resolve to identical JSON will NOT share a
+/// digest, and the same ref representing changed underlying content will
+/// keep the same digest.
+///
+/// # Stability contract
+///
+/// This digest is part of the **public hook contract**. Repetition-detection
+/// hooks key on `BeforeCapabilityHookContext.arguments_digest` across
+/// invocations; a shifted digest silently breaks them. Changing the hashing
+/// structure (length-prefix ordering, hasher choice, which fields contribute)
+/// requires:
+///
+/// 1. Updating the fixture in
+///    `tests::invocation_arguments_digest_is_stable_for_known_inputs` with
+///    the new captured hex.
+/// 2. Surfacing the change in the cross-crate wire-format contract section
+///    of `crate::identity` (the same section that pins `HookId::to_hex()`).
+/// 3. Bumping the hook framework's contract version if downstream
+///    consumers exist.
+///
+/// What this digest is NOT:
+///
+/// - **Not** a content digest of the resolved capability arguments. Hooks
+///   that want to key on resolved content should use
+///   `CapabilityInputResolver` + `SanitizedArguments`, not this digest.
+/// - **Not** suitable as a primary key for cross-process deduplication —
+///   two distinct invocations with the same `input_ref` (rare but legal)
+///   produce the same digest.
 fn invocation_arguments_digest(invocation: &CapabilityInvocation) -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     let cap = invocation.capability_id.to_string();
@@ -647,7 +678,9 @@ mod tests {
                 result_ref: LoopResultRef::new(format!("result:{}", request.capability_id))
                     .expect("ok"),
                 safe_summary: format!("ran {}", request.capability_id),
+                progress: ironclaw_turns::run_profile::CapabilityProgress::MadeProgress,
                 terminate_hint: false,
+                byte_len: 0,
             }))
         }
 
@@ -709,6 +742,40 @@ mod tests {
         }
     }
 
+    /// Records the digest a real `BeforeCapability` hook receives, then passes.
+    #[derive(Clone)]
+    struct CapturingBeforeCapabilityHook {
+        captured: Arc<Mutex<Vec<[u8; 32]>>>,
+    }
+
+    impl CapturingBeforeCapabilityHook {
+        fn new() -> Self {
+            Self {
+                captured: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+
+        fn captured(&self) -> Vec<[u8; 32]> {
+            self.captured.lock().expect("not poisoned").clone()
+        }
+    }
+
+    #[async_trait]
+    impl RestrictedBeforeCapabilityHook for CapturingBeforeCapabilityHook {
+        async fn evaluate(
+            &self,
+            ctx: &BeforeCapabilityHookContext,
+            sink: &mut dyn RestrictedGateSink,
+        ) {
+            self.captured
+                .lock()
+                .expect("not poisoned")
+                .push(ctx.arguments_digest);
+            // Restricted hooks must make an explicit decision; no-op would fail closed.
+            sink.pass();
+        }
+    }
+
     fn dispatcher_with_restricted_hook(
         local: &str,
         hook: Box<dyn RestrictedBeforeCapabilityHook>,
@@ -726,6 +793,7 @@ mod tests {
             phase: HookPhase::Policy,
             priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
+            event_kind_filter: None,
             owning_extension: None,
             scope: HookBindingScope::Global,
             poisoned: false,
@@ -762,6 +830,234 @@ mod tests {
         }
     }
 
+    // Canonical digest fixture shared by helper-level and caller-driven pins.
+    // If the hex changes, audit every caller that keys on `arguments_digest`.
+    const SNAPSHOT_FIXTURE_DIGEST_HEX: &str =
+        "4d0ab78e009b32615c2766bd1c26921bd59ef81b5741a75387707f82f0344315";
+
+    fn snapshot_fixture_invocation() -> CapabilityInvocation {
+        CapabilityInvocation {
+            surface_version: ironclaw_turns::run_profile::CapabilitySurfaceVersion::new(
+                "snapshot:v1",
+            )
+            .expect("surface version literal is valid"),
+            capability_id: CapabilityId::new("cap.snapshot.fixture")
+                .expect("capability id literal is valid"),
+            input_ref: ironclaw_turns::run_profile::CapabilityInputRef::new(
+                "input:cap.snapshot.fixture",
+            )
+            .expect("input ref literal is valid"),
+        }
+    }
+
+    fn digest_hex(digest: &[u8; 32]) -> String {
+        digest.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn dispatcher_with_capturing_hook(hook: CapturingBeforeCapabilityHook) -> Arc<HookDispatcher> {
+        let (dispatcher, _) = dispatcher_with_restricted_hook("capture-digest", Box::new(hook));
+        dispatcher
+    }
+
+    fn assert_hook_observed_snapshot_digest(hook: &CapturingBeforeCapabilityHook, path: &str) {
+        let captured = hook.captured();
+        assert_eq!(
+            captured.len(),
+            1,
+            "hook must observe exactly one BeforeCapability context"
+        );
+        assert_eq!(
+            digest_hex(&captured[0]),
+            SNAPSHOT_FIXTURE_DIGEST_HEX,
+            "arguments_digest observed through {path} shifted; this is a \
+             hook-visible wire-contract break"
+        );
+    }
+
+    /// Snapshot regression: pins `invocation_arguments_digest` for a known
+    /// `(capability_id, input_ref)` pair. If this assertion fails, the
+    /// digest's hashing structure changed — see the stability contract on
+    /// `invocation_arguments_digest`. **Do not update the expected hex
+    /// without auditing every caller that keys on `arguments_digest`.**
+    #[test]
+    fn invocation_arguments_digest_is_stable_for_known_inputs() {
+        let invocation = CapabilityInvocation {
+            surface_version: ironclaw_turns::run_profile::CapabilitySurfaceVersion::new(
+                "snapshot:v1",
+            )
+            .expect("surface version literal is valid"),
+            capability_id: CapabilityId::new("cap.snapshot.fixture")
+                .expect("capability id literal is valid"),
+            input_ref: ironclaw_turns::run_profile::CapabilityInputRef::new(
+                "input:cap.snapshot.fixture",
+            )
+            .expect("input ref literal is valid"),
+        };
+        let digest = invocation_arguments_digest(&invocation);
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex, "4d0ab78e009b32615c2766bd1c26921bd59ef81b5741a75387707f82f0344315",
+            "invocation_arguments_digest shifted for a fixed input — \
+             this is a wire-contract break. See the stability-contract \
+             rustdoc on `invocation_arguments_digest`."
+        );
+    }
+
+    /// serrrfirat #3637 regression: pin the digest at the boundary that
+    /// hook authors actually observe — `BeforeCapabilityHookContext.arguments_digest`
+    /// produced by `HookedLoopCapabilityPort::hook_context`. If caller-side
+    /// wiring drifts (wrong field set, transform inserted, default value
+    /// leaked, or an alternate path bypassing the helper), this assertion
+    /// catches it while the helper-only snapshot would stay green.
+    #[tokio::test]
+    async fn hook_context_arguments_digest_is_stable_at_middleware_boundary() {
+        use ironclaw_host_api::TenantId;
+        use std::sync::Arc as StdArc;
+        struct NoopInner;
+        #[async_trait]
+        impl LoopCapabilityPort for NoopInner {
+            async fn visible_capabilities(
+                &self,
+                _request: VisibleCapabilityRequest,
+            ) -> Result<VisibleCapabilitySurface, AgentLoopHostError> {
+                unreachable!("snapshot test never calls visible_capabilities")
+            }
+            async fn invoke_capability(
+                &self,
+                _request: CapabilityInvocation,
+            ) -> Result<CapabilityOutcome, AgentLoopHostError> {
+                unreachable!("snapshot test never invokes through inner port")
+            }
+            async fn invoke_capability_batch(
+                &self,
+                _request: CapabilityBatchInvocation,
+            ) -> Result<CapabilityBatchOutcome, AgentLoopHostError> {
+                unreachable!("snapshot test never invokes through inner port")
+            }
+        }
+
+        let port = HookedLoopCapabilityPort::new(
+            StdArc::new(NoopInner),
+            StdArc::new(HookDispatcher::new(HookRegistry::new())),
+            TenantId::new("alpha").expect("ok"),
+        );
+        let invocation = CapabilityInvocation {
+            surface_version: ironclaw_turns::run_profile::CapabilitySurfaceVersion::new(
+                "snapshot:v1",
+            )
+            .expect("surface version literal is valid"),
+            capability_id: CapabilityId::new("cap.snapshot.fixture")
+                .expect("capability id literal is valid"),
+            input_ref: ironclaw_turns::run_profile::CapabilityInputRef::new(
+                "input:cap.snapshot.fixture",
+            )
+            .expect("input ref literal is valid"),
+        };
+        let ctx = port.hook_context(&invocation, None).await;
+        let hex: String = ctx
+            .arguments_digest
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(
+            hex, "4d0ab78e009b32615c2766bd1c26921bd59ef81b5741a75387707f82f0344315",
+            "BeforeCapabilityHookContext.arguments_digest shifted at the \
+             middleware boundary; this is a hook-visible wire-contract \
+            break, not just a helper-output drift."
+        );
+    }
+
+    /// Caller-driven regression pin for the digest hook authors observe.
+    #[tokio::test]
+    async fn invoke_capability_arguments_digest_is_stable_at_middleware_boundary() {
+        let inner = Arc::new(AlwaysCompletedPort::new());
+        let hook = CapturingBeforeCapabilityHook::new();
+        let dispatcher = dispatcher_with_capturing_hook(hook.clone());
+        let wrapped = HookedLoopCapabilityPort::new(inner.clone(), dispatcher, tenant());
+
+        let outcome = wrapped
+            .invoke_capability(snapshot_fixture_invocation())
+            .await
+            .expect("ok");
+
+        assert!(matches!(outcome, CapabilityOutcome::Completed(_)));
+        assert_eq!(
+            inner.calls().len(),
+            1,
+            "allowed invocation must reach inner"
+        );
+        assert_hook_observed_snapshot_digest(&hook, "invoke_capability");
+    }
+
+    /// Batch-path variant of the caller-driven digest pin.
+    #[tokio::test]
+    async fn invoke_capability_batch_arguments_digest_is_stable_at_middleware_boundary() {
+        let inner = Arc::new(AlwaysCompletedPort::new());
+        let hook = CapturingBeforeCapabilityHook::new();
+        let dispatcher = dispatcher_with_capturing_hook(hook.clone());
+        let wrapped = HookedLoopCapabilityPort::new(inner.clone(), dispatcher, tenant());
+
+        let batch = CapabilityBatchInvocation {
+            invocations: vec![snapshot_fixture_invocation(), snapshot_fixture_invocation()],
+            stop_on_first_suspension: false,
+        };
+        let outcome = wrapped.invoke_capability_batch(batch).await.expect("ok");
+
+        assert_eq!(outcome.outcomes.len(), 2);
+        assert!(
+            outcome
+                .outcomes
+                .iter()
+                .all(|o| matches!(o, CapabilityOutcome::Completed(_)))
+        );
+
+        let captured = hook.captured();
+        assert_eq!(
+            captured.len(),
+            2,
+            "hook must observe one BeforeCapability context per batch entry"
+        );
+        for digest in &captured {
+            assert_eq!(
+                digest_hex(digest),
+                SNAPSHOT_FIXTURE_DIGEST_HEX,
+                "arguments_digest observed through invoke_capability_batch shifted; \
+                 this is a hook-visible wire-contract break"
+            );
+        }
+
+        let batch_calls = inner.batch_calls();
+        assert_eq!(
+            batch_calls.len(),
+            1,
+            "allowed batch must reach inner as exactly one batched call"
+        );
+        assert_eq!(batch_calls[0].len(), 2, "both entries batched together");
+    }
+
+    /// Distinct inputs must produce distinct digests (sanity check; the
+    /// snapshot test pins one specific point in input space, this widens
+    /// coverage to the structural property).
+    #[test]
+    fn invocation_arguments_digest_differs_for_different_input_refs() {
+        let cap_id = CapabilityId::new("cap.x").expect("ok");
+        let surface = ironclaw_turns::run_profile::CapabilitySurfaceVersion::new("v").expect("ok");
+        let a = CapabilityInvocation {
+            surface_version: surface.clone(),
+            capability_id: cap_id.clone(),
+            input_ref: ironclaw_turns::run_profile::CapabilityInputRef::new("input:a").expect("ok"),
+        };
+        let b = CapabilityInvocation {
+            surface_version: surface,
+            capability_id: cap_id,
+            input_ref: ironclaw_turns::run_profile::CapabilityInputRef::new("input:b").expect("ok"),
+        };
+        assert_ne!(
+            invocation_arguments_digest(&a),
+            invocation_arguments_digest(&b)
+        );
+    }
+
     fn invocation(capability: &str) -> CapabilityInvocation {
         CapabilityInvocation {
             surface_version: CapabilitySurfaceVersion::new("v1").expect("ok"),
@@ -784,6 +1080,7 @@ mod tests {
             phase: HookPhase::Policy,
             priority: HookPriority::DEFAULT,
             point: HookPointSpec::BeforeCapability,
+            event_kind_filter: None,
             owning_extension: None,
             scope: HookBindingScope::Global,
             poisoned: false,
@@ -898,6 +1195,7 @@ mod tests {
             CapabilityOutcome::AuthRequired {
                 gate_ref,
                 safe_summary,
+                ..
             } => {
                 assert!(gate_ref.as_str().starts_with("gate:hook-auth-"));
                 assert_eq!(safe_summary, "needs auth for this capability");
@@ -1037,6 +1335,7 @@ mod tests {
                 phase: HookPhase::Telemetry,
                 priority: HookPriority::DEFAULT,
                 point: HookPointSpec::AfterCapability,
+                event_kind_filter: None,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
                 poisoned: false,
@@ -1246,6 +1545,7 @@ mod tests {
                 point: HookPointSpec::AfterCapability,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
+                event_kind_filter: None,
                 poisoned: false,
             })
             .expect("ok");
@@ -1741,6 +2041,7 @@ mod tests {
                 point: HookPointSpec::BeforeCapability,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
+                event_kind_filter: None,
                 poisoned: false,
             })
             .expect("insert no_input");
@@ -1754,6 +2055,7 @@ mod tests {
                 point: HookPointSpec::BeforeCapability,
                 owning_extension: None,
                 scope: HookBindingScope::Global,
+                event_kind_filter: None,
                 poisoned: false,
             })
             .expect("insert needs_input");
@@ -1862,6 +2164,7 @@ mod tests {
             point: HookPointSpec::BeforeCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,
+            event_kind_filter: None,
             poisoned: false,
         };
 
@@ -1875,6 +2178,7 @@ mod tests {
             point: HookPointSpec::AfterCapability,
             owning_extension: None,
             scope: HookBindingScope::Global,
+            event_kind_filter: None,
             poisoned: false,
         };
 

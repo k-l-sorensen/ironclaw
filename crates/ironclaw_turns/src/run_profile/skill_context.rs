@@ -5,15 +5,18 @@
 //!
 //! # Trust and Visibility Model
 //!
-//! Every installed skill in a run has two dimensions that gate what the model sees:
+//! Every installed skill in a run has three dimensions that gate what the model sees:
 //!
 //! - **Trust level** ([`SkillTrustLevel`]): determines how much content the model receives.
-//!   `Trusted` skills include their full prompt content; `Installed` skills expose only
-//!   a safe description.
+//!   `Trusted` skills may include prompt content after activation; `Installed` skills expose
+//!   only a safe description.
 //!
 //! - **Visibility** ([`SkillVisibility`]): determines whether the model sees the skill at all.
 //!   `Visible` skills appear in the context; `Hidden` and `Denied` skills are omitted entirely
 //!   so the model has no knowledge of their existence.
+//!
+//! - **Activation state** ([`SkillActivationState`]): determines whether a visible trusted
+//!   skill is only discoverable metadata or loaded prompt context.
 //!
 //! # Fail-closed semantics
 //!
@@ -40,7 +43,8 @@ use crate::LoopMessageRef;
 
 use super::snippet_ref::stable_skill_snippet_display_hash;
 use super::{
-    AgentLoopHostError, AgentLoopHostErrorKind, LoopContextSnippet, LoopContextSnippetMetadata,
+    AgentLoopHostError, AgentLoopHostErrorKind, LOOP_CONTEXT_SNIPPET_MODEL_CONTENT_MAX_BYTES,
+    LOOP_CONTEXT_TOTAL_MODEL_CONTENT_MAX_BYTES, LoopContextSnippet, LoopContextSnippetMetadata,
 };
 
 // ---------------------------------------------------------------------------
@@ -105,13 +109,13 @@ pub enum SkillVisibility {
 /// on `ironclaw_skills`.
 ///
 /// - `Installed`: read-only context; the model sees only the safe description.
-/// - `Trusted`: full context; the model sees description and prompt content.
+/// - `Trusted`: loaded context may include description and prompt content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkillTrustLevel {
     /// Registry/external skill — description only, no prompt content.
     Installed,
-    /// User-placed/trusted skill — description and prompt content.
+    /// User-placed/trusted skill — description and, once loaded, prompt content.
     Trusted,
 }
 
@@ -124,31 +128,60 @@ impl SkillTrustLevel {
     }
 }
 
+/// Activation state for a skill in the current run.
+///
+/// Discovery exposes only safe metadata. Loaded skills may expose prompt
+/// content when the host also marks them trusted and visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkillActivationState {
+    /// The model may know this skill exists, but prompt content is withheld.
+    Discoverable,
+    /// The skill was deterministically selected for the run.
+    Loaded,
+}
+
+impl SkillActivationState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Discoverable => "discoverable",
+            Self::Loaded => "loaded",
+        }
+    }
+}
+
+fn default_skill_activation_state() -> SkillActivationState {
+    SkillActivationState::Loaded
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot types and context budgets
 // ---------------------------------------------------------------------------
 
 const EMPTY_SNAPSHOT_VERSION: &str = "empty";
-const DEFAULT_MAX_SKILL_SNIPPET_BYTES: usize = 8 * 1024;
-const DEFAULT_MAX_SKILL_CONTEXT_BYTES: usize = 32 * 1024;
+// Trusted skill prompts can be materially larger than their safe descriptions.
+// Use the shared loop-context model-content limits here so prompt construction
+// has one bounded policy for host-approved model-visible snippet content.
+const DEFAULT_MAX_SKILL_SNIPPET_BYTES: usize = LOOP_CONTEXT_SNIPPET_MODEL_CONTENT_MAX_BYTES;
+const DEFAULT_MAX_SKILL_CONTEXT_BYTES: usize = LOOP_CONTEXT_TOTAL_MODEL_CONTENT_MAX_BYTES;
 
 /// Byte budgets for model-visible skill context produced by [`SkillContextService`].
 ///
 /// Hosts can map a run's context profile to these limits via
-/// [`SkillContextService::with_budget`]. Both limits fail closed when exceeded.
+/// [`SkillContextService::with_budget`]. The aggregate limit fails closed when exceeded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SkillContextBudget {
-    /// Maximum bytes for one snippet summary.
+    /// Maximum bytes for one model-visible skill snippet.
     pub max_snippet_bytes: usize,
-    /// Maximum aggregate bytes across emitted snippet refs and summaries.
+    /// Maximum aggregate bytes across emitted snippet refs and model-visible content.
     pub max_context_bytes: usize,
 }
 
 impl SkillContextBudget {
     /// Create explicit skill-context budget limits.
-    pub const fn new(max_snippet_bytes: usize, max_context_bytes: usize) -> Self {
+    pub const fn new(max_context_bytes: usize) -> Self {
         Self {
-            max_snippet_bytes,
+            max_snippet_bytes: DEFAULT_MAX_SKILL_SNIPPET_BYTES,
             max_context_bytes,
         }
     }
@@ -176,8 +209,12 @@ pub struct InstalledSkillSnapshot {
     pub trust: SkillTrustLevel,
     /// Visibility — determines whether the model sees this skill at all.
     pub visibility: SkillVisibility,
+    /// Activation state — determines whether prompt content may be disclosed.
+    #[serde(default = "default_skill_activation_state")]
+    pub activation_state: SkillActivationState,
     /// Full prompt content. Only included in model context when
-    /// `trust == Trusted` and `visibility == Visible`.
+    /// `trust == Trusted`, `visibility == Visible`, and
+    /// `activation_state == Loaded`.
     pub prompt_content: Option<String>,
     /// Sanitized description safe for model consumption.
     pub safe_description: String,
@@ -220,6 +257,7 @@ impl SkillRunSnapshot {
             return Self::empty();
         }
 
+        entries.iter_mut().for_each(canonicalize_skill_entry);
         entries.sort_by(compare_skill_entries);
         let version = compute_snapshot_version(&entries);
         Self {
@@ -235,7 +273,9 @@ impl SkillRunSnapshot {
 pub struct SkillContextSnippet {
     /// Reference identifier, e.g. `skill:<name>`.
     pub snippet_ref: String,
-    /// Sanitized summary containing only the safe description and optionally prompt content.
+    /// Full model-visible skill content.
+    pub model_content: String,
+    /// Short sanitized summary for metadata and diagnostics.
     pub safe_summary: String,
     /// Model-visible skill name used for telemetry, never for authority decisions.
     pub skill_name: String,
@@ -248,6 +288,7 @@ impl SkillContextSnippet {
     pub fn into_loop_snippet(self) -> LoopContextSnippet {
         LoopContextSnippet {
             snippet_ref: self.snippet_ref,
+            model_content: self.model_content,
             safe_summary: self.safe_summary,
             metadata: Some(LoopContextSnippetMetadata {
                 source_name: self.skill_name,
@@ -335,34 +376,36 @@ impl SkillContextSource for SkillContextService {
         let mut total_bytes = 0usize;
 
         for entry in visible {
-            let safe_summary = match entry.trust {
-                SkillTrustLevel::Trusted => {
-                    if let Some(ref content) = entry.prompt_content {
-                        format!("{}\n\n{}", entry.safe_description, content)
-                    } else {
-                        entry.safe_description.clone()
-                    }
+            let model_content = if can_disclose_prompt_content(entry) {
+                if let Some(ref content) = entry.prompt_content {
+                    format!("{}\n\n{}", entry.safe_description, content)
+                } else {
+                    entry.safe_description.clone()
                 }
-                SkillTrustLevel::Installed => entry.safe_description.clone(),
+            } else {
+                entry.safe_description.clone()
             };
+            let safe_summary = entry.safe_description.clone();
 
-            if safe_summary.len() > self.budget.max_snippet_bytes {
+            if model_content.len() > self.budget.max_snippet_bytes {
                 return Err(SkillContextError::ContextBudgetExceeded);
             }
 
             validate_model_visible_skill_name(&entry.name)?;
-            validate_model_visible_text(&safe_summary)?;
+            validate_model_visible_content(&model_content)?;
+            validate_model_visible_summary(&safe_summary)?;
 
             let snippet_ref = format!("skill:{}", entry.name);
             total_bytes = checked_context_total_bytes(
                 total_bytes,
                 snippet_ref.len(),
-                safe_summary.len(),
+                model_content.len(),
                 self.budget.max_context_bytes,
             )?;
 
             snippets.push(SkillContextSnippet {
                 snippet_ref,
+                model_content,
                 safe_summary,
                 skill_name: entry.name.clone(),
                 trust: entry.trust,
@@ -467,14 +510,9 @@ fn validate_snapshot(snapshot: &SkillRunSnapshot) -> Result<(), SkillContextErro
         return Err(SkillContextError::InvalidSnapshotVersion);
     }
 
-    let expected_version = if entries_are_sorted_by_key(&snapshot.entries) {
-        compute_snapshot_version(&snapshot.entries)
-    } else {
-        let mut sorted_entries = snapshot.entries.clone();
-        sorted_entries.sort_by(compare_skill_entries);
-        compute_snapshot_version(&sorted_entries)
-    };
-    if snapshot.snapshot_version != expected_version {
+    if snapshot.snapshot_version != expected_snapshot_version(snapshot, compute_snapshot_version)
+        && !legacy_snapshot_version_matches(snapshot)
+    {
         return Err(SkillContextError::InvalidSnapshotVersion);
     }
 
@@ -482,10 +520,7 @@ fn validate_snapshot(snapshot: &SkillRunSnapshot) -> Result<(), SkillContextErro
 }
 
 fn validate_budget(budget: SkillContextBudget) -> Result<(), SkillContextError> {
-    if budget.max_snippet_bytes == 0
-        || budget.max_context_bytes == 0
-        || budget.max_snippet_bytes > budget.max_context_bytes
-    {
+    if budget.max_context_bytes == 0 {
         return Err(SkillContextError::BudgetMisconfigured);
     }
 
@@ -496,6 +531,32 @@ fn entries_are_sorted_by_key(entries: &[InstalledSkillSnapshot]) -> bool {
     entries
         .windows(2)
         .all(|pair| compare_skill_entries(&pair[0], &pair[1]) != Ordering::Greater)
+}
+
+fn expected_snapshot_version(
+    snapshot: &SkillRunSnapshot,
+    compute_version: fn(&[InstalledSkillSnapshot]) -> String,
+) -> String {
+    if entries_are_sorted_by_key(&snapshot.entries) {
+        compute_version(&snapshot.entries)
+    } else {
+        let mut sorted_entries = snapshot.entries.clone();
+        sorted_entries.sort_by(compare_skill_entries);
+        compute_version(&sorted_entries)
+    }
+}
+
+fn legacy_snapshot_version_matches(snapshot: &SkillRunSnapshot) -> bool {
+    if !snapshot
+        .entries
+        .iter()
+        .all(|entry| entry.activation_state == SkillActivationState::Loaded)
+    {
+        return false;
+    }
+
+    snapshot.snapshot_version
+        == expected_snapshot_version(snapshot, compute_legacy_snapshot_version)
 }
 
 fn compare_visible_skill_entries(
@@ -511,8 +572,21 @@ fn compare_skill_entries(a: &InstalledSkillSnapshot, b: &InstalledSkillSnapshot)
         .then_with(|| a.name.cmp(&b.name))
         .then_with(|| trust_rank(a.trust).cmp(&trust_rank(b.trust)))
         .then_with(|| visibility_rank(a.visibility).cmp(&visibility_rank(b.visibility)))
+        .then_with(|| activation_rank(a.activation_state).cmp(&activation_rank(b.activation_state)))
         .then_with(|| a.safe_description.cmp(&b.safe_description))
         .then_with(|| a.prompt_content.cmp(&b.prompt_content))
+}
+
+fn canonicalize_skill_entry(entry: &mut InstalledSkillSnapshot) {
+    if !can_disclose_prompt_content(entry) {
+        entry.prompt_content = None;
+    }
+}
+
+fn can_disclose_prompt_content(entry: &InstalledSkillSnapshot) -> bool {
+    entry.trust == SkillTrustLevel::Trusted
+        && entry.visibility == SkillVisibility::Visible
+        && entry.activation_state == SkillActivationState::Loaded
 }
 
 const fn trust_rank(trust: SkillTrustLevel) -> u8 {
@@ -527,6 +601,13 @@ const fn visibility_rank(visibility: SkillVisibility) -> u8 {
         SkillVisibility::Visible => 0,
         SkillVisibility::Hidden => 1,
         SkillVisibility::Denied => 2,
+    }
+}
+
+const fn activation_rank(activation_state: SkillActivationState) -> u8 {
+    match activation_state {
+        SkillActivationState::Discoverable => 0,
+        SkillActivationState::Loaded => 1,
     }
 }
 
@@ -546,7 +627,18 @@ fn validate_model_visible_skill_name(name: &str) -> Result<(), SkillContextError
     Ok(())
 }
 
-fn validate_model_visible_text(text: &str) -> Result<(), SkillContextError> {
+fn validate_model_visible_content(text: &str) -> Result<(), SkillContextError> {
+    if text
+        .chars()
+        .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
+    {
+        return Err(SkillContextError::UnsafeModelVisibleContent);
+    }
+
+    Ok(())
+}
+
+fn validate_model_visible_summary(text: &str) -> Result<(), SkillContextError> {
     if text
         .chars()
         .any(|ch| ch.is_control() && !matches!(ch, '\n' | '\r' | '\t'))
@@ -602,12 +694,12 @@ fn contains_ascii_case_insensitive(haystack: &str, needle: &str) -> bool {
 fn checked_context_total_bytes(
     current_total: usize,
     snippet_ref_bytes: usize,
-    safe_summary_bytes: usize,
+    model_content_bytes: usize,
     max_context_bytes: usize,
 ) -> Result<usize, SkillContextError> {
     let next_total = current_total
         .checked_add(snippet_ref_bytes)
-        .and_then(|total| total.checked_add(safe_summary_bytes))
+        .and_then(|total| total.checked_add(model_content_bytes))
         .ok_or(SkillContextError::ContextBudgetExceeded)?;
 
     if next_total > max_context_bytes {
@@ -622,6 +714,44 @@ fn checked_context_total_bytes(
 /// Uses a SHA-256 digest over length-prefixed field data. The digest is collision-resistant
 /// for consistency checks, but is not an authenticity proof or authorization decision.
 fn compute_snapshot_version(sorted_entries: &[InstalledSkillSnapshot]) -> String {
+    let mut digest = Sha256::new();
+
+    for entry in sorted_entries {
+        feed_digest_field(&mut digest, entry.name.as_bytes());
+        feed_digest_field(
+            &mut digest,
+            match entry.trust {
+                SkillTrustLevel::Installed => b"installed",
+                SkillTrustLevel::Trusted => b"trusted",
+            },
+        );
+        feed_digest_field(
+            &mut digest,
+            match entry.visibility {
+                SkillVisibility::Visible => b"visible",
+                SkillVisibility::Hidden => b"hidden",
+                SkillVisibility::Denied => b"denied",
+            },
+        );
+        feed_digest_field(&mut digest, entry.activation_state.as_str().as_bytes());
+        match entry.prompt_content {
+            Some(ref content) => {
+                digest.update([1]);
+                feed_digest_field(&mut digest, content.as_bytes());
+            }
+            None => digest.update([0]),
+        }
+        feed_digest_field(&mut digest, entry.safe_description.as_bytes());
+        feed_digest_field(&mut digest, entry.ordering_key.as_bytes());
+        digest.update([0xFE]);
+    }
+
+    format!("sha256:{}", hex::encode(digest.finalize()))
+}
+
+/// Compute the pre-activation-state snapshot version for persisted snapshots
+/// serialized before progressive skill disclosure was introduced.
+fn compute_legacy_snapshot_version(sorted_entries: &[InstalledSkillSnapshot]) -> String {
     let mut digest = Sha256::new();
 
     for entry in sorted_entries {
@@ -677,6 +807,7 @@ mod tests {
             name: "alpha".to_string(),
             trust: SkillTrustLevel::Trusted,
             visibility: SkillVisibility::Visible,
+            activation_state: SkillActivationState::Loaded,
             prompt_content: Some("prompt".to_string()),
             safe_description: "description".to_string(),
             ordering_key: "alpha".to_string(),

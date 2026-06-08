@@ -846,14 +846,19 @@ impl DurableEventLog for JsonlDurableEventLog {
     ) -> Result<EventReplay<RuntimeEvent>, EventError> {
         let owned_filter = filter.clone();
         self.store
-            .read_after(
-                StreamKind::Runtime,
-                stream,
-                filter,
-                after,
-                limit,
-                move |event| owned_filter.matches_event(event),
-            )
+            .read_runtime_after(StreamKind::Runtime, stream, after, limit, move |event| {
+                owned_filter.matches_event(event)
+            })
+            .await
+    }
+
+    async fn head_cursor(
+        &self,
+        stream: &EventStreamKey,
+        after: EventCursor,
+    ) -> Result<EventCursor, EventError> {
+        self.store
+            .head_cursor(StreamKind::Runtime, stream, after)
             .await
     }
 }
@@ -1012,6 +1017,70 @@ impl JsonlStore {
         .map_err(|_| durable_error("jsonl event store failed to read stream"))?
     }
 
+    async fn read_runtime_after(
+        &self,
+        kind: StreamKind,
+        stream: &EventStreamKey,
+        after: Option<EventCursor>,
+        limit: usize,
+        is_match: impl Fn(&RuntimeEvent) -> bool + Send + 'static,
+    ) -> Result<EventReplay<RuntimeEvent>, EventError> {
+        if limit == 0 {
+            return Err(EventError::InvalidReplayRequest {
+                reason: "limit must be greater than zero".to_string(),
+            });
+        }
+        let after = after.unwrap_or_default();
+        let lock = self.stream_lock(kind, stream).await;
+        let _guard = lock.lock().await;
+        let path = self.stream_path(kind, stream);
+        tokio::task::spawn_blocking(move || {
+            stream_read_after_with(
+                &path,
+                after,
+                limit,
+                is_match,
+                trusted_runtime_jsonl_entry_from_str,
+            )
+        })
+        .await
+        .map_err(|_| durable_error("jsonl event store failed to read stream"))?
+    }
+
+    /// Atomic head snapshot: read the last assigned cursor directly from the
+    /// stream file's tail. `read_last_jsonl_cursor` seeks to EOF and parses
+    /// only the final line, so this is O(1) in stream length — never an
+    /// unbounded forward scan. We take the in-process stream lock (and the
+    /// shared OS lock inside the reader is unnecessary here because we only
+    /// read the already-committed last line) so a concurrent in-process append
+    /// cannot interleave a partial tail line. The observed last cursor is the
+    /// true head at the instant of the call.
+    ///
+    /// `after` is the caller's known-valid resume cursor. A head strictly below
+    /// `after` means the caller asked for a foreign / future cursor, so we
+    /// surface [`EventError::ReplayGap`] — mirroring `read_after`.
+    async fn head_cursor(
+        &self,
+        kind: StreamKind,
+        stream: &EventStreamKey,
+        after: EventCursor,
+    ) -> Result<EventCursor, EventError> {
+        let lock = self.stream_lock(kind, stream).await;
+        let _guard = lock.lock().await;
+        let path = self.stream_path(kind, stream);
+        let head = tokio::task::spawn_blocking(move || read_last_jsonl_cursor(&path))
+            .await
+            .map_err(|_| durable_error("jsonl event store failed to read stream head"))??
+            .unwrap_or(0);
+        if after.as_u64() > head {
+            return Err(EventError::ReplayGap {
+                requested: after,
+                earliest: EventCursor::new(head),
+            });
+        }
+        Ok(EventCursor::new(head))
+    }
+
     async fn stream_lock(&self, kind: StreamKind, stream: &EventStreamKey) -> Arc<Mutex<()>> {
         let key = stream_lock_key(kind, stream);
         let mut locks = self.locks.lock().await;
@@ -1064,6 +1133,13 @@ impl StreamKind {
 struct JsonlEntry<T> {
     cursor: EventCursor,
     record: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustedRuntimeJsonlEntry {
+    cursor: EventCursor,
+    #[serde(deserialize_with = "ironclaw_events::deserialize_trusted_runtime_event")]
+    record: RuntimeEvent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1140,6 +1216,20 @@ where
     T: DeserializeOwned,
     F: Fn(&T) -> bool,
 {
+    stream_read_after_with(path, after, limit, is_match, parse_jsonl_entry::<T>)
+}
+
+fn stream_read_after_with<T, F, D>(
+    path: &Path,
+    after: EventCursor,
+    limit: usize,
+    is_match: F,
+    decode_entry: D,
+) -> Result<EventReplay<T>, EventError>
+where
+    F: Fn(&T) -> bool,
+    D: Fn(&str) -> Result<JsonlEntry<T>, EventError>,
+{
     use std::io::{BufRead, BufReader};
 
     let file = match std::fs::File::open(path) {
@@ -1206,11 +1296,7 @@ where
         // strictly greater than `after`.
         after_validated = true;
         last_scanned = envelope_cursor;
-        let envelope = serde_json::from_str::<JsonlEntry<T>>(&line).map_err(|error| {
-            EventError::Serialize {
-                reason: error.to_string(),
-            }
-        })?;
+        let envelope = decode_entry(&line)?;
         if !is_match(&envelope.record) {
             continue;
         }
@@ -1244,6 +1330,29 @@ where
     Ok(EventReplay {
         entries: replay_entries,
         next_cursor,
+    })
+}
+
+fn parse_jsonl_entry<T>(line: &str) -> Result<JsonlEntry<T>, EventError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str::<JsonlEntry<T>>(line).map_err(|error| EventError::Serialize {
+        reason: error.to_string(),
+    })
+}
+
+fn trusted_runtime_jsonl_entry_from_str(
+    line: &str,
+) -> Result<JsonlEntry<RuntimeEvent>, EventError> {
+    let envelope = serde_json::from_str::<TrustedRuntimeJsonlEntry>(line).map_err(|error| {
+        EventError::Serialize {
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(JsonlEntry {
+        cursor: envelope.cursor,
+        record: envelope.record,
     })
 }
 
@@ -1433,9 +1542,91 @@ async fn create_secure_dir_all(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use ironclaw_host_api::{AgentId, TenantId, UserId};
+    use ironclaw_host_api::{
+        AgentId, CapabilityId, InvocationId, ProjectId, ResourceScope, TenantId, UserId,
+    };
 
     use super::*;
+
+    fn jsonl_scope() -> ResourceScope {
+        ResourceScope {
+            tenant_id: TenantId::new("default").expect("tenant id"),
+            user_id: UserId::new("alice").expect("user id"),
+            agent_id: Some(AgentId::new("default").expect("agent id")),
+            project_id: Some(ProjectId::new("project-a").expect("project id")),
+            mission_id: None,
+            thread_id: None,
+            invocation_id: InvocationId::new(),
+        }
+    }
+
+    async fn jsonl_event_log(root: std::path::PathBuf) -> Arc<dyn DurableEventLog> {
+        build_reborn_event_stores(
+            RebornProfile::LocalDev,
+            RebornEventStoreConfig::Jsonl {
+                root,
+                accept_single_node_durable: false,
+            },
+        )
+        .await
+        .expect("build jsonl event store")
+        .events
+    }
+
+    #[tokio::test]
+    async fn jsonl_head_cursor_reports_latest_and_rejects_future() {
+        // The JSONL production backend's head_cursor is the replay/live
+        // boundary probe taken at subscription start. A cursor-arithmetic bug
+        // or a missed ReplayGap would silently misclassify replay vs live, so
+        // exercise the empty-stream, post-append, mid-stream, and future-cursor
+        // cases directly. Mirrors the filesystem backend contract test.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = jsonl_event_log(temp.path().join("event-store")).await;
+        let scope = jsonl_scope();
+        let stream = EventStreamKey::from_scope(&scope);
+        let capability = CapabilityId::new("demo.echo").expect("capability id");
+
+        // Empty stream: head is origin (no records yet).
+        assert_eq!(
+            log.head_cursor(&stream, EventCursor::origin())
+                .await
+                .expect("head of empty stream"),
+            EventCursor::origin()
+        );
+
+        for _ in 0..3 {
+            log.append(RuntimeEvent::dispatch_requested(
+                scope.clone(),
+                capability.clone(),
+            ))
+            .await
+            .expect("append");
+        }
+
+        // Head is the latest appended cursor.
+        assert_eq!(
+            log.head_cursor(&stream, EventCursor::origin())
+                .await
+                .expect("head after 3 appends"),
+            EventCursor::new(3)
+        );
+        // Probing from a valid mid-stream cursor still returns the true head.
+        assert_eq!(
+            log.head_cursor(&stream, EventCursor::new(2))
+                .await
+                .expect("head from mid-stream cursor"),
+            EventCursor::new(3)
+        );
+        // A cursor beyond head is a foreign/future cursor -> ReplayGap.
+        let err = log
+            .head_cursor(&stream, EventCursor::new(99))
+            .await
+            .expect_err("future cursor must be rejected");
+        assert!(
+            matches!(err, EventError::ReplayGap { .. }),
+            "expected ReplayGap, got {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn jsonl_stream_lock_registry_prunes_released_locks() {

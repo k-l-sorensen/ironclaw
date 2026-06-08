@@ -9,8 +9,12 @@ pub use bounded_ring::BoundedRing;
 pub use ironclaw_turns::LoopFailureKind;
 pub use signature::{ArgsHash, CapabilityCallSignature, CapabilityCallSignatureError};
 pub use slots::{
-    CapabilityStrategyState, ContextStrategyState, GateStrategyState, ModelStrategyState,
-    RecoveryAttemptClass, RecoveryStrategyState, StopStrategyState,
+    CapabilityStrategyState, CompactionPromptSnapshot, CompactionStrategyState,
+    ContextStrategyState, DeferredCompactionWatermark, GateStrategyState, GoalRefreshStrategyState,
+    IndexedMessageKind, MessageIndexEntry, ModelStrategyState, PostCapabilityStageState,
+    RecoveryAttemptClass, RecoveryStrategyState, RepeatedCallWarningPhase,
+    RepeatedCallWarningState, ReplyAdmissionRejection, ReplyAdmissionRejectionReason,
+    ReplyAdmissionStrategyState, StopStrategyState,
 };
 
 use ironclaw_turns::{
@@ -18,10 +22,11 @@ use ironclaw_turns::{
     run_profile::{CapabilitySurfaceVersion, LoopInputCursor, LoopRunContext},
 };
 
-/// Checkpoint payload schema reserved for the default Reborn loop.
+/// Initial checkpoint payload schema reserved for the default Reborn loop.
 ///
-/// Changing the payload layout is a compatibility break and requires an
-/// explicit migration plan.
+/// Reborn checkpoint persistence has not shipped yet, so this branch is still
+/// defining the v1 payload shape. Once persisted checkpoints are in use,
+/// changing this layout requires an explicit schema bump and migration plan.
 pub const CHECKPOINT_SCHEMA_ID: &str = "reborn:default-loop-v1";
 pub const CHECKPOINT_SCHEMA_VERSION: u64 = 1;
 
@@ -49,12 +54,29 @@ pub struct LoopExecutionState {
     // executor-observed (populated by executor; read-only to strategies)
     pub recent_call_signatures: BoundedRing<CapabilityCallSignature, 8>,
     pub recent_failure_kinds: BoundedRing<LoopFailureKind, 8>,
+    /// Rolling window of assistant-output token counts (from
+    /// `LoopModelResponse::usage.output_tokens`). The default stop
+    /// strategy uses this to detect diminishing-returns loops:
+    /// `noprogress_window` consecutive turns whose output stays at or
+    /// below `min_delta_tokens` → `StopKind::NoProgressDetected`
+    /// (#3841 follow-up F1).
+    pub recent_output_token_counts: BoundedRing<u32, 8>,
 
     // strategy slots — one per strategy that mutates state.
     pub context_state: ContextStrategyState,
     pub capability_state: CapabilityStrategyState,
     pub model_state: ModelStrategyState,
+    #[serde(default)]
+    pub compaction_state: CompactionStrategyState,
+    #[serde(default)]
+    pub compaction_prompt: CompactionPromptSnapshot,
+    #[serde(default)]
+    pub post_capability_state: PostCapabilityStageState,
+    #[serde(default)]
+    pub goal_refresh_state: GoalRefreshStrategyState,
     pub recovery_state: RecoveryStrategyState,
+    #[serde(default)]
+    pub reply_admission_state: ReplyAdmissionStrategyState,
     pub stop_state: StopStrategyState,
     pub gate_state: GateStrategyState,
 }
@@ -78,10 +100,16 @@ impl LoopExecutionState {
             surface_version: None,
             recent_call_signatures: BoundedRing::new(),
             recent_failure_kinds: BoundedRing::new(),
+            recent_output_token_counts: BoundedRing::new(),
             context_state: ContextStrategyState::default(),
             capability_state: CapabilityStrategyState::default(),
             model_state: ModelStrategyState::default(),
+            compaction_state: CompactionStrategyState::default(),
+            compaction_prompt: CompactionPromptSnapshot::default(),
+            post_capability_state: PostCapabilityStageState::default(),
+            goal_refresh_state: GoalRefreshStrategyState::default(),
             recovery_state: RecoveryStrategyState::default(),
+            reply_admission_state: ReplyAdmissionStrategyState::default(),
             stop_state: StopStrategyState::default(),
             gate_state: GateStrategyState::default(),
         }
@@ -394,6 +422,30 @@ mod tests {
     }
 
     #[test]
+    fn compaction_prompt_snapshot_round_trips_through_checkpoints() {
+        let context = test_run_context();
+        let mut state = LoopExecutionState::initial_for_run(&context);
+        state.compaction_prompt =
+            CompactionPromptSnapshot::from_message_index(vec![MessageIndexEntry {
+                sequence: 1,
+                kind: IndexedMessageKind::User,
+                estimated_tokens: 42,
+            }]);
+
+        let value = serde_json::to_value(&state).unwrap();
+        assert!(
+            value
+                .as_object()
+                .expect("state serializes as object")
+                .contains_key("compaction_prompt")
+        );
+        let restored: LoopExecutionState = serde_json::from_value(value).unwrap();
+
+        assert_eq!(restored.compaction_prompt, state.compaction_prompt);
+        assert_eq!(restored.compaction_state, state.compaction_state);
+    }
+
+    #[test]
     fn loop_execution_state_has_no_control_state_field() {
         // Grep-style assertion: when serialized, the JSON object must carry
         // `stop_state` and `gate_state` and must NOT carry `control_state`.
@@ -510,5 +562,51 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    /// Round-2 test coverage: verify that a non-default `post_capability_state`
+    /// (populated `pending_capability_bytes` + `skip_model_this_iteration = true`)
+    /// survives `to_checkpoint_payload` / `from_checkpoint_payload` intact.
+    ///
+    /// This is the replay-correctness gate: if these fields are lost on
+    /// checkpoint encode/decode, a resumed run would start with a stale byte
+    /// accumulator or would incorrectly re-run the model that was supposed to
+    /// be skipped.
+    #[test]
+    fn post_capability_state_with_bytes_round_trips_through_checkpoint() {
+        let context = test_run_context();
+        let mut state = LoopExecutionState::initial_for_run(&context);
+
+        // Seed pending_capability_bytes with a non-zero entry.
+        let cap_id = CapabilityId::new("builtin.http").expect("valid capability id");
+        state
+            .post_capability_state
+            .pending_capability_bytes
+            .insert(cap_id.clone(), 33_001);
+        // Also set skip_model_this_iteration to verify it round-trips.
+        state.post_capability_state.skip_model_this_iteration = true;
+
+        let payload = encode_payload(&state);
+        let restored =
+            LoopExecutionState::from_checkpoint_payload(&payload, CheckpointKind::BeforeModel)
+                .expect("decode checkpoint payload");
+
+        assert_eq!(
+            restored
+                .post_capability_state
+                .pending_capability_bytes
+                .get(&cap_id),
+            Some(&33_001),
+            "pending_capability_bytes must survive checkpoint encode/decode"
+        );
+        assert!(
+            restored.post_capability_state.skip_model_this_iteration,
+            "skip_model_this_iteration must survive checkpoint encode/decode"
+        );
+        // Full equality check — no other fields must have changed.
+        assert_eq!(
+            restored.post_capability_state, state.post_capability_state,
+            "entire PostCapabilityStageState must round-trip without loss"
+        );
     }
 }

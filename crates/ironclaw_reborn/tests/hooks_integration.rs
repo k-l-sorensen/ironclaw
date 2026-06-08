@@ -29,10 +29,17 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use tokio::sync::Notify;
 
 use async_trait::async_trait;
 use chrono::Utc;
+use ironclaw_events::{
+    DurableEventLog, DurableEventSink, EventCursor as RuntimeEventCursor, EventSink,
+    EventStreamKey, InMemoryDurableEventLog, InMemorySecurityAuditSink, ReadScope, RuntimeEvent,
+    RuntimeEventKind, SecurityAuditSink, SecurityBoundary, SecurityDecision,
+};
 use ironclaw_hooks::HookRegistrar;
 use ironclaw_hooks::dispatch::{HookDispatcher, HookDispatcherBuilder};
 use ironclaw_hooks::error::HookError;
@@ -46,20 +53,24 @@ use ironclaw_hooks::manifest::{
 };
 use ironclaw_hooks::ordering::HookPhase;
 use ironclaw_hooks::points::{
-    BeforeCapabilityHookContext, BeforePromptHookContext, ObserverHookContext,
+    BeforeCapabilityHookContext, BeforePromptHookContext, EventTriggeredHookContext,
+    ObserverHookContext,
 };
 use ironclaw_hooks::predicate::{
     CapabilityPredicate, HookPredicateSpec, OnExceededAction, ValueOrRateBound,
 };
 use ironclaw_hooks::registry::{HookBindingScope, HookPointSpec, HookRegistry};
 use ironclaw_hooks::sink::{
-    ObserverHook, ObserverSink, PrivilegedBeforeCapabilityHook, PrivilegedGateSink,
-    RestrictedBeforeCapabilityHook, RestrictedGateSink,
+    EventTriggeredHook, ObserverHook, ObserverSink, PrivilegedBeforeCapabilityHook,
+    PrivilegedGateSink, RestrictedBeforeCapabilityHook, RestrictedGateSink,
 };
 use ironclaw_hooks::wasm::{
     WasmHookModuleRequest, WasmHookModuleResolver, WasmHookRuntime, WasmHookRuntimeError,
 };
-use ironclaw_host_api::{AgentId, CapabilityId, ProjectId, TenantId, ThreadId, UserId};
+use ironclaw_host_api::{
+    AgentId, CapabilityId, InvocationId, ProjectId, ResourceScope, RuntimeKind, TenantId, ThreadId,
+    UserId,
+};
 use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
     HostManagedModelResponse, LoopCapabilityInputResolver,
@@ -69,7 +80,8 @@ use ironclaw_reborn::hook_gate_refs::{
     InMemoryHookGateRouter, RouterBackedHookGateRefFactory, hook_gate_arguments_digest,
 };
 use ironclaw_reborn::loop_driver_host::{
-    RebornLoopDriverHostFactory, RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
+    EventTriggeredHookSubscription, RebornLoopDriverHostFactory, RebornLoopDriverHostRequest,
+    TextOnlyLoopHostConfig,
 };
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
@@ -87,10 +99,10 @@ use ironclaw_turns::{
         AgentLoopHostError, CapabilityBatchInvocation, CapabilityBatchOutcome,
         CapabilityDeniedReasonKind, CapabilityDescriptorView, CapabilityInputRef,
         CapabilityInvocation, CapabilityOutcome, CapabilityResultMessage, CapabilitySurfaceVersion,
-        InMemoryLoopHostMilestoneSink, LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort,
-        LoopCheckpointRequest, LoopHostMilestoneKind, LoopModelPort, LoopModelRequest,
-        LoopPromptPort, LoopRunContext, LoopTranscriptPort, RunScopedHookMilestoneSink,
-        VisibleCapabilityRequest, VisibleCapabilitySurface,
+        InMemoryLoopHostMilestoneSink, InstructionSafetyContext, LoopCapabilityPort,
+        LoopCheckpointKind, LoopCheckpointPort, LoopCheckpointRequest, LoopHostMilestoneKind,
+        LoopModelPort, LoopModelRequest, LoopPromptPort, LoopRunContext, LoopTranscriptPort,
+        RunScopedHookMilestoneSink, VisibleCapabilityRequest, VisibleCapabilitySurface,
     },
     runner::ClaimedTurnRun,
 };
@@ -203,7 +215,9 @@ impl LoopCapabilityPort for RecordingCapabilityPort {
             result_ref: LoopResultRef::new(format!("result:{}", request.capability_id))
                 .expect("result ref literal is valid"),
             safe_summary: "stub capability completed".to_string(),
+            progress: ironclaw_turns::run_profile::CapabilityProgress::MadeProgress,
             terminate_hint: false,
+            byte_len: 0,
         }))
     }
 
@@ -273,7 +287,9 @@ impl LoopCapabilityPort for ProviderAwareCapabilityPort {
             result_ref: LoopResultRef::new(format!("result:{}", request.capability_id))
                 .expect("result ref literal is valid"),
             safe_summary: "stub capability completed".to_string(),
+            progress: ironclaw_turns::run_profile::CapabilityProgress::MadeProgress,
             terminate_hint: false,
+            byte_len: 0,
         }))
     }
 
@@ -395,6 +411,189 @@ impl RestrictedBeforeCapabilityHook for PauseApprovalHook {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SeenRuntimeEvent {
+    cursor: RuntimeEventCursor,
+    kind: RuntimeEventKind,
+    provider: Option<ironclaw_host_api::ExtensionId>,
+    hook_id: Option<String>,
+    is_replay: bool,
+}
+
+/// Recorder used by event-triggered hook integration tests. Pairs the
+/// observed-events vec with a `Notify` so `wait_for_seen_events` can
+/// suspend until the next event arrives instead of polling on a 10 ms
+/// timer — see henrypark133 nit #8 on PR #3640.
+#[derive(Default)]
+struct SeenLog {
+    events: Mutex<Vec<SeenRuntimeEvent>>,
+    notify: Notify,
+}
+
+impl SeenLog {
+    fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    fn push(&self, event: SeenRuntimeEvent) {
+        self.events
+            .lock()
+            .expect("seen-event mutex not poisoned")
+            .push(event);
+        // `notify_one` is a permit-store; an arriving event before the
+        // waiter parks still wakes the waiter on its next `notified()`.
+        self.notify.notify_one();
+    }
+
+    fn snapshot(&self) -> Vec<SeenRuntimeEvent> {
+        self.events
+            .lock()
+            .expect("seen-event mutex not poisoned")
+            .clone()
+    }
+
+    fn len(&self) -> usize {
+        self.events
+            .lock()
+            .expect("seen-event mutex not poisoned")
+            .len()
+    }
+}
+
+struct RecordingEventTriggeredHook {
+    seen: Arc<SeenLog>,
+    delay: Option<Duration>,
+}
+
+#[async_trait]
+impl EventTriggeredHook for RecordingEventTriggeredHook {
+    async fn observe(&self, ctx: &EventTriggeredHookContext<'_>, sink: &mut dyn ObserverSink) {
+        if let Some(delay) = self.delay {
+            tokio::time::sleep(delay).await;
+        }
+        self.seen.push(SeenRuntimeEvent {
+            cursor: ctx.event_cursor,
+            kind: ctx.event.kind,
+            provider: ctx.event.provider.clone(),
+            hook_id: ctx.event.hook_id.clone(),
+            is_replay: ctx.is_replay,
+        });
+        sink.note(NoteCategory::HookFired, "event hook fired");
+    }
+}
+
+fn event_triggered_dispatcher(
+    event_kind: RuntimeEventKind,
+    seen: Arc<SeenLog>,
+) -> Arc<HookDispatcher> {
+    event_triggered_dispatcher_with_scope(
+        event_kind,
+        seen,
+        HookBindingScope::Global,
+        "integration-tests",
+        None,
+    )
+}
+
+fn event_triggered_dispatcher_with_scope(
+    event_kind: RuntimeEventKind,
+    seen: Arc<SeenLog>,
+    scope: HookBindingScope,
+    owning_extension: &str,
+    delay: Option<Duration>,
+) -> Arc<HookDispatcher> {
+    let hook_id = HookId::derive(
+        &ExtensionId::new(owning_extension.to_string()).expect("extension id literal is valid"),
+        "0.0.1",
+        &HookLocalId::new(format!(
+            "event-{}",
+            format!("{event_kind:?}").to_lowercase()
+        ))
+        .expect("hook local id literal is valid"),
+        HookVersion::ONE,
+    );
+    HookDispatcherBuilder::new(HookRegistry::new())
+        .with_timeout(Duration::from_millis(500))
+        .install_installed_event_triggered(
+            hook_id,
+            HookPhase::Telemetry,
+            event_kind,
+            ironclaw_host_api::ExtensionId::new(owning_extension).expect("valid ext id"),
+            scope,
+            Box::new(RecordingEventTriggeredHook { seen, delay }),
+        )
+        .expect("event-triggered hook installs")
+        .build_arc()
+}
+
+/// No-op `before_capability` hook used only to register a *subject* binding in
+/// the dispatcher's registry. PR #3931 (Hole 2): hook-lifecycle ownership is
+/// resolved from the registry by `hook_id`, never from the forgeable carried
+/// `provider`. A legitimate Phase 5 alerting flow therefore needs the subject
+/// hook present in the registry so its owner resolves; this hook lets tests
+/// register such subjects without affecting capability dispatch.
+struct NoopSubjectHook;
+
+#[async_trait]
+impl RestrictedBeforeCapabilityHook for NoopSubjectHook {
+    async fn evaluate(
+        &self,
+        _ctx: &BeforeCapabilityHookContext,
+        _sink: &mut dyn RestrictedGateSink,
+    ) {
+        // No opinion: registering this binding only makes its owner resolvable
+        // via `owning_extension_for_hook_hex`.
+    }
+}
+
+/// Like [`event_triggered_dispatcher_with_scope`], but also registers the
+/// supplied `subjects` (`(hook_id, owning_extension)`) as installed
+/// `before_capability` bindings so the registry can resolve their owners for
+/// hook-lifecycle event scope filtering (PR #3931, Hole 2). The subjects never
+/// fire for the lifecycle event kind under test; they exist purely as registry
+/// owner anchors.
+fn event_triggered_dispatcher_with_subjects(
+    event_kind: RuntimeEventKind,
+    seen: Arc<SeenLog>,
+    scope: HookBindingScope,
+    owning_extension: &str,
+    subjects: &[(HookId, ironclaw_host_api::ExtensionId)],
+) -> Arc<HookDispatcher> {
+    let watcher_id = HookId::derive(
+        &ExtensionId::new(owning_extension.to_string()).expect("extension id literal is valid"),
+        "0.0.1",
+        &HookLocalId::new(format!(
+            "event-{}",
+            format!("{event_kind:?}").to_lowercase()
+        ))
+        .expect("hook local id literal is valid"),
+        HookVersion::ONE,
+    );
+    let mut builder = HookDispatcherBuilder::new(HookRegistry::new())
+        .with_timeout(Duration::from_millis(500))
+        .install_installed_event_triggered(
+            watcher_id,
+            HookPhase::Telemetry,
+            event_kind,
+            ironclaw_host_api::ExtensionId::new(owning_extension).expect("valid ext id"),
+            scope,
+            Box::new(RecordingEventTriggeredHook { seen, delay: None }),
+        )
+        .expect("event-triggered hook installs");
+    for (subject_id, subject_owner) in subjects {
+        builder = builder
+            .install_installed_before_capability(
+                *subject_id,
+                HookPhase::Policy,
+                subject_owner.clone(),
+                HookBindingScope::OwnCapabilities,
+                Box::new(NoopSubjectHook),
+            )
+            .expect("subject before_capability hook installs");
+    }
+    builder.build_arc()
+}
+
 fn pause_approval_dispatcher() -> Arc<HookDispatcher> {
     let hook_id = HookId::derive(
         &ExtensionId::new("integration-tests").expect("valid ExtensionId in test"),
@@ -445,6 +644,38 @@ fn predicate_deny_dispatcher() -> Arc<HookDispatcher> {
         )
         .expect("Installed-tier predicate hook installs at policy phase")
         .build_arc()
+}
+
+/// Same predicate-deny hook as [`predicate_deny_dispatcher`], but returns the
+/// pre-`build_arc` [`HookDispatcherBuilder`] so the host factory's
+/// builder-factory path can attach a security-audit sink before sealing. This
+/// is the only dispatcher-installation path that consumes
+/// `RebornLoopDriverHostFactory::with_hook_security_audit_sink`.
+fn predicate_deny_builder() -> HookDispatcherBuilder {
+    let hook_id = HookId::derive(
+        &ExtensionId::new("integration-tests").expect("valid ExtensionId in test"),
+        "0.0.1",
+        &HookLocalId::new("deny-cap-blocked").expect("valid HookLocalId in test"),
+        HookVersion::ONE,
+    );
+    let spec = HookPredicateSpec::DenyCapability {
+        when: CapabilityPredicate::NameEquals {
+            name: "cap.blocked".to_string(),
+        },
+        reason: "integration-test deny rule".to_string(),
+    };
+    let evaluator = Arc::new(PredicateEvaluator::new());
+    let hook = PredicateBackedBeforeCapabilityHook::new(hook_id, spec, evaluator);
+
+    HookDispatcherBuilder::new(HookRegistry::new())
+        .install_installed_before_capability(
+            hook_id,
+            HookPhase::Policy,
+            ironclaw_host_api::ExtensionId::new("integration-tests").expect("valid ext id"),
+            HookBindingScope::Global,
+            Box::new(hook),
+        )
+        .expect("Installed-tier predicate hook installs at policy phase")
 }
 
 fn selective_deny_dispatcher(target: &str) -> Arc<HookDispatcher> {
@@ -533,11 +764,12 @@ fn wasm_dispatcher_from_wat_with_timeout(
     if let Some(timeout) = dispatcher_timeout {
         builder = builder.with_timeout(timeout);
     }
+    let entries = vec![entry];
     let (builder, ids) = registrar
         .install(
             ironclaw_host_api::ExtensionId::new("integration-tests").expect("valid ext id"),
-            "0.0.1".to_string(),
-            vec![entry],
+            "0.0.1",
+            &entries,
             builder,
         )
         .expect("wasm hook installs");
@@ -565,11 +797,12 @@ fn wasm_before_prompt_dispatcher_from_wat(
     )
     .with_scope(HookManifestScope::OwnCapabilities);
     let builder = HookDispatcherBuilder::new(HookRegistry::new());
+    let entries = vec![entry];
     let (builder, _ids) = registrar
         .install(
             ironclaw_host_api::ExtensionId::new("integration-tests").expect("valid ext id"),
-            "0.0.1".to_string(),
-            vec![entry],
+            "0.0.1",
+            &entries,
             builder,
         )
         .expect("wasm before_prompt hook installs");
@@ -785,7 +1018,7 @@ impl Fixture {
             tenant_id: tenant_id.clone(),
             agent_id: agent_id.clone(),
             project_id: Some(project_id.clone()),
-            owner_user_id: None,
+            owner_user_id: Some(user_id.clone()),
             mission_id: None,
         };
         thread_service
@@ -841,6 +1074,7 @@ impl Fixture {
             received_at: Utc::now(),
             checkpoint_id: None,
             gate_ref: None,
+            credential_requirements: Vec::new(),
             failure: None,
             event_cursor: EventCursor(1),
         };
@@ -880,6 +1114,7 @@ impl Fixture {
                 max_messages: 8,
                 require_model_route_snapshot: false,
             },
+            InstructionSafetyContext::local_development_noop(),
         )
     }
 
@@ -902,6 +1137,38 @@ fn router_backed_factory(
         HookGateReservationContext::new(run_context.clone(), actor.clone())
     })
     .expect("router-backed hook gate-ref factory accepts positive ttl")
+}
+
+fn runtime_scope(fixture: &Fixture) -> ResourceScope {
+    ResourceScope {
+        tenant_id: fixture.context.scope.tenant_id.clone(),
+        user_id: fixture.actor_id.clone(),
+        agent_id: fixture.context.scope.agent_id.clone(),
+        project_id: fixture.context.scope.project_id.clone(),
+        mission_id: None,
+        thread_id: Some(fixture.context.thread_id.clone()),
+        invocation_id: InvocationId::new(),
+    }
+}
+
+fn runtime_capability(capability_id: &str) -> CapabilityId {
+    CapabilityId::new(capability_id).expect("runtime capability id literal is valid")
+}
+
+fn event_log_subscription(
+    log: Arc<InMemoryDurableEventLog>,
+    stream: EventStreamKey,
+    after: RuntimeEventCursor,
+) -> EventTriggeredHookSubscription {
+    let log: Arc<dyn DurableEventLog> = log;
+    // PR #3931 followup: ReadScope::any() is accepted again — the host build
+    // path derives the effective filter from the authoritative run/thread
+    // scope (see `EventTriggeredHookSubscription::effective_read_scope`), so a
+    // permissive caller filter cannot widen the read or leak across
+    // threads/projects. No fixture-side tightening is needed.
+    EventTriggeredHookSubscription::new(log, stream, ReadScope::any(), after)
+        .with_poll_interval(Duration::from_millis(5))
+        .with_batch_limit(16)
 }
 
 fn invocation(
@@ -949,7 +1216,1037 @@ fn expect_denied_with_summary(
     }
 }
 
+async fn wait_for_seen_events(seen: &Arc<SeenLog>, expected: usize) -> Vec<SeenRuntimeEvent> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = seen.snapshot();
+        if snapshot.len() >= expected {
+            return snapshot;
+        }
+        let remaining = match deadline.checked_duration_since(Instant::now()) {
+            Some(remaining) => remaining,
+            None => {
+                panic!(
+                    "timed out waiting for {expected} event-triggered hook calls, saw {}",
+                    snapshot.len()
+                );
+            }
+        };
+        // Notify-driven wakeup; tokio::time::timeout caps the wait so the
+        // test still fails loud if the hook never fires. `notify_one`
+        // stores a permit when racing the waiter's parking, so an event
+        // arriving between `snapshot()` and `notified().await` still
+        // wakes us immediately.
+        let _ = tokio::time::timeout(remaining, seen.notify.notified()).await;
+    }
+}
+
 // ─── Tests ─────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn event_triggered_hook_matches_runtime_event_kind_subscription() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let hook_id = HookId::for_builtin("tests::hooks_integration::failed_hook", HookVersion::ONE);
+
+    log.append(RuntimeEvent::hook_decision_emitted(
+        scope.clone(),
+        runtime_capability("hooks.test"),
+        hook_id.to_hex(),
+        "pass",
+        None,
+    ))
+    .await
+    .expect("append non-matching hook event");
+    log.append(RuntimeEvent::hook_failed(
+        scope,
+        runtime_capability("hooks.test"),
+        hook_id.to_hex(),
+        "panic",
+        "fail_isolated",
+        None,
+    ))
+    .await
+    .expect("append matching hook event");
+
+    let seen = SeenLog::new();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(event_triggered_dispatcher(
+            RuntimeEventKind::HookFailed,
+            Arc::clone(&seen),
+        ))
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds with event subscription");
+
+    let events = wait_for_seen_events(&seen, 1).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, RuntimeEventKind::HookFailed);
+}
+
+#[tokio::test]
+async fn event_triggered_subscription_replays_from_resume_cursor() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let hook_id = HookId::for_builtin("tests::hooks_integration::resume_hook", HookVersion::ONE);
+    let prefix = log
+        .append(RuntimeEvent::hook_decision_emitted(
+            scope.clone(),
+            runtime_capability("hooks.resume"),
+            hook_id.to_hex(),
+            "pass",
+            None,
+        ))
+        .await
+        .expect("append prefix event");
+    for _ in 0..3 {
+        log.append(RuntimeEvent::hook_failed(
+            scope.clone(),
+            runtime_capability("hooks.resume"),
+            hook_id.to_hex(),
+            "timeout",
+            "fail_isolated",
+            None,
+        ))
+        .await
+        .expect("append replayed event");
+    }
+
+    let first_seen = SeenLog::new();
+    {
+        let inner = Arc::new(RecordingCapabilityPort::new());
+        let _host = fixture
+            .factory()
+            .with_hook_dispatcher(event_triggered_dispatcher(
+                RuntimeEventKind::HookFailed,
+                Arc::clone(&first_seen),
+            ))
+            .with_event_subscription(event_log_subscription(
+                Arc::clone(&log),
+                stream.clone(),
+                prefix.cursor,
+            ))
+            .build_text_only_host_with_capabilities(fixture.request(), inner)
+            .await
+            .expect("first host builds with event subscription");
+        let events = wait_for_seen_events(&first_seen, 3).await;
+        assert_eq!(
+            events.iter().map(|event| event.cursor).collect::<Vec<_>>(),
+            vec![
+                RuntimeEventCursor::new(2),
+                RuntimeEventCursor::new(3),
+                RuntimeEventCursor::new(4),
+            ]
+        );
+    }
+
+    let second_seen = SeenLog::new();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(event_triggered_dispatcher(
+            RuntimeEventKind::HookFailed,
+            Arc::clone(&second_seen),
+        ))
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            prefix.cursor,
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("restarted host builds with event subscription");
+    let events = wait_for_seen_events(&second_seen, 3).await;
+    assert_eq!(
+        events.iter().map(|event| event.cursor).collect::<Vec<_>>(),
+        vec![
+            RuntimeEventCursor::new(2),
+            RuntimeEventCursor::new(3),
+            RuntimeEventCursor::new(4),
+        ]
+    );
+}
+
+/// PR #3640 followup (Bug 2, replay signal): events caught up from the resume
+/// cursor to the stream head at subscription time must be dispatched through
+/// the replay path (`is_replay = true`) so reconnect/restart side effects can
+/// dedupe. Events that arrive after the backlog is drained (head reached) must
+/// be live (`is_replay = false`). Previously every event went through the live
+/// path, so the public `EventTriggeredHookContext::is_replay` contract was dead
+/// surface and replayed side effects fired with no dedupe signal.
+#[tokio::test]
+async fn event_subscription_marks_is_replay_true_for_replayed_events() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let hook_id = HookId::for_builtin("tests::hooks_integration::replay_flag", HookVersion::ONE);
+
+    // Backlog of two events appended BEFORE the subscription starts. These are
+    // the gap between the resume cursor (origin) and head-at-startup, so they
+    // must replay.
+    for _ in 0..2 {
+        log.append(RuntimeEvent::hook_failed(
+            scope.clone(),
+            runtime_capability("hooks.replay"),
+            hook_id.to_hex(),
+            "timeout",
+            "fail_isolated",
+            None,
+        ))
+        .await
+        .expect("append backlog event");
+    }
+
+    let seen = SeenLog::new();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(event_triggered_dispatcher(
+            RuntimeEventKind::HookFailed,
+            Arc::clone(&seen),
+        ))
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds with event subscription");
+
+    // Both backlog events must arrive marked as replay.
+    let replayed = wait_for_seen_events(&seen, 2).await;
+    assert_eq!(replayed.len(), 2, "both backlog events must be observed");
+    assert!(
+        replayed.iter().all(|event| event.is_replay),
+        "backlog events caught up to head must be marked is_replay = true: {replayed:?}"
+    );
+
+    // Append a fresh event AFTER the backlog has drained (the subscription has
+    // by now reached an empty poll and switched to live). It must be live.
+    log.append(RuntimeEvent::hook_failed(
+        scope.clone(),
+        runtime_capability("hooks.replay"),
+        hook_id.to_hex(),
+        "timeout",
+        "fail_isolated",
+        None,
+    ))
+    .await
+    .expect("append live event");
+
+    let all = wait_for_seen_events(&seen, 3).await;
+    assert_eq!(all.len(), 3, "live event must also be observed");
+    assert!(
+        !all[2].is_replay,
+        "event arriving after head must be live (is_replay = false): {:?}",
+        all[2]
+    );
+}
+
+/// PR #3931 (Hole 1, replay/live boundary race): a live event appended after
+/// the subscription started but BEFORE the subscription's first empty poll must
+/// be dispatched as LIVE (`is_replay = false`), not replay. The old
+/// implementation flipped a `replaying` flag only on the first empty poll, so
+/// any record observed before that flip — including ones appended post-startup
+/// — was wrongly marked as replay. Snapshotting the head at startup fixes the
+/// boundary: cursor 2 (appended after startup_head = 1) is live.
+#[tokio::test]
+async fn event_subscription_live_event_before_first_empty_poll_is_live() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let hook_id = HookId::for_builtin("tests::hooks_integration::race_live", HookVersion::ONE);
+
+    // One backlog event present at subscription start (startup_head = cursor 1).
+    log.append(RuntimeEvent::hook_failed(
+        scope.clone(),
+        runtime_capability("hooks.race"),
+        hook_id.to_hex(),
+        "timeout",
+        "fail_isolated",
+        None,
+    ))
+    .await
+    .expect("append backlog event");
+
+    let seen = SeenLog::new();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    // A per-observe delay keeps the subscription dispatching the backlog while
+    // we append the live event, so the live append lands before any empty
+    // poll could occur.
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(event_triggered_dispatcher_with_scope(
+            RuntimeEventKind::HookFailed,
+            Arc::clone(&seen),
+            HookBindingScope::Global,
+            "integration-tests",
+            Some(Duration::from_millis(80)),
+        ))
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds with event subscription");
+
+    // Append a SECOND event immediately after startup. Its cursor (2) is beyond
+    // startup_head (1), so it is live even though it may be read before the
+    // subscription ever observes an empty poll.
+    log.append(RuntimeEvent::hook_failed(
+        scope.clone(),
+        runtime_capability("hooks.race"),
+        hook_id.to_hex(),
+        "timeout",
+        "fail_isolated",
+        None,
+    ))
+    .await
+    .expect("append live event after startup");
+
+    let all = wait_for_seen_events(&seen, 2).await;
+    assert_eq!(all.len(), 2, "both events must be observed");
+    let backlog = all
+        .iter()
+        .find(|e| e.cursor == RuntimeEventCursor::new(1))
+        .expect("backlog event observed");
+    let live = all
+        .iter()
+        .find(|e| e.cursor == RuntimeEventCursor::new(2))
+        .expect("live event observed");
+    assert!(
+        backlog.is_replay,
+        "event at/below startup_head must be replay: {backlog:?}"
+    );
+    assert!(
+        !live.is_replay,
+        "event appended after startup_head must be LIVE, not replay: {live:?}"
+    );
+}
+
+/// PR #3931 (Hole 1, continuous-drain variant): when the backlog drains
+/// continuously (the subscription never hits an empty poll because new events
+/// keep landing), events appended past `startup_head` must still be live. The
+/// old empty-poll heuristic would keep marking everything replay until the
+/// stream went quiet. Here `batch_limit = 1` plus a per-event observe delay
+/// guarantees a steady, never-empty drain across the boundary.
+#[tokio::test]
+async fn event_subscription_event_during_continuous_drain_is_live() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let hook_id = HookId::for_builtin("tests::hooks_integration::race_drain", HookVersion::ONE);
+
+    // Three backlog events present at startup (startup_head = cursor 3).
+    for _ in 0..3 {
+        log.append(RuntimeEvent::hook_failed(
+            scope.clone(),
+            runtime_capability("hooks.drain"),
+            hook_id.to_hex(),
+            "timeout",
+            "fail_isolated",
+            None,
+        ))
+        .await
+        .expect("append backlog event");
+    }
+
+    let seen = SeenLog::new();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let log_for_sub: Arc<dyn DurableEventLog> = Arc::clone(&log) as Arc<dyn DurableEventLog>;
+    let read_scope = ReadScope {
+        project_id: fixture.context.scope.project_id.clone(),
+        mission_id: None,
+        thread_id: Some(fixture.context.thread_id.clone()),
+        process_id: None,
+    };
+    // batch_limit = 1 forces one record per poll; the observe delay holds each
+    // dispatch open long enough that we keep the stream non-empty by appending
+    // a fresh event while the backlog is still draining.
+    let subscription = EventTriggeredHookSubscription::new(
+        log_for_sub,
+        stream,
+        read_scope,
+        RuntimeEventCursor::origin(),
+    )
+    .with_poll_interval(Duration::from_millis(2))
+    .with_batch_limit(1);
+
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(event_triggered_dispatcher_with_scope(
+            RuntimeEventKind::HookFailed,
+            Arc::clone(&seen),
+            HookBindingScope::Global,
+            "integration-tests",
+            Some(Duration::from_millis(40)),
+        ))
+        .with_event_subscription(subscription)
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds with event subscription");
+
+    // While the 3-event backlog is still draining (first dispatch is blocked on
+    // the 40ms delay), append a fourth event. Its cursor (4) is beyond
+    // startup_head (3) and must be live.
+    log.append(RuntimeEvent::hook_failed(
+        scope.clone(),
+        runtime_capability("hooks.drain"),
+        hook_id.to_hex(),
+        "timeout",
+        "fail_isolated",
+        None,
+    ))
+    .await
+    .expect("append live event during drain");
+
+    let all = wait_for_seen_events(&seen, 4).await;
+    assert_eq!(all.len(), 4, "all four events must be observed");
+    for cursor in 1..=3u64 {
+        let e = all
+            .iter()
+            .find(|e| e.cursor == RuntimeEventCursor::new(cursor))
+            .unwrap_or_else(|| panic!("backlog event {cursor} observed"));
+        assert!(
+            e.is_replay,
+            "backlog event {cursor} (<= startup_head) must be replay: {e:?}"
+        );
+    }
+    let live = all
+        .iter()
+        .find(|e| e.cursor == RuntimeEventCursor::new(4))
+        .expect("live event observed");
+    assert!(
+        !live.is_replay,
+        "event appended past startup_head during continuous drain must be LIVE: {live:?}"
+    );
+}
+
+#[tokio::test]
+async fn event_triggered_hook_respects_own_capabilities_scope_filter() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let ext_a = ironclaw_host_api::ExtensionId::new("ext-a").expect("valid ext");
+    let ext_b = ironclaw_host_api::ExtensionId::new("ext-b").expect("valid ext");
+
+    log.append(RuntimeEvent::dispatch_succeeded(
+        scope.clone(),
+        runtime_capability("ext-a.call"),
+        ext_a.clone(),
+        RuntimeKind::Wasm,
+        16,
+    ))
+    .await
+    .expect("append own-provider event");
+    log.append(RuntimeEvent::dispatch_succeeded(
+        scope,
+        runtime_capability("ext-b.call"),
+        ext_b,
+        RuntimeKind::Wasm,
+        16,
+    ))
+    .await
+    .expect("append foreign-provider event");
+
+    let seen = SeenLog::new();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(event_triggered_dispatcher_with_scope(
+            RuntimeEventKind::DispatchSucceeded,
+            Arc::clone(&seen),
+            HookBindingScope::OwnCapabilities,
+            ext_a.as_str(),
+            None,
+        ))
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds with scoped event hook");
+
+    let events = wait_for_seen_events(&seen, 1).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].kind, RuntimeEventKind::DispatchSucceeded);
+    assert_eq!(events[0].provider.as_ref(), Some(&ext_a));
+}
+
+#[tokio::test]
+async fn event_triggered_own_capabilities_scope_resolves_hook_failed_owner_from_hook_id() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let ext_a = ironclaw_host_api::ExtensionId::new("ext-a").expect("valid ext");
+    let ext_b = ironclaw_host_api::ExtensionId::new("ext-b").expect("valid ext");
+    let ext_a_source_hook_id = HookId::derive(
+        &ExtensionId::new(ext_a.as_str().to_string()).expect("extension id literal is valid"),
+        "0.0.1",
+        &HookLocalId::new("hook-failed-source-a".to_string())
+            .expect("hook local id literal is valid"),
+        HookVersion::ONE,
+    );
+    let ext_b_source_hook_id = HookId::derive(
+        &ExtensionId::new(ext_b.as_str().to_string()).expect("extension id literal is valid"),
+        "0.0.1",
+        &HookLocalId::new("hook-failed-source-b".to_string())
+            .expect("hook local id literal is valid"),
+        HookVersion::ONE,
+    );
+    let ext_a_source_hook_hex = ext_a_source_hook_id.to_hex();
+    let ext_b_source_hook_hex = ext_b_source_hook_id.to_hex();
+
+    log.append(RuntimeEvent::hook_failed(
+        scope.clone(),
+        runtime_capability("hooks.ext_a.first"),
+        ext_a_source_hook_hex.clone(),
+        "panic",
+        "fail_isolated",
+        None,
+    ))
+    .await
+    .expect("append ext-A hook failure event");
+    log.append(RuntimeEvent::hook_failed(
+        scope.clone(),
+        runtime_capability("hooks.ext_b"),
+        ext_b_source_hook_hex.clone(),
+        "panic",
+        "fail_isolated",
+        None,
+    ))
+    .await
+    .expect("append ext-B hook failure event");
+    log.append(RuntimeEvent::hook_failed(
+        scope,
+        runtime_capability("hooks.ext_a.second"),
+        ext_a_source_hook_hex.clone(),
+        "panic",
+        "fail_isolated",
+        None,
+    ))
+    .await
+    .expect("append second ext-A hook failure event");
+
+    let seen = SeenLog::new();
+    let inert_seen = SeenLog::new();
+    let subscription_hook_id = HookId::derive(
+        &ExtensionId::new(ext_a.as_str().to_string()).expect("extension id literal is valid"),
+        "0.0.1",
+        &HookLocalId::new("hook-failed-own-capabilities-subscription".to_string())
+            .expect("hook local id literal is valid"),
+        HookVersion::ONE,
+    );
+    let dispatcher = HookDispatcherBuilder::new(HookRegistry::new())
+        .with_timeout(Duration::from_millis(500))
+        .install_installed_event_triggered(
+            subscription_hook_id,
+            HookPhase::Telemetry,
+            RuntimeEventKind::HookFailed,
+            ext_a.clone(),
+            HookBindingScope::OwnCapabilities,
+            Box::new(RecordingEventTriggeredHook {
+                seen: Arc::clone(&seen),
+                delay: None,
+            }),
+        )
+        .expect("install ext-A HookFailed subscription")
+        .install_installed_event_triggered(
+            ext_a_source_hook_id,
+            HookPhase::Telemetry,
+            RuntimeEventKind::DispatchSucceeded,
+            ext_a,
+            HookBindingScope::Global,
+            Box::new(RecordingEventTriggeredHook {
+                seen: Arc::clone(&inert_seen),
+                delay: None,
+            }),
+        )
+        .expect("install ext-A source hook binding")
+        .install_installed_event_triggered(
+            ext_b_source_hook_id,
+            HookPhase::Telemetry,
+            RuntimeEventKind::DispatchSucceeded,
+            ext_b,
+            HookBindingScope::Global,
+            Box::new(RecordingEventTriggeredHook {
+                seen: Arc::clone(&inert_seen),
+                delay: None,
+            }),
+        )
+        .expect("install ext-B source hook binding")
+        .build_arc();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds with scoped hook-failure event subscription");
+
+    let events = wait_for_seen_events(&seen, 2).await;
+    assert_eq!(events.len(), 2);
+    assert!(
+        events.iter().all(|event| event.provider.is_none()),
+        "HookFailed constructors leave provider unset; test must exercise hook_id owner lookup"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.hook_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec![
+            Some(ext_a_source_hook_hex.as_str()),
+            Some(ext_a_source_hook_hex.as_str())
+        ],
+        "ext-A OwnCapabilities subscription must fire only for ext-A hook failures"
+    );
+}
+
+/// Phase 5 (hook-failure / decision-emitted alerting): an `OwnCapabilities`-
+/// scoped event-triggered subscription must fire for lifecycle events owned by
+/// its own extension and stay inert for foreign-owned ones.
+///
+/// PR #3931 (Hole 2) hardened this: ownership is resolved from the registry by
+/// the event's `hook_id`, NOT from the forgeable carried `provider` payload. So
+/// the legitimate flow requires the subject hooks registered in the dispatcher
+/// (which they are in production — the subject hook ran in this same host). The
+/// carried `provider` is still present on the wire but is no longer the
+/// authority; the registry-resolved owner is. A spoofed `provider` on an
+/// unregistered hook_id can no longer mint authority (covered by the dispatch
+/// unit tests `unknown_lifecycle_hook_id_with_carried_provider_stays_inert` and
+/// `hook_failed_with_spoofed_provider_does_not_fire_target_extension_hooks`).
+#[tokio::test]
+async fn event_triggered_own_capabilities_matches_hook_failed_for_registry_owned_hook() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let ext_a = ironclaw_host_api::ExtensionId::new("ext-a").expect("valid ext");
+    let ext_b = ironclaw_host_api::ExtensionId::new("ext-b").expect("valid ext");
+    // Subject hooks are registered in the dispatcher so their owners resolve
+    // from the registry (the production reality: the failed hook ran here).
+    let foreign_subject = HookId::for_builtin("tests::foreign_failed", HookVersion::ONE);
+    let own_subject = HookId::for_builtin("tests::own_failed", HookVersion::ONE);
+
+    // Two HookFailed events. The ext-B-owned one must be filtered out; the
+    // ext-A-owned one must fire the subscription. Ownership comes from the
+    // registry binding for each subject hook_id, not from the payload provider.
+    log.append(RuntimeEvent::hook_failed(
+        scope.clone(),
+        runtime_capability("hooks.ext_b.failed"),
+        foreign_subject.to_hex(),
+        "panic",
+        "fail_isolated",
+        Some(ext_b.clone()),
+    ))
+    .await
+    .expect("append foreign-owned hook failure event");
+    log.append(RuntimeEvent::hook_failed(
+        scope,
+        runtime_capability("hooks.ext_a.failed"),
+        own_subject.to_hex(),
+        "panic",
+        "fail_isolated",
+        Some(ext_a.clone()),
+    ))
+    .await
+    .expect("append own-owned hook failure event");
+
+    let seen = SeenLog::new();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(event_triggered_dispatcher_with_subjects(
+            RuntimeEventKind::HookFailed,
+            Arc::clone(&seen),
+            HookBindingScope::OwnCapabilities,
+            ext_a.as_str(),
+            &[
+                (own_subject, ext_a.clone()),
+                (foreign_subject, ext_b.clone()),
+            ],
+        ))
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds with HookFailed OwnCapabilities subscription");
+
+    let events = wait_for_seen_events(&seen, 1).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one event (the ext-A registry-owned one) must fire"
+    );
+    assert_eq!(events[0].kind, RuntimeEventKind::HookFailed);
+    assert_eq!(
+        events[0].hook_id.as_deref(),
+        Some(own_subject.to_hex().as_str()),
+        "the firing event must be the ext-A-owned subject"
+    );
+}
+
+/// NOTE(#3640): subscription stream/read-scope must be
+/// bound to the host's run scope. A subscription pointing at a foreign
+/// tenant's stream must fail the host build instead of silently dispatching
+/// foreign events through this host's dispatcher.
+#[tokio::test]
+async fn event_triggered_subscription_with_foreign_tenant_stream_fails_host_build() {
+    let fixture = Fixture::new().await;
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let foreign_tenant = ironclaw_host_api::TenantId::new("tenant-foreign").expect("valid tenant");
+    let our_user = fixture.actor_id.clone();
+    let our_agent = fixture
+        .context
+        .scope
+        .agent_id
+        .clone()
+        .expect("fixture sets an agent");
+    // Stream keyed to a different tenant — must be rejected.
+    let foreign_stream = EventStreamKey::new(foreign_tenant, our_user, Some(our_agent));
+
+    let dispatcher = event_triggered_dispatcher(RuntimeEventKind::HookFailed, SeenLog::new());
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let err = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            foreign_stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect_err("host build must reject foreign-tenant subscription");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("tenant_id"),
+        "expected error to cite tenant_id mismatch; got {msg}"
+    );
+}
+
+/// Same property, but for the user dimension: stream keyed to a different
+/// user than the thread owner must be rejected.
+#[tokio::test]
+async fn event_triggered_subscription_with_foreign_user_stream_fails_host_build() {
+    let fixture = Fixture::new().await;
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let foreign_user = ironclaw_host_api::UserId::new("user-foreign").expect("valid user");
+    let our_tenant = fixture.thread_scope.tenant_id.clone();
+    let our_agent = fixture
+        .context
+        .scope
+        .agent_id
+        .clone()
+        .expect("fixture sets an agent");
+    let foreign_stream = EventStreamKey::new(our_tenant, foreign_user, Some(our_agent));
+
+    let dispatcher = event_triggered_dispatcher(RuntimeEventKind::HookFailed, SeenLog::new());
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let err = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            foreign_stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect_err("host build must reject foreign-user subscription");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("user_id"),
+        "expected error to cite user_id mismatch; got {msg}"
+    );
+}
+
+/// NOTE(#3640): a hook subscribing to its own lifecycle
+/// events (HookFailed/HookDispatched/HookDecisionEmitted) with a scope
+/// that matches its own provider would otherwise be dispatched for events
+/// describing its OWN executions — the dispatch loop's emit_failure /
+/// emit_decision projections cause N+1, infinite storm. The dispatcher now
+/// skips events whose `event.hook_id` equals the binding's own hook id for
+/// hook-lifecycle event kinds.
+#[tokio::test]
+async fn event_triggered_self_lifecycle_event_does_not_redispatch() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let ext = ironclaw_host_api::ExtensionId::new("ext-self").expect("valid ext");
+
+    // The subscription's own hook id (matches what
+    // `event_triggered_dispatcher_with_scope` derives).
+    let subscriber_hook_id = HookId::derive(
+        &ExtensionId::new(ext.as_str().to_string()).expect("extension id literal is valid"),
+        "0.0.1",
+        &HookLocalId::new(format!(
+            "event-{}",
+            format!("{:?}", RuntimeEventKind::HookFailed).to_lowercase()
+        ))
+        .expect("hook local id literal is valid"),
+        HookVersion::ONE,
+    );
+
+    // Event #1: a HookFailed whose `hook_id` is the subscriber's own id and
+    // whose `provider` matches its own extension. Without the self-trigger
+    // skip, this would dispatch the subscriber and start the storm.
+    log.append(RuntimeEvent::hook_failed(
+        scope.clone(),
+        runtime_capability("hooks.self_failed"),
+        subscriber_hook_id.to_hex(),
+        "panic",
+        "fail_isolated",
+        Some(ext.clone()),
+    ))
+    .await
+    .expect("append self-targeted hook failure event");
+    // Event #2: a HookFailed about a DIFFERENT hook owned by the same
+    // extension — this SHOULD fire the subscription (control case, proves the
+    // filter is narrow). PR #3931 (Hole 2): this subject hook is registered in
+    // the dispatcher below so its owner resolves from the registry, not from
+    // the carried provider.
+    let other_hook_id = HookId::derive(
+        &ExtensionId::new(ext.as_str().to_string()).expect("extension id literal is valid"),
+        "0.0.1",
+        &HookLocalId::new("some-other-hook".to_string()).expect("hook local id literal is valid"),
+        HookVersion::ONE,
+    );
+    log.append(RuntimeEvent::hook_failed(
+        scope,
+        runtime_capability("hooks.other_failed"),
+        other_hook_id.to_hex(),
+        "panic",
+        "fail_isolated",
+        Some(ext.clone()),
+    ))
+    .await
+    .expect("append foreign-hook failure event");
+
+    let seen = SeenLog::new();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(event_triggered_dispatcher_with_subjects(
+            RuntimeEventKind::HookFailed,
+            Arc::clone(&seen),
+            HookBindingScope::OwnCapabilities,
+            ext.as_str(),
+            // Register the control-case subject so its owner resolves from the
+            // registry. The subscriber's own hook id is already registered by
+            // the event-triggered watcher install.
+            &[(other_hook_id, ext.clone())],
+        ))
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds");
+
+    let events = wait_for_seen_events(&seen, 1).await;
+    assert_eq!(
+        events.len(),
+        1,
+        "exactly one event should fire — the self-targeted one is suppressed"
+    );
+    assert_eq!(
+        events[0].hook_id.as_deref(),
+        Some(other_hook_id.to_hex().as_str()),
+        "only the OTHER hook's failure should fire; the subscriber's own \
+         lifecycle event is suppressed to break the self-trigger loop"
+    );
+}
+
+/// NOTE(#3640): a `ReplayGap` from the durable log used to
+/// log a warn and silently break the subscription loop. Now it surfaces an
+/// `EventSubscriptionTerminated` `DriverNote` milestone so SSE/audit
+/// consumers can see that the subscription died and why.
+#[tokio::test]
+async fn event_triggered_replay_gap_emits_subscription_terminated_milestone() {
+    use ironclaw_turns::run_profile::{LoopDriverNoteKind, LoopHostMilestoneKind};
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+
+    for i in 0..3 {
+        log.append(RuntimeEvent::hook_decision_emitted(
+            scope.clone(),
+            runtime_capability("hooks.gap"),
+            HookId::for_builtin(&format!("tests::gap_{i}"), HookVersion::ONE).to_hex(),
+            "pass",
+            None,
+        ))
+        .await
+        .expect("append");
+    }
+    log.truncate_before_or_at(&stream, RuntimeEventCursor::new(2))
+        .expect("truncate");
+
+    let dispatcher =
+        event_triggered_dispatcher(RuntimeEventKind::HookDecisionEmitted, SeenLog::new());
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let milestone_sink = fixture.milestone_sink.clone();
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(dispatcher)
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds; ReplayGap surfaces from the background task");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let milestones = milestone_sink.milestones();
+        let found = milestones.iter().any(|m| {
+            matches!(
+                &m.kind,
+                LoopHostMilestoneKind::DriverNote {
+                    kind: LoopDriverNoteKind::EventSubscriptionTerminated,
+                    ..
+                }
+            )
+        });
+        if found {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "expected an EventSubscriptionTerminated DriverNote milestone after \
+                 the subscription hit a ReplayGap; got {milestones:?}"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn event_triggered_sink_is_observer_only_at_caller_boundary() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let hook_id = HookId::for_builtin(
+        "tests::hooks_integration::observer_only_event_hook",
+        HookVersion::ONE,
+    );
+    let event = RuntimeEvent::hook_failed(
+        scope,
+        runtime_capability("hooks.observer_only"),
+        hook_id.to_hex(),
+        "panic",
+        "fail_isolated",
+        None,
+    );
+    let seen = SeenLog::new();
+    let dispatcher = event_triggered_dispatcher(RuntimeEventKind::HookFailed, Arc::clone(&seen));
+
+    let outcome = dispatcher
+        .dispatch_event_triggered_at(
+            fixture.context.scope.tenant_id.clone(),
+            RuntimeEventCursor::new(1),
+            &event,
+        )
+        .await;
+
+    assert!(outcome.failures.is_empty());
+    assert_eq!(outcome.facts.len(), 1);
+    assert_eq!(seen.len(), 1);
+}
+
+#[tokio::test]
+async fn event_triggered_slow_hook_does_not_block_event_emit_caller() {
+    let fixture = Fixture::new().await;
+    let scope = runtime_scope(&fixture);
+    let stream = EventStreamKey::from_scope(&scope);
+    let log = Arc::new(InMemoryDurableEventLog::new());
+    let sink = DurableEventSink::new(Arc::clone(&log) as Arc<dyn DurableEventLog>);
+    let hook_id = HookId::for_builtin(
+        "tests::hooks_integration::slow_event_hook",
+        HookVersion::ONE,
+    );
+    let seen = SeenLog::new();
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let _host = fixture
+        .factory()
+        .with_hook_dispatcher(event_triggered_dispatcher_with_scope(
+            RuntimeEventKind::HookFailed,
+            Arc::clone(&seen),
+            HookBindingScope::Global,
+            "integration-tests",
+            Some(Duration::from_millis(100)),
+        ))
+        .with_event_subscription(event_log_subscription(
+            Arc::clone(&log),
+            stream,
+            RuntimeEventCursor::origin(),
+        ))
+        .build_text_only_host_with_capabilities(fixture.request(), inner)
+        .await
+        .expect("host builds with event subscription");
+
+    let started = Instant::now();
+    for _ in 0..10 {
+        sink.emit(RuntimeEvent::hook_failed(
+            scope.clone(),
+            runtime_capability("hooks.slow"),
+            hook_id.to_hex(),
+            "timeout",
+            "fail_isolated",
+            None,
+        ))
+        .await
+        .expect("emit event");
+    }
+    assert!(
+        started.elapsed() < Duration::from_millis(200),
+        "event emission should not wait for ten 100ms hook callbacks"
+    );
+
+    let events = wait_for_seen_events(&seen, 10).await;
+    assert_eq!(events.len(), 10);
+    assert!(
+        events
+            .iter()
+            .all(|event| event.kind == RuntimeEventKind::HookFailed)
+    );
+}
 
 #[tokio::test]
 async fn predicate_deny_hook_short_circuits_inner_port() {
@@ -978,6 +2275,64 @@ async fn predicate_deny_hook_short_circuits_inner_port() {
         inner.invocations().is_empty(),
         "inner port must NOT be invoked when a hook denies; got {:?}",
         inner.invocations()
+    );
+}
+
+/// Caller-level regression for
+/// `RebornLoopDriverHostFactory::with_hook_security_audit_sink`. The
+/// dispatcher-level unit test in `ironclaw_hooks` proves a manually wired
+/// dispatcher records `HookDeny`, but it bypasses the factory and would not
+/// catch a regression where the factory forgets to attach the sink to the
+/// per-build builder before `build_arc()` (henrypark133 / serrrfirat MEDIUM
+/// on PR #3922). This drives the full factory → builder-factory → host →
+/// `invoke_capability` deny path and asserts the sink received exactly one
+/// `HookDeny` event.
+#[tokio::test]
+async fn factory_hook_security_audit_sink_records_deny_through_build() {
+    let fixture = Fixture::new().await;
+    let inner = Arc::new(RecordingCapabilityPort::new());
+    let surface_version = fixture.surface_version.clone();
+
+    let sink: Arc<InMemorySecurityAuditSink> = Arc::new(InMemorySecurityAuditSink::new());
+    let sink_dyn: Arc<dyn SecurityAuditSink> = sink.clone();
+
+    // The builder-factory path is the only one that consumes the factory's
+    // security-audit sink; pair it with `with_hook_security_audit_sink`.
+    let host = fixture
+        .factory()
+        .with_hook_dispatcher_builder_factory(|| Ok(predicate_deny_builder()))
+        .with_hook_security_audit_sink(sink_dyn)
+        .build_text_only_host_with_capabilities(fixture.request(), inner.clone())
+        .await
+        .expect("host builds with hook dispatcher + security-audit sink installed");
+
+    let outcome = host
+        .invoke_capability(invocation(&surface_version, "cap.blocked"))
+        .await
+        .expect("invoke_capability returns a (denied) outcome, not an error");
+    expect_denied_with(outcome, "hook_denied");
+    assert!(
+        inner.invocations().is_empty(),
+        "inner port must NOT be invoked when a hook denies"
+    );
+
+    let events = sink.snapshot();
+    assert_eq!(
+        events.len(),
+        1,
+        "factory wiring must record exactly one HookDeny event, got {events:?}"
+    );
+    let event = &events[0];
+    assert_eq!(event.boundary, SecurityBoundary::HookDeny);
+    assert_eq!(event.decision, SecurityDecision::Blocked);
+    assert_eq!(event.code, "hook_deny_predicate");
+    assert_eq!(
+        event
+            .capability_id
+            .as_ref()
+            .map(ironclaw_host_api::CapabilityId::as_str),
+        Some("cap.blocked"),
+        "capability id should propagate from the invoked capability"
     );
 }
 
@@ -1440,10 +2795,11 @@ async fn wasm_unsupported_host_import_is_rejected_at_install_time() {
     .with_scope(HookManifestScope::SameTenant)
     .with_requires_grant("integration-test-wasm-hooks");
     let builder = HookDispatcherBuilder::new(HookRegistry::new());
+    let entries = vec![entry];
     let result = registrar.install(
         ironclaw_host_api::ExtensionId::new("integration-tests").expect("valid ext id"),
-        "0.0.1".to_string(),
-        vec![entry],
+        "0.0.1",
+        &entries,
         builder,
     );
     match result {
@@ -1491,10 +2847,11 @@ async fn wasm_missing_export_is_rejected_at_install_time() {
     .with_scope(HookManifestScope::SameTenant)
     .with_requires_grant("integration-test-wasm-hooks");
     let builder = HookDispatcherBuilder::new(HookRegistry::new());
+    let entries = vec![entry];
     let result = registrar.install(
         ironclaw_host_api::ExtensionId::new("integration-tests").expect("valid ext id"),
-        "0.0.1".to_string(),
-        vec![entry],
+        "0.0.1",
+        &entries,
         builder,
     );
     match result {
@@ -2432,6 +3789,7 @@ async fn observer_hook_fires_after_checkpoint_through_factory() {
     host.checkpoint(LoopCheckpointRequest {
         kind: LoopCheckpointKind::BeforeModel,
         state_ref: state_record.state_ref,
+        gate_ref: None,
     })
     .await
     .expect("checkpoint write succeeds through the wrapped checkpoint port");
@@ -2873,7 +4231,7 @@ async fn hook_telemetry_attribution_is_per_run_not_captured() {
                 sink.deny("two-run-telemetry-test");
             }
         }
-        HDBuilder::new(HReg::new())
+        Ok(HDBuilder::new(HReg::new())
             .install_installed_before_capability(
                 hook_id,
                 HookPhase::Policy,
@@ -2881,7 +4239,7 @@ async fn hook_telemetry_attribution_is_per_run_not_captured() {
                 HookBindingScope::Global,
                 Box::new(AlwaysDeny),
             )
-            .expect("install always-deny hook")
+            .expect("install always-deny hook"))
     });
 
     // Run 1.

@@ -1,5 +1,8 @@
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Mutex;
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use ironclaw_event_projections::{ProjectionCursor, ProjectionScope};
@@ -8,15 +11,35 @@ use ironclaw_turns::{TurnActor, TurnScope};
 use serde::Serialize;
 
 use crate::validation::{
-    validate_advance_request, validate_delivery_attempt, validate_delivery_identity,
-    validate_delivery_status_request, validate_policy, validate_subscription_identity,
-    validate_subscription_record, validate_subscription_request,
+    validate_advance_request, validate_communication_preference, validate_delivery_attempt,
+    validate_delivery_identity, validate_delivery_status_request, validate_policy,
+    validate_subscription_identity, validate_subscription_record, validate_subscription_request,
 };
 use crate::{
-    AdvanceSubscriptionCursorRequest, LoadSubscriptionCursorRequest, OutboundDeliveryAttempt,
-    OutboundDeliveryId, OutboundError, OutboundStateStore, ProjectionSubscriptionId,
-    ProjectionSubscriptionRecord, ThreadNotificationPolicy, UpdateDeliveryStatusRequest,
+    AdvanceSubscriptionCursorRequest, CommunicationPreferenceKey, CommunicationPreferenceRecord,
+    CommunicationPreferenceRepository, CommunicationPreferenceUpdate,
+    LoadSubscriptionCursorRequest, OutboundDeliveryAttempt, OutboundDeliveryId, OutboundError,
+    OutboundStateStore, ProjectionSubscriptionId, ProjectionSubscriptionRecord,
+    ThreadNotificationPolicy, UpdateDeliveryStatusRequest,
 };
+
+const MAX_CAS_RETRIES: usize = 5;
+
+struct YieldOnce(bool);
+
+impl Future for YieldOnce {
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if self.0 {
+            Poll::Ready(())
+        } else {
+            self.0 = true;
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+    }
+}
 
 #[derive(Default)]
 pub struct InMemoryOutboundStateStore {
@@ -25,6 +48,7 @@ pub struct InMemoryOutboundStateStore {
 
 #[derive(Default)]
 struct InMemoryOutboundState {
+    communication_preferences: HashMap<CommunicationPreferenceKey, CommunicationPreferenceRecord>,
     policies: HashMap<ThreadScopeKey, ThreadNotificationPolicy>,
     subscriptions: HashMap<ProjectionSubscriptionKey, ProjectionSubscriptionRecord>,
     deliveries: HashMap<OutboundDeliveryId, OutboundDeliveryAttempt>,
@@ -84,6 +108,63 @@ impl ProjectionSubscriptionKey {
         })
         .map(Self)
         .map_err(|_| OutboundError::Serialization)
+    }
+}
+
+#[async_trait]
+impl CommunicationPreferenceRepository for InMemoryOutboundStateStore {
+    async fn put_communication_preference(
+        &self,
+        record: CommunicationPreferenceRecord,
+    ) -> Result<(), OutboundError> {
+        validate_communication_preference(&record)?;
+        let mut state = self.lock_state()?;
+        state.communication_preferences.insert(record.key(), record);
+        Ok(())
+    }
+
+    async fn load_communication_preference(
+        &self,
+        key: CommunicationPreferenceKey,
+    ) -> Result<Option<CommunicationPreferenceRecord>, OutboundError> {
+        let state = self.lock_state()?;
+        Ok(state.communication_preferences.get(&key).cloned())
+    }
+
+    async fn update_communication_preference(
+        &self,
+        key: CommunicationPreferenceKey,
+        mut update: CommunicationPreferenceUpdate,
+    ) -> Result<CommunicationPreferenceRecord, OutboundError> {
+        for _ in 0..MAX_CAS_RETRIES {
+            let existing = {
+                let state = self.lock_state()?;
+                state.communication_preferences.get(&key).cloned()
+            };
+            let record = update(existing.clone())?;
+            validate_communication_preference(&record)?;
+            if record.key() != key {
+                return Err(OutboundError::InvalidRequest {
+                    reason: "communication preference update key mismatch",
+                });
+            }
+            let updated = {
+                let mut state = self.lock_state()?;
+                if state.communication_preferences.get(&key).cloned() == existing {
+                    state
+                        .communication_preferences
+                        .insert(record.key(), record.clone());
+                    true
+                } else {
+                    false
+                }
+            };
+            if updated {
+                return Ok(record);
+            }
+            YieldOnce(false).await;
+        }
+        Err(OutboundError::Backend)
     }
 }
 

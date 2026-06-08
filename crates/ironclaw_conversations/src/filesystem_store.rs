@@ -46,8 +46,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     AcceptInboundMessageRequest, AcceptedInboundMessage, AcceptedInboundMessageLookup,
     AcceptedInboundMessageReplay, AdapterInstallationId, AdapterKind,
-    ConversationBindingResolution, ConversationBindingService, ExternalActorRef,
-    ExternalConversationIdentity, InMemoryConversationServices, InboundTurnError,
+    ConversationActorPairingService, ConversationBindingResolution, ConversationBindingService,
+    ExternalActorRef, ExternalConversationIdentity, InMemoryConversationServices, InboundTurnError,
     LinkConversationRequest, LinkedConversationBinding, ReplyTargetBinding,
     ResolveConversationRequest, SessionThreadService, ThreadMessageRecord,
     ValidateReplyTargetRequest,
@@ -471,6 +471,28 @@ impl RebornFilesystemConversationServices {
 }
 
 #[async_trait]
+impl ConversationActorPairingService for RebornFilesystemConversationServices {
+    async fn pair_external_actor(
+        &self,
+        tenant_id: ironclaw_host_api::TenantId,
+        adapter_kind: AdapterKind,
+        adapter_installation_id: AdapterInstallationId,
+        external_actor_ref: ExternalActorRef,
+        user_id: UserId,
+    ) -> Result<(), InboundTurnError> {
+        self.inner
+            .try_pair_external_actor(
+                tenant_id,
+                adapter_kind,
+                adapter_installation_id,
+                external_actor_ref,
+                user_id,
+            )
+            .await
+    }
+}
+
+#[async_trait]
 impl ConversationBindingService for RebornFilesystemConversationServices {
     async fn resolve_or_create_binding(
         &self,
@@ -484,12 +506,14 @@ impl ConversationBindingService for RebornFilesystemConversationServices {
         request: ResolveConversationRequest,
         trusted_agent_id: Option<ironclaw_host_api::AgentId>,
         trusted_project_id: Option<ironclaw_host_api::ProjectId>,
+        trusted_owner_user_id: Option<ironclaw_host_api::UserId>,
     ) -> Result<ConversationBindingResolution, InboundTurnError> {
         self.inner
             .resolve_or_create_binding_with_trusted_scope(
                 request,
                 trusted_agent_id,
                 trusted_project_id,
+                trusted_owner_user_id,
             )
             .await
     }

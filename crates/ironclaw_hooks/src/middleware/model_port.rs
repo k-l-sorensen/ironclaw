@@ -129,10 +129,12 @@ mod tests {
             }
             Ok(LoopModelResponse {
                 chunks: Vec::new(),
+                safe_reasoning_deltas: Vec::new(),
                 output: ParentLoopOutput::AssistantReply(AssistantReply {
                     content: "hi".to_string(),
                 }),
                 effective_model_profile_id: ModelProfileId::new("model_test").expect("ok"),
+                usage: None,
             })
         }
     }
@@ -178,6 +180,7 @@ mod tests {
                 phase: HookPhase::Telemetry,
                 priority: HookPriority::DEFAULT,
                 point: HookPointSpec::AfterModel,
+                event_kind_filter: None,
                 owning_extension: None,
                 scope: crate::registry::HookBindingScope::Global,
                 poisoned: false,

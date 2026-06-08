@@ -7,13 +7,24 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_authorization::GrantAuthorizer;
 use ironclaw_extensions::{ExtensionManifest, ExtensionPackage, ExtensionRegistry, ManifestSource};
-use ironclaw_filesystem::LocalFilesystem;
+use ironclaw_filesystem::{LocalFilesystem, RootFilesystem};
+use ironclaw_hooks::{
+    HookId, HookLocalId, HookRegistrar, HookRegistry, HookVersion,
+    dispatch::HookDispatcherBuilder,
+    evaluator::PredicateEvaluator,
+    manifest::{HookManifestBody, HookManifestEntry, HookManifestKind},
+    ordering::HookPhase,
+    points::ObserverHookContext,
+    predicate::{CapabilityPredicate, HookPredicateSpec},
+    registry::HookPointSpec,
+    sink::{ObserverHook, ObserverSink},
+};
 use ironclaw_host_api::{
     AgentId, ApprovalRequestId, CapabilityDescriptor, CapabilityGrant, CapabilityGrantId,
     CapabilityId, CapabilitySet, EffectKind, ExecutionContext, ExtensionId, GrantConstraints,
-    HostPortCatalog, MountView, NetworkPolicy, PackageId, PermissionMode, Principal, ProcessId,
-    ProjectId, ResourceEstimate, ResourceUsage, RuntimeKind, SecretHandle, TenantId, ThreadId,
-    TrustClass, UserId, VirtualPath,
+    HostPath, HostPortCatalog, MountView, NetworkPolicy, PackageId, PermissionMode, Principal,
+    ProcessId, ProjectId, ResourceEstimate, ResourceUsage, RuntimeKind, SecretHandle, TenantId,
+    ThreadId, TrustClass, UserId, VirtualPath,
 };
 use ironclaw_host_runtime::{
     CancelRuntimeWorkOutcome, CancelRuntimeWorkRequest, CapabilitySurfacePolicy, HostRuntime,
@@ -25,23 +36,25 @@ use ironclaw_host_runtime::{
     VisibleCapability, VisibleCapabilityAccess,
 };
 use ironclaw_loop_support::{
-    CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
-    EmptyLoopCapabilityPort, HostIdentityContextBuildError, HostIdentityContextCandidate,
-    HostIdentityContextSource, HostIdentityMessageContent, HostInputBatch, HostInputEnvelope,
-    HostInputQueue, HostInputQueueError, HostManagedModelError, HostManagedModelErrorKind,
-    HostManagedModelGateway, HostManagedModelRequest, HostManagedModelResponse,
-    HostRuntimeLoopCapabilityPort, HostSkillContextBuildError, HostSkillContextCandidate,
-    HostSkillContextSource, IdentityApplicability, IdentityFileName, LoopCapabilityInputResolver,
-    LoopCapabilityResultWriter, ProductLiveCancellationProbe, RunCancellationFactory,
-    RunCancellationHandle, identity_message_ref,
+    CapabilityAllowSet, CapabilityResolveError, CapabilityResultWrite,
+    CapabilitySurfaceProfileResolver, EmptyLoopCapabilityPort, HostIdentityContextBuildError,
+    HostIdentityContextCandidate, HostIdentityContextSource, HostIdentityMessageContent,
+    HostInputBatch, HostInputEnvelope, HostInputQueue, HostInputQueueError, HostManagedModelError,
+    HostManagedModelErrorKind, HostManagedModelGateway, HostManagedModelMessageRole,
+    HostManagedModelRequest, HostManagedModelResponse, HostRuntimeLoopCapabilityPort,
+    HostSkillContextBuildError, HostSkillContextCandidate, HostSkillContextSource,
+    IdentityApplicability, IdentityFileName, JsonSpawnSubagentInputCodec,
+    LoopCapabilityInputResolver, LoopCapabilityPortFactory, LoopCapabilityResultWriter,
+    ProductLiveCancellationProbe, RunCancellationFactory, RunCancellationHandle,
+    identity_message_ref, loop_driver_execution_extension_id,
 };
 use ironclaw_processes::ProcessServices;
 use ironclaw_reborn::driver_registry::{
     DriverKind, DriverRegistry, DriverRequirements, LoopDriverRegistryKey,
 };
 use ironclaw_reborn::loop_driver_host::{
-    LoopCapabilityPortFactory, RebornLoopDriverHost, RebornLoopDriverHostFactory,
-    RebornLoopDriverHostRequest, TextOnlyLoopHostConfig,
+    RebornLoopDriverHost, RebornLoopDriverHostFactory, RebornLoopDriverHostRequest,
+    TextOnlyLoopHostConfig,
 };
 use ironclaw_reborn::loop_exit_applier::{
     BlockedEvidenceRequest, CompletionEvidenceRequest, FailureEvidenceRequest,
@@ -52,10 +65,16 @@ use ironclaw_reborn::model_routes::{
     ModelRoute, ModelRoutePolicy, ModelRouteResolver, ModelSelectionMode, ModelSlot,
     StaticModelRouteResolver,
 };
-use ironclaw_reborn::planned_driver_factory::default_planned_run_profile_resolver;
+use ironclaw_reborn::planned_driver_factory::{
+    SUBAGENT_PLANNED_PROFILE_ID, default_planned_run_profile_resolver,
+};
 use ironclaw_reborn::runtime::{
     DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, build_default_planned_runtime,
     build_product_live_planned_runtime,
+};
+use ironclaw_reborn::subagent::{
+    flavors::StaticSubagentDefinitionResolver, gate_resolution::BoundedSubagentGateResolutionStore,
+    goal_store::InMemoryBoundedSubagentGoalStore,
 };
 use ironclaw_reborn::text_loop_driver::TextOnlyModelReplyDriver;
 use ironclaw_reborn::turn_runner::{
@@ -68,8 +87,8 @@ use ironclaw_scripts::{
 use ironclaw_skills::SkillTrust;
 use ironclaw_threads::{
     AcceptInboundMessageRequest, EnsureThreadRequest, InMemorySessionThreadService, MessageContent,
-    MessageKind, MessageStatus, SessionThreadService, ThreadHistoryRequest, ThreadMessageId,
-    ThreadScope,
+    MessageKind, MessageStatus, SessionThreadService, SummaryModelContextPolicy,
+    ThreadHistoryRequest, ThreadMessageId, ThreadScope,
 };
 use ironclaw_trust::{
     AdminConfig, AdminEntry, AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment,
@@ -80,28 +99,33 @@ use ironclaw_turns::{
     AgentLoopDriverResumeRequest, AgentLoopDriverRunRequest, CancelRunRequest, CancelRunResponse,
     CheckpointStateStore, DefaultTurnCoordinator, EventCursor, GetCheckpointStateRequest,
     GetLoopCheckpointRequest, GetRunStateRequest, IdempotencyKey, InMemoryCheckpointStateStore,
-    InMemoryLoopCheckpointStore, InMemoryRunProfileResolver, InMemoryTurnStateStore,
-    InMemoryTurnStateStoreLimits, LoopBlocked, LoopBlockedKind, LoopCheckpointRecord,
-    LoopCheckpointStore, LoopCompleted, LoopCompletionKind, LoopExit, LoopExitId, LoopGateRef,
-    LoopMessageRef, LoopResultRef, PutCheckpointStateRequest, PutLoopCheckpointRequest,
-    ReplyTargetBindingRef, ResumeTurnRequest, RunProfileId, RunProfileResolutionRequest,
-    RunProfileResolver, RunProfileVersion, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse,
-    TurnActor, TurnAdmissionPolicy, TurnCoordinator, TurnError, TurnId, TurnLeaseToken, TurnRunId,
-    TurnRunState, TurnRunnerId, TurnScope, TurnStateStore, TurnStatus,
+    InMemoryLoopCheckpointStore, InMemoryRunProfileResolver, InMemoryTurnEventSink,
+    InMemoryTurnStateStore, InMemoryTurnStateStoreLimits, LoopBlocked, LoopBlockedKind,
+    LoopCheckpointRecord, LoopCheckpointStore, LoopCompleted, LoopCompletionKind, LoopExit,
+    LoopExitId, LoopGateRef, LoopMessageRef, LoopResultRef, PutCheckpointStateRequest,
+    PutLoopCheckpointRequest, ReplyTargetBindingRef, ResumeTurnRequest, RunProfileId,
+    RunProfileRequest, RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion,
+    SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnAdmissionPolicy,
+    TurnCoordinator, TurnError, TurnId, TurnLeaseToken, TurnRunId, TurnRunState, TurnRunnerId,
+    TurnScope, TurnStateStore, TurnStatus,
     run_profile::{
         AgentLoopDriverHost, AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply,
-        BatchPolicyKind, CapabilityDeniedReasonKind, CapabilityFailureKind, CapabilityInputRef,
-        CapabilityInvocation, CapabilityOutcome, CapabilitySurfaceVersion,
-        FinalizeAssistantMessage, InMemoryLoopHostMilestoneSink, InstructionSafetyContext,
-        LoopCancelReasonKind, LoopCancellationPort, LoopCapabilityPort, LoopCheckpointKind,
-        LoopCheckpointPort, LoopCheckpointRequest, LoopCheckpointStateRef, LoopContextRequest,
+        BatchPolicyKind, CapabilityDeniedReasonKind, CapabilityDescriptorView,
+        CapabilityFailureKind, CapabilityInputRef, CapabilityInvocation, CapabilityOutcome,
+        CapabilitySurfaceVersion, CompactionInitiator, FinalizeAssistantMessage,
+        InMemoryLoopHostMilestoneSink, InstructionSafetyContext, LoopCancelReasonKind,
+        LoopCancellationPort, LoopCapabilityPort, LoopCheckpointKind, LoopCheckpointPort,
+        LoopCheckpointRequest, LoopCheckpointStateRef, LoopCompactionError, LoopCompactionMode,
+        LoopCompactionOutcome, LoopCompactionPort, LoopCompactionRequest, LoopContextRequest,
         LoopDriverId, LoopDriverNoteKind, LoopGateKind, LoopHostMilestone, LoopHostMilestoneKind,
         LoopInlineMessage, LoopInlineMessageRole, LoopInput, LoopInputAckToken, LoopInputCursor,
         LoopInputCursorToken, LoopInputPort, LoopModelBudgetAccountant, LoopModelGatewayError,
         LoopModelPort, LoopModelRequest, LoopModelRouteSnapshot, LoopProgressEvent,
-        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopSafeSummary, ModelCallOutcome,
-        NoOpBudgetAccountant, NoOpPolicyGuard, ParentLoopOutput, PersonalContextPolicy, PromptMode,
-        SkillVisibility, StageCheckpointPayloadRequest, VisibleCapabilityRequest,
+        LoopPromptBundleRequest, LoopPromptPort, LoopRunContext, LoopSafeSummary, ModelWorkKind,
+        ModelWorkOutcome, ModelWorkRequest, NoOpBudgetAccountant, NoOpPolicyGuard,
+        ParentLoopOutput, PersonalContextPolicy, PromptMode, SkillVisibility,
+        StageCheckpointPayloadRequest, SystemInferenceTaskId, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
     runner::{ClaimRunRequest, ClaimedTurnRun, TurnRunTransitionPort},
 };
@@ -124,6 +148,23 @@ fn turn_state_store_dyn(store: &Arc<InMemoryTurnStateStore>) -> Arc<dyn TurnStat
 fn test_safety_context() -> InstructionSafetyContext {
     InstructionSafetyContext::new("policy:test", "test safety context")
         .expect("test safety context")
+}
+
+const SYNTHETIC_CAPABILITY_INFO_ID: &str = "ironclaw.loop.capability_info";
+
+fn only_runtime_surface_descriptor<'a>(
+    surface: &'a VisibleCapabilitySurface,
+    expected_id: &CapabilityId,
+) -> &'a CapabilityDescriptorView {
+    let runtime_descriptors = surface
+        .descriptors
+        .iter()
+        .filter(|descriptor| descriptor.capability_id.as_str() != SYNTHETIC_CAPABILITY_INFO_ID)
+        .collect::<Vec<_>>();
+    assert_eq!(runtime_descriptors.len(), 1);
+    let descriptor = runtime_descriptors[0];
+    assert_eq!(&descriptor.capability_id, expected_id);
+    descriptor
 }
 
 #[tokio::test]
@@ -172,7 +213,7 @@ async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
         })
         .await
         .unwrap();
-    assert_eq!(prompt_bundle.messages.len(), 1);
+    assert_eq!(prompt_bundle.messages.len(), 2);
     assert!(prompt_bundle.instruction_fingerprint.is_some());
 
     let model_response = host_dyn
@@ -204,6 +245,7 @@ async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
         .checkpoint(LoopCheckpointRequest {
             kind: LoopCheckpointKind::BeforeModel,
             state_ref: checkpoint_state.state_ref.clone(),
+            gate_ref: None,
         })
         .await
         .unwrap();
@@ -234,9 +276,16 @@ async fn text_only_host_factory_builds_complete_agent_loop_driver_host() {
     assert_eq!(assistant.content.as_deref(), Some("model says hi"));
 
     assert_eq!(fixture.gateway.requests().len(), 1);
-    assert_eq!(
-        fixture.gateway.requests()[0].messages[0].content,
-        "hello reborn"
+    let request_messages = &fixture.gateway.requests()[0].messages;
+    assert!(request_messages.iter().any(|message| {
+        message
+            .content
+            .contains("No instruction safety scanner is configured")
+    }));
+    assert!(
+        request_messages
+            .iter()
+            .any(|message| message.content == "hello reborn")
     );
 
     let milestone_names = fixture.milestone_names();
@@ -354,6 +403,122 @@ async fn text_only_host_factory_invokes_model_budget_accountant() {
 }
 
 #[tokio::test]
+async fn compaction_system_inference_budget_denial_skips_model_gateway_dispatch() {
+    let fixture = HostFixture::new("thread-host-compaction-accounting", "hello compaction").await;
+    let accountant = Arc::new(RejectingSystemInferenceBudgetAccountant::default());
+    let factory = fixture
+        .factory()
+        .with_model_budget_accountant(accountant.clone());
+    let host = factory
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap();
+
+    let error = host
+        .compact_loop_context(LoopCompactionRequest {
+            task_id: SystemInferenceTaskId::new(),
+            thread_id: fixture.thread_id.clone(),
+            last_compacted_through_seq: None,
+            drop_through_seq: 1,
+            preserve_tail_tokens: 8_000,
+            mode: LoopCompactionMode::Fresh,
+            deadline_ms: 1_000,
+        })
+        .await
+        .expect_err("budget denial should reject compaction inference");
+
+    assert!(matches!(error, LoopCompactionError::InferenceFailed { .. }));
+    assert!(accountant.was_pre_called());
+    assert!(
+        fixture.gateway.requests().is_empty(),
+        "system inference budget denial must happen before provider dispatch"
+    );
+}
+
+#[tokio::test]
+async fn compact_loop_context_dispatches_system_inference_and_persists_summary() {
+    let fixture = HostFixture::new(
+        "thread-host-compaction-success",
+        "visible text for compaction",
+    )
+    .await;
+    fixture
+        .gateway
+        .set_response(Ok(HostManagedModelResponse::assistant_reply(
+            "<compact & keep>",
+        )));
+    let host = fixture.build_host().await;
+
+    let response = host
+        .compact_loop_context(LoopCompactionRequest {
+            task_id: SystemInferenceTaskId::new(),
+            thread_id: fixture.thread_id.clone(),
+            last_compacted_through_seq: None,
+            drop_through_seq: 1,
+            preserve_tail_tokens: 8_000,
+            mode: LoopCompactionMode::Fresh,
+            deadline_ms: 1_000,
+        })
+        .await
+        .expect("host compaction should succeed through the gateway-backed inference path");
+
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].messages.len(), 2);
+    assert_eq!(
+        requests[0].messages[0].role,
+        HostManagedModelMessageRole::System
+    );
+    assert_eq!(
+        requests[0].messages[1].role,
+        HostManagedModelMessageRole::User
+    );
+    assert!(requests[0].surface_version.is_none());
+    assert!(
+        requests[0].messages[1]
+            .content
+            .contains("visible text for compaction")
+    );
+
+    let history = fixture
+        .thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: fixture.thread_scope.clone(),
+            thread_id: fixture.thread_id.clone(),
+        })
+        .await
+        .unwrap();
+    let summary = history
+        .summary_artifacts
+        .first()
+        .expect("host compaction should persist a summary artifact");
+    let LoopCompactionOutcome::Compacted(response) = response else {
+        panic!("host compaction should produce a persisted summary artifact");
+    };
+    assert_eq!(
+        response.summary_artifact_id.as_str(),
+        summary.summary_id.to_string()
+    );
+    assert!(
+        summary
+            .content
+            .starts_with("This message is a generated session summary.")
+    );
+    assert!(
+        summary
+            .content
+            .contains("<summary>&lt;compact &amp; keep&gt;</summary>")
+    );
+    assert_eq!(
+        summary.model_context_policy,
+        Some(SummaryModelContextPolicy::ReplaceRangeWhenSelected)
+    );
+}
+
+#[tokio::test]
 async fn progress_port_routes_loop_progress_milestones() {
     let fixture = HostFixture::new("thread-progress-route", "hello progress").await;
     let host = fixture.build_host().await;
@@ -427,6 +592,100 @@ async fn progress_port_routes_loop_progress_milestones() {
 }
 
 #[tokio::test]
+async fn progress_port_routes_compaction_progress_milestones() {
+    let fixture = HostFixture::new("thread-progress-compaction", "hello progress").await;
+    let host = fixture.build_host().await;
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+    let started_task = SystemInferenceTaskId::new();
+    let completed_task = SystemInferenceTaskId::new();
+    let failed_task = SystemInferenceTaskId::new();
+
+    host_dyn
+        .emit_loop_progress(LoopProgressEvent::CompactionStarted {
+            task_id: started_task,
+            initiator: CompactionInitiator::Auto,
+        })
+        .await
+        .unwrap();
+    host_dyn
+        .emit_loop_progress(LoopProgressEvent::CompactionCompleted {
+            task_id: completed_task,
+            compression_ratio_ppm: 250_000,
+        })
+        .await
+        .unwrap();
+    host_dyn
+        .emit_loop_progress(LoopProgressEvent::CompactionFailed {
+            task_id: failed_task,
+            reason_kind: LoopSafeSummary::new("security rejected").unwrap(),
+        })
+        .await
+        .unwrap();
+
+    let milestones = fixture.milestones();
+    assert!(matches!(
+        milestones[0].kind,
+        LoopHostMilestoneKind::CompactionStarted {
+            task_id,
+            initiator: CompactionInitiator::Auto,
+        } if task_id == started_task
+    ));
+    assert!(matches!(
+        milestones[1].kind,
+        LoopHostMilestoneKind::CompactionCompleted {
+            task_id,
+            compression_ratio_ppm: 250_000,
+        } if task_id == completed_task
+    ));
+    assert!(matches!(
+        &milestones[2].kind,
+        LoopHostMilestoneKind::CompactionFailed {
+            task_id,
+            reason_kind,
+        } if *task_id == failed_task && reason_kind.as_str() == "security rejected"
+    ));
+    assert!(milestones.iter().all(|milestone| {
+        milestone.scope == fixture.context.scope
+            && milestone.turn_id == fixture.context.turn_id
+            && milestone.run_id == fixture.context.run_id
+    }));
+}
+
+#[tokio::test]
+async fn progress_port_routes_capability_result_overflow_initiator() {
+    // Mirror progress_port_routes_compaction_progress_milestones but using
+    // CompactionInitiator::CapabilityResultOverflow to validate the
+    // snake_case serialization ("capability_result_overflow") and the
+    // milestone routing path don't drop the new variant.
+    let fixture = HostFixture::new("thread-progress-overflow-initiator", "hello overflow").await;
+    let host = fixture.build_host().await;
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+    let started_task = SystemInferenceTaskId::new();
+
+    host_dyn
+        .emit_loop_progress(LoopProgressEvent::CompactionStarted {
+            task_id: started_task,
+            initiator: CompactionInitiator::CapabilityResultOverflow,
+        })
+        .await
+        .unwrap();
+
+    let milestones = fixture.milestones();
+    assert!(matches!(
+        milestones[0].kind,
+        LoopHostMilestoneKind::CompactionStarted {
+            task_id,
+            initiator: CompactionInitiator::CapabilityResultOverflow,
+        } if task_id == started_task
+    ));
+    assert!(milestones.iter().all(|milestone| {
+        milestone.scope == fixture.context.scope
+            && milestone.turn_id == fixture.context.turn_id
+            && milestone.run_id == fixture.context.run_id
+    }));
+}
+
+#[tokio::test]
 async fn progress_port_checkpoint_written_does_not_double_emit() {
     let fixture = HostFixture::new("thread-progress-checkpoint", "hello progress").await;
     let host = fixture.build_host().await;
@@ -484,6 +743,7 @@ async fn progress_event_serde_roundtrip_all_variants() {
     let bundle_ref = ironclaw_turns::run_profile::LoopPromptBundleRef::for_run(&context, "bundle")
         .expect("bundle ref");
     let surface_version = CapabilitySurfaceVersion::new("surface:v1").expect("surface version");
+    let task_id = SystemInferenceTaskId::new();
 
     let events = vec![
         LoopProgressEvent::driver_note(LoopDriverNoteKind::Planning, "safe note").unwrap(),
@@ -516,6 +776,32 @@ async fn progress_event_serde_roundtrip_all_variants() {
         LoopProgressEvent::CheckpointWritten {
             iteration: 1,
             kind: LoopCheckpointKind::Final,
+        },
+        LoopProgressEvent::CompactionStarted {
+            task_id,
+            initiator: CompactionInitiator::Auto,
+        },
+        LoopProgressEvent::CompactionCompleted {
+            task_id,
+            compression_ratio_ppm: 250_000,
+        },
+        LoopProgressEvent::CompactionFailed {
+            task_id,
+            reason_kind: LoopSafeSummary::new("inference failed").unwrap(),
+        },
+        LoopProgressEvent::CompactionLeakDetected {
+            task_id,
+            reason_kind: LoopSafeSummary::new("leak detected").unwrap(),
+        },
+        LoopProgressEvent::GoalRefreshStarted { task_id },
+        LoopProgressEvent::GoalRefreshCompleted { task_id },
+        LoopProgressEvent::GoalRefreshFailed {
+            task_id,
+            reason_kind: LoopSafeSummary::new("goal failed").unwrap(),
+        },
+        LoopProgressEvent::GoalRefreshLeakDetected {
+            task_id,
+            reason_kind: LoopSafeSummary::new("goal leak detected").unwrap(),
         },
     ];
 
@@ -569,11 +855,10 @@ async fn text_only_model_reply_driver_runs_prompt_model_transcript_path() {
 
     let requests = fixture.gateway.requests();
     assert_eq!(requests.len(), 1);
-    assert_eq!(requests[0].messages.len(), 1);
-    assert_eq!(
-        requests[0].messages[0].content,
-        "RAW_PROMPT_TEXT_SENTINEL sk-prompt-secret /host/path tool_input"
-    );
+    assert_eq!(requests[0].messages.len(), 2);
+    assert!(requests[0].messages.iter().any(|message| {
+        message.content == "RAW_PROMPT_TEXT_SENTINEL sk-prompt-secret /host/path tool_input"
+    }));
     assert_eq!(
         fixture.milestone_names(),
         vec![
@@ -592,9 +877,11 @@ async fn text_only_model_reply_driver_redacts_credential_marker_reply_text() {
     let mut fixture = HostFixture::new("thread-driver-marker-reply", "hello config").await;
     fixture.gateway.set_response(Ok(HostManagedModelResponse {
         safe_text_deltas: vec!["Use OPENAI_API_KEY in the environment".to_string()],
+        safe_reasoning_deltas: Vec::new(),
         output: ParentLoopOutput::AssistantReply(AssistantReply {
             content: "Use OPENAI_API_KEY in the environment".to_string(),
         }),
+        usage: None,
     }));
     let driver = TextOnlyModelReplyDriver::default();
     assign_driver_to_fixture(&mut fixture, driver.descriptor());
@@ -703,12 +990,22 @@ async fn text_only_model_reply_driver_rejects_profiles_not_assigned_to_driver() 
 #[tokio::test]
 async fn text_only_host_factory_includes_safety_context_in_prompt_bundle() {
     let fixture = HostFixture::new("thread-host-safety-context", "hello safety").await;
-    let host = fixture
-        .factory()
-        .with_safety_context(
-            InstructionSafetyContext::new("safety:prompt-write", "prompt write safety enforced")
-                .unwrap(),
-        )
+    let factory = RebornLoopDriverHostFactory::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        Arc::clone(&fixture.gateway),
+        fixture.checkpoint_state_store.clone(),
+        fixture.turn_state_store.clone(),
+        fixture.loop_checkpoint_store.clone(),
+        fixture.milestone_sink.clone(),
+        TextOnlyLoopHostConfig {
+            max_messages: 8,
+            require_model_route_snapshot: false,
+        },
+        InstructionSafetyContext::new("safety:prompt-write", "prompt write safety enforced")
+            .unwrap(),
+    );
+    let host = factory
         .build_text_only_host(RebornLoopDriverHostRequest {
             claimed_run: fixture.claimed.clone(),
             loop_run_context: fixture.context.clone(),
@@ -746,6 +1043,57 @@ async fn text_only_host_factory_includes_safety_context_in_prompt_bundle() {
             .messages
             .iter()
             .any(|message| message.content == "prompt write safety enforced")
+    );
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .all(|message| !message.content.contains("No instruction safety scanner"))
+    );
+}
+
+#[tokio::test]
+async fn text_only_host_factory_uses_explicit_local_noop_safety_context() {
+    let fixture = HostFixture::new("thread-host-default-safety-context", "hello safety").await;
+    let host = fixture
+        .factory()
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap();
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+
+    let prompt_bundle = host_dyn
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+            inline_messages: Vec::new(),
+            capability_view: None,
+        })
+        .await
+        .unwrap();
+    host_dyn
+        .stream_model(LoopModelRequest {
+            messages: prompt_bundle.messages,
+            surface_version: None,
+            model_preference: None,
+            capability_view: None,
+        })
+        .await
+        .unwrap();
+
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content.contains("No instruction safety scanner"))
     );
 }
 
@@ -932,6 +1280,10 @@ async fn turn_runner_worker_completes_after_libsql_turn_and_thread_services_reop
                     requested_run_profile: None,
                     idempotency_key: IdempotencyKey::new("idem-libsql-restart").unwrap(),
                     received_at: Utc::now(),
+                    requested_run_id: None,
+                    parent_run_id: None,
+                    subagent_depth: 0,
+                    spawn_tree_root_run_id: None,
                 },
                 &ironclaw_turns::AllowAllTurnAdmissionPolicy,
                 &resolver,
@@ -996,6 +1348,7 @@ async fn turn_runner_worker_completes_after_libsql_turn_and_thread_services_reop
             max_messages: 8,
             require_model_route_snapshot: false,
         },
+        InstructionSafetyContext::local_development_noop(),
     );
     let mut registry = DriverRegistry::new();
     registry
@@ -1267,7 +1620,7 @@ async fn turn_runner_worker_drives_script_capability_through_real_host_runtime()
     let runtime: Arc<dyn HostRuntime + Send + Sync> = Arc::new(
         HostRuntimeServices::new(
             Arc::new(e2e_registry_with_manifest(E2E_SCRIPT_MANIFEST)),
-            Arc::new(LocalFilesystem::new()),
+            Arc::new(e2e_script_filesystem().await),
             Arc::new(InMemoryResourceGovernor::new()),
             Arc::new(GrantAuthorizer::new()),
             ProcessServices::in_memory(),
@@ -1430,21 +1783,21 @@ async fn turn_runner_rejects_driver_fabricated_approval_block_without_durable_ga
     let cancel_clone = cancel.clone();
     let handle = tokio::spawn(async move { worker.run(cancel_clone).await });
 
-    let recovery_state = wait_for_run_status(
+    let failed_state = wait_for_run_status(
         turn_store.as_ref(),
         &fixture.context.scope,
         run_id,
-        TurnStatus::RecoveryRequired,
+        TurnStatus::Failed,
         "production-like evidence must reject fabricated approval block",
     )
     .await;
     cancel.cancel();
     handle.await.unwrap();
 
-    assert_eq!(recovery_state.run_id, run_id);
-    assert_eq!(recovery_state.gate_ref, None);
+    assert_eq!(failed_state.run_id, run_id);
+    assert_eq!(failed_state.gate_ref, None);
     assert_eq!(
-        recovery_state.failure.expect("failure").category(),
+        failed_state.failure.expect("failure").category(),
         "driver_protocol_violation"
     );
     assert!(fixture.gateway.requests().is_empty());
@@ -1538,6 +1891,7 @@ async fn turn_runner_blocks_on_approval_then_coordinator_resume_completes_same_r
             actor: TurnActor::new(UserId::new("user-text-host").unwrap()),
             run_id,
             gate_resolution_ref: gate_ref.clone(),
+            precondition: ironclaw_turns::ResumeTurnPrecondition::AnyBlockedGate,
             source_binding_ref: SourceBindingRef::new("source-web-resumed").unwrap(),
             reply_target_binding_ref: ReplyTargetBindingRef::new("reply-web-resumed").unwrap(),
             idempotency_key: IdempotencyKey::new("resume-approval-once").unwrap(),
@@ -1670,6 +2024,7 @@ async fn text_only_host_e2e_keeps_persisted_model_route_through_full_flow() {
         .checkpoint(LoopCheckpointRequest {
             kind: LoopCheckpointKind::BeforeModel,
             state_ref: checkpoint_state.state_ref.clone(),
+            gate_ref: None,
         })
         .await
         .unwrap();
@@ -1677,7 +2032,12 @@ async fn text_only_host_e2e_keeps_persisted_model_route_through_full_flow() {
     let requests = fixture.gateway.requests();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].resolved_model_route, Some(persisted_route));
-    assert_eq!(requests[0].messages[0].content, "hello routed e2e");
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "hello routed e2e")
+    );
     assert!(reply_ref.as_str().starts_with("msg:"));
     assert!(
         fixture
@@ -1705,7 +2065,7 @@ async fn text_only_host_e2e_keeps_persisted_model_route_through_full_flow() {
 }
 
 #[tokio::test]
-async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_claimed_scope() {
+async fn turn_runner_worker_fails_when_real_host_factory_rejects_claimed_scope() {
     let fixture = HostFixture::new_unsubmitted("thread-runner-host-edge", "hello edge").await;
     let turn_store = Arc::new(InMemoryTurnStateStore::default());
     let resolver = InMemoryRunProfileResolver::default();
@@ -1742,6 +2102,7 @@ async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_clai
             max_messages: 8,
             require_model_route_snapshot: false,
         },
+        InstructionSafetyContext::local_development_noop(),
     );
 
     let (_wake_sender, wake_receiver) = TurnRunnerWakeReceiver::new();
@@ -1771,13 +2132,13 @@ async fn turn_runner_worker_records_recovery_when_real_host_factory_rejects_clai
             })
             .await
             .unwrap();
-        if state.status == TurnStatus::RecoveryRequired {
+        if state.status == TurnStatus::Failed {
             assert!(state.failure.is_some());
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "host factory scope rejection should record RecoveryRequired"
+            "host factory scope rejection should fail the run"
         );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
@@ -1867,7 +2228,7 @@ async fn planned_host_factory_create_host_uses_profiled_capabilities() {
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime: runtime.clone(),
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
@@ -1898,8 +2259,7 @@ async fn planned_host_factory_create_host_uses_profiled_capabilities() {
         .visible_capabilities(VisibleCapabilityRequest)
         .await
         .unwrap();
-    assert_eq!(surface.descriptors.len(), 1);
-    assert_eq!(surface.descriptors[0].capability_id, allowed_id);
+    let _descriptor = only_runtime_surface_descriptor(&surface, &allowed_id);
 
     let outcome = host
         .invoke_capability(CapabilityInvocation {
@@ -1950,6 +2310,55 @@ async fn planned_host_factory_create_host_requires_profiled_capabilities() {
 }
 
 #[tokio::test]
+async fn subagent_planned_host_factory_create_host_requires_prompt_composer() {
+    let fixture = HostFixture::new("thread-host-subagent-missing-composer", "hello").await;
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
+        runtime,
+        visible_request: host_runtime_visible_request(&fixture, []),
+        io: io.clone(),
+        milestone_sink: fixture.milestone_sink.clone(),
+    });
+    let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
+        CapabilityAllowSet::All,
+    ));
+    let planned = default_planned_run_profile_resolver()
+        .expect("planned default profile resolver")
+        .resolve_run_profile(
+            RunProfileResolutionRequest::interactive_default().with_requested_run_profile(
+                RunProfileRequest::new(SUBAGENT_PLANNED_PROFILE_ID).unwrap(),
+            ),
+        )
+        .await
+        .unwrap();
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_run_profile_id = planned.profile_id.clone();
+    claimed.state.resolved_run_profile_version = planned.loop_driver.version;
+    claimed.resolved_run_profile = planned;
+
+    let error = match fixture
+        .factory()
+        .with_driver_requirements(driver_requirements_for(
+            &claimed.resolved_run_profile.loop_driver,
+            DriverRequirements::all_required(),
+        ))
+        .with_profiled_capability_port_factory(capability_factory, surface_resolver)
+        .create_host(&claimed)
+        .await
+    {
+        Ok(_) => panic!("subagent hosts must fail closed without prompt composer"),
+        Err(error) => error,
+    };
+
+    assert!(
+        error
+            .reason
+            .contains("subagent prompt composer is required")
+    );
+}
+
+#[tokio::test]
 async fn planned_host_factory_fails_closed_when_driver_requirements_are_missing() {
     let fixture = HostFixture::new("thread-host-planned-missing-requirements", "hello").await;
     let planned = default_planned_run_profile_resolver()
@@ -1984,7 +2393,7 @@ async fn planned_host_factory_sanitizes_capability_profile_resolver_errors() {
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime,
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let surface_resolver = Arc::new(FailingCapabilitySurfaceProfileResolver::internal(
@@ -2081,7 +2490,7 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime: runtime.clone(),
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
@@ -2092,9 +2501,10 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
         turn_store.clone(),
         turn_store.clone(),
     ));
+    let event_sink = Arc::new(InMemoryTurnEventSink::default());
     let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {
         turn_state: turn_store.clone(),
-        thread_service: fixture.thread_service.clone(),
+        thread_service: fixture.thread_service.clone() as Arc<dyn SessionThreadService>,
         thread_scope: fixture.thread_scope.clone(),
         model_gateway: fixture.gateway.clone(),
         checkpoint_state_store: fixture.checkpoint_state_store.clone(),
@@ -2102,6 +2512,12 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
         milestone_sink: fixture.milestone_sink.clone(),
         capability_factory,
         capability_surface_resolver: surface_resolver,
+        capability_result_writer: io.clone(),
+        subagent_goal_store: Arc::new(InMemoryBoundedSubagentGoalStore::new()),
+        subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+        subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
+        subagent_spawn_limits: ironclaw_loop_support::SubagentSpawnLimits::default(),
         loop_exit_evidence: evidence,
         config: DefaultPlannedRuntimeConfig {
             worker: TurnRunnerWorkerConfig {
@@ -2119,6 +2535,9 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
         model_policy_guard: None,
         model_budget_accountant: None,
         safety_context: None,
+        hook_dispatcher_builder_factory: None,
+        hook_security_audit_sink: None,
+        turn_event_sink: Some(event_sink.clone()),
     })
     .unwrap();
 
@@ -2133,10 +2552,18 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
             requested_run_profile: None,
             idempotency_key: IdempotencyKey::new("idem-runtime-planned").unwrap(),
             received_at: Utc::now(),
+            requested_run_id: None,
+            parent_run_id: None,
+            subagent_depth: 0,
+            spawn_tree_root_run_id: None,
         })
         .await
         .unwrap();
     assert_eq!(status, TurnStatus::Queued);
+    let events = event_sink.events();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].run_id, run_id);
+    assert_eq!(events[0].status, TurnStatus::Queued);
 
     let claimed = turn_store
         .claim_next_run(ClaimRunRequest {
@@ -2162,8 +2589,7 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
         .visible_capabilities(VisibleCapabilityRequest)
         .await
         .unwrap();
-    assert_eq!(surface.descriptors.len(), 1);
-    assert_eq!(surface.descriptors[0].capability_id, allowed_id);
+    let _descriptor = only_runtime_surface_descriptor(&surface, &allowed_id);
 
     let outcome = host
         .invoke_capability(CapabilityInvocation {
@@ -2179,6 +2605,371 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
             if denied.reason_kind.as_str() == "surface_profile_denied"
     ));
     assert!(runtime.invocations().is_empty());
+}
+
+// ─── Hook framework activation (#3934) e2e through build_default_planned_runtime ──
+//
+// These tests drive the *production* composition function
+// `build_default_planned_runtime` with a per-run hook dispatcher builder
+// factory shaped exactly like the one `ironclaw_reborn_composition::hooks`
+// produces (first-party builtin no-op observer + extension-declared `Installed`
+// hooks via `HookRegistrar::install`). They then build a host through the
+// composed `host_factory` and invoke a capability, proving the hook gate fires
+// (or doesn't) through the real runtime composition rather than a test-only
+// factory wiring.
+
+/// Canonical identity path for the test-local no-op observer used by the
+/// host-plumbing doubles below.
+///
+/// This is a TEST-LOCAL host-plumbing double path, NOT aligned with any
+/// production type. `NoOpObserverHook` was removed from the production
+/// first-party catalog in `1e618d076`: `install_first_party_hooks` now ships
+/// an empty catalog, so there is no production type at
+/// `ironclaw_reborn_composition::hooks::NoOpObserverHook`. The only surviving
+/// `NoOpObserverHook` is the composition crate's test-only one at
+/// `ironclaw_reborn_composition::hooks::tests::NoOpObserverHook`. This constant
+/// just needs a stable, distinct builtin identity for the host-plumbing doubles
+/// (see the note at the `first_party_only_hook_factory` definition below); the
+/// path string is opaque and need not match any real type.
+const E2E_NOOP_OBSERVER_PATH: &str = "ironclaw_reborn::tests::loop_driver_host::E2eNoOpObserver";
+
+#[derive(Debug, Default)]
+struct E2eNoOpObserver;
+
+#[async_trait]
+impl ObserverHook for E2eNoOpObserver {
+    async fn observe(&self, _ctx: &ObserverHookContext, _sink: &mut dyn ObserverSink) {}
+}
+
+/// Build a host factory→runtime via `build_default_planned_runtime` with an
+/// optional hook dispatcher builder factory, then return the composed host
+/// (built from a freshly-claimed run) plus the recording runtime so the test
+/// can assert whether the inner port was reached.
+async fn build_runtime_host_with_optional_hooks(
+    thread_label: &str,
+    allowed_id: &CapabilityId,
+    hook_factory: Option<ironclaw_reborn::loop_driver_host::HookDispatcherBuilderFactory>,
+) -> (
+    Box<dyn AgentLoopDriverHost + Send + Sync>,
+    Arc<RecordingHostRuntime>,
+    Arc<InMemoryCapabilityIo>,
+    CapabilitySurfaceVersion,
+) {
+    let fixture = HostFixture::new_unsubmitted(thread_label, "hello").await;
+    let turn_store = Arc::new(InMemoryTurnStateStore::default());
+    let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
+        capability_descriptor(allowed_id.as_str()),
+    ])));
+    let io = Arc::new(InMemoryCapabilityIo::default());
+    let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
+        runtime: runtime.clone(),
+        visible_request: host_runtime_visible_request(&fixture, ["demo"]),
+        io: io.clone(),
+        milestone_sink: fixture.milestone_sink.clone(),
+    });
+    let surface_resolver = Arc::new(StaticCapabilitySurfaceProfileResolver::new(
+        CapabilityAllowSet::allowlist([allowed_id.clone()]),
+    ));
+    let evidence = Arc::new(ThreadCheckpointLoopExitEvidencePort::new(
+        fixture.thread_service.clone(),
+        turn_store.clone(),
+        turn_store.clone(),
+    ));
+    let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {
+        turn_state: turn_store.clone(),
+        thread_service: fixture.thread_service.clone(),
+        thread_scope: fixture.thread_scope.clone(),
+        model_gateway: fixture.gateway.clone(),
+        checkpoint_state_store: fixture.checkpoint_state_store.clone(),
+        loop_checkpoint_store: turn_store.clone(),
+        milestone_sink: fixture.milestone_sink.clone(),
+        capability_factory,
+        capability_surface_resolver: surface_resolver,
+        capability_result_writer: io.clone(),
+        subagent_goal_store: Arc::new(InMemoryBoundedSubagentGoalStore::new()),
+        subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+        subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
+        subagent_spawn_limits: ironclaw_loop_support::SubagentSpawnLimits::default(),
+        loop_exit_evidence: evidence,
+        config: DefaultPlannedRuntimeConfig::default(),
+        model_route_resolver: None,
+        // A ready cancellation factory so `create_host` doesn't need the run
+        // present in the (otherwise unused) in-memory turn-state store. The
+        // hook wiring under test is independent of cancellation.
+        cancellation_factory: Some(Arc::new(ReadyRunCancellationFactory::default())),
+        skill_context_source: None,
+        input_queue: None,
+        identity_context_source: Arc::new(StaticIdentityContextSource::new(Vec::new())),
+        model_policy_guard: None,
+        model_budget_accountant: None,
+        safety_context: None,
+        hook_security_audit_sink: None,
+        turn_event_sink: None,
+        hook_dispatcher_builder_factory: hook_factory,
+    })
+    .unwrap();
+
+    // Align the claimed run with the planned profile that
+    // `build_default_planned_runtime` registers, so the planned driver's
+    // capability surface resolves (otherwise the host reports no capabilities).
+    let planned = default_planned_run_profile_resolver()
+        .expect("planned default profile resolver")
+        .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
+        .await
+        .unwrap();
+    let mut claimed = fixture.claimed.clone();
+    claimed.state.resolved_run_profile_id = planned.profile_id.clone();
+    claimed.state.resolved_run_profile_version = planned.loop_driver.version;
+    claimed.resolved_run_profile = planned;
+
+    let host = composition
+        .host_factory
+        .create_host(&claimed)
+        .await
+        .unwrap();
+    let surface = host
+        .visible_capabilities(VisibleCapabilityRequest)
+        .await
+        .unwrap();
+    (host, runtime, io, surface.version)
+}
+
+// NOTE (review item #6): the two builder factories below are HAND-BUILT test
+// doubles that exercise the `ironclaw_reborn` host-factory PLUMBING — i.e. that
+// a dispatcher minted by a builder factory is wired through
+// `HookedLoopCapabilityPort` and that a deny short-circuits the inner runtime
+// port. They are deliberately NOT a substitute for activation coverage: they do
+// not prove the production composition root wires the canonical registry/config.
+// That activation coverage now lives where it belongs — driving the REAL
+// `build_hook_dispatcher_builder_factory` and `build_reborn_runtime` — in
+// `ironclaw_reborn_composition::hooks` and
+// `ironclaw_reborn_composition::runtime` tests. Keep this split: host plumbing
+// is tested here; composition activation is tested in the composition crate.
+
+/// First-party-only builder factory: installs just the no-op observer, mirroring
+/// the composition's first-party-only state. Host-plumbing double only — see the
+/// note above.
+fn first_party_only_hook_factory() -> ironclaw_reborn::loop_driver_host::HookDispatcherBuilderFactory
+{
+    Arc::new(|| {
+        let hook_id = HookId::for_builtin(E2E_NOOP_OBSERVER_PATH, HookVersion::ONE);
+        Ok(HookDispatcherBuilder::new(HookRegistry::new())
+            .install_builtin_observer(
+                hook_id,
+                HookPhase::Telemetry,
+                HookPointSpec::AfterCapability,
+                Box::new(E2eNoOpObserver),
+            )
+            .expect("install first-party no-op observer"))
+    })
+}
+
+/// Builder factory matching the composition loader: first-party no-op observer
+/// plus an extension-declared `Installed`-tier deny hook (projected from a
+/// manifest entry through `HookRegistrar::install`, exactly as the composition
+/// does). Denies `deny_target`.
+fn extension_deny_hook_factory(
+    extension: &str,
+    deny_target: &str,
+) -> ironclaw_reborn::loop_driver_host::HookDispatcherBuilderFactory {
+    let extension = extension.to_string();
+    let deny_target = deny_target.to_string();
+    Arc::new(move || {
+        let evaluator = Arc::new(PredicateEvaluator::new());
+        let registrar = HookRegistrar::new(evaluator);
+        let mut builder = first_party_only_hook_factory()().expect("first-party builder");
+        let entry = HookManifestEntry::new(
+            HookLocalId::new("deny-cap").expect("valid hook local id"),
+            HookManifestKind::BeforeCapability,
+            HookManifestBody::Predicate {
+                spec: HookPredicateSpec::DenyCapability {
+                    when: CapabilityPredicate::NameEquals {
+                        name: deny_target.clone(),
+                    },
+                    reason: "e2e extension deny".to_string(),
+                },
+            },
+        );
+        let ext_id =
+            ironclaw_host_api::ExtensionId::new(extension.clone()).expect("valid extension id");
+        let entries = vec![entry];
+        let (next, _ids) = registrar
+            .install(ext_id, "0.1.0", &entries, builder)
+            .expect("install extension deny hook");
+        builder = next;
+        Ok(builder)
+    })
+}
+
+/// Flag OFF (no factory): a capability the surface allows reaches the inner
+/// host runtime port unaffected. This is the exact pre-hooks behavior — the
+/// hard rollout-safety contract.
+#[tokio::test]
+async fn hooks_flag_off_capability_invocation_is_unaffected() {
+    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
+    let (host, runtime, io, surface_version) =
+        build_runtime_host_with_optional_hooks("thread-hooks-off", &allowed_id, None).await;
+
+    let input_ref = CapabilityInputRef::new("input:hooks-off").unwrap();
+    io.put_input(input_ref.clone(), json!({ "message": "off" }));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: allowed_id.clone(),
+            output: json!({ "ok": true }),
+            usage: ResourceUsage::default(),
+            display_preview: None,
+        },
+    )));
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version,
+            capability_id: allowed_id.clone(),
+            input_ref,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, CapabilityOutcome::Completed(_)),
+        "flag OFF: allowed capability must complete unaffected, got {outcome:?}"
+    );
+    assert_eq!(
+        runtime.invocations().len(),
+        1,
+        "flag OFF: the inner host runtime port must be reached"
+    );
+}
+
+/// Flag ON, first-party-only (no-op observer): an allowed capability still
+/// completes and reaches the inner port — the no-op observer ships dark.
+#[tokio::test]
+async fn hooks_flag_on_first_party_only_does_not_change_outcome() {
+    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
+    let (host, runtime, io, surface_version) = build_runtime_host_with_optional_hooks(
+        "thread-hooks-on-noop",
+        &allowed_id,
+        Some(first_party_only_hook_factory()),
+    )
+    .await;
+
+    let input_ref = CapabilityInputRef::new("input:hooks-noop").unwrap();
+    io.put_input(input_ref.clone(), json!({ "message": "noop" }));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: allowed_id.clone(),
+            output: json!({ "ok": true }),
+            usage: ResourceUsage::default(),
+            display_preview: None,
+        },
+    )));
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version,
+            capability_id: allowed_id.clone(),
+            input_ref,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, CapabilityOutcome::Completed(_)),
+        "first-party no-op observer must not change the outcome, got {outcome:?}"
+    );
+    assert_eq!(runtime.invocations().len(), 1, "inner port must be reached");
+}
+
+/// Flag ON, extension-declared deny hook (Installed tier, projected from a
+/// manifest entry exactly as the composition loader does): the capability is
+/// denied through the composed runtime and the inner host runtime port is
+/// never reached.
+#[tokio::test]
+async fn hooks_flag_on_extension_deny_hook_denies_through_composed_runtime() {
+    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
+    let (host, runtime, _io, surface_version) = build_runtime_host_with_optional_hooks(
+        "thread-hooks-on-deny",
+        &allowed_id,
+        // The hook's owning extension must match the capability provider
+        // ("demo") so the default OwnCapabilities scope keeps the hook in
+        // scope for `demo.allowed`.
+        Some(extension_deny_hook_factory("demo", "demo.allowed")),
+    )
+    .await;
+
+    // No input staged and no outcome pushed: the hook must deny before the
+    // capability port resolves input or reaches the inner runtime.
+    let outcome = host
+        .invoke_capability(CapabilityInvocation {
+            surface_version,
+            capability_id: allowed_id.clone(),
+            input_ref: CapabilityInputRef::new("input:hooks-deny").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome, CapabilityOutcome::Denied(_)),
+        "extension deny hook must deny through the composed runtime, got {outcome:?}"
+    );
+    assert!(
+        runtime.invocations().is_empty(),
+        "hook deny must short-circuit before the inner host runtime port"
+    );
+}
+
+/// Per-tenant isolation: tenant A composes a runtime with a deny hook;
+/// tenant B composes a runtime with no hooks. The same capability is denied
+/// for A but completes for B — proving one tenant's hooks never apply to
+/// another. Each `build_default_planned_runtime` call is its own tenant scope
+/// (the composition builds one runtime per identity).
+#[tokio::test]
+async fn hooks_are_isolated_per_tenant_runtime() {
+    let allowed_id = CapabilityId::new("demo.allowed").unwrap();
+
+    // Tenant A: deny hook active.
+    let (host_a, runtime_a, _io_a, surface_a) = build_runtime_host_with_optional_hooks(
+        "thread-tenant-a",
+        &allowed_id,
+        Some(extension_deny_hook_factory("demo", "demo.allowed")),
+    )
+    .await;
+    let outcome_a = host_a
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface_a,
+            capability_id: allowed_id.clone(),
+            input_ref: CapabilityInputRef::new("input:tenant-a").unwrap(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome_a, CapabilityOutcome::Denied(_)),
+        "tenant A's deny hook must fire"
+    );
+    assert!(runtime_a.invocations().is_empty());
+
+    // Tenant B: no hooks composed. Same capability completes.
+    let (host_b, runtime_b, io_b, surface_b) =
+        build_runtime_host_with_optional_hooks("thread-tenant-b", &allowed_id, None).await;
+    let input_ref_b = CapabilityInputRef::new("input:tenant-b").unwrap();
+    io_b.put_input(input_ref_b.clone(), json!({ "message": "b" }));
+    runtime_b.push_outcome(RuntimeCapabilityOutcome::Completed(Box::new(
+        RuntimeCapabilityCompleted {
+            capability_id: allowed_id.clone(),
+            output: json!({ "ok": true }),
+            usage: ResourceUsage::default(),
+            display_preview: None,
+        },
+    )));
+    let outcome_b = host_b
+        .invoke_capability(CapabilityInvocation {
+            surface_version: surface_b,
+            capability_id: allowed_id.clone(),
+            input_ref: input_ref_b,
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(outcome_b, CapabilityOutcome::Completed(_)),
+        "tenant B has no hooks; tenant A's deny must not leak across runtimes, got {outcome_b:?}"
+    );
+    assert_eq!(runtime_b.invocations().len(), 1);
 }
 
 // Identity source is now required by the `DefaultPlannedRuntimeParts` type
@@ -2198,7 +2989,7 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime,
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let model_route_resolver: Arc<dyn ModelRouteResolver> = Arc::new(
@@ -2213,7 +3004,7 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
 
     let composition = build_product_live_planned_runtime(DefaultPlannedRuntimeParts {
         turn_state: turn_store.clone(),
-        thread_service: fixture.thread_service.clone(),
+        thread_service: fixture.thread_service.clone() as Arc<dyn SessionThreadService>,
         thread_scope: fixture.thread_scope.clone(),
         model_gateway: fixture.gateway.clone(),
         checkpoint_state_store: fixture.checkpoint_state_store.clone(),
@@ -2223,6 +3014,12 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
         capability_surface_resolver: Arc::new(StaticCapabilitySurfaceProfileResolver::new(
             CapabilityAllowSet::allowlist([CapabilityId::new("demo.allowed").unwrap()]),
         )),
+        capability_result_writer: io.clone(),
+        subagent_goal_store: Arc::new(InMemoryBoundedSubagentGoalStore::new()),
+        subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+        subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
+        subagent_spawn_limits: ironclaw_loop_support::SubagentSpawnLimits::default(),
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new(
             fixture.thread_service.clone(),
             turn_state_store_dyn(&turn_store),
@@ -2237,6 +3034,9 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
         model_policy_guard: Some(Arc::new(NoOpPolicyGuard)),
         model_budget_accountant: Some(Arc::new(NoOpBudgetAccountant)),
         safety_context: Some(test_safety_context()),
+        hook_dispatcher_builder_factory: None,
+        hook_security_audit_sink: None,
+        turn_event_sink: None,
     })
     .expect("all product-live adapters should satisfy readiness");
 
@@ -2246,6 +3046,45 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
         .await
         .unwrap();
     assert_eq!(resolved.profile_id.as_str(), "reborn-planned-default");
+
+    let host = composition
+        .host_factory
+        .build_text_only_host(RebornLoopDriverHostRequest {
+            claimed_run: fixture.claimed.clone(),
+            loop_run_context: fixture.context.clone(),
+        })
+        .await
+        .unwrap();
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+    let prompt_bundle = host_dyn
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(8),
+            inline_messages: Vec::new(),
+            capability_view: None,
+        })
+        .await
+        .unwrap();
+    host_dyn
+        .stream_model(LoopModelRequest {
+            messages: prompt_bundle.messages,
+            surface_version: None,
+            model_preference: None,
+            capability_view: None,
+        })
+        .await
+        .unwrap();
+    let requests = fixture.gateway.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "test safety context")
+    );
 }
 
 /// Build a fully-populated `DefaultPlannedRuntimeParts` for product-live
@@ -2253,11 +3092,7 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
 /// to assert the fail-closed branch fires.
 async fn product_live_parts_for_gate_test(
     thread_label: &'static str,
-) -> DefaultPlannedRuntimeParts<
-    InMemoryTurnStateStore,
-    InMemorySessionThreadService,
-    RecordingGateway,
-> {
+) -> DefaultPlannedRuntimeParts<InMemoryTurnStateStore, RecordingGateway> {
     let fixture = HostFixture::new_unsubmitted(thread_label, "hello").await;
     let turn_store = Arc::new(InMemoryTurnStateStore::default());
     let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
@@ -2267,7 +3102,7 @@ async fn product_live_parts_for_gate_test(
     let capability_factory = Arc::new(TestHostRuntimeCapabilityFactory {
         runtime,
         visible_request: host_runtime_visible_request(&fixture, ["demo"]),
-        io,
+        io: io.clone(),
         milestone_sink: fixture.milestone_sink.clone(),
     });
     let model_route_resolver: Arc<dyn ModelRouteResolver> = Arc::new(
@@ -2281,7 +3116,7 @@ async fn product_live_parts_for_gate_test(
     );
     DefaultPlannedRuntimeParts {
         turn_state: turn_store.clone(),
-        thread_service: fixture.thread_service.clone(),
+        thread_service: fixture.thread_service.clone() as Arc<dyn SessionThreadService>,
         thread_scope: fixture.thread_scope.clone(),
         model_gateway: fixture.gateway.clone(),
         checkpoint_state_store: fixture.checkpoint_state_store.clone(),
@@ -2291,6 +3126,12 @@ async fn product_live_parts_for_gate_test(
         capability_surface_resolver: Arc::new(StaticCapabilitySurfaceProfileResolver::new(
             CapabilityAllowSet::allowlist([CapabilityId::new("demo.allowed").unwrap()]),
         )),
+        capability_result_writer: io.clone(),
+        subagent_goal_store: Arc::new(InMemoryBoundedSubagentGoalStore::new()),
+        subagent_gate_store: Arc::new(BoundedSubagentGateResolutionStore::new()),
+        subagent_definition_resolver: Arc::new(StaticSubagentDefinitionResolver),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(io.clone())),
+        subagent_spawn_limits: ironclaw_loop_support::SubagentSpawnLimits::default(),
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new(
             fixture.thread_service.clone(),
             turn_state_store_dyn(&turn_store),
@@ -2305,6 +3146,9 @@ async fn product_live_parts_for_gate_test(
         model_policy_guard: Some(Arc::new(NoOpPolicyGuard)),
         model_budget_accountant: Some(Arc::new(NoOpBudgetAccountant)),
         safety_context: Some(test_safety_context()),
+        hook_dispatcher_builder_factory: None,
+        hook_security_audit_sink: None,
+        turn_event_sink: None,
     }
 }
 
@@ -2682,6 +3526,7 @@ async fn text_only_host_e2e_flow_persists_checkpoint_mapping_in_turn_state_store
         .checkpoint(LoopCheckpointRequest {
             kind: LoopCheckpointKind::BeforeBlock,
             state_ref: checkpoint_state.state_ref.clone(),
+            gate_ref: None,
         })
         .await
         .unwrap();
@@ -2742,7 +3587,7 @@ async fn text_only_host_prompt_accepts_empty_surface_version() {
         .await
         .unwrap();
 
-    assert_eq!(prompt_bundle.messages.len(), 1);
+    assert_eq!(prompt_bundle.messages.len(), 2);
 }
 
 #[tokio::test]
@@ -2801,11 +3646,11 @@ async fn text_only_host_prompt_rejects_codeact_mode_and_zero_budget() {
 }
 
 #[tokio::test]
-async fn text_only_host_prompt_rejects_inline_messages() {
+async fn text_only_host_prompt_materializes_inline_messages() {
     let fixture = HostFixture::new("thread-host-prompt-inline", "hello reborn").await;
     let host = fixture.build_host().await;
 
-    let error = host
+    let prompt_bundle = host
         .build_prompt_bundle(LoopPromptBundleRequest {
             mode: PromptMode::TextOnly,
             context_cursor: None,
@@ -2819,15 +3664,16 @@ async fn text_only_host_prompt_rejects_inline_messages() {
             }],
         })
         .await
-        .unwrap_err();
+        .unwrap();
 
-    assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
-    assert_eq!(
-        error.safe_summary,
-        "inline_messages not yet supported by this prompt builder"
+    assert_eq!(prompt_bundle.messages[0].role, "user");
+    assert!(
+        prompt_bundle.messages[0]
+            .content_ref
+            .as_str()
+            .starts_with("msg:inline.user.")
     );
     assert!(fixture.gateway.requests().is_empty());
-    assert!(fixture.milestones().is_empty());
 }
 
 #[tokio::test]
@@ -2987,7 +3833,12 @@ async fn text_only_host_factory_threads_identity_source_to_prompt_and_model() {
         .unwrap();
 
     let requests = fixture.gateway.requests();
-    assert_eq!(requests[0].messages[0].content, "factory identity content");
+    assert!(
+        requests[0]
+            .messages
+            .iter()
+            .any(|message| message.content == "factory identity content")
+    );
 }
 
 #[tokio::test]
@@ -3052,6 +3903,7 @@ async fn text_only_host_default_cancellation_factory_observes_durable_cancel_req
             max_messages: 8,
             require_model_route_snapshot: false,
         },
+        InstructionSafetyContext::local_development_noop(),
     );
 
     assert!(factory.cancellation_observation_kind().is_live_capable());
@@ -3086,6 +3938,7 @@ async fn text_only_host_factory_rejects_thread_scope_mismatch() {
             max_messages: 8,
             require_model_route_snapshot: false,
         },
+        InstructionSafetyContext::local_development_noop(),
     );
 
     let error = factory
@@ -3312,6 +4165,7 @@ async fn text_only_host_checkpoint_port_persists_ref_without_public_payload() {
         .checkpoint(LoopCheckpointRequest {
             kind: LoopCheckpointKind::BeforeSideEffect,
             state_ref: checkpoint_state.state_ref.clone(),
+            gate_ref: None,
         })
         .await
         .unwrap();
@@ -3375,6 +4229,7 @@ async fn text_only_host_checkpoint_port_rejects_foreign_state_ref() {
         .checkpoint(LoopCheckpointRequest {
             kind: LoopCheckpointKind::BeforeModel,
             state_ref: foreign_state.state_ref,
+            gate_ref: None,
         })
         .await
         .unwrap_err();
@@ -3394,6 +4249,7 @@ async fn text_only_host_checkpoint_port_rejects_kind_mismatch() {
         .checkpoint(LoopCheckpointRequest {
             kind: LoopCheckpointKind::BeforeSideEffect,
             state_ref: state.state_ref,
+            gate_ref: None,
         })
         .await
         .unwrap_err();
@@ -3420,6 +4276,7 @@ async fn text_only_host_checkpoint_port_maps_store_failures_to_unavailable() {
         .checkpoint(LoopCheckpointRequest {
             kind: LoopCheckpointKind::BeforeBlock,
             state_ref: state.state_ref,
+            gate_ref: None,
         })
         .await
         .unwrap_err();
@@ -3455,6 +4312,7 @@ async fn text_only_host_stage_checkpoint_payload_returns_ref_usable_by_checkpoin
         .checkpoint(LoopCheckpointRequest {
             kind: LoopCheckpointKind::BeforeSideEffect,
             state_ref: state_ref.clone(),
+            gate_ref: None,
         })
         .await
         .expect("checkpoint should accept the staged state_ref");
@@ -3539,7 +4397,7 @@ async fn text_only_host_stage_checkpoint_payload_rejects_foreign_schema_id() {
 async fn text_only_host_skill_context_does_not_expand_capability_surface() {
     let fixture = HostFixture::new("thread-host-skill-capability", "hello").await;
     let source = Arc::new(StaticSkillContextSource::new(vec![
-        HostSkillContextCandidate::new(
+        HostSkillContextCandidate::loaded(
             skill_md(
                 "installed-alpha",
                 "installed skill description",
@@ -3571,7 +4429,7 @@ async fn text_only_host_skill_context_does_not_expand_capability_surface() {
         })
         .await
         .unwrap();
-    assert_eq!(prompt_bundle.messages.len(), 2);
+    assert_eq!(prompt_bundle.messages.len(), 3);
 
     let surface = host
         .visible_capabilities(VisibleCapabilityRequest)
@@ -3642,7 +4500,7 @@ async fn text_only_host_prompt_bundle_includes_surface_metadata_and_still_stream
 
     assert!(prompt_bundle.instruction_fingerprint.is_some());
     assert_eq!(prompt_bundle.surface_version, Some(surface.version.clone()));
-    assert_eq!(prompt_bundle.messages.len(), 2);
+    assert_eq!(prompt_bundle.messages.len(), 3);
 
     host.stream_model(LoopModelRequest {
         messages: prompt_bundle.messages,
@@ -3665,6 +4523,7 @@ async fn text_only_host_routes_capability_invocation_through_host_runtime() {
         RuntimeCapabilityCompleted {
             capability_id: capability_id.clone(),
             output: json!({"echoed": true}),
+            display_preview: None,
             usage: ResourceUsage::default(),
         },
     )));
@@ -3696,8 +4555,12 @@ async fn text_only_host_routes_capability_invocation_through_host_runtime() {
         .visible_capabilities(VisibleCapabilityRequest)
         .await
         .unwrap();
-    assert_eq!(surface.descriptors.len(), 1);
-    assert_eq!(surface.descriptors[0].capability_id, capability_id);
+    assert!(
+        surface
+            .descriptors
+            .iter()
+            .any(|descriptor| descriptor.capability_id == capability_id)
+    );
 
     let outcome = host
         .invoke_capability(CapabilityInvocation {
@@ -3760,8 +4623,7 @@ async fn text_only_host_profiled_capabilities_filter_surface_and_invocation() {
         .visible_capabilities(VisibleCapabilityRequest)
         .await
         .unwrap();
-    assert_eq!(surface.descriptors.len(), 1);
-    assert_eq!(surface.descriptors[0].capability_id, allowed_id);
+    let _descriptor = only_runtime_surface_descriptor(&surface, &allowed_id);
 
     let outcome = host
         .invoke_capability(CapabilityInvocation {
@@ -3833,8 +4695,7 @@ async fn default_strategy_filter_all_loses_to_host_profile_filter() {
         .visible_capabilities(VisibleCapabilityRequest)
         .await
         .unwrap();
-    assert_eq!(surface.descriptors.len(), 1);
-    assert_eq!(surface.descriptors[0].capability_id, tool_a_id);
+    let _descriptor = only_runtime_surface_descriptor(&surface, &tool_a_id);
 
     // Invoking tool_b must be denied — the host profile filter wins over the
     // strategy's implicit `All` permit.
@@ -3874,6 +4735,7 @@ async fn text_only_host_uses_fresh_execution_context_per_capability_invocation()
             RuntimeCapabilityCompleted {
                 capability_id: capability_id.clone(),
                 output,
+                display_preview: None,
                 usage: ResourceUsage::default(),
             },
         )));
@@ -4030,11 +4892,13 @@ async fn text_only_host_sanitizes_runtime_failure_message_before_driver_output()
     let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
         capability_descriptor(capability_id.as_str()),
     ])));
-    runtime.push_outcome(RuntimeCapabilityOutcome::Failed(RuntimeCapabilityFailure {
-        capability_id: capability_id.clone(),
-        kind: RuntimeFailureKind::Dispatcher,
-        message: Some("raw provider error sk-secret /host/path tool_input".to_string()),
-    }));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Failed(
+        RuntimeCapabilityFailure::new(
+            capability_id.clone(),
+            RuntimeFailureKind::Dispatcher,
+            Some("raw provider error sk-secret /host/path tool_input".to_string()),
+        ),
+    ));
     let io = Arc::new(InMemoryCapabilityIo::default());
     let input_ref = CapabilityInputRef::new("input:failure-request").unwrap();
     io.put_input(input_ref.clone(), json!({"message": "fail"}));
@@ -4102,6 +4966,7 @@ async fn text_only_host_maps_runtime_suspension_and_process_outcomes() {
         capability_id: auth_id.clone(),
         reason: RuntimeBlockedReason::AuthRequired,
         required_secrets: vec![SecretHandle::new("api_key").unwrap()],
+        credential_requirements: Vec::new(),
     }));
     runtime.push_outcome(RuntimeCapabilityOutcome::ResourceBlocked(
         RuntimeResourceGate {
@@ -4184,7 +5049,11 @@ async fn text_only_host_maps_runtime_suspension_and_process_outcomes() {
     ));
     assert!(matches!(
         &outcomes[1],
-        CapabilityOutcome::AuthRequired { gate_ref, safe_summary }
+        CapabilityOutcome::AuthRequired {
+            gate_ref,
+            safe_summary,
+            ..
+        }
             if gate_ref.as_str().starts_with("gate:auth-")
                 && safe_summary == "capability requires authentication"
     ));
@@ -4358,6 +5227,7 @@ async fn text_only_host_batch_stops_on_first_suspension_before_later_invocations
         RuntimeCapabilityCompleted {
             capability_id: echo_id.clone(),
             output: json!({"should_not_run": true}),
+            display_preview: None,
             usage: ResourceUsage::default(),
         },
     )));
@@ -4426,11 +5296,9 @@ async fn text_only_host_does_not_reinvoke_runtime_after_failed_outcome_retry() {
     let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
         capability_descriptor(capability_id.as_str()),
     ])));
-    runtime.push_outcome(RuntimeCapabilityOutcome::Failed(RuntimeCapabilityFailure {
-        capability_id: capability_id.clone(),
-        kind: RuntimeFailureKind::Dispatcher,
-        message: None,
-    }));
+    runtime.push_outcome(RuntimeCapabilityOutcome::Failed(
+        RuntimeCapabilityFailure::new(capability_id.clone(), RuntimeFailureKind::Dispatcher, None),
+    ));
     let io = Arc::new(InMemoryCapabilityIo::default());
     let input_ref = CapabilityInputRef::new("input:failed-idempotent-request").unwrap();
     io.put_input(input_ref.clone(), json!({"message": "fail once"}));
@@ -4547,6 +5415,7 @@ async fn text_only_host_waits_for_concurrent_duplicate_invocation_result() {
             RuntimeCapabilityCompleted {
                 capability_id: capability_id.clone(),
                 output,
+                display_preview: None,
                 usage: ResourceUsage::default(),
             },
         )));
@@ -4614,6 +5483,7 @@ async fn text_only_host_bounds_completed_dispatch_records() {
             RuntimeCapabilityCompleted {
                 capability_id: capability_id.clone(),
                 output: json!({"call": index}),
+                display_preview: None,
                 usage: ResourceUsage::default(),
             },
         )));
@@ -4625,6 +5495,7 @@ async fn text_only_host_bounds_completed_dispatch_records() {
         RuntimeCapabilityCompleted {
             capability_id: capability_id.clone(),
             output: json!({"call": "retried-after-eviction"}),
+            display_preview: None,
             usage: ResourceUsage::default(),
         },
     )));
@@ -4726,6 +5597,7 @@ async fn text_only_host_does_not_reinvoke_runtime_after_result_write_failure_ret
         RuntimeCapabilityCompleted {
             capability_id: capability_id.clone(),
             output: json!({"write": "fails"}),
+            display_preview: None,
             usage: ResourceUsage::default(),
         },
     )));
@@ -4733,6 +5605,7 @@ async fn text_only_host_does_not_reinvoke_runtime_after_result_write_failure_ret
         RuntimeCapabilityCompleted {
             capability_id: capability_id.clone(),
             output: json!({"duplicate": true}),
+            display_preview: None,
             usage: ResourceUsage::default(),
         },
     )));
@@ -4798,6 +5671,7 @@ async fn text_only_host_rejects_runtime_outcome_for_different_capability() {
         RuntimeCapabilityCompleted {
             capability_id: returned_id,
             output: json!({"wrong": true}),
+            display_preview: None,
             usage: ResourceUsage::default(),
         },
     )));
@@ -4856,6 +5730,7 @@ async fn text_only_host_rejects_previous_surface_after_refetch() {
         RuntimeCapabilityCompleted {
             capability_id: first_id.clone(),
             output: json!({"stale": true}),
+            display_preview: None,
             usage: ResourceUsage::default(),
         },
     )));
@@ -4952,7 +5827,7 @@ async fn text_only_host_e2e_invokes_script_capability_through_real_host_runtime(
     let runtime: Arc<dyn HostRuntime + Send + Sync> = Arc::new(
         HostRuntimeServices::new(
             Arc::new(e2e_registry_with_manifest(E2E_SCRIPT_MANIFEST)),
-            Arc::new(LocalFilesystem::new()),
+            Arc::new(e2e_script_filesystem().await),
             Arc::new(InMemoryResourceGovernor::new()),
             Arc::new(GrantAuthorizer::new()),
             ProcessServices::in_memory(),
@@ -4993,12 +5868,15 @@ async fn text_only_host_e2e_invokes_script_capability_through_real_host_runtime(
         .visible_capabilities(VisibleCapabilityRequest)
         .await
         .unwrap();
-    assert_eq!(surface.descriptors.len(), 1);
     assert_eq!(
-        surface.descriptors[0].capability_id,
-        e2e_script_capability_id()
+        surface
+            .descriptors
+            .iter()
+            .find(|descriptor| descriptor.capability_id == e2e_script_capability_id())
+            .expect("script capability should be visible")
+            .runtime,
+        RuntimeKind::Script
     );
-    assert_eq!(surface.descriptors[0].runtime, RuntimeKind::Script);
 
     let outcome = host
         .invoke_capability(CapabilityInvocation {
@@ -5081,6 +5959,7 @@ async fn text_only_host_allows_retry_after_missing_capability_input_is_staged() 
         RuntimeCapabilityCompleted {
             capability_id: capability_id.clone(),
             output: json!({"retried": true}),
+            display_preview: None,
             usage: ResourceUsage::default(),
         },
     )));
@@ -5473,10 +6352,8 @@ impl LoopCapabilityInputResolver for InMemoryCapabilityIo {
 impl LoopCapabilityResultWriter for InMemoryCapabilityIo {
     async fn write_capability_result(
         &self,
-        run_context: &LoopRunContext,
-        capability_id: &CapabilityId,
-        output: Value,
-    ) -> Result<LoopResultRef, AgentLoopHostError> {
+        write: CapabilityResultWrite<'_>,
+    ) -> Result<(LoopResultRef, u64), AgentLoopHostError> {
         let mut remaining_failures = self.fail_result_writes_remaining.lock().unwrap();
         if *remaining_failures > 0 {
             *remaining_failures -= 1;
@@ -5489,15 +6366,20 @@ impl LoopCapabilityResultWriter for InMemoryCapabilityIo {
         self.results
             .lock()
             .unwrap()
-            .push((capability_id.clone(), output));
-        let result_ref = format!("result:{}-{}", run_context.run_id, capability_id.as_str());
+            .push((write.capability_id.clone(), write.output));
+        let result_ref = format!(
+            "result:{}-{}",
+            write.run_context.run_id,
+            write.capability_id.as_str()
+        );
         self.result_refs.lock().unwrap().push(result_ref.clone());
-        LoopResultRef::new(result_ref).map_err(|_| {
+        let result_ref = LoopResultRef::new(result_ref).map_err(|_| {
             AgentLoopHostError::new(
                 AgentLoopHostErrorKind::Internal,
                 "capability result ref could not be represented",
             )
-        })
+        })?;
+        Ok((result_ref, 0))
     }
 }
 
@@ -5621,6 +6503,7 @@ fn capability_descriptor(id: &str) -> CapabilityDescriptor {
         parameters_schema: json!({"type": "object"}),
         effects: vec![EffectKind::DispatchCapability],
         default_permission: PermissionMode::Allow,
+        runtime_credentials: Vec::new(),
         resource_profile: None,
     }
 }
@@ -5682,10 +6565,11 @@ fn host_runtime_visible_request_with_dispatch_grant(
     capability_id: CapabilityId,
 ) -> ironclaw_host_runtime::VisibleCapabilityRequest {
     let mut request = host_runtime_visible_request(fixture, ["script"]);
+    let loop_driver_extension = loop_driver_execution_extension_id(&fixture.context).unwrap();
     request.context.grants.grants.push(CapabilityGrant {
         id: CapabilityGrantId::new(),
         capability: capability_id,
-        grantee: Principal::Extension(request.context.extension_id.clone()),
+        grantee: Principal::Extension(loop_driver_extension),
         issued_by: Principal::HostRuntime,
         constraints: GrantConstraints {
             allowed_effects: vec![EffectKind::DispatchCapability],
@@ -5698,6 +6582,41 @@ fn host_runtime_visible_request_with_dispatch_grant(
         },
     });
     request
+}
+
+async fn e2e_script_filesystem() -> LocalFilesystem {
+    let storage = tempfile::tempdir().unwrap().keep();
+    let mut filesystem = LocalFilesystem::new();
+    filesystem
+        .mount_local(
+            VirtualPath::new("/system/extensions").unwrap(),
+            HostPath::from_path_buf(storage),
+        )
+        .unwrap();
+    filesystem
+        .write_file(
+            &VirtualPath::new("/system/extensions/script/schemas/script/echo.input.v1.json")
+                .unwrap(),
+            br#"{"type":"object"}"#,
+        )
+        .await
+        .unwrap();
+    filesystem
+        .write_file(
+            &VirtualPath::new("/system/extensions/script/schemas/script/echo.output.v1.json")
+                .unwrap(),
+            br#"{"type":"object"}"#,
+        )
+        .await
+        .unwrap();
+    filesystem
+        .write_file(
+            &VirtualPath::new("/system/extensions/script/prompt/script/echo.md").unwrap(),
+            b"Echo the input JSON through the script runtime.",
+        )
+        .await
+        .unwrap();
+    filesystem
 }
 
 fn e2e_registry_with_manifest(manifest: &str) -> ExtensionRegistry {
@@ -5763,9 +6682,10 @@ id = "script.echo"
 description = "Echo text through Reborn adapter e2e"
 effects = ["dispatch_capability"]
 default_permission = "allow"
-visibility = "host_internal"
+visibility = "model"
 input_schema_ref = "schemas/script/echo.input.v1.json"
 output_schema_ref = "schemas/script/echo.output.v1.json"
+prompt_doc_ref = "prompt/script/echo.md"
 "#;
 
 /// Test-only evidence port that bypasses all durable evidence checks.
@@ -5899,6 +6819,7 @@ impl HostFactory for CapabilityHostFactory {
                 max_messages: 8,
                 require_model_route_snapshot: false,
             },
+            InstructionSafetyContext::local_development_noop(),
         )
         .build_text_only_host_with_capabilities(
             RebornLoopDriverHostRequest {
@@ -6024,6 +6945,7 @@ impl AgentLoopDriver for ApprovalBlockThenFinalReplyDriver {
         Ok(LoopExit::Blocked(LoopBlocked {
             kind: LoopBlockedKind::Approval,
             gate_ref: LoopGateRef::new("gate:approval-resume-e2e").unwrap(),
+            credential_requirements: Vec::new(),
             checkpoint_id: ironclaw_turns::TurnCheckpointId::new(),
             state_ref: LoopCheckpointStateRef::new("checkpoint:approval-resume-state").unwrap(),
             exit_id: LoopExitId::new("exit:approval-resume-blocked").unwrap(),
@@ -6210,6 +7132,10 @@ async fn queue_fixture_turn(
                 requested_run_profile: None,
                 idempotency_key: IdempotencyKey::new(idempotency_key).unwrap(),
                 received_at: Utc::now(),
+                requested_run_id: None,
+                parent_run_id: None,
+                subagent_depth: 0,
+                spawn_tree_root_run_id: None,
             },
             &ironclaw_turns::AllowAllTurnAdmissionPolicy,
             resolver,
@@ -6334,6 +7260,7 @@ impl HostFixture {
             received_at: Utc::now(),
             checkpoint_id: None,
             gate_ref: None,
+            credential_requirements: Vec::new(),
             failure: None,
             event_cursor: EventCursor(1),
         };
@@ -6416,6 +7343,7 @@ impl HostFixture {
             loop_checkpoint_store,
             self.milestone_sink.clone(),
             config,
+            InstructionSafetyContext::local_development_noop(),
         )
     }
 
@@ -6591,11 +7519,14 @@ impl RecordingGateway {
     fn respond_with_capability_calls(&self) {
         *self.response.lock().unwrap() = Ok(HostManagedModelResponse {
             safe_text_deltas: Vec::new(),
+            safe_reasoning_deltas: Vec::new(),
+            usage: None,
             output: ParentLoopOutput::CapabilityCalls(vec![
                 ironclaw_turns::run_profile::CapabilityCallCandidate {
                     surface_version: CapabilitySurfaceVersion::new("empty:v1").unwrap(),
                     capability_id: CapabilityId::new("demo.echo").unwrap(),
                     input_ref: CapabilityInputRef::new("input:opaque-tool-call").unwrap(),
+                    effective_capability_ids: vec![CapabilityId::new("demo.echo").unwrap()],
                     provider_replay: None,
                 },
             ]),
@@ -6640,25 +7571,65 @@ impl RecordingBudgetAccountant {
 
 #[async_trait]
 impl LoopModelBudgetAccountant for RecordingBudgetAccountant {
-    async fn pre_model_call(
+    async fn pre_model_work(
         &self,
         _context: &LoopRunContext,
-        _request: &LoopModelRequest,
+        _request: &ModelWorkRequest,
     ) -> Result<(), LoopModelGatewayError> {
         *self.pre_calls.lock().unwrap() += 1;
         Ok(())
     }
 
-    async fn post_model_call(
+    async fn post_model_work(
         &self,
         _context: &LoopRunContext,
-        _request: &LoopModelRequest,
-        outcome: ModelCallOutcome<'_>,
+        _request: &ModelWorkRequest,
+        outcome: ModelWorkOutcome,
     ) -> Result<(), LoopModelGatewayError> {
         self.post_calls
             .lock()
             .unwrap()
-            .push(matches!(outcome, ModelCallOutcome::Failure(_)));
+            .push(matches!(outcome, ModelWorkOutcome::Failure(_)));
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct RejectingSystemInferenceBudgetAccountant {
+    pre_calls: Mutex<usize>,
+}
+
+impl RejectingSystemInferenceBudgetAccountant {
+    fn was_pre_called(&self) -> bool {
+        *self.pre_calls.lock().unwrap() > 0
+    }
+}
+
+#[async_trait]
+impl LoopModelBudgetAccountant for RejectingSystemInferenceBudgetAccountant {
+    async fn pre_model_work(
+        &self,
+        _context: &LoopRunContext,
+        request: &ModelWorkRequest,
+    ) -> Result<(), LoopModelGatewayError> {
+        assert!(matches!(
+            request.kind,
+            ModelWorkKind::SystemInference { .. }
+        ));
+        *self.pre_calls.lock().unwrap() += 1;
+        Err(LoopModelGatewayError::new(
+            AgentLoopHostErrorKind::BudgetExceeded,
+            "system inference budget exceeded",
+        )
+        .expect("safe summary is valid"))
+    }
+
+    async fn post_model_work(
+        &self,
+        _context: &LoopRunContext,
+        _request: &ModelWorkRequest,
+        _outcome: ModelWorkOutcome,
+    ) -> Result<(), LoopModelGatewayError> {
+        panic!("post_model_work must not run when pre_model_work rejects")
     }
 }
