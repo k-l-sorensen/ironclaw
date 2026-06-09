@@ -2482,7 +2482,7 @@ impl Workspace {
                 }
                 Err(e) => {
                     let hint = if matches!(e, EmbeddingError::AuthFailed) {
-                        auth_failed_hint(provider.provider_name())
+                        provider.provider_kind().auth_failed_hint()
                     } else {
                         ""
                     };
@@ -2492,43 +2492,6 @@ impl Workspace {
         }
 
         Ok(count)
-    }
-}
-
-/// Operator-facing hint appended to an embedding `AuthFailed` warning, tailored
-/// to where the active provider keeps its credential. `AuthFailed` surfaces from
-/// OpenAI (401), NEAR AI (401 or session-token fetch failure), and Bedrock
-/// (AccessDenied) alike, so a single OpenAI-flavored hint misleads the other two
-/// (#3755).
-fn auth_failed_hint(provider_name: &str) -> &'static str {
-    match provider_name {
-        "nearai" => {
-            ". Run `ironclaw onboard` to refresh your NEAR AI session, or set \
-             EMBEDDING_PROVIDER=ollama for local embeddings"
-        }
-        "bedrock" => {
-            ". Check your AWS credentials (AWS_PROFILE or AWS_ACCESS_KEY_ID + \
-             AWS_SECRET_ACCESS_KEY), or set EMBEDDING_PROVIDER=ollama for local \
-             embeddings"
-        }
-        _ => {
-            ". Check OPENAI_API_KEY or set EMBEDDING_PROVIDER=ollama for local \
-             embeddings"
-        }
-    }
-}
-
-#[cfg(test)]
-mod auth_hint_tests {
-    use super::auth_failed_hint;
-
-    #[test]
-    fn hint_is_provider_aware() {
-        assert!(auth_failed_hint("nearai").contains("onboard"));
-        assert!(auth_failed_hint("bedrock").contains("AWS_PROFILE"));
-        assert!(auth_failed_hint("openai").contains("OPENAI_API_KEY"));
-        // Unknown / default falls back to the OpenAI-flavored hint.
-        assert!(auth_failed_hint("unknown").contains("OPENAI_API_KEY"));
     }
 }
 

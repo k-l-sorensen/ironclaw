@@ -128,8 +128,8 @@ impl EmbeddingProvider for OpenAiEmbeddings {
         &self.model
     }
 
-    fn provider_name(&self) -> &str {
-        "openai"
+    fn provider_kind(&self) -> crate::provider::EmbeddingProviderKind {
+        crate::provider::EmbeddingProviderKind::OpenAi
     }
 
     fn max_input_length(&self) -> usize {

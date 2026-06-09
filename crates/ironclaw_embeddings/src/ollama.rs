@@ -58,8 +58,8 @@ impl EmbeddingProvider for OllamaEmbeddings {
         &self.model
     }
 
-    fn provider_name(&self) -> &str {
-        "ollama"
+    fn provider_kind(&self) -> crate::provider::EmbeddingProviderKind {
+        crate::provider::EmbeddingProviderKind::Ollama
     }
 
     fn max_input_length(&self) -> usize {

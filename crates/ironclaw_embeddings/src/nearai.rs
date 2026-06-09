@@ -67,8 +67,8 @@ impl EmbeddingProvider for NearAiEmbeddings {
         &self.model
     }
 
-    fn provider_name(&self) -> &str {
-        "nearai"
+    fn provider_kind(&self) -> crate::provider::EmbeddingProviderKind {
+        crate::provider::EmbeddingProviderKind::NearAi
     }
 
     fn max_input_length(&self) -> usize {

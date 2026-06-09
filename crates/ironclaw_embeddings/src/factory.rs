@@ -224,6 +224,15 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_provider_returns_none() {
+        // The defensive `other =>` arm: a caller that builds EmbeddingsConfig
+        // directly with a misspelled provider gets a loud None, not a silent
+        // OpenAI fallback (#3751).
+        let cfg = config_with_provider("totally-unknown");
+        assert!(create_provider(&cfg, stub_deps()).await.is_none());
+    }
+
+    #[tokio::test]
     async fn accepts_localhost_ollama() {
         let cfg = EmbeddingsConfig {
             ollama_base_url: "http://localhost:11434".to_string(),
