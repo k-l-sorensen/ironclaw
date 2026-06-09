@@ -2,7 +2,7 @@
 //!
 //! This crate ships the minimal native WebUI v2 route set on top of the
 //! [`ironclaw_product_workflow::RebornServicesApi`] facade. It is off by
-//! default — enable the `webui-v2-beta` Cargo feature to compile it in.
+//! default - enable the `webui-v2-beta` Cargo feature to compile it in.
 //!
 //! ## Boundaries
 //!
@@ -54,6 +54,8 @@ mod schema;
 #[cfg(feature = "webui-v2-beta")]
 mod sse_capacity;
 
+#[allow(deprecated)]
+pub use descriptors::is_webui_v2_llm_config_route_id;
 #[cfg(feature = "webui-v2-beta")]
 pub use descriptors::{
     WEBUI_V2_ROUTE_ACTIVATE_EXTENSION, WEBUI_V2_ROUTE_CANCEL_RUN,
@@ -75,8 +77,8 @@ pub use descriptors::{
     WEBUI_V2_ROUTE_START_CODEX_LOGIN, WEBUI_V2_ROUTE_START_NEARAI_LOGIN,
     WEBUI_V2_ROUTE_STREAM_EVENTS, WEBUI_V2_ROUTE_STREAM_EVENTS_WS,
     WEBUI_V2_ROUTE_TEST_LLM_CONNECTION, WEBUI_V2_ROUTE_UPDATE_SKILL,
-    WEBUI_V2_ROUTE_UPSERT_LLM_PROVIDER, is_webui_v2_llm_config_route_id,
-    is_webui_v2_operator_webui_config_route_id, webui_v2_routes,
+    WEBUI_V2_ROUTE_UPSERT_LLM_PROVIDER, is_webui_v2_operator_webui_config_route_id,
+    webui_v2_routes,
 };
 #[cfg(feature = "webui-v2-beta")]
 pub use error::{WebUiV2HttpError, WebUiV2HttpErrorBody};
