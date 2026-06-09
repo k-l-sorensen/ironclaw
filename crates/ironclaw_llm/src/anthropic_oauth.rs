@@ -891,4 +891,71 @@ mod tests {
         // Subsequent reads see the updated token
         assert_eq!(token.read().unwrap().expose_secret(), "new_token");
     }
+
+    #[tokio::test]
+    async fn complete_omits_temperature_and_keeps_thinking_off_for_opus_47() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0_u8; 8192];
+            let n = socket.read(&mut buf).await.unwrap();
+            let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+            let _ = tx.send(raw.split("\r\n\r\n").nth(1).unwrap_or("").to_string());
+            let resp = serde_json::json!({
+                "content": [{ "type": "text", "text": "ok" }],
+                "stop_reason": "end_turn",
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0
+                }
+            })
+            .to_string();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\r\n{}",
+                resp.len(),
+                resp
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let mut cfg = crate::config::RegistryProviderConfig::generic(
+            crate::registry::ProviderProtocol::Anthropic,
+            "anthropic_oauth",
+            None,
+            base_url,
+            "claude-opus-4-7",
+        );
+        cfg.oauth_token = Some(SecretString::from("test-token".to_string()));
+        let provider = AnthropicOAuthProvider::new(&cfg).expect("provider");
+
+        // Opus 4.7 rejects an explicit temperature, so the wire body must omit it.
+        // Dropping it must NOT enable adaptive thinking: the caller supplied a
+        // temperature (which disables thinking), and the thinking gate must still
+        // honor that intent (#4334). Opus 4.7 is in the adaptive-thinking set, so a
+        // regression here would surface as a `thinking` block in the body.
+        let req = CompletionRequest::new(vec![ChatMessage::user("hi")])
+            .with_model("claude-opus-4-7")
+            .with_temperature(0.5);
+        let _ = provider.complete(req).await;
+
+        let body = rx.await.expect("captured request body");
+        let json: serde_json::Value =
+            serde_json::from_str(&body).expect("request body should be JSON");
+        assert!(
+            json.get("temperature").is_none(),
+            "Opus 4.7 must omit temperature on the wire; body={body}"
+        );
+        assert!(
+            json.get("thinking").is_none(),
+            "dropping temperature must not enable thinking; body={body}"
+        );
+        let _ = server.await;
+    }
 }
