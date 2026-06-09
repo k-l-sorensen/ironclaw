@@ -1164,6 +1164,34 @@ async fn get_session_returns_false_operator_capability_when_capabilities_default
 }
 
 #[tokio::test]
+async fn operator_route_defaults_to_sanitized_service_unavailable() {
+    let services = Arc::new(StubServices::default());
+    let router = router_with_capabilities(
+        services,
+        WebUiV2Capabilities {
+            operator_webui_config: true,
+        },
+    );
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/webchat/v2/operator/status")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "unavailable");
+    assert_eq!(body["kind"], "service_unavailable");
+    assert_eq!(body["retryable"], false);
+}
+
+#[tokio::test]
 async fn list_connectable_channels_error_maps_to_http_status() {
     let services = Arc::new(StubServices::default());
     services.fail_list_connectable_channels(RebornServicesError {
