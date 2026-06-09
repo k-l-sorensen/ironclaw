@@ -56,8 +56,9 @@ use ironclaw_host_runtime::{
     SKILL_INSTALL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID, SKILL_REMOVE_CAPABILITY_ID,
     SPAWN_SUBAGENT_CAPABILITY_ID, SurfaceKind, TIME_CAPABILITY_ID,
     TRACE_COMMONS_CREDITS_CAPABILITY_ID, TRACE_COMMONS_ONBOARD_CAPABILITY_ID,
-    TRACE_COMMONS_STATUS_CAPABILITY_ID, TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID,
-    TRIGGER_REMOVE_CAPABILITY_ID, VisibleCapabilityRequest as RuntimeVisibleCapabilityRequest,
+    TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID, TRACE_COMMONS_STATUS_CAPABILITY_ID,
+    TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID, TRIGGER_REMOVE_CAPABILITY_ID,
+    VisibleCapabilityRequest as RuntimeVisibleCapabilityRequest,
     VisibleCapabilitySurface as RuntimeVisibleCapabilitySurface, WRITE_FILE_CAPABILITY_ID,
     builtin_first_party_handlers, builtin_first_party_package,
 };
@@ -1706,6 +1707,7 @@ impl HostRuntimeCapabilityHarness {
                 CapabilityId::new(TRACE_COMMONS_ONBOARD_CAPABILITY_ID)?,
                 CapabilityId::new(TRACE_COMMONS_STATUS_CAPABILITY_ID)?,
                 CapabilityId::new(TRACE_COMMONS_CREDITS_CAPABILITY_ID)?,
+                CapabilityId::new(TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID)?,
             ],
             vec![
                 EffectKind::DispatchCapability,

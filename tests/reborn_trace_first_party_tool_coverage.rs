@@ -13,9 +13,9 @@ use ironclaw_host_runtime::{
     MEMORY_WRITE_CAPABILITY_ID, READ_FILE_CAPABILITY_ID, SHELL_CAPABILITY_ID,
     SKILL_INSTALL_CAPABILITY_ID, SKILL_LIST_CAPABILITY_ID, SKILL_REMOVE_CAPABILITY_ID,
     SPAWN_SUBAGENT_CAPABILITY_ID, TIME_CAPABILITY_ID, TRACE_COMMONS_CREDITS_CAPABILITY_ID,
-    TRACE_COMMONS_ONBOARD_CAPABILITY_ID, TRACE_COMMONS_STATUS_CAPABILITY_ID,
-    TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID, TRIGGER_REMOVE_CAPABILITY_ID,
-    WRITE_FILE_CAPABILITY_ID, builtin_first_party_package,
+    TRACE_COMMONS_ONBOARD_CAPABILITY_ID, TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID,
+    TRACE_COMMONS_STATUS_CAPABILITY_ID, TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID,
+    TRIGGER_REMOVE_CAPABILITY_ID, WRITE_FILE_CAPABILITY_ID, builtin_first_party_package,
 };
 use ironclaw_loop_support::{HostManagedModelMessageRole, HostManagedModelResponse};
 use ironclaw_turns::{TurnStatus, run_profile::LoopHostMilestoneKind};
@@ -53,6 +53,7 @@ const REBORN_FIRST_PARTY_E2E_COVERED_CAPABILITIES: &[&str] = &[
     TRACE_COMMONS_ONBOARD_CAPABILITY_ID,
     TRACE_COMMONS_STATUS_CAPABILITY_ID,
     TRACE_COMMONS_CREDITS_CAPABILITY_ID,
+    TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID,
 ];
 
 const SKILL_NAME: &str = "reborn-skill-e2e";
@@ -496,6 +497,8 @@ async fn reborn_trace_trace_commons_first_party_tools_parity() {
     let onboard = CapabilityId::new(TRACE_COMMONS_ONBOARD_CAPABILITY_ID).expect("capability id");
     let status = CapabilityId::new(TRACE_COMMONS_STATUS_CAPABILITY_ID).expect("capability id");
     let credits = CapabilityId::new(TRACE_COMMONS_CREDITS_CAPABILITY_ID).expect("capability id");
+    let profile_token =
+        CapabilityId::new(TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID).expect("capability id");
     let model_gateway = RebornTraceReplayModelGateway::with_scripted_steps([
         // confirmed=false hits the consent gate before any egress wiring is
         // consulted, so the onboard step is deterministic with no network.
@@ -522,6 +525,14 @@ async fn reborn_trace_trace_commons_first_party_tools_parity() {
             calls: vec![RebornScriptedProviderToolCall::new(
                 credits.clone(),
                 "call_trace_commons_credits",
+                serde_json::json!({}),
+            )],
+            expected_tool_results: Vec::new(),
+        },
+        RebornModelReplayStep::ProviderToolCalls {
+            calls: vec![RebornScriptedProviderToolCall::new(
+                profile_token.clone(),
+                "call_trace_commons_profile_token",
                 serde_json::json!({}),
             )],
             expected_tool_results: Vec::new(),
@@ -558,13 +569,14 @@ async fn reborn_trace_trace_commons_first_party_tools_parity() {
         .expect("final reply");
 
     let invocations = harness.capability_invocations();
-    assert_eq!(invocations.len(), 3);
+    assert_eq!(invocations.len(), 4);
     assert_eq!(invocations[0].capability_id, onboard);
     assert_eq!(invocations[1].capability_id, status);
     assert_eq!(invocations[2].capability_id, credits);
+    assert_eq!(invocations[3].capability_id, profile_token);
 
     let results = harness.capability_results();
-    assert_eq!(results.len(), 3);
+    assert_eq!(results.len(), 4);
     assert_eq!(results[0].capability_id, onboard);
     assert_eq!(results[0].output["enrolled"], serde_json::json!(false));
     assert_eq!(
@@ -582,17 +594,68 @@ async fn reborn_trace_trace_commons_first_party_tools_parity() {
             .expect("pending_credit is a number"),
         0.0
     );
+    assert_eq!(results[3].capability_id, profile_token);
+    assert_eq!(results[3].output["minted"], serde_json::json!(false));
+    assert_eq!(
+        results[3].output["error_code"],
+        serde_json::json!("NotEnrolled")
+    );
 
     let requests = harness.model_requests();
-    assert_eq!(requests.len(), 4);
+    assert_eq!(requests.len(), 5);
     assert_eq!(tool_result_count(&requests[1]), 1);
     assert_eq!(tool_result_count(&requests[2]), 2);
     assert_eq!(tool_result_count(&requests[3]), 3);
+    assert_eq!(tool_result_count(&requests[4]), 4);
     assert_milestone_order(
         &harness.milestones(),
         |kind| matches!(kind, LoopHostMilestoneKind::CapabilityBatchCompleted { .. }),
         |kind| matches!(kind, LoopHostMilestoneKind::AssistantReplyFinalized { .. }),
     );
+    harness.assert_model_exhausted();
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
+async fn reborn_trace_trace_commons_pilot_tools_are_model_visible() {
+    let onboard = CapabilityId::new(TRACE_COMMONS_ONBOARD_CAPABILITY_ID).expect("capability id");
+    let status = CapabilityId::new(TRACE_COMMONS_STATUS_CAPABILITY_ID).expect("capability id");
+    let credits = CapabilityId::new(TRACE_COMMONS_CREDITS_CAPABILITY_ID).expect("capability id");
+    let profile_token =
+        CapabilityId::new(TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID).expect("capability id");
+    let model_gateway = RebornTraceReplayModelGateway::with_scripted_steps([
+        RebornModelReplayStep::AssertProviderToolsThenResponse {
+            capability_ids: vec![onboard, status, credits, profile_token],
+            response: HostManagedModelResponse::assistant_reply(
+                "trace commons pilot tool surface complete",
+            ),
+            expected_tool_results: Vec::new(),
+        },
+    ]);
+    let mut harness = RebornBinaryE2EHarness::with_host_runtime_trace_commons_capabilities(
+        "room-trace-trace-commons-pilot-tool-surface",
+        model_gateway,
+    )
+    .await
+    .expect("harness");
+    harness.start();
+
+    let submitted = harness
+        .submit_text(
+            "event-trace-trace-commons-pilot-tool-surface",
+            "show trace commons pilot tools",
+        )
+        .await
+        .expect("submit text");
+    harness
+        .wait_for_status(submitted.run_id, TurnStatus::Completed)
+        .await
+        .expect("completed run");
+    harness
+        .assert_final_reply("trace commons pilot tool surface complete")
+        .await
+        .expect("final reply");
     harness.assert_model_exhausted();
 
     harness.shutdown().await;

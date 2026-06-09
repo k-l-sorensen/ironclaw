@@ -238,3 +238,9 @@ capability = "builtin.trace_commons.credits"
 effects = ["dispatch_capability", "read_filesystem"]
 mounts = "ambient"
 network = "default"
+
+[[grants]]
+capability = "builtin.trace_commons.profile_token"
+effects = ["dispatch_capability", "read_filesystem", "network", "external_write"]
+mounts = "ambient"
+network = "local_dev_wildcard"

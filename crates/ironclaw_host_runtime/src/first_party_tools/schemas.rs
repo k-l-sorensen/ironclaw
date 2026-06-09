@@ -214,6 +214,11 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
             "properties": {},
             "additionalProperties": false
         }),
+        "schemas/builtin/trace_commons-profile_token.input.v1.json" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
         "schemas/builtin/read_file.input.v1.json" => json!({
             "type": "object",
             "properties": {

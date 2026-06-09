@@ -1,11 +1,11 @@
-//! First-party Trace Commons capabilities: onboard, status, and credits.
+//! First-party Trace Commons capabilities: onboard, status, credits, and profile token.
 //!
 //! `trace_commons.onboard` drives the operator-invite enrollment flow.
 //! `trace_commons.status` is a read-only policy inspector.
 //! `trace_commons.credits` is a read-only credit balance reporter.
+//! `trace_commons.profile_token` mints a short-lived public-attribution token.
 //!
-//! All three are model-visible; the agent-facing guidance lives in the
-//! prompt_doc_ref files (prompts/builtin/trace-commons-{onboard,status,credits}.md).
+//! All four are model-visible.
 
 use std::{panic::AssertUnwindSafe, sync::Arc};
 
@@ -18,8 +18,8 @@ use ironclaw_host_api::{
     RuntimeHttpEgressError, RuntimeHttpEgressRequest, RuntimeKind,
 };
 use ironclaw_reborn_traces::contribution::{
-    StandingTraceContributionPolicy, TraceCreditReport, TraceUploadAuthMode,
-    read_trace_policy_for_scope,
+    ProfileAttributionToken, StandingTraceContributionPolicy, TraceCreditReport,
+    TraceUploadAuthMode, mint_profile_attribution_token_for_scope, read_trace_policy_for_scope,
 };
 use ironclaw_reborn_traces::onboarding::{
     OnboardConsents, OnboardError, OnboardHttpResponse, OnboardOutcome, OnboardingHttpSink,
@@ -45,6 +45,7 @@ use super::{
 pub const TRACE_COMMONS_ONBOARD_CAPABILITY_ID: &str = "builtin.trace_commons.onboard";
 pub const TRACE_COMMONS_STATUS_CAPABILITY_ID: &str = "builtin.trace_commons.status";
 pub const TRACE_COMMONS_CREDITS_CAPABILITY_ID: &str = "builtin.trace_commons.credits";
+pub const TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID: &str = "builtin.trace_commons.profile_token";
 
 // ── Manifest helpers ─────────────────────────────────────────────────────────
 
@@ -93,6 +94,30 @@ pub(super) fn credits_manifest() -> Result<CapabilityManifest, ExtensionError> {
         vec![EffectKind::ReadFilesystem],
         PermissionMode::Allow,
         resource_profile(),
+    )
+}
+
+pub(super) fn profile_token_manifest() -> Result<CapabilityManifest, ExtensionError> {
+    first_party_capability_manifest(
+        TRACE_COMMONS_PROFILE_TOKEN_CAPABILITY_ID,
+        "Mint a short-lived Trace Commons profile-management value for the current user. \
+         Use when the user asks for the attribution or profile value needed by the \
+         community profile page. The returned field can be pasted into the page and \
+         is scoped only to community profile management; it cannot submit traces.",
+        vec![
+            EffectKind::ReadFilesystem,
+            EffectKind::Network,
+            EffectKind::ExternalWrite,
+        ],
+        PermissionMode::Ask,
+        Some(ResourceProfile {
+            default_estimate: ResourceEstimate {
+                wall_clock_ms: Some(10_000),
+                output_bytes: Some(FIRST_PARTY_DEFAULT_OUTPUT_BYTES),
+                ..ResourceEstimate::default()
+            },
+            hard_ceiling: None,
+        }),
     )
 }
 
@@ -425,6 +450,69 @@ pub(crate) fn format_credits(report: &TraceCreditReport) -> Value {
     })
 }
 
+// ── Profile token dispatch ───────────────────────────────────────────────────
+
+pub(super) async fn dispatch_profile_token(
+    request: &FirstPartyCapabilityRequest,
+) -> Result<Value, FirstPartyCapabilityError> {
+    let scope = request.scope.user_id.as_str().to_string();
+    match mint_profile_attribution_token_for_scope(Some(scope.as_str())).await {
+        Ok(token) => Ok(format_profile_token(&token)),
+        Err(error) => Ok(profile_token_error_value(error.to_string())),
+    }
+}
+
+fn format_profile_token(token: &ProfileAttributionToken) -> Value {
+    json!({
+        "minted": true,
+        "token_type": "Bearer",
+        "access_token": token.access_token.as_str(),
+        "expires_at": token.expires_at.as_ref().map(|dt| dt.to_rfc3339()),
+        "expires_in": token.expires_in,
+        "consent_scope": "public_attribution",
+        "allowed_uses": [],
+        "profile_url": "https://tracecommons.ai/profile",
+        "message": "Paste access_token exactly as shown into https://tracecommons.ai/profile. \
+    Do not add a Bearer prefix. This token is short-lived and only authorizes public profile management."
+    })
+}
+
+fn profile_token_error_value(error: String) -> Value {
+    let (error_code, message) = if error.contains("not enrolled in Trace Commons")
+        || error.contains("could not read policy")
+    {
+        (
+            "NotEnrolled",
+            "Trace Commons enrollment was not found for this user. Onboard with the operator invite link first.",
+        )
+    } else if error.contains("issuer URL is not configured") {
+        (
+            "IssuerNotConfigured",
+            "Trace Commons enrollment is missing the upload-claim issuer URL. Re-run onboarding with a fresh invite.",
+        )
+    } else if error.contains("device key") {
+        (
+            "DeviceKeyUnavailable",
+            "Trace Commons device-key state is incomplete. Re-run onboarding with a fresh invite.",
+        )
+    } else if error.contains("refused") {
+        (
+            "IssuerRefused",
+            "The Trace Commons issuer refused to mint a profile token. Ask the operator to check invite/device-key status.",
+        )
+    } else {
+        (
+            "ProfileTokenMintFailed",
+            "Could not mint a Trace Commons profile token. Check enrollment status and retry.",
+        )
+    };
+    json!({
+        "minted": false,
+        "error_code": error_code,
+        "message": message,
+    })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -711,5 +799,55 @@ mod tests {
         assert_eq!(v["recent_explanations"], json!([]));
         assert_eq!(v["last_submission_at"], json!(null));
         assert_eq!(v["last_credit_sync_at"], json!(null));
+    }
+
+    #[test]
+    fn format_profile_token_reports_raw_token_and_scope_boundary() {
+        let expires_at: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-06-09T20:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let token = ProfileAttributionToken {
+            access_token: "eyJ.profile.token".to_string(),
+            expires_at: Some(expires_at),
+            expires_in: Some(300),
+        };
+        let v = format_profile_token(&token);
+        assert_eq!(v["minted"], json!(true));
+        assert_eq!(v["token_type"], json!("Bearer"));
+        assert_eq!(v["access_token"], json!("eyJ.profile.token"));
+        assert_eq!(v["consent_scope"], json!("public_attribution"));
+        assert_eq!(v["allowed_uses"], json!([]));
+        assert_eq!(v["profile_url"], json!("https://tracecommons.ai/profile"));
+        let message = v["message"].as_str().unwrap();
+        assert!(
+            message.contains("Do not add a Bearer prefix"),
+            "message must tell users to paste the raw token"
+        );
+    }
+
+    #[test]
+    fn profile_token_error_maps_missing_enrollment_without_raw_error() {
+        let v =
+            profile_token_error_value("not enrolled in Trace Commons - onboard first".to_string());
+        assert_eq!(v["minted"], json!(false));
+        assert_eq!(v["error_code"], json!("NotEnrolled"));
+        let serialized = serde_json::to_string(&v).unwrap();
+        assert!(
+            !serialized.contains("onboard first"),
+            "raw anyhow text should not be copied into model-visible output"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_profile_token_without_enrollment_returns_onboard_guidance() {
+        let request = test_request(json!({}));
+        let result = dispatch_profile_token(&request).await.unwrap();
+        assert_eq!(result["minted"], json!(false));
+        assert_eq!(result["error_code"], json!("NotEnrolled"));
+        let message = result["message"].as_str().unwrap();
+        assert!(
+            message.contains("Onboard with the operator invite link first"),
+            "agent-visible guidance should direct the user to onboard first"
+        );
     }
 }
