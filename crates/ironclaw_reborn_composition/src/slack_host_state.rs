@@ -1775,6 +1775,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filesystem_slack_host_state_upsert_personal_dm_target_concurrent_write_returns_winner()
+    {
+        let root = Arc::new(RouteLockTestBackend::barrier_personal_dm_writes());
+        let writer_one = state_with_backend(root.clone());
+        let writer_two = state_with_backend(root.clone());
+        let reader = state_with_backend(root);
+        let key = SlackPersonalDmTargetKey::new(
+            TenantId::new("tenant-alpha").unwrap(),
+            installation(),
+            "T123".to_string(),
+            user("user:alice"),
+        )
+        .unwrap();
+        let target_one =
+            SlackPersonalDmTarget::new(key.clone(), SlackUserId::new("U123"), "D123".to_string())
+                .unwrap();
+        let target_two =
+            SlackPersonalDmTarget::new(key.clone(), SlackUserId::new("U123"), "D456".to_string())
+                .unwrap();
+
+        let (stored_one, stored_two) = tokio::join!(
+            writer_one.upsert_personal_dm_target(target_one),
+            writer_two.upsert_personal_dm_target(target_two)
+        );
+        let stored_one = stored_one.expect("first upsert succeeds");
+        let stored_two = stored_two.expect("second upsert succeeds");
+        let persisted = reader
+            .load_personal_dm_target(&key)
+            .await
+            .expect("load personal DM target succeeds")
+            .expect("personal DM target persists");
+
+        assert_eq!(stored_one, stored_two);
+        assert_eq!(persisted, stored_one);
+        assert!(matches!(persisted.dm_channel_id.as_str(), "D123" | "D456"));
+    }
+
+    #[tokio::test]
     async fn filesystem_slack_host_state_rejects_rebinding_actor_to_different_user() {
         let state = state();
         state
@@ -2600,6 +2638,7 @@ mod tests {
         inner: InMemoryBackend,
         reject_lock_renewal: bool,
         route_write_delay: Option<Duration>,
+        personal_dm_write_barrier: Option<Arc<tokio::sync::Barrier>>,
         route_write_failures: AtomicUsize,
         lock_puts: AtomicUsize,
     }
@@ -2610,6 +2649,7 @@ mod tests {
                 inner: InMemoryBackend::default(),
                 reject_lock_renewal: false,
                 route_write_delay: None,
+                personal_dm_write_barrier: None,
                 route_write_failures: AtomicUsize::new(0),
                 lock_puts: AtomicUsize::new(0),
             }
@@ -2620,6 +2660,7 @@ mod tests {
                 inner: InMemoryBackend::default(),
                 reject_lock_renewal: false,
                 route_write_delay: Some(delay),
+                personal_dm_write_barrier: None,
                 route_write_failures: AtomicUsize::new(0),
                 lock_puts: AtomicUsize::new(0),
             }
@@ -2630,6 +2671,18 @@ mod tests {
                 inner: InMemoryBackend::default(),
                 reject_lock_renewal: true,
                 route_write_delay: Some(delay),
+                personal_dm_write_barrier: None,
+                route_write_failures: AtomicUsize::new(0),
+                lock_puts: AtomicUsize::new(0),
+            }
+        }
+
+        fn barrier_personal_dm_writes() -> Self {
+            Self {
+                inner: InMemoryBackend::default(),
+                reject_lock_renewal: false,
+                route_write_delay: None,
+                personal_dm_write_barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
                 route_write_failures: AtomicUsize::new(0),
                 lock_puts: AtomicUsize::new(0),
             }
@@ -2669,6 +2722,10 @@ mod tests {
                 && let Some(delay) = self.route_write_delay
             {
                 tokio::time::sleep(delay).await;
+            } else if is_personal_dm_target_record_path(path)
+                && let Some(barrier) = &self.personal_dm_write_barrier
+            {
+                barrier.wait().await;
             }
             if is_channel_route_record_path(path)
                 && self.route_write_failures.load(Ordering::SeqCst) > 0
@@ -2717,6 +2774,12 @@ mod tests {
         path.as_str().contains("/slack-channel-routes/")
             && path.as_str().ends_with(".json")
             && !is_replace_lock_path(path)
+    }
+
+    fn is_personal_dm_target_record_path(path: &VirtualPath) -> bool {
+        path.as_str()
+            .contains("/slack-personal-binding/dm-targets/")
+            && path.as_str().ends_with(".json")
     }
 
     fn binding(user_id: &str) -> RebornUserIdentityBinding {

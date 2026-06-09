@@ -33,6 +33,7 @@ use crate::slack_dm_open::{SlackDmOpenError, open_slack_dm_channel};
 use crate::slack_serve::{SlackTeamId, SlackUserId};
 
 pub(crate) const SLACK_OUTBOUND_TARGET_LIST_PAGE_SIZE: usize = 500;
+const SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES: usize = 10_000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SlackConfiguredChannelRoute {
@@ -452,6 +453,11 @@ impl SlackHostBetaOutboundTargetProvider {
                 )
                 .await
                 .map_err(map_slack_target_route_error)?;
+            if routes.len() + stored.routes.len() > SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES {
+                return Err(map_slack_target_route_error(
+                    SlackChannelRouteError::StoreUnavailable,
+                ));
+            }
             for route in stored.routes {
                 stored_channel_ids.insert(route.channel_id.clone());
                 routes.push(SlackConfiguredChannelRoute::new(
@@ -468,6 +474,13 @@ impl SlackHostBetaOutboundTargetProvider {
                 ));
             }
             cursor = next_cursor;
+        }
+        if routes.len() + self.configured_channel_routes.len()
+            > SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES
+        {
+            return Err(map_slack_target_route_error(
+                SlackChannelRouteError::StoreUnavailable,
+            ));
         }
         routes.extend(
             self.configured_channel_routes
@@ -623,9 +636,31 @@ impl OutboundDeliveryTargetProvider for SlackHostBetaOutboundTargetProvider {
         if caller.tenant_id != self.tenant_id {
             return Ok(Vec::new());
         }
-        let mut routes = self
-            .shared_channel_routes()
-            .await?
+        let personal_dm_key = SlackPersonalDmTargetKey::new(
+            self.tenant_id.clone(),
+            self.installation_id.clone(),
+            self.team_id.as_str().to_string(),
+            caller.user_id.clone(),
+        );
+        let personal_dm_target = async {
+            match personal_dm_key {
+                Ok(key) => Some(
+                    self.personal_dm_target_store
+                        .load_personal_dm_target(&key)
+                        .await,
+                ),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "Slack personal DM target key could not be built while listing outbound targets"
+                    );
+                    None
+                }
+            }
+        };
+        let (routes, personal_dm_target) =
+            tokio::join!(self.shared_channel_routes(), personal_dm_target);
+        let mut routes = routes?
             .into_iter()
             .filter(|route| route.subject_user_id == caller.user_id)
             .collect::<Vec<_>>();
@@ -634,27 +669,8 @@ impl OutboundDeliveryTargetProvider for SlackHostBetaOutboundTargetProvider {
             .into_iter()
             .map(|route| self.entry_for_shared_channel_route(&route))
             .collect::<Result<Vec<_>, _>>()?;
-        let key = match SlackPersonalDmTargetKey::new(
-            self.tenant_id.clone(),
-            self.installation_id.clone(),
-            self.team_id.as_str().to_string(),
-            caller.user_id.clone(),
-        ) {
-            Ok(key) => key,
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "Slack personal DM target key could not be built while listing outbound targets"
-                );
-                return Ok(targets);
-            }
-        };
-        match self
-            .personal_dm_target_store
-            .load_personal_dm_target(&key)
-            .await
-        {
-            Ok(Some(target)) => match self.entry_for_personal_dm_target(&target) {
+        match personal_dm_target {
+            Some(Ok(Some(target))) => match self.entry_for_personal_dm_target(&target) {
                 Ok(target) => targets.push(target),
                 Err(error) => {
                     tracing::warn!(
@@ -663,13 +679,14 @@ impl OutboundDeliveryTargetProvider for SlackHostBetaOutboundTargetProvider {
                     );
                 }
             },
-            Ok(None) => {}
-            Err(error) => {
+            Some(Ok(None)) => {}
+            Some(Err(error)) => {
                 tracing::warn!(
                     %error,
                     "Slack personal DM target lookup failed while listing outbound targets"
                 );
             }
+            None => {}
         }
         Ok(targets)
     }
@@ -834,4 +851,46 @@ fn validate_slack_id(field: &'static str, value: &str) -> Result<(), SlackPerson
         return Err(SlackPersonalDmTargetError::InvalidTarget);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_slack_id_accepts_128_char_id_and_rejects_129_char_id() {
+        validate_slack_id("slack id", &"A".repeat(128)).expect("128 chars is valid");
+        assert!(matches!(
+            validate_slack_id("slack id", &"A".repeat(129)),
+            Err(SlackPersonalDmTargetError::InvalidTarget)
+        ));
+    }
+
+    #[test]
+    fn validate_slack_id_rejects_whitespace_and_special_chars() {
+        for value in ["", "A B", "A\0B", "A/B", "A\\B", "A:B", "A;B", "A\nB"] {
+            assert!(matches!(
+                validate_slack_id("slack id", value),
+                Err(SlackPersonalDmTargetError::InvalidTarget)
+            ));
+        }
+    }
+
+    #[test]
+    fn slack_personal_dm_target_rejects_non_d_prefixed_channel_id() {
+        let key = SlackPersonalDmTargetKey::new(
+            TenantId::new("tenant-alpha").expect("tenant"),
+            AdapterInstallationId::new("install-alpha").expect("installation"),
+            "T123".to_string(),
+            UserId::new("user:alice").expect("user"),
+        )
+        .expect("personal target key");
+
+        assert!(matches!(
+            SlackPersonalDmTarget::new(key.clone(), SlackUserId::new("U123"), "C123".to_string()),
+            Err(SlackPersonalDmTargetError::InvalidTarget)
+        ));
+        SlackPersonalDmTarget::new(key, SlackUserId::new("U123"), "D123".to_string())
+            .expect("DM-prefixed channel is valid");
+    }
 }

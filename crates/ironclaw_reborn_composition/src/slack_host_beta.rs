@@ -651,8 +651,8 @@ mod tests {
     use ironclaw_secrets::InMemorySecretStore;
     use ironclaw_threads::{ListThreadsForScopeRequest, ThreadHistoryRequest, ThreadScope};
     use ironclaw_turns::{
-        GetRunStateRequest, TurnCoordinator, TurnRunId, TurnScope, TurnStatus,
-        run_profile::LoopCapabilityPort,
+        GetRunStateRequest, ReplyTargetBindingRef, TurnCoordinator, TurnRunId, TurnScope,
+        TurnStatus, run_profile::LoopCapabilityPort,
     };
     use secrecy::ExposeSecret;
     use tower::ServiceExt;
@@ -1997,6 +1997,49 @@ mod tests {
             "slack:personal-dm:T0HOST:user:slack-host"
         );
         assert_eq!(resolved.reply_target_binding_ref, binding_ref);
+    }
+
+    #[tokio::test]
+    async fn slack_personal_dm_resolve_binding_rejects_mismatched_dm_channel_id() {
+        let store = Arc::new(InMemorySlackPersonalDmTargetStore::new());
+        let key = SlackPersonalDmTargetKey::new(
+            TenantId::new(TENANT).expect("tenant"),
+            AdapterInstallationId::new(INSTALLATION).expect("installation"),
+            TEAM.to_string(),
+            UserId::new(USER).expect("user"),
+        )
+        .expect("personal target key");
+        let target =
+            SlackPersonalDmTarget::new(key, SlackUserId::new(SLACK_USER), "D0HOST".to_string())
+                .expect("personal DM target");
+        store
+            .upsert_personal_dm_target(target)
+            .await
+            .expect("personal DM target stores");
+        let provider = SlackHostBetaOutboundTargetProvider::new(
+            outbound_target_provider_config(config_without_channel_routes()),
+            Arc::new(InMemorySlackChannelRouteStore::new()),
+            store,
+        );
+        let listed = provider
+            .list_outbound_delivery_targets(&operator_caller())
+            .await
+            .expect("target list");
+        let mismatched_binding_ref = ReplyTargetBindingRef::new(
+            listed[0]
+                .reply_target_binding_ref
+                .as_str()
+                .replace("D0HOST", "D1HOST"),
+        )
+        .expect("mismatched binding ref still validates");
+
+        assert!(
+            provider
+                .resolve_reply_target_binding(&operator_caller(), &mismatched_binding_ref)
+                .await
+                .expect("binding lookup succeeds")
+                .is_none()
+        );
     }
 
     #[tokio::test]
