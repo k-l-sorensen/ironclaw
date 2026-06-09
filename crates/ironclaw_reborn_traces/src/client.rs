@@ -41,6 +41,12 @@ pub struct TraceClientAutonomousCaptureRequest<'a> {
     pub messages: &'a [ConversationMessage],
     pub policy: &'a trace::StandingTraceContributionPolicy,
     pub max_turns: usize,
+    /// Caller-known task outcome that overrides the outcome derived from
+    /// message content. The Reborn runtime knows a turn's terminal status
+    /// (Completed vs Failed) from the lifecycle event, which is more
+    /// authoritative than the response-presence fallback used when message
+    /// transcripts carry no structured outcome payload.
+    pub outcome_override: Option<trace::TaskSuccess>,
 }
 
 #[derive(Debug)]
@@ -121,10 +127,13 @@ impl TraceClientHost {
             return Ok(TraceClientAutonomousCaptureOutcome::Skipped);
         }
 
-        let (mut turns, persisted_outcome) =
+        let (mut turns, mut persisted_outcome) =
             capture_turns_from_conversation_messages_with_outcomes(request.messages);
         if turns.is_empty() {
             return Ok(TraceClientAutonomousCaptureOutcome::Skipped);
+        }
+        if let Some(task_success) = request.outcome_override {
+            persisted_outcome.task_success = task_success;
         }
 
         let max_turns = request.max_turns.max(1);
@@ -476,6 +485,7 @@ mod tests {
                 messages: &messages,
                 policy: &policy,
                 max_turns: 5,
+                outcome_override: None,
             })
             .await
             .expect("capture succeeds")
@@ -507,6 +517,7 @@ mod tests {
                 messages: &messages,
                 policy: &policy,
                 max_turns: 5,
+                outcome_override: None,
             })
             .await
             .expect("policy skip is not an error");
@@ -530,6 +541,7 @@ mod tests {
                 messages: &messages,
                 policy: &policy,
                 max_turns: 5,
+                outcome_override: None,
             })
             .await
             .expect("capture evaluates");

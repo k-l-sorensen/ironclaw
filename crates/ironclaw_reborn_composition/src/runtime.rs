@@ -217,6 +217,7 @@ pub struct RebornRuntime {
     worker_handle: JoinHandle<()>,
     worker_cancel: CancellationToken,
     trigger_poller_handle: Option<TriggerPollerRuntimeHandle>,
+    trace_flush_worker: crate::trace_capture::TraceQueueFlushWorkerHandle,
     #[cfg(any(test, feature = "test-support"))]
     trigger_conversation_pairing:
         Option<Arc<dyn ironclaw_conversations::ConversationActorPairingService>>,
@@ -1249,6 +1250,7 @@ impl RebornRuntime {
                 .shutdown(TRIGGER_POLLER_SHUTDOWN_TIMEOUT)
                 .await;
         }
+        self.trace_flush_worker.shutdown().await;
         self.worker_cancel.cancel();
         if let Some(projection) = self.budget_event_projection {
             projection.shutdown().await;
@@ -1861,6 +1863,20 @@ pub async fn build_reborn_runtime(
         })?
     };
 
+    // Autonomous Trace Commons capture: a best-effort lifecycle sink mirrors
+    // the v1 binary's turn-end capture. Policy-gated per user scope — the
+    // sink is inert (one policy-file read per turn) until a scope enrolls
+    // via `builtin.trace_commons.onboard` or `traces opt-in`.
+    let trace_capture_scopes: crate::trace_capture::ObservedTraceScopes =
+        Arc::new(std::sync::Mutex::new(std::collections::BTreeSet::from([
+            actor_user_id.as_str().to_string(),
+        ])));
+    let trace_capture_sink: Arc<dyn ironclaw_turns::TurnEventSink> =
+        Arc::new(crate::trace_capture::TraceCaptureTurnEventSink::new(
+            Arc::clone(&thread_service),
+            Arc::clone(&trace_capture_scopes),
+        ));
+
     let composition = build_default_planned_runtime(DefaultPlannedRuntimeParts {
         turn_state: Arc::clone(&turn_state_store),
         thread_service: Arc::clone(&thread_service),
@@ -1909,7 +1925,7 @@ pub async fn build_reborn_runtime(
         model_budget_accountant,
         safety_context: None,
         hook_security_audit_sink: Some(Arc::new(ironclaw_events::TracingSecurityAuditSink)),
-        turn_event_sink: None,
+        turn_event_sink: Some(trace_capture_sink),
         hook_dispatcher_builder_factory,
     })?;
     let default_resolved_run_profile = composition
@@ -2057,6 +2073,8 @@ pub async fn build_reborn_runtime(
     let worker_handle = tokio::spawn(async move {
         worker.run(worker_cancel_clone).await;
     });
+    let trace_flush_worker =
+        crate::trace_capture::spawn_trace_queue_flush_worker(trace_capture_scopes);
     services.readiness.workers.turn_runner = true;
     services.readiness.workers.trigger_poller = trigger_poller_handle.is_some();
     let turn_coordinator = planned_turn_coordinator;
@@ -2089,6 +2107,7 @@ pub async fn build_reborn_runtime(
         worker_handle,
         worker_cancel,
         trigger_poller_handle,
+        trace_flush_worker,
         #[cfg(any(test, feature = "test-support"))]
         trigger_conversation_pairing: trigger_conversation_pairing_value,
         budget_event_projection,
