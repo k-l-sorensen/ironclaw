@@ -466,6 +466,38 @@ mod tests {
             "builtin.trigger_remove",
             &[EffectKind::DispatchCapability, EffectKind::ExternalWrite],
         );
+
+        // Trace Commons capabilities must be granted here or they vanish from
+        // the model-visible tool surface in local-dev (REPL/serve) runs.
+        let onboard = policy
+            .grant(&CapabilityId::new("builtin.trace_commons.onboard").expect("capability id"))
+            .expect("trace_commons.onboard grant");
+        assert_eq!(
+            onboard.effects,
+            vec![
+                EffectKind::DispatchCapability,
+                EffectKind::Network,
+                EffectKind::ExternalWrite,
+            ]
+        );
+        assert_eq!(onboard.mounts, LocalDevMountProfile::Ambient);
+        // Onboarding posts to an operator-chosen invite origin, so it needs the
+        // wildcard egress profile (private/metadata IP ranges stay blocked).
+        assert_eq!(onboard.network, LocalDevNetworkProfile::LocalDevWildcard);
+        for capability in [
+            "builtin.trace_commons.status",
+            "builtin.trace_commons.credits",
+        ] {
+            let grant = policy
+                .grant(&CapabilityId::new(capability).expect("capability id"))
+                .expect("trace_commons read grant");
+            assert_eq!(
+                grant.effects,
+                vec![EffectKind::DispatchCapability, EffectKind::ReadFilesystem]
+            );
+            assert_eq!(grant.mounts, LocalDevMountProfile::Ambient);
+            assert_eq!(grant.network, LocalDevNetworkProfile::Default);
+        }
     }
 
     fn assert_trigger_grant(
