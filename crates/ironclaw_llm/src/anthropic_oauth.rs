@@ -290,15 +290,17 @@ impl LlmProvider for AnthropicOAuthProvider {
             .take_model_override()
             .unwrap_or_else(|| self.active_model_name());
         self.strip_unsupported_completion_params(&mut req);
-        // Opus 4.7/4.8 reject an explicit temperature, and Anthropic also serves
-        // models that accept it, so drop it per resolved model rather than via a
-        // provider-wide flag (#4334).
+        // Opus 4.7/4.8 reject an explicit temperature on the wire (#4334), so drop
+        // it per resolved model. Keep the caller's original value for the thinking
+        // gate: `thinking_for_request` disables thinking when a temperature is set,
+        // and dropping it here must not silently flip thinking back on.
+        let requested_temperature = req.temperature;
         req.temperature = crate::reasoning_models::effective_temperature(&model, req.temperature);
         let (system, messages) = convert_messages(req.messages);
         let max_tokens = req.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS);
 
         let request = AnthropicRequest {
-            thinking: thinking_for_request(&model, max_tokens, req.temperature, false),
+            thinking: thinking_for_request(&model, max_tokens, requested_temperature, false),
             model,
             messages,
             system,
@@ -337,7 +339,9 @@ impl LlmProvider for AnthropicOAuthProvider {
             .take_model_override()
             .unwrap_or_else(|| self.active_model_name());
         self.strip_unsupported_tool_params(&mut req);
-        // See `complete`: drop temperature for Opus 4.7/4.8 per resolved model (#4334).
+        // See `complete`: drop the wire temperature for Opus 4.7/4.8 but keep the
+        // caller's original value for the thinking gate (#4334).
+        let requested_temperature = req.temperature;
         req.temperature = crate::reasoning_models::effective_temperature(&model, req.temperature);
         let (system, messages) = convert_messages(req.messages);
 
@@ -383,7 +387,7 @@ impl LlmProvider for AnthropicOAuthProvider {
             thinking: if has_tools {
                 None
             } else {
-                thinking_for_request(&model, max_tokens, req.temperature, false)
+                thinking_for_request(&model, max_tokens, requested_temperature, false)
             },
             model,
             messages,
