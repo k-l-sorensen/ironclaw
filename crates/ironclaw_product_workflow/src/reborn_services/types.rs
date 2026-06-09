@@ -945,3 +945,52 @@ pub enum RebornOperatorServiceLifecycleAction {
     Stop,
     Status,
 }
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RebornOperatorConfigListResponse {
+    pub entries: Vec<RebornOperatorConfigEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub precedence: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RebornOperatorConfigGetResponse {
+    pub entry: RebornOperatorConfigEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RebornOperatorConfigEntry {
+    pub key: String,
+    pub value: serde_json::Value,
+    pub source: String,
+    pub redacted: bool,
+    pub mutable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RebornOperatorConfigSetRequest {
+    pub value: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornOperatorConfigValidateResponse {
+    pub valid: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<RebornOperatorConfigDiagnostic>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornOperatorConfigDiagnostic {
+    pub key: String,
+    pub severity: RebornOperatorConfigDiagnosticSeverity,
+    pub reason_code: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornOperatorConfigDiagnosticSeverity {
+    Info,
+    Warning,
+    Error,
+}

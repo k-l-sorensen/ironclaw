@@ -28,16 +28,17 @@ use ironclaw_product_workflow::{
     RebornCancelRunResponse, RebornConnectableChannelListResponse, RebornCreateThreadResponse,
     RebornDeleteThreadRequest, RebornDeleteThreadResponse, RebornExtensionActionResponse,
     RebornExtensionListResponse, RebornExtensionRegistryResponse, RebornListAutomationsResponse,
-    RebornListThreadsResponse, RebornOperatorCommandPlaneResponse,
-    RebornOperatorConfigValidateRequest, RebornOperatorLogsQuery,
-    RebornOperatorServiceLifecycleRequest, RebornOperatorSetupRequest, RebornResolveGateResponse,
-    RebornServicesApi, RebornServicesError, RebornServicesErrorCode, RebornServicesErrorKind,
-    RebornSetupExtensionResponse, RebornStreamEventsRequest, RebornSubmitTurnResponse,
-    RebornTimelineRequest, RebornTimelineResponse, SetActiveLlmRequest, UpsertLlmProviderRequest,
-    WebUiAuthenticatedCaller, WebUiCancelRunRequest, WebUiCreateThreadRequest,
-    WebUiInboundValidationCode, WebUiInboundValidationError, WebUiListAutomationsRequest,
-    WebUiListThreadsRequest, WebUiResolveGateRequest, WebUiSendMessageRequest,
-    WebUiSetupExtensionRequest,
+    RebornListThreadsResponse, RebornOperatorCommandPlaneResponse, RebornOperatorConfigGetResponse,
+    RebornOperatorConfigListResponse, RebornOperatorConfigSetRequest,
+    RebornOperatorConfigValidateRequest, RebornOperatorConfigValidateResponse,
+    RebornOperatorLogsQuery, RebornOperatorServiceLifecycleRequest, RebornOperatorSetupRequest,
+    RebornResolveGateResponse, RebornServicesApi, RebornServicesError, RebornServicesErrorCode,
+    RebornServicesErrorKind, RebornSetupExtensionResponse, RebornStreamEventsRequest,
+    RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse, SetActiveLlmRequest,
+    UpsertLlmProviderRequest, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
+    WebUiCreateThreadRequest, WebUiInboundValidationCode, WebUiInboundValidationError,
+    WebUiListAutomationsRequest, WebUiListThreadsRequest, WebUiResolveGateRequest,
+    WebUiSendMessageRequest, WebUiSetupExtensionRequest,
 };
 use serde::{Deserialize, Serialize};
 
@@ -595,8 +596,40 @@ pub async fn run_operator_setup(
 pub async fn list_operator_config(
     State(state): State<WebUiV2State>,
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
-) -> Result<Json<RebornOperatorCommandPlaneResponse>, WebUiV2HttpError> {
+) -> Result<Json<RebornOperatorConfigListResponse>, WebUiV2HttpError> {
     let response = state.services().list_operator_config(caller).await?;
+    Ok(Json(response))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OperatorConfigKeyPath {
+    pub key: String,
+}
+
+/// `GET /api/webchat/v2/operator/config/{key}`
+pub async fn get_operator_config_key(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Path(OperatorConfigKeyPath { key }): Path<OperatorConfigKeyPath>,
+) -> Result<Json<RebornOperatorConfigGetResponse>, WebUiV2HttpError> {
+    let response = state
+        .services()
+        .get_operator_config_key(caller, key)
+        .await?;
+    Ok(Json(response))
+}
+
+/// `POST /api/webchat/v2/operator/config/{key}`
+pub async fn set_operator_config_key(
+    State(state): State<WebUiV2State>,
+    Extension(caller): Extension<WebUiAuthenticatedCaller>,
+    Path(OperatorConfigKeyPath { key }): Path<OperatorConfigKeyPath>,
+    Json(body): Json<RebornOperatorConfigSetRequest>,
+) -> Result<Json<RebornOperatorConfigGetResponse>, WebUiV2HttpError> {
+    let response = state
+        .services()
+        .set_operator_config_key(caller, key, body)
+        .await?;
     Ok(Json(response))
 }
 
@@ -605,7 +638,7 @@ pub async fn validate_operator_config(
     State(state): State<WebUiV2State>,
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
     Json(body): Json<RebornOperatorConfigValidateRequest>,
-) -> Result<Json<RebornOperatorCommandPlaneResponse>, WebUiV2HttpError> {
+) -> Result<Json<RebornOperatorConfigValidateResponse>, WebUiV2HttpError> {
     let response = state
         .services()
         .validate_operator_config(caller, body)
