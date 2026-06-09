@@ -1184,7 +1184,9 @@ mod tests {
         let serialized = serde_json::to_value(entry).expect("serialize entry");
         assert_eq!(serialized.get("value"), Some(&serde_json::Value::Null));
         assert_eq!(
-            serialized.get("redacted").and_then(serde_json::Value::as_bool),
+            serialized
+                .get("redacted")
+                .and_then(serde_json::Value::as_bool),
             Some(true)
         );
     }

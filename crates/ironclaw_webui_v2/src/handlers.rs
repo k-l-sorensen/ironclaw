@@ -743,9 +743,11 @@ pub async fn set_operator_config_key(
 /// `validate` is reserved for the validation operation and is not a readable
 /// config key. This explicit static-path handler keeps axum static route
 /// priority from surfacing an ambiguous 405.
-pub async fn reject_reserved_operator_config_key(
-) -> Result<Json<RebornOperatorConfigGetResponse>, WebUiV2HttpError> {
-    Err(operator_config_key_error(WebUiInboundValidationCode::InvalidValue))
+pub async fn reject_reserved_operator_config_key()
+-> Result<Json<RebornOperatorConfigGetResponse>, WebUiV2HttpError> {
+    Err(operator_config_key_error(
+        WebUiInboundValidationCode::InvalidValue,
+    ))
 }
 
 /// `POST /api/webchat/v2/operator/config/validate`
