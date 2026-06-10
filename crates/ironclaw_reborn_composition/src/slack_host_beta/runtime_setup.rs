@@ -10,6 +10,7 @@ use ironclaw_product_workflow::{
     RebornServicesErrorCode, RebornServicesErrorKind, WebUiAuthenticatedCaller,
 };
 use ironclaw_turns::ReplyTargetBindingRef;
+use tokio::sync::Mutex;
 
 use crate::RebornRuntime;
 use crate::outbound_preferences::{OutboundDeliveryTargetEntry, OutboundDeliveryTargetProvider};
@@ -186,6 +187,7 @@ struct DynamicSlackInstallationResolver {
     state: Arc<FilesystemSlackHostState<crate::factory::LocalDevRootFilesystem>>,
     pairing: SlackPersonalBindingPairingService,
     channel_route_store: Arc<dyn SlackChannelRouteStore>,
+    cached_resolver: Arc<Mutex<DynamicSlackInstallationResolverCache>>,
 }
 
 impl DynamicSlackInstallationResolver {
@@ -202,16 +204,51 @@ impl DynamicSlackInstallationResolver {
             state,
             pairing,
             channel_route_store,
+            cached_resolver: Arc::new(Mutex::new(DynamicSlackInstallationResolverCache::default())),
         }
     }
 
-    async fn resolver(&self) -> Result<StaticSlackInstallationResolver, SlackIngressError> {
+    async fn resolver(&self) -> Result<Arc<StaticSlackInstallationResolver>, SlackIngressError> {
         let setup = self
             .setup_service
             .current_setup()
             .await
             .map_err(|_| SlackIngressError::InstallationNotFound)?
             .ok_or(SlackIngressError::InstallationNotFound)?;
+        let revision = setup.revision;
+        if let Some(resolver) = self.cached_resolver(revision).await {
+            return Ok(resolver);
+        }
+
+        let resolver = Arc::new(self.build_resolver(setup).await?);
+        let mut cache = self.cached_resolver.lock().await;
+        if let Some(current) = &cache.current {
+            if current.revision == revision {
+                return Ok(Arc::clone(&current.resolver));
+            }
+        }
+        if let Some(previous) = cache.current.replace(DynamicCachedSlackResolver {
+            revision,
+            resolver: Arc::clone(&resolver),
+        }) {
+            cache.retired.push(previous.resolver);
+        }
+        Ok(resolver)
+    }
+
+    async fn cached_resolver(&self, revision: u64) -> Option<Arc<StaticSlackInstallationResolver>> {
+        let cache = self.cached_resolver.lock().await;
+        cache
+            .current
+            .as_ref()
+            .filter(|current| current.revision == revision)
+            .map(|current| Arc::clone(&current.resolver))
+    }
+
+    async fn build_resolver(
+        &self,
+        setup: SlackInstallationSetup,
+    ) -> Result<StaticSlackInstallationResolver, SlackIngressError> {
         let config = slack_host_beta_config_from_setup(&self.setup_service, setup)
             .await
             .map_err(|_| SlackIngressError::InstallationNotFound)?
@@ -245,6 +282,18 @@ impl DynamicSlackInstallationResolver {
         .map_err(|_| SlackIngressError::InstallationNotFound)?;
         Ok(StaticSlackInstallationResolver::new([record]))
     }
+
+    async fn drain_cached_resolvers(&self) {
+        let resolvers = {
+            let cache = self.cached_resolver.lock().await;
+            cache.resolvers()
+        };
+        for resolver in &resolvers {
+            resolver.drain_installations().await;
+        }
+        let mut cache = self.cached_resolver.lock().await;
+        cache.forget_retired(&resolvers);
+    }
 }
 
 impl SlackInstallationResolver for DynamicSlackInstallationResolver {
@@ -265,12 +314,34 @@ impl SlackInstallationResolver for DynamicSlackInstallationResolver {
     fn drain_installations<'a>(
         &'a self,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
-        Box::pin(async move {
-            if let Ok(resolver) = self.resolver().await {
-                resolver.drain_installations().await;
-            }
-        })
+        Box::pin(async move { self.drain_cached_resolvers().await })
     }
+}
+
+#[derive(Default)]
+struct DynamicSlackInstallationResolverCache {
+    current: Option<DynamicCachedSlackResolver>,
+    retired: Vec<Arc<StaticSlackInstallationResolver>>,
+}
+
+impl DynamicSlackInstallationResolverCache {
+    fn resolvers(&self) -> Vec<Arc<StaticSlackInstallationResolver>> {
+        self.current
+            .iter()
+            .map(|current| Arc::clone(&current.resolver))
+            .chain(self.retired.iter().map(Arc::clone))
+            .collect()
+    }
+
+    fn forget_retired(&mut self, drained: &[Arc<StaticSlackInstallationResolver>]) {
+        self.retired
+            .retain(|resolver| !drained.iter().any(|drained| Arc::ptr_eq(drained, resolver)));
+    }
+}
+
+struct DynamicCachedSlackResolver {
+    revision: u64,
+    resolver: Arc<StaticSlackInstallationResolver>,
 }
 
 #[derive(Clone)]
