@@ -193,6 +193,7 @@ registerPack("ko", {
   "traceCommons.delayedLedgerDesc": "검토 후 변경될 수 있음",
   "traceCommons.submissions": "제출",
   "traceCommons.submissionsValue": "총 {total}건 중 {submitted}건 제출, {accepted}건 승인",
+  "traceCommons.cardAccepted": "승인됨 {accepted} / {submitted}",
   "traceCommons.lastSubmission": "마지막 제출",
   "traceCommons.lastSync": "마지막 크레딧 동기화",
   "traceCommons.lastSyncDesc": "마지막 동기화 기준 로컬 보기",

@@ -193,6 +193,7 @@ registerPack("hi", {
   "traceCommons.delayedLedgerDesc": "समीक्षा के बाद बदल सकता है",
   "traceCommons.submissions": "प्रस्तुतियाँ",
   "traceCommons.submissionsValue": "कुल {total} में से {submitted} प्रस्तुत, {accepted} स्वीकृत",
+  "traceCommons.cardAccepted": "स्वीकृत {accepted} / {submitted}",
   "traceCommons.lastSubmission": "अंतिम प्रस्तुति",
   "traceCommons.lastSync": "अंतिम क्रेडिट सिंक",
   "traceCommons.lastSyncDesc": "अंतिम सिंक के समय का स्थानीय दृश्य",

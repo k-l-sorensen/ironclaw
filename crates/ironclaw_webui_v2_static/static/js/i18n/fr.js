@@ -193,6 +193,7 @@ registerPack("fr", {
   "traceCommons.delayedLedgerDesc": "Peut encore changer après examen",
   "traceCommons.submissions": "Soumissions",
   "traceCommons.submissionsValue": "{submitted} soumises, {accepted} acceptées sur {total} au total",
+  "traceCommons.cardAccepted": "Acceptés {accepted} / {submitted}",
   "traceCommons.lastSubmission": "Dernière soumission",
   "traceCommons.lastSync": "Dernière synchronisation des crédits",
   "traceCommons.lastSyncDesc": "Vue locale à la dernière synchronisation",

@@ -193,6 +193,7 @@ registerPack("ar", {
   "traceCommons.delayedLedgerDesc": "قد يتغير بعد المراجعة",
   "traceCommons.submissions": "المساهمات",
   "traceCommons.submissionsValue": "{submitted} مُرسلة، {accepted} مقبولة من أصل {total}",
+  "traceCommons.cardAccepted": "مقبول {accepted} / {submitted}",
   "traceCommons.lastSubmission": "آخر مساهمة",
   "traceCommons.lastSync": "آخر مزامنة للرصيد",
   "traceCommons.lastSyncDesc": "عرض محلي حتى آخر مزامنة",

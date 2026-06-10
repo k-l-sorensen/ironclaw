@@ -193,6 +193,7 @@ registerPack("uk", {
   "traceCommons.delayedLedgerDesc": "Може змінитися після перевірки",
   "traceCommons.submissions": "Подання",
   "traceCommons.submissionsValue": "{submitted} подано, {accepted} прийнято з {total} загалом",
+  "traceCommons.cardAccepted": "Прийнято {accepted} / {submitted}",
   "traceCommons.lastSubmission": "Останнє подання",
   "traceCommons.lastSync": "Остання синхронізація кредитів",
   "traceCommons.lastSyncDesc": "Локальний перегляд станом на останню синхронізацію",

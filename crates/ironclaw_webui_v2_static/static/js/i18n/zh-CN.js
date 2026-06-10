@@ -193,6 +193,7 @@ registerPack("zh-CN", {
   "traceCommons.delayedLedgerDesc": "审核后仍可能变化",
   "traceCommons.submissions": "提交",
   "traceCommons.submissionsValue": "共 {total} 条，已提交 {submitted} 条，已接受 {accepted} 条",
+  "traceCommons.cardAccepted": "已接受 {accepted} / {submitted}",
   "traceCommons.lastSubmission": "最近提交",
   "traceCommons.lastSync": "最近积分同步",
   "traceCommons.lastSyncDesc": "截至最近同步的本地视图",

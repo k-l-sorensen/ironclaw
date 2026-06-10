@@ -193,6 +193,7 @@ registerPack("ja", {
   "traceCommons.delayedLedgerDesc": "審査後に変わる可能性があります",
   "traceCommons.submissions": "提出",
   "traceCommons.submissionsValue": "合計 {total} 件中 {submitted} 件提出、{accepted} 件承認",
+  "traceCommons.cardAccepted": "承認済み {accepted} / {submitted}",
   "traceCommons.lastSubmission": "最終提出",
   "traceCommons.lastSync": "最終クレジット同期",
   "traceCommons.lastSyncDesc": "最終同期時点のローカル表示",

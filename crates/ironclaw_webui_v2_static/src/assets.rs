@@ -180,6 +180,38 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_trace_credits_card_assets_are_embedded() {
+        // The compact card is mounted in the sidebar above the conversation
+        // list and reuses the existing trace-credits hook + endpoint.
+        let card = asset_text("js/components/sidebar-trace-credits.js");
+        assert!(card.contains("export function SidebarTraceCredits"));
+        // Reuses the shared hook (and thus the `/api/webchat/v2/traces/credit`
+        // endpoint), not a parallel fetch.
+        assert!(card.contains("useTraceCredits"));
+        // Renders nothing unless enrolled — keeps the sidebar clean.
+        assert!(card.contains("if (!credits || !credits.enrolled) return null;"));
+        // Click-through opens the full Settings -> Trace Commons tab.
+        assert!(card.contains("to=\"/settings/traces\""));
+        assert!(card.contains("traceCommons.cardAccepted"));
+
+        let sidebar = asset_text("js/components/sidebar.js");
+        assert!(sidebar.contains("SidebarTraceCredits"));
+        // Mounted between the nav and the threads list.
+        assert!(sidebar.contains("<${SidebarTraceCredits} />"));
+
+        // The hook refetches so the card and Settings tab reflect new
+        // accepted submissions without a manual reload.
+        let hook = asset_text("js/pages/settings/hooks/useTraceCredits.js");
+        assert!(hook.contains("refetchInterval: 60_000"));
+        assert!(hook.contains("refetchOnWindowFocus: true"));
+
+        // The one new i18n key is present in the eagerly-bundled English pack
+        // (other locales fall back to it if missing, but all 11 carry it).
+        let en = asset_text("js/i18n/en.js");
+        assert!(en.contains("\"traceCommons.cardAccepted\""));
+    }
+
+    #[test]
     fn auth_session_assets_use_server_capabilities_for_admin_status() {
         let api = asset_text("js/lib/api.js");
         assert!(api.contains("fetchSession"));

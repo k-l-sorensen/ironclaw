@@ -203,6 +203,7 @@ registerPack("en", {
   "traceCommons.delayedLedgerDesc": "Can still change after review",
   "traceCommons.submissions": "Submissions",
   "traceCommons.submissionsValue": "{submitted} submitted, {accepted} accepted of {total} total",
+  "traceCommons.cardAccepted": "Accepted {accepted} / {submitted}",
   "traceCommons.lastSubmission": "Last submission",
   "traceCommons.lastSync": "Last credit sync",
   "traceCommons.lastSyncDesc": "Local view as of last sync",
