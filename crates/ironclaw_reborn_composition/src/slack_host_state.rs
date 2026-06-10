@@ -43,8 +43,10 @@ use crate::slack_personal_binding_pairing::{
     SlackPersonalBindingPairingError,
 };
 use crate::slack_serve::SlackUserId;
+use crate::slack_setup::{SlackInstallationSetup, SlackInstallationSetupStore, SlackSetupError};
 
 const SLACK_HOST_STATE_ROOT: &str = "/tenant-shared/slack-personal-binding";
+const SLACK_INSTALLATION_SETUP_PATH: &str = "/tenant-shared/slack-setup/installation.json";
 const IDENTITY_ROOT: &str = "/tenant-shared/slack-personal-binding/identities";
 const PAIRING_CODE_ROOT: &str = "/tenant-shared/slack-personal-binding/pairing/codes";
 const PAIRING_ACTOR_ROOT: &str = "/tenant-shared/slack-personal-binding/pairing/actors";
@@ -667,6 +669,35 @@ where
             }
             Err(error) => Err(map_route_fs_error(error)),
         }
+    }
+}
+
+#[async_trait::async_trait]
+impl<F> SlackInstallationSetupStore for FilesystemSlackHostState<F>
+where
+    F: RootFilesystem + 'static,
+{
+    async fn get_slack_installation_setup(
+        &self,
+    ) -> Result<Option<SlackInstallationSetup>, SlackSetupError> {
+        let path = ScopedPath::new(SLACK_INSTALLATION_SETUP_PATH)
+            .map_err(|_| SlackSetupError::StoreUnavailable)?;
+        self.read_record(&path)
+            .await
+            .map(|record| record.map(|(setup, _)| setup))
+            .map_err(|_| SlackSetupError::StoreUnavailable)
+    }
+
+    async fn put_slack_installation_setup(
+        &self,
+        setup: &SlackInstallationSetup,
+    ) -> Result<(), SlackSetupError> {
+        let path = ScopedPath::new(SLACK_INSTALLATION_SETUP_PATH)
+            .map_err(|_| SlackSetupError::StoreUnavailable)?;
+        self.write_record(&path, setup, CasExpectation::Any)
+            .await
+            .map(|_| ())
+            .map_err(|_| SlackSetupError::StoreUnavailable)
     }
 }
 
@@ -1339,6 +1370,10 @@ struct StoredSlackPersonalDmTarget {
 }
 
 impl StoredSlackPersonalDmTarget {
+    #[allow(
+        dead_code,
+        reason = "paired with the optional explicit Slack DM target upsert path"
+    )]
     fn from_target(target: &SlackPersonalDmTarget, created_at: DateTime<Utc>) -> Self {
         Self {
             tenant_id: target.key.tenant_id.as_str().to_string(),

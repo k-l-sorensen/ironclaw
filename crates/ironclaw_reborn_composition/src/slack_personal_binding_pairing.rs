@@ -120,9 +120,58 @@ pub trait SlackPersonalBindingPairingNotifier: Send + Sync {
     ) -> Result<(), SlackPersonalBindingPairingError>;
 }
 
+#[async_trait::async_trait]
+pub(crate) trait SlackPersonalUserBinder: Send + Sync + std::fmt::Debug {
+    async fn validate_installation_actor(
+        &self,
+        principal: &SlackPersonalBindingPrincipal,
+        installation_id: &AdapterInstallationId,
+        slack_user_id: &SlackUserId,
+    ) -> Result<(), SlackPersonalUserBindingError>;
+
+    async fn bind_installation_actor(
+        &self,
+        principal: SlackPersonalBindingPrincipal,
+        installation_id: AdapterInstallationId,
+        slack_user_id: SlackUserId,
+    ) -> Result<RebornUserIdentityBinding, SlackPersonalUserBindingError>;
+}
+
+#[async_trait::async_trait]
+impl SlackPersonalUserBinder for SlackPersonalUserBindingService {
+    async fn validate_installation_actor(
+        &self,
+        principal: &SlackPersonalBindingPrincipal,
+        installation_id: &AdapterInstallationId,
+        slack_user_id: &SlackUserId,
+    ) -> Result<(), SlackPersonalUserBindingError> {
+        SlackPersonalUserBindingService::validate_installation_actor(
+            self,
+            principal,
+            installation_id,
+            slack_user_id,
+        )
+    }
+
+    async fn bind_installation_actor(
+        &self,
+        principal: SlackPersonalBindingPrincipal,
+        installation_id: AdapterInstallationId,
+        slack_user_id: SlackUserId,
+    ) -> Result<RebornUserIdentityBinding, SlackPersonalUserBindingError> {
+        SlackPersonalUserBindingService::bind_installation_actor(
+            self,
+            principal,
+            installation_id,
+            slack_user_id,
+        )
+        .await
+    }
+}
+
 #[derive(Clone)]
 pub struct SlackPersonalBindingPairingService {
-    binding_service: SlackPersonalUserBindingService,
+    binding_service: Arc<dyn SlackPersonalUserBinder>,
     challenge_store: Arc<dyn SlackPersonalBindingPairingChallengeStore>,
     notifier: Arc<dyn SlackPersonalBindingPairingNotifier>,
 }
@@ -130,6 +179,14 @@ pub struct SlackPersonalBindingPairingService {
 impl SlackPersonalBindingPairingService {
     pub fn new(
         binding_service: SlackPersonalUserBindingService,
+        challenge_store: Arc<dyn SlackPersonalBindingPairingChallengeStore>,
+        notifier: Arc<dyn SlackPersonalBindingPairingNotifier>,
+    ) -> Self {
+        Self::new_with_binder(Arc::new(binding_service), challenge_store, notifier)
+    }
+
+    pub(crate) fn new_with_binder(
+        binding_service: Arc<dyn SlackPersonalUserBinder>,
         challenge_store: Arc<dyn SlackPersonalBindingPairingChallengeStore>,
         notifier: Arc<dyn SlackPersonalBindingPairingNotifier>,
     ) -> Self {
@@ -174,6 +231,7 @@ impl SlackPersonalBindingPairingService {
                 &preview.installation_id,
                 &preview.slack_user_id,
             )
+            .await
             .map_err(SlackPersonalBindingPairingError::Binding)?;
         let challenge = self.challenge_store.consume_challenge(&code).await?;
         self.binding_service
