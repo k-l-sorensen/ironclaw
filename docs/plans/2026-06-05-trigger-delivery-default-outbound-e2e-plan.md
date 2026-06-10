@@ -137,18 +137,31 @@ Targets and preferences:
 Gate prompts and outcomes:
 
 - Approval/auth prompts on triggered runs fall back to the scope's
-  final-reply target when their slots are unset; explicit slots win; neither
-  set fails closed. Gate prompts are never silently dropped when the scope
-  has a final-reply default. Progress never falls back.
-- Delivery outcome visibility: the trigger terminal delivery caller records
-  a sanitized outcome for every terminal completion — `delivered |
+  final-reply target when their prompt-specific slots are unset; explicit
+  slots win; neither set fails closed. Gate prompts are never silently
+  dropped when the scope has a final-reply default. Progress never falls
+  back. The fallback delivery is a **non-authority notification** with
+  delivery-status semantics — it carries no authorization URLs, no secrets,
+  and no interactive resume affordance; it names the waiting state and links
+  to the WebUI gate surface. The authority prompt payload (ApprovalPrompt /
+  AuthPrompt) remains exact-owner-only per rule 1 and is never widened to
+  shared destinations. Auth-gate fallbacks additionally name the credential
+  owner ("waiting on &lt;owner&gt;'s &lt;provider&gt; authorization"); only
+  the credential owner can resolve an auth gate. Auth prompts must resolve
+  to an exact credential-owner `auth_prompt_target`; if any fallback is
+  used, the fallback target must be validated as the credential owner's
+  private target, not a shared project channel.
+- Delivery outcome visibility: the trigger terminal delivery caller always
+  **attempts** an outcome record for every terminal completion — `delivered |
   no_default_configured | target_unavailable | denied | failed | skipped` +
   delivery kind + timestamp — including resolution-stage failures that must
   not create `OutboundDeliveryAttempt` rows. Outcome writes are best-effort
-  and never alter delivery. Surfaced on automation rows (recent runs +
-  `last_delivery`), with `no_default_configured` linking to the delivery
-  panel. No triggered terminal completion ends with neither a send nor an
-  outcome record.
+  and never alter, retry, or fail the delivery; a write failure is logged
+  with a metric and may leave a missing outcome row. The invariant is: no
+  triggered terminal completion ends without either a send or an attempted
+  outcome record — not a durable-row guarantee. Surfaced on automation rows
+  (recent runs + `last_delivery`), with `no_default_configured` linking to
+  the delivery panel.
 
 CX (decided 2026-06-09):
 
@@ -223,15 +236,18 @@ before reaching the model while the poller records `last_status: Ok`:
   explicit-ownerless marker the project preference key derivation needs.
 
 Fix (chunk 2 below): tri-state `TrustedOwnerScope { Unspecified,
-Owned(UserId), Ownerless }` on the trusted binding contract;
-`BindingRecord::resolution()` maps Owned -> `new_with_owner(Some)`,
-Ownerless -> `new_with_owner(None)` (explicit), Unspecified -> `new()`;
-materializer passes Owned(creator) for personal and Ownerless for project
-fires. The ownerless state is trusted-scope-only input — raw adapters must
-not reach it. Projection consequence accepted: ownerless lifecycle events
-drop out of creator-owner-filtered streams until membership-based visibility
-(chunk 4); project runs surface through the project tab instead. The ignored
-e2e test, reworked to seed a project-scoped trigger, is the acceptance test.
+User(UserId), Project }` on the trusted binding contract;
+`BindingRecord::resolution()` maps `User(id)` -> `new_with_owner(Some(id))`,
+`Project` -> `new_with_owner(None)` (explicit ownerless), `Unspecified` ->
+`new()`; materializer passes `User(creator_user_id)` for personal and
+`Project` for project fires. The `Project` variant is trusted-scope-only
+input — raw adapters must not reach it. `Project` means owned by the
+binding's project scope, encoded as an explicitly absent user owner until
+the roadmap's Phase C principal enum lands. Projection consequence accepted:
+project-owned lifecycle events drop out of creator-owner-filtered streams
+until membership-based visibility (chunk 4); project runs surface through
+the project tab instead. The ignored e2e test, reworked to seed a
+project-scoped trigger, is the acceptance test.
 
 ## Implementation Plan
 
@@ -255,8 +271,9 @@ workstream; chunks 3-6 follow):
      target validation maps shared-channel routes to project scope (agent
      stays route metadata).
 2. Ownership propagation fix (see Blocking Bug). `ironclaw_conversations`
-   `TrustedOwnerScope`, `ThreadScopeResolver` already honors explicit
-   owners; materializer mapping; un-ignore + rework the e2e test.
+   `TrustedOwnerScope { Unspecified, User(UserId), Project }`,
+   `ThreadScopeResolver` already honors explicit owners; materializer
+   mapping; un-ignore + rework the e2e test.
 3. Workspace bootstrap + membership store/port (composition factory +
    product workflow port). Membership checks for project list/create and
    project preference writes replace the operator-flag gate on those routes.
@@ -275,7 +292,15 @@ Then the remaining feature stack:
   `RunNotificationOrigin::Triggered` / `TriggeredFromSourceRoute` from the
   persisted ownership, resolves scoped defaults, validates through
   `OutboundPolicyService`, renders through the Slack adapter, records
-  delivery outcomes (decision above). Requires chunks 1-2.
+  delivery outcomes (decision above). Requires chunks 1-2 **and chunk 3
+  (Workspace bootstrap + membership store)**. PR F may land the wiring but
+  external Slack egress for triggered completions stays disabled until the
+  membership/fire-time-authorization source of truth (chunk 3 / roadmap
+  Phase B) is real — matching the "External delivery stays disabled until
+  this is real" hardening bullet below and the roadmap's "PR F requires
+  Phase B" line. The wiring-before-authz ordering contradiction in earlier
+  wave text is resolved by this dependency: PR F is gated on chunk 3, not
+  just chunks 1-2.
 - PR G: personal Slack DM provisioning route + post-pairing one-click
   default prompt + panel "Connect Slack DM" action (#4600). Two entry
   points, one backend provisioning route.
@@ -323,9 +348,10 @@ Trigger delivery E2E (PR F):
   the final-reply target when no explicit gate slot is set.
 - `OutboundPolicyService` runs before adapter render on every path; policy
   denial prevents egress.
-- Every terminal completion records a delivery outcome; resolution-stage
-  failures record outcomes without attempt rows; outcome write failure never
-  alters delivery.
+- Every terminal completion attempts an outcome record; resolution-stage
+  failures attempt outcomes without attempt rows; outcome write failure never
+  alters delivery and may leave a missing outcome row (best-effort, logged
+  with a metric).
 
 WebUI:
 

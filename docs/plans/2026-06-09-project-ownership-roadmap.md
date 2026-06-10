@@ -92,9 +92,11 @@ OwnershipPrincipal = User(user_id) | Project(project_id) | System
   hazard that rule exists to prevent. This phase is scheduled immediately
   after Phase B, not "someday", so the convention does not accumulate new
   callers.
-- `TrustedOwnerScope` stays as the sealed trusted-ingress input and maps
-  onto the principal; its variants should be named for ownership
-  (`User`/`Project`), not for the encoding (`Ownerless`).
+- `TrustedOwnerScope { Unspecified, User(UserId), Project }` is the sealed
+  trusted-ingress input and maps onto the principal. The `Project` variant
+  means owned by the binding's project scope, encoded as an explicitly
+  absent user owner until this phase; it is the final vocabulary and is
+  already in use in the implementation (see companion plan chunk 2).
 
 ### Phase D — Principal-keyed storage placement
 

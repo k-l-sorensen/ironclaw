@@ -155,13 +155,17 @@ has been selected and validated.
 
 ## 5. Preference Fields
 
-User communication preferences are owned by an
-`ironclaw_outbound::CommunicationPreferenceRepository` backed by a dedicated
-typed tenant/user database table. They are not stored in the generic JSON
-settings store and are not profile/tone preferences.
+Communication preferences are owned by an
+`ironclaw_outbound::CommunicationPreferenceRepository`. They are not stored in
+the generic JSON settings store and are not profile/tone preferences.
 
-The V1 preference row is keyed by `(tenant_id, user_id)` and may contain these
-optional `ReplyTargetBindingRef` candidate fields:
+Preference records are keyed by a scoped `CommunicationPreferenceKey`:
+
+- `personal(tenant_id, user_id)` — per-user personal preferences;
+- `project(tenant_id, project_id)` — per-project shared preferences.
+
+Each scope holds the same set of optional `ReplyTargetBindingRef` candidate
+fields:
 
 - `final_reply_target`: default target for ordinary run results when no live
   source route applies;
@@ -171,6 +175,9 @@ optional `ReplyTargetBindingRef` candidate fields:
 - `auth_prompt_target`: exact-owner target for auth prompts;
 - `default_modality`: preferred modality when a caller does not specify a more
   specific supported modality.
+
+Writes use versioned compare-and-swap. Byte-only backends that cannot preserve
+`Absent`/`Version` expectations fail closed.
 
 Preference fields are candidates only. The outbound service must revalidate
 tenant ownership, exact owner where required, target capability, delivery kind,
@@ -200,17 +207,29 @@ The first matching rule yields the only candidate.
    descended from both a trigger and a live source route, the source route is
    provenance only; ordinary final replies, progress updates, and
    delivery-status notices resolve through the same scoped trigger defaults as
-   other triggered delivery.
+   other triggered delivery. The previous behavior (source route wins for
+   ordinary final replies and progress) is superseded; this contract is
+   authoritative, and the matching resolver change ships in the stacked
+   implementation PR (#4663) — implementers must not preserve source-route
+   precedence for triggered runs.
 5. **Triggered preferred target wins for ordinary trigger results.** If the run
    descended from a trigger, final replies prefer the run owner's configured
    `final_reply_target`.
-6. **Triggered approval/auth prompts fall back to the final-reply target.** For
+6. **Triggered gate-prompt fallback is a non-authority notification.** For
    `Triggered` and `TriggeredFromSourceRoute` origins, an explicitly configured
-   `approval_prompt_target` or `auth_prompt_target` always wins; when that slot
-   is unset, the resolver falls back to the same scope's `final_reply_target`
-   so gate prompts are not silently dropped for scopes that configured
-   delivery. When neither slot is set, resolution fails closed. Progress and
-   delivery-status kinds never use this fallback.
+   `approval_prompt_target` or `auth_prompt_target` always wins per rule 1, and
+   those exact-owner-validated targets are the only recipients of the authority
+   prompt payload. When that slot is unset, the resolver falls back to the same
+   scope's `final_reply_target` — but the fallback delivery is a
+   **non-authority notification** with `DeliveryStatus` semantics: it carries
+   no authorization URLs, no secrets, and no interactive resume affordance; it
+   names the waiting state and links to the WebUI gate surface only.
+   Interactive gate resume remains exact-owner-only per rule 1 and is never
+   widened to shared destinations. Auth-gate fallback notifications additionally
+   name the credential owner ("waiting on &lt;owner&gt;'s &lt;provider&gt;
+   authorization"); only the credential owner can resolve an auth gate. When
+   neither the prompt slot nor `final_reply_target` is set, resolution fails
+   closed. Progress and delivery-status kinds never use this fallback.
 7. **Triggered scope resolution fails closed on ambiguous ownership.** For
    `Triggered` and `TriggeredFromSourceRoute` origins, the preference key comes
    from the persisted thread ownership: an explicit owner resolves the personal
