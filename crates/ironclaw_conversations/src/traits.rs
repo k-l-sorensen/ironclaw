@@ -31,10 +31,11 @@ pub trait ConversationBindingService: Send + Sync {
     /// - `TrustedOwnerScope::User(user_id)` — the binding is owned by the named
     ///   user on first bind; may be adopted on shared-route re-entry when the
     ///   stored owner is absent (equivalent to the former `Some(user_id)`).
-    /// - `TrustedOwnerScope::Project` — the binding is explicitly owned by the
-    ///   binding's project scope (no personal user owner).
-    ///   `BindingRecord::resolution()` emits
-    ///   `TurnScope::new_with_owner(..., None)`, carrying the explicit-ownerless
+    /// - `TrustedOwnerScope::Project` — the binding is owned by its project scope
+    ///   (no personal user owner); encoded as an explicitly absent user owner
+    ///   (the explicit-None turn-scope encoding) until the ownership-principal
+    ///   enum lands. `BindingRecord::resolution()` emits
+    ///   `TurnScope::new_with_owner(..., None)`, carrying the explicit-absent-user
     ///   marker through to the run's scope. Raw adapter paths must not reach
     ///   this variant; `resolve_or_create_binding` always uses `Unspecified`.
     async fn resolve_or_create_binding_with_trusted_scope(

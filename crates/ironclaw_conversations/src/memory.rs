@@ -1292,16 +1292,16 @@ impl ReplyTargetRecord {
 /// had `owner_user_id: Option<UserId>` and no `owner_explicitly_ownerless`
 /// field:
 ///
-/// - Old record with `owner_user_id: Some(u)` → deserializes as `Owned(u)`
+/// - Old record with `owner_user_id: Some(u)` → deserializes as `User(u)`
 ///   (the `owner_explicitly_ownerless` field defaults to `false`, so the
 ///   `Some` wins).
 /// - Old record with `owner_user_id` absent or `null` → deserializes as
 ///   `Unspecified` (both fields at their defaults).
-/// - New record written as `Ownerless` → `owner_user_id: null` (or absent)
+/// - New record written as `Project` → `owner_user_id: null` (or absent)
 ///   plus `owner_explicitly_ownerless: true`.
 ///
-/// Invariant: `Owned(u)` always has `owner_explicitly_ownerless == false`.
-/// `Ownerless` always has `owner_user_id == None`.  `Unspecified` has both
+/// Invariant: `User(u)` always has `owner_explicitly_ownerless == false`.
+/// `Project` always has `owner_user_id == None`.  `Unspecified` has both
 /// at default.  The `from_fields` / `to_fields` helpers enforce this on
 /// every round-trip.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1309,9 +1309,9 @@ pub(crate) enum StoredOwnerScope {
     /// No ownership claim was stored (legacy default).
     Unspecified,
     /// Binding is owned by the given user.
-    Owned(UserId),
-    /// Binding is explicitly ownerless (project/shared automation).
-    Ownerless,
+    User(UserId),
+    /// Binding is owned by its project scope (explicitly absent user owner).
+    Project,
 }
 
 impl StoredOwnerScope {
@@ -1319,8 +1319,8 @@ impl StoredOwnerScope {
     /// [`BindingTarget`].
     fn from_fields(owner_user_id: Option<UserId>, explicitly_ownerless: bool) -> Self {
         match (owner_user_id, explicitly_ownerless) {
-            (Some(u), _) => Self::Owned(u),
-            (None, true) => Self::Ownerless,
+            (Some(u), _) => Self::User(u),
+            (None, true) => Self::Project,
             (None, false) => Self::Unspecified,
         }
     }
@@ -1328,8 +1328,8 @@ impl StoredOwnerScope {
     /// Encode into the two wire fields.
     fn to_fields(&self) -> (Option<UserId>, bool) {
         match self {
-            Self::Owned(u) => (Some(u.clone()), false),
-            Self::Ownerless => (None, true),
+            Self::User(u) => (Some(u.clone()), false),
+            Self::Project => (None, true),
             Self::Unspecified => (None, false),
         }
     }
@@ -1339,8 +1339,8 @@ impl From<TrustedOwnerScope> for StoredOwnerScope {
     fn from(scope: TrustedOwnerScope) -> Self {
         match scope {
             TrustedOwnerScope::Unspecified => Self::Unspecified,
-            TrustedOwnerScope::User(u) => Self::Owned(u),
-            TrustedOwnerScope::Project => Self::Ownerless,
+            TrustedOwnerScope::User(u) => Self::User(u),
+            TrustedOwnerScope::Project => Self::Project,
         }
     }
 }
@@ -1436,17 +1436,17 @@ impl BindingRecord {
         tenant_id: TenantId,
     ) -> ConversationBindingResolution {
         // User    -> TurnScope::new_with_owner(..., Some(u))  — explicit personal owner
-        // Project -> TurnScope::new_with_owner(..., None)   — explicit ownerless (project run)
+        // Project -> TurnScope::new_with_owner(..., None)   — explicit project-owned (no user)
         // Unspecified -> TurnScope::new(...)                  — legacy, no owner marker
         let turn_scope = match self.owner_scope() {
-            StoredOwnerScope::Owned(owner_user_id) => TurnScope::new_with_owner(
+            StoredOwnerScope::User(owner_user_id) => TurnScope::new_with_owner(
                 tenant_id.clone(),
                 self.agent_id.clone(),
                 self.project_id.clone(),
                 self.thread_id.clone(),
                 Some(owner_user_id),
             ),
-            StoredOwnerScope::Ownerless => TurnScope::new_with_owner(
+            StoredOwnerScope::Project => TurnScope::new_with_owner(
                 tenant_id.clone(),
                 self.agent_id.clone(),
                 self.project_id.clone(),
@@ -1522,24 +1522,24 @@ mod tests {
     // ── StoredOwnerScope codec round-trips ────────────────────────────────────
 
     #[test]
-    fn stored_owner_scope_owned_round_trips_through_fields() {
+    fn stored_owner_scope_user_round_trips_through_fields() {
         let user = UserId::new("alice").unwrap();
-        let scope = StoredOwnerScope::Owned(user.clone());
+        let scope = StoredOwnerScope::User(user.clone());
         let (owner_user_id, explicitly_ownerless) = scope.to_fields();
         assert_eq!(owner_user_id.as_ref().map(UserId::as_str), Some("alice"));
         assert!(!explicitly_ownerless);
         let decoded = StoredOwnerScope::from_fields(owner_user_id, explicitly_ownerless);
-        assert_eq!(decoded, StoredOwnerScope::Owned(user));
+        assert_eq!(decoded, StoredOwnerScope::User(user));
     }
 
     #[test]
-    fn stored_owner_scope_ownerless_round_trips_through_fields() {
-        let scope = StoredOwnerScope::Ownerless;
+    fn stored_owner_scope_project_round_trips_through_fields() {
+        let scope = StoredOwnerScope::Project;
         let (owner_user_id, explicitly_ownerless) = scope.to_fields();
         assert!(owner_user_id.is_none());
         assert!(explicitly_ownerless);
         let decoded = StoredOwnerScope::from_fields(owner_user_id, explicitly_ownerless);
-        assert_eq!(decoded, StoredOwnerScope::Ownerless);
+        assert_eq!(decoded, StoredOwnerScope::Project);
     }
 
     #[test]
@@ -1555,9 +1555,9 @@ mod tests {
     // ── Legacy serde compat ───────────────────────────────────────────────────
 
     /// Legacy records with `owner_user_id: Some(u)` and no
-    /// `owner_explicitly_ownerless` field must deserialize as `Owned(u)`.
+    /// `owner_explicitly_ownerless` field must deserialize as `User(u)`.
     #[test]
-    fn legacy_binding_record_with_owner_user_id_deserializes_as_owned() {
+    fn legacy_binding_record_with_owner_user_id_deserializes_as_user() {
         let json = serde_json::json!({
             "tenant_id": "t1",
             "adapter_kind": "telegram",
@@ -1597,8 +1597,8 @@ mod tests {
             serde_json::from_value(json).expect("legacy binding must deserialize");
         assert_eq!(
             record.owner_scope(),
-            StoredOwnerScope::Owned(UserId::new("alice").unwrap()),
-            "legacy record with owner_user_id must decode as Owned"
+            StoredOwnerScope::User(UserId::new("alice").unwrap()),
+            "legacy record with owner_user_id must decode as User"
         );
     }
 
@@ -1649,9 +1649,9 @@ mod tests {
         );
     }
 
-    /// New records with `owner_explicitly_ownerless: true` must decode as `Ownerless`.
+    /// New records with `owner_explicitly_ownerless: true` must decode as `Project`.
     #[test]
-    fn new_binding_record_with_explicitly_ownerless_deserializes_as_ownerless() {
+    fn new_binding_record_with_explicitly_ownerless_deserializes_as_project() {
         let json = serde_json::json!({
             "tenant_id": "t1",
             "adapter_kind": "telegram",
@@ -1690,8 +1690,8 @@ mod tests {
             serde_json::from_value(json).expect("ownerless binding must deserialize");
         assert_eq!(
             record.owner_scope(),
-            StoredOwnerScope::Ownerless,
-            "record with owner_explicitly_ownerless:true must decode as Ownerless"
+            StoredOwnerScope::Project,
+            "record with owner_explicitly_ownerless:true must decode as Project"
         );
     }
 
@@ -1775,16 +1775,16 @@ mod tests {
     // ── from(TrustedOwnerScope) codec ─────────────────────────────────────────
 
     #[test]
-    fn trusted_owner_scope_user_converts_to_stored_owned() {
+    fn trusted_owner_scope_user_converts_to_stored_user() {
         let user = UserId::new("bob").unwrap();
         let stored = StoredOwnerScope::from(TrustedOwnerScope::User(user.clone()));
-        assert_eq!(stored, StoredOwnerScope::Owned(user));
+        assert_eq!(stored, StoredOwnerScope::User(user));
     }
 
     #[test]
-    fn trusted_owner_scope_project_converts_to_stored_ownerless() {
+    fn trusted_owner_scope_project_converts_to_stored_project() {
         let stored = StoredOwnerScope::from(TrustedOwnerScope::Project);
-        assert_eq!(stored, StoredOwnerScope::Ownerless);
+        assert_eq!(stored, StoredOwnerScope::Project);
     }
 
     #[test]

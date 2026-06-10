@@ -3295,11 +3295,11 @@ async fn ownerless_scope_produces_turn_scope_with_explicit_ownerless_marker() {
     assert_eq!(
         resolution.turn_scope.explicit_owner_user_id(),
         None,
-        "Ownerless scope must carry no owner user id"
+        "Project scope must carry no owner user id"
     );
     assert!(
         resolution.turn_scope.has_explicit_thread_owner(),
-        "has_explicit_thread_owner must be true for explicitly ownerless scope"
+        "has_explicit_thread_owner must be true for explicitly project-owned scope"
     );
 }
 
@@ -3423,7 +3423,7 @@ async fn ownerless_marks_binding_when_stored_scope_is_unspecified_on_shared_rout
         .expect("legacy unscoped bind");
     assert!(!legacy.turn_scope.has_explicit_thread_owner());
 
-    // Shared re-entry with Ownerless: should mark binding as explicitly ownerless
+    // Shared re-entry with Project: should mark binding as project-owned (explicitly absent user)
     let mut shared_req = resolve_request(
         telegram(),
         external_actor("telegram-user-1"),
@@ -3444,7 +3444,7 @@ async fn ownerless_marks_binding_when_stored_scope_is_unspecified_on_shared_rout
     assert_eq!(marked.turn_scope.explicit_owner_user_id(), None);
     assert!(
         marked.turn_scope.has_explicit_thread_owner(),
-        "has_explicit_thread_owner must be true after Ownerless adoption"
+        "has_explicit_thread_owner must be true after Project-scope adoption"
     );
 }
 
@@ -3556,7 +3556,7 @@ async fn owned_does_not_overwrite_already_owned_binding() {
 // to exercise the serde round-trip indirectly via FilesystemConversationStateStore.
 // The internal serde unit tests live in memory.rs (in-crate mod tests).
 
-/// Raw (untrusted) adapter path must never reach Ownerless scope — it always
+/// Raw (untrusted) adapter path must never reach Project scope — it always
 /// passes `TrustedOwnerScope::Unspecified` internally.
 #[tokio::test]
 async fn untrusted_resolve_or_create_binding_never_sets_ownerless_marker() {

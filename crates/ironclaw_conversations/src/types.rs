@@ -221,7 +221,7 @@ impl TrustedInboundTurnRequest {
     /// Construct a trusted request with an explicit owner scope.
     ///
     /// Called by the composition materializer (wave-2 workstream) to pass
-    /// `Owned(creator)` for personal fires and `Ownerless` for project fires.
+    /// `User(creator)` for personal fires and `Project` for project fires.
     #[allow(dead_code)] // used by ironclaw_reborn_composition (wave 2)
     pub(crate) fn new_with_owner(
         request: InboundTurnRequest,

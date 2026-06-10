@@ -829,11 +829,45 @@ impl OutboundDeliveryTargetProvider for SlackHostBetaOutboundTargetProvider {
         if caller.tenant_id != self.tenant_id {
             return Ok(Vec::new());
         }
-        let mut routes = self
-            .shared_channel_routes()
-            .await?
-            .into_iter()
-            .collect::<Vec<_>>();
+        // Paginate through all shared-channel routes (all subjects) for this
+        // installation so that project-level listings show every configured
+        // channel regardless of which user the store assigned it to.
+        let mut cursor = 0;
+        let mut routes: Vec<SlackConfiguredChannelRoute> = Vec::new();
+        loop {
+            let page = self
+                .channel_route_store
+                .list_routes(
+                    &self.tenant_id,
+                    &self.installation_id,
+                    self.team_id.as_str(),
+                    cursor,
+                    SLACK_OUTBOUND_TARGET_LIST_PAGE_SIZE,
+                )
+                .await
+                .map_err(map_slack_target_route_error)?;
+            if routes.len() + page.routes.len() > SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES {
+                return Err(map_slack_target_route_error(
+                    SlackChannelRouteError::StoreUnavailable,
+                ));
+            }
+            for route in page.routes {
+                routes.push(
+                    UserId::new(route.subject_user_id)
+                        .map_err(|_| slack_target_backend_error())
+                        .map(|uid| SlackConfiguredChannelRoute::new(route.channel_id, uid))?,
+                );
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            if next_cursor <= cursor {
+                return Err(map_slack_target_route_error(
+                    SlackChannelRouteError::StoreUnavailable,
+                ));
+            }
+            cursor = next_cursor;
+        }
         routes.sort_by(|left, right| left.channel_id.cmp(&right.channel_id));
         routes
             .into_iter()
