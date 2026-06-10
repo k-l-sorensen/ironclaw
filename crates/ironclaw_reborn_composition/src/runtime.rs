@@ -87,7 +87,7 @@ use ironclaw_turns::{
     LoopGateRef, ReplyTargetBindingRef, RunProfileResolutionRequest, SanitizedCancelReason,
     SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError,
     TurnEventProjectionSource, TurnId, TurnPersistenceSnapshot, TurnRunId, TurnRunRecord,
-    TurnScope, TurnSpawnTreeStateStore, TurnStatus,
+    TurnRunState, TurnScope, TurnSpawnTreeStateStore, TurnStatus,
     run_profile::{LoopHostMilestoneSink, LoopRunContext},
 };
 
@@ -223,6 +223,7 @@ pub struct AssistantReply {
     pub conversation: ConversationId,
     pub run_id: TurnRunId,
     pub status: TurnStatus,
+    pub failure_category: Option<String>,
     pub text: Option<String>,
 }
 
@@ -1248,7 +1249,7 @@ impl RebornRuntime {
         self.wake_sender.wake();
 
         let reply = async {
-            let terminal_status = self
+            let terminal_state = self
                 .wait_for_terminal(&scope, run_id, &cancellation)
                 .await?;
             let assistant_text = self
@@ -1258,7 +1259,11 @@ impl RebornRuntime {
             Ok(AssistantReply {
                 conversation: conversation.clone(),
                 run_id,
-                status: terminal_status,
+                status: terminal_state.status,
+                failure_category: terminal_state
+                    .failure
+                    .as_ref()
+                    .map(|failure| failure.category().to_string()),
                 text: assistant_text,
             })
         }
@@ -1383,7 +1388,7 @@ impl RebornRuntime {
         scope: &TurnScope,
         run_id: TurnRunId,
         cancellation: &CancellationToken,
-    ) -> Result<TurnStatus, RebornRuntimeError> {
+    ) -> Result<TurnRunState, RebornRuntimeError> {
         let start = std::time::Instant::now();
         loop {
             if self.worker_handle.is_finished() {
@@ -1397,7 +1402,7 @@ impl RebornRuntime {
                 })
                 .await?;
             if state.status.is_terminal() {
-                return Ok(state.status);
+                return Ok(state);
             }
             // TurnStatus::RecoveryRequired is now terminal (is_terminal() returns true)
             // so the branch above handles it; no special cancel-to-release-lock is needed.

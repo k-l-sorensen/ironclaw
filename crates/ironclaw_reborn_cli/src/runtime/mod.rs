@@ -281,10 +281,70 @@ fn print_repl_help() {
 fn print_reply(reply: &ironclaw_reborn_composition::AssistantReply) {
     match reply.text.as_deref() {
         Some(text) => println!("{text}"),
-        None => eprintln!(
-            "(no assistant text; status={:?}, run_id={})",
-            reply.status, reply.run_id
-        ),
+        None => eprintln!("{}", no_assistant_text_message(reply)),
+    }
+}
+
+fn no_assistant_text_message(reply: &ironclaw_reborn_composition::AssistantReply) -> String {
+    let summary = reply_without_text_summary(reply);
+    let failure_category = reply
+        .failure_category
+        .as_deref()
+        .map(|category| format!("\nfailure_category={category}"))
+        .unwrap_or_default();
+    format!(
+        "{summary}{failure_category}\nstatus={:?}; run_id={}",
+        reply.status, reply.run_id
+    )
+}
+
+fn reply_without_text_summary(reply: &ironclaw_reborn_composition::AssistantReply) -> &'static str {
+    match reply.status {
+        ironclaw_reborn_composition::TurnStatus::Failed
+        | ironclaw_reborn_composition::TurnStatus::RecoveryRequired => {
+            failure_summary_for_cli(reply.failure_category.as_deref())
+        }
+        ironclaw_reborn_composition::TurnStatus::Cancelled => {
+            "The run was cancelled before producing a reply."
+        }
+        ironclaw_reborn_composition::TurnStatus::Completed => {
+            "The run completed without producing an assistant reply."
+        }
+        _ => "The run has not produced an assistant reply yet.",
+    }
+}
+
+fn failure_summary_for_cli(category: Option<&str>) -> &'static str {
+    match category {
+        Some("driver_not_found") => {
+            "The run failed because the configured execution driver was not available."
+        }
+        Some("driver_unavailable") => {
+            "The run failed because the execution driver was temporarily unavailable."
+        }
+        Some("driver_failed") => "The run failed because the execution driver reported an error.",
+        Some("driver_invalid_request") => {
+            "The run failed because the execution driver rejected the request."
+        }
+        Some("driver_panic") => "The run failed because the execution driver stopped unexpectedly.",
+        Some("host_creation_failed") => "The run failed while preparing the runtime host.",
+        Some("route_snapshot_persistence_failed") => {
+            "The run failed while saving the selected model route."
+        }
+        Some("model_credits_exhausted") => {
+            "The AI provider account is out of credits. Add credits or switch providers and try again."
+        }
+        Some("heartbeat_failed") => {
+            "The run failed after the runner heartbeat could not be recorded."
+        }
+        Some("exit_application_failed") => "The run failed while recording its final result.",
+        Some("lease_expired") => "The run failed because its runner lease expired.",
+        Some("interrupted_unexpectedly") => "The run stopped before it could complete cleanly.",
+        Some("no_progress_detected") => {
+            "The run stopped because it repeated the same step without making progress."
+        }
+        Some("unknown_failure") => "The run failed for an unknown reason.",
+        Some(_) | None => "The run failed before producing a reply.",
     }
 }
 
@@ -733,7 +793,7 @@ mod tests {
     use super::with_run_local_trigger_fire_access_checker;
     use super::{
         RuntimeInputCaller, RuntimeInputOptions, block_on_cli, build_runtime_input,
-        build_runtime_input_with_options, resolve_google_oauth_config,
+        build_runtime_input_with_options, failure_summary_for_cli, resolve_google_oauth_config,
     };
 
     fn clear_trigger_poller_env() -> (EnvGuard, EnvGuard) {
@@ -748,6 +808,22 @@ mod tests {
         let value = block_on_cli(async { Ok::<_, anyhow::Error>(42) }).expect("block future");
 
         assert_eq!(value, 42);
+    }
+
+    #[test]
+    fn failure_summary_for_cli_describes_known_category() {
+        assert_eq!(
+            failure_summary_for_cli(Some("driver_invalid_request")),
+            "The run failed because the execution driver rejected the request."
+        );
+    }
+
+    #[test]
+    fn failure_summary_for_cli_falls_back_for_unknown_category() {
+        assert_eq!(
+            failure_summary_for_cli(Some("unexpected_category")),
+            "The run failed before producing a reply."
+        );
     }
 
     #[test]
