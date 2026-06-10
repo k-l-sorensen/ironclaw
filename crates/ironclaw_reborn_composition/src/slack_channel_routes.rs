@@ -605,14 +605,14 @@ impl SlackChannelRouteAdminRouteConfig {
         .map_err(|_| SlackRouteError::BadRequest)
     }
 
-    fn tenant_id(&self) -> &TenantId {
+    pub(crate) fn tenant_id(&self) -> &TenantId {
         match &self.scope {
             SlackChannelRouteAdminScope::Static { tenant_id, .. }
             | SlackChannelRouteAdminScope::Dynamic { tenant_id, .. } => tenant_id,
         }
     }
 
-    fn operator_user_id(&self) -> &UserId {
+    pub(crate) fn operator_user_id(&self) -> &UserId {
         match &self.scope {
             SlackChannelRouteAdminScope::Static {
                 operator_user_id, ..
