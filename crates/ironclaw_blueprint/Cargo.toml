@@ -1,0 +1,37 @@
+[package]
+name = "ironclaw_blueprint"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+description = "Declarative tenant/operator blueprint format and parser for IronClaw Reborn (epic #3036)"
+authors = ["NEAR AI <support@near.ai>"]
+license = "MIT OR Apache-2.0"
+homepage = "https://github.com/nearai/ironclaw"
+repository = "https://github.com/nearai/ironclaw"
+publish = false
+
+# Boundary crate only: it owns the blueprint *input* format and its parser.
+# The apply path (reconcilers writing typed repos) is a later slice and must
+# not be folded back into this crate — keeping it dependency-light makes the
+# parser cheap to embed in the CLI, the admin web endpoint, and tests alike.
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+# Reuse the boot-config inline-secret guard rather than reimplementing the
+# rejection rule. The guard already cites this epic and tracks the secret
+# shapes operators paste by mistake.
+ironclaw_reborn_config = { path = "../ironclaw_reborn_config" }
+
+hex = "0.4.3"
+semver = "1"
+serde = { version = "1", features = ["derive"] }
+sha2 = "0.10"
+thiserror = "2"
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
