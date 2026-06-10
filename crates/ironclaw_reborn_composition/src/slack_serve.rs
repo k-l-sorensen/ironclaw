@@ -132,21 +132,48 @@ impl SlackIngressService {
         }
 
         match ingress {
-            ResolvedSlackIngress::UrlVerification { challenge, .. } => {
+            ResolvedSlackIngress::UrlVerification {
+                installation,
+                challenge,
+            } => {
+                tracing::info!(
+                    target = "ironclaw::reborn::slack_events",
+                    tenant_id = %installation.tenant_id(),
+                    adapter_installation_id = %installation.adapter_installation_id(),
+                    wrapper_type = "url_verification",
+                    "verified Slack Events API request received"
+                );
                 (StatusCode::OK, challenge).into_response()
             }
-            ResolvedSlackIngress::Event { installation, .. } => match installation
-                .dispatcher()
-                .process_verified_webhook_immediate_ack(
-                    body.as_ref(),
-                    installation.evidence(),
-                    installation.workflow_observer().or(workflow_observer),
-                )
-                .await
-            {
-                Ok(_) => (StatusCode::OK, "ok").into_response(),
-                Err(error) => runner_error_response(error),
-            },
+            ResolvedSlackIngress::Event {
+                installation,
+                metadata,
+            } => {
+                tracing::info!(
+                    target = "ironclaw::reborn::slack_events",
+                    tenant_id = %installation.tenant_id(),
+                    adapter_installation_id = %installation.adapter_installation_id(),
+                    wrapper_type = metadata.wrapper_type.as_deref().unwrap_or("unknown"),
+                    event_type = metadata.event_type.as_deref().unwrap_or("unknown"),
+                    team_id = metadata.team_id.as_deref().unwrap_or("unknown"),
+                    api_app_id = metadata.api_app_id.as_deref().unwrap_or("unknown"),
+                    event_channel_id = metadata.event_channel_id.as_deref().unwrap_or("unknown"),
+                    event_user_id = metadata.event_user_id.as_deref().unwrap_or("unknown"),
+                    "verified Slack Events API request received"
+                );
+                match installation
+                    .dispatcher()
+                    .process_verified_webhook_immediate_ack(
+                        body.as_ref(),
+                        installation.evidence(),
+                        installation.workflow_observer().or(workflow_observer),
+                    )
+                    .await
+                {
+                    Ok(_) => (StatusCode::OK, "ok").into_response(),
+                    Err(error) => runner_error_response(error),
+                }
+            }
         }
     }
 

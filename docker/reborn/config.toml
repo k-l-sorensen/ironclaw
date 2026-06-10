@@ -33,3 +33,7 @@ user_id = "reborn-cli"
 shared_subject_user_id = "reborn-cli"
 signing_secret_env = "IRONCLAW_REBORN_SLACK_SIGNING_SECRET"
 bot_token_env = "IRONCLAW_REBORN_SLACK_BOT_TOKEN"
+
+[[slack.channel_routes]]
+channel_id = "C0B9U4ABWQ4"
+subject_user_id = "reborn-cli"

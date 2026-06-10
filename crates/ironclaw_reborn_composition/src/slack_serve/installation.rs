@@ -62,6 +62,8 @@ slack_id_type!(SlackChannelId);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SlackEnvelopeMetadata {
+    pub wrapper_type: Option<String>,
+    pub event_type: Option<String>,
     pub team_id: Option<SlackTeamId>,
     pub enterprise_id: Option<SlackEnterpriseId>,
     pub api_app_id: Option<SlackApiAppId>,
@@ -81,6 +83,8 @@ impl SlackEnvelopeMetadata {
         event_channel_id: Option<SlackChannelId>,
     ) -> Self {
         Self {
+            wrapper_type: None,
+            event_type: None,
             team_id: team_id.clone(),
             enterprise_id: enterprise_id.clone(),
             api_app_id,
@@ -96,7 +100,9 @@ impl SlackEnvelopeMetadata {
     }
 
     fn from_wrapper(wrapper: SlackEnvelopeMetadataWrapper) -> Self {
+        let wrapper_type = wrapper.kind.clone();
         let event = wrapper.event;
+        let event_type = event.as_ref().and_then(|event| event.event_type.clone());
         let mut install_contexts: Vec<_> = wrapper
             .authorizations
             .into_iter()
@@ -119,6 +125,8 @@ impl SlackEnvelopeMetadata {
 
         let primary_context = install_contexts.first().cloned().unwrap_or_default();
         Self {
+            wrapper_type,
+            event_type,
             team_id: primary_context.team_id.clone(),
             enterprise_id: primary_context.enterprise_id.clone(),
             api_app_id: wrapper.api_app_id.map(SlackApiAppId::new),
@@ -199,6 +207,8 @@ impl SlackEnvelopeMetadataWrapper {
 
 #[derive(Debug, Clone, Deserialize)]
 struct SlackEnvelopeEventMetadata {
+    #[serde(rename = "type")]
+    event_type: Option<String>,
     user: Option<String>,
     channel: Option<String>,
 }
@@ -943,6 +953,8 @@ mod tests {
         assert_eq!(metadata.enterprise_id.as_deref(), Some("E-install"));
         assert_eq!(metadata.install_user_id.as_deref(), Some("U-install"));
         assert_eq!(metadata.event_user_id.as_deref(), Some("U-external"));
+        assert_eq!(metadata.wrapper_type.as_deref(), Some("event_callback"));
+        assert_eq!(metadata.event_type.as_deref(), Some("message"));
     }
 
     #[test]
@@ -1042,6 +1054,8 @@ mod tests {
         assert_eq!(installation.tenant_id().as_str(), "tenant-b");
         assert_eq!(installation.adapter_installation_id().as_str(), "install-b");
         assert_eq!(metadata.install_user_id.as_deref(), Some("U-install-b"));
+        assert_eq!(metadata.wrapper_type.as_deref(), Some("event_callback"));
+        assert_eq!(metadata.event_type.as_deref(), Some("message"));
         Ok(())
     }
 
