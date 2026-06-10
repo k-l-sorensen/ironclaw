@@ -274,6 +274,13 @@ impl SlackSetupService {
         };
         let shared_subject_user_id =
             validate_optional_user("shared_subject_user_id", update.shared_subject_user_id)?;
+        let installation_identity_changed = previous
+            .map(|setup| {
+                setup.installation_id != installation_id
+                    || setup.team_id != team_id
+                    || setup.api_app_id != api_app_id
+            })
+            .unwrap_or(false);
 
         let (bot_token_handle, pending_bot_token) = match update.bot_token {
             Some(secret) if !secret.expose_secret().is_empty() => (
@@ -283,6 +290,9 @@ impl SlackSetupService {
             _ => {
                 let previous =
                     previous.ok_or(SlackSetupError::MissingField { field: "bot_token" })?;
+                if installation_identity_changed {
+                    return Err(SlackSetupError::MissingField { field: "bot_token" });
+                }
                 (previous.bot_token_handle.clone(), None)
             }
         };
@@ -295,6 +305,11 @@ impl SlackSetupService {
                 let previous = previous.ok_or(SlackSetupError::MissingField {
                     field: "signing_secret",
                 })?;
+                if installation_identity_changed {
+                    return Err(SlackSetupError::MissingField {
+                        field: "signing_secret",
+                    });
+                }
                 (previous.signing_secret_handle.clone(), None)
             }
         };
@@ -601,6 +616,106 @@ mod tests {
                 .expect("tenant b token")
                 .expose_secret(),
             "xoxb-tenant-b"
+        );
+    }
+
+    #[tokio::test]
+    async fn save_rejects_installation_identity_change_without_fresh_secrets() {
+        let setup_store = Arc::new(MemorySetupStore::default());
+        let service = SlackSetupService::new(
+            TenantId::new("tenant:test").expect("tenant"),
+            AgentId::new("agent:test").expect("agent"),
+            Some(ProjectId::new("project:test").expect("project")),
+            UserId::new("user:operator").expect("user"),
+            setup_store.clone(),
+            Arc::new(InMemorySecretStore::new()),
+        );
+        let original = service
+            .save(SlackInstallationSetupUpdate {
+                installation_id: "install_runtime".to_string(),
+                team_id: "T0RUNTIME".to_string(),
+                api_app_id: "A0RUNTIME".to_string(),
+                user_id: None,
+                shared_subject_user_id: None,
+                bot_token: Some(SecretString::from("xoxb-original")),
+                signing_secret: Some(SecretString::from("slack-signing-original")),
+            })
+            .await
+            .expect("save original");
+
+        let error = service
+            .save(SlackInstallationSetupUpdate {
+                installation_id: "install_changed".to_string(),
+                team_id: "T0RUNTIME".to_string(),
+                api_app_id: "A0RUNTIME".to_string(),
+                user_id: None,
+                shared_subject_user_id: None,
+                bot_token: None,
+                signing_secret: None,
+            })
+            .await
+            .expect_err("identity change requires fresh secrets");
+
+        assert!(matches!(
+            error,
+            SlackSetupError::MissingField { field: "bot_token" }
+        ));
+        assert_eq!(
+            setup_store
+                .get_slack_installation_setup()
+                .await
+                .expect("setup")
+                .expect("stored"),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn save_reuses_secret_handles_for_non_installation_metadata_update() {
+        let service = SlackSetupService::new(
+            TenantId::new("tenant:test").expect("tenant"),
+            AgentId::new("agent:test").expect("agent"),
+            Some(ProjectId::new("project:test").expect("project")),
+            UserId::new("user:operator").expect("user"),
+            Arc::new(MemorySetupStore::default()),
+            Arc::new(InMemorySecretStore::new()),
+        );
+        let original = service
+            .save(SlackInstallationSetupUpdate {
+                installation_id: "install_runtime".to_string(),
+                team_id: "T0RUNTIME".to_string(),
+                api_app_id: "A0RUNTIME".to_string(),
+                user_id: None,
+                shared_subject_user_id: None,
+                bot_token: Some(SecretString::from("xoxb-original")),
+                signing_secret: Some(SecretString::from("slack-signing-original")),
+            })
+            .await
+            .expect("save original");
+
+        let updated = service
+            .save(SlackInstallationSetupUpdate {
+                installation_id: "install_runtime".to_string(),
+                team_id: "T0RUNTIME".to_string(),
+                api_app_id: "A0RUNTIME".to_string(),
+                user_id: Some("user:slack-operator".to_string()),
+                shared_subject_user_id: Some("user:shared-agent".to_string()),
+                bot_token: None,
+                signing_secret: None,
+            })
+            .await
+            .expect("save metadata update");
+
+        assert_eq!(updated.bot_token_handle, original.bot_token_handle);
+        assert_eq!(
+            updated.signing_secret_handle,
+            original.signing_secret_handle
+        );
+        assert_eq!(updated.revision, 2);
+        assert_eq!(updated.user_id, "user:slack-operator");
+        assert_eq!(
+            updated.shared_subject_user_id.as_deref(),
+            Some("user:shared-agent")
         );
     }
 }
