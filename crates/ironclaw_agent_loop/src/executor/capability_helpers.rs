@@ -4,19 +4,19 @@ use ironclaw_host_api::CapabilityId;
 use ironclaw_turns::{
     LoopResultRef,
     run_profile::{
-        AgentLoopDriverHost, AppendCapabilityResultRef, CapabilityCallCandidate,
-        CapabilityDescriptorView, CapabilityFailure, CapabilityFailureDetail,
-        CapabilityFailureKind, CapabilityInputIssue, CapabilityInputIssueCode,
-        CapabilityInputRepair, CapabilityInvocation, CapabilityRecoveryHint,
-        CapabilityResultMessage, CapabilitySurfaceVersion, ModelVisibleToolObservation,
-        ObservationTrust, ProviderToolCallReference, SameCallRetryConstraint,
-        ToolObservationDetail, ToolObservationStatus, ToolRecoveryObservation,
-        VisibleCapabilitySurface,
+        AgentLoopDriverHost, AppendCapabilityResultRef, CapabilityApprovalResume,
+        CapabilityCallCandidate, CapabilityDescriptorView, CapabilityFailure,
+        CapabilityFailureDetail, CapabilityFailureKind, CapabilityInputIssue,
+        CapabilityInputIssueCode, CapabilityInputRepair, CapabilityInvocation,
+        CapabilityRecoveryHint, CapabilityResultMessage, CapabilitySurfaceVersion,
+        ModelVisibleToolObservation, ObservationTrust, ProviderToolCallReference,
+        SameCallRetryConstraint, ToolObservationDetail, ToolObservationStatus,
+        ToolRecoveryObservation, VisibleCapabilitySurface,
     },
 };
 
 use crate::{
-    state::{CapabilityCallSignature, LoopExecutionState},
+    state::{CapabilityCallSignature, LoopExecutionState, PendingApprovalResume},
     strategies::{CapabilityCallSummary, CapabilityErrorSummary, CapabilityFilter, GateKind},
 };
 
@@ -27,11 +27,26 @@ const MAX_MODEL_OBSERVATION_TEXT_BYTES: usize = 256;
 
 pub(super) fn capability_invocation_from_candidate(
     call: CapabilityCallCandidate,
+    approval_resume: Option<CapabilityApprovalResume>,
 ) -> CapabilityInvocation {
     CapabilityInvocation {
         surface_version: call.surface_version,
         capability_id: call.capability_id,
         input_ref: call.input_ref,
+        approval_resume,
+    }
+}
+
+pub(super) fn pending_approval_resume_candidate(
+    resume: &PendingApprovalResume,
+    surface_version: CapabilitySurfaceVersion,
+) -> CapabilityCallCandidate {
+    CapabilityCallCandidate {
+        surface_version,
+        capability_id: resume.capability_id.clone(),
+        input_ref: resume.input_ref.clone(),
+        effective_capability_ids: resume.effective_capability_ids.clone(),
+        provider_replay: resume.provider_replay.clone(),
     }
 }
 
@@ -370,8 +385,75 @@ pub(super) fn gate_tool_result_summary(kind: GateKind, outcome: &'static str) ->
 
 pub(super) fn push_completed_result(
     state: &mut LoopExecutionState,
+    capability_id: &CapabilityId,
     result: CapabilityResultMessage,
 ) {
     state.recovery_state = state.recovery_state.cleared_attempts();
+    if let Some(n) = state
+        .post_capability_state
+        .pending_capability_bytes
+        .get_mut(capability_id)
+    {
+        *n = n.saturating_add(result.byte_len);
+    } else {
+        state
+            .post_capability_state
+            .pending_capability_bytes
+            .insert(capability_id.clone(), result.byte_len);
+    }
     state.result_refs.push(result.result_ref);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::test_run_context;
+    use ironclaw_turns::run_profile::CapabilityProgress;
+
+    #[test]
+    fn push_completed_result_accumulates_bytes_per_capability() {
+        let ctx = test_run_context("push-completed-result-bytes");
+        let mut state = LoopExecutionState::initial_for_run(&ctx);
+        let cap_a = CapabilityId::new("test.cap_a").unwrap();
+        let cap_b = CapabilityId::new("test.cap_b").unwrap();
+        let result_a1 = CapabilityResultMessage {
+            result_ref: ironclaw_turns::LoopResultRef::new("result:a1".to_string()).unwrap(),
+            safe_summary: "a1".into(),
+            progress: CapabilityProgress::MadeProgress,
+            terminate_hint: false,
+            byte_len: 1000,
+        };
+        let result_a2 = CapabilityResultMessage {
+            result_ref: ironclaw_turns::LoopResultRef::new("result:a2".to_string()).unwrap(),
+            safe_summary: "a2".into(),
+            progress: CapabilityProgress::MadeProgress,
+            terminate_hint: false,
+            byte_len: 500,
+        };
+        let result_b = CapabilityResultMessage {
+            result_ref: ironclaw_turns::LoopResultRef::new("result:b".to_string()).unwrap(),
+            safe_summary: "b".into(),
+            progress: CapabilityProgress::MadeProgress,
+            terminate_hint: false,
+            byte_len: 2000,
+        };
+        push_completed_result(&mut state, &cap_a, result_a1);
+        push_completed_result(&mut state, &cap_a, result_a2);
+        push_completed_result(&mut state, &cap_b, result_b);
+        assert_eq!(
+            state
+                .post_capability_state
+                .pending_capability_bytes
+                .get(&cap_a),
+            Some(&1500)
+        );
+        assert_eq!(
+            state
+                .post_capability_state
+                .pending_capability_bytes
+                .get(&cap_b),
+            Some(&2000)
+        );
+        assert_eq!(state.result_refs.len(), 3);
+    }
 }

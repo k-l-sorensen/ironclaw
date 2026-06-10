@@ -22,7 +22,7 @@ use crate::strategies::CompactionDecision;
 use super::{
     AgentLoopExecutorError, CancelCheck, CheckpointStage, ExecutorStage, HostStage,
     PendingInputAck, StageContext, apply_capability_filter, cancelled_exit, debug_host_unavailable,
-    failed_exit,
+    failed_exit, pending_approval_resume_candidate,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -48,9 +48,31 @@ pub(super) struct PromptOutput {
     pub(super) rendered_repeated_call_warning: bool,
 }
 
+pub(super) struct ApprovalResumePromptOutput {
+    pub(super) state: LoopExecutionState,
+    pub(super) pending_input_ack: PendingInputAck,
+    pub(super) surface: VisibleCapabilitySurface,
+    pub(super) call: ironclaw_turns::run_profile::CapabilityCallCandidate,
+}
+
 pub(super) enum PromptStep {
     Prepared(Box<PromptOutput>),
+    ResumeApproval(Box<ApprovalResumePromptOutput>),
     Exit(LoopExit),
+    /// Compaction-only turn: PromptCompactionStep ran (forced by the
+    /// `skip_model_this_iteration` flag), no prompt was assembled, no
+    /// model call this iteration. canonical.rs bypasses ModelStage +
+    /// CapabilityStage + PostCapabilityStage and routes directly to
+    /// StopStage.observe().
+    ///
+    /// Carries `pending_input_ack` alongside the state so canonical.rs can
+    /// ack inbound user input BEFORE stop.observe runs, mirroring the
+    /// Prepared path. PromptCompactionStep::run only acks internally on
+    /// Compacted; the Skipped branch (reachable when force_compact is
+    /// true but message_index is empty) returns without acking — without
+    /// this field the ack would silently drop.
+    // Boxed to avoid a large_enum_variant warning.
+    SkipModel(Box<LoopExecutionState>, PendingInputAck),
 }
 
 pub(super) struct BuiltPromptBundle {
@@ -172,6 +194,36 @@ impl<'a> PromptPlanningPipeline<'a> {
             return Ok(PromptStep::Exit(exit));
         }
 
+        // PostCapabilityStage set skip_model_this_iteration after a byte-cap
+        // trip on the prior turn. Compact here and short-circuit before
+        // building the prompt bundle — no surface filter, no prompt assembly,
+        // no model call this iteration. PromptStep::SkipModel signals
+        // canonical.rs to route past Model/Capability/PostCapability straight
+        // to stop.observe().
+        if self.state.post_capability_state.skip_model_this_iteration {
+            self.state.post_capability_state.skip_model_this_iteration = false;
+            let compaction = PromptCompactionStep::new(self.ctx, &mut self.pending_input_ack)
+                .run(self.state)
+                .await?;
+            let state = match compaction {
+                PromptCompactionOutcome::Exited(exit) => return Ok(PromptStep::Exit(exit)),
+                PromptCompactionOutcome::Skipped(mut state) => {
+                    // Compaction couldn't actually run (e.g. empty message_index) — clear
+                    // both the force flag AND the initiator so a later unrelated
+                    // compaction (Auto-triggered) doesn't .take() a stale
+                    // CapabilityResultOverflow initiator and misattribute telemetry.
+                    state.compaction_state.force_compact_on_next_iteration = false;
+                    state.compaction_state.force_compact_initiator = None;
+                    state
+                }
+                PromptCompactionOutcome::Compacted(state) => state,
+            };
+            return Ok(PromptStep::SkipModel(
+                Box::new(state),
+                self.pending_input_ack,
+            ));
+        }
+
         let surface = self.visible_surface(surface_filter).await?;
         let capability_view = LoopModelCapabilityView {
             visible_capability_ids: surface
@@ -183,6 +235,17 @@ impl<'a> PromptPlanningPipeline<'a> {
         self.state.surface_version = Some(surface.version.clone());
         if let Some(exit) = self.cancel_boundary().await? {
             return Ok(PromptStep::Exit(exit));
+        }
+        if let Some(resume) = self.state.pending_approval_resume.as_ref() {
+            let call = pending_approval_resume_candidate(resume, surface.version.clone());
+            return Ok(PromptStep::ResumeApproval(Box::new(
+                ApprovalResumePromptOutput {
+                    state: self.state,
+                    pending_input_ack: self.pending_input_ack,
+                    surface,
+                    call,
+                },
+            )));
         }
 
         let candidate_bundle = PromptBundleCandidate::build(
@@ -324,13 +387,15 @@ impl<'a, 'b> PromptCompactionStep<'a, 'b> {
         };
 
         let task_id = SystemInferenceTaskId::new();
+        let initiator = state
+            .compaction_state
+            .force_compact_initiator
+            .take()
+            .unwrap_or(CompactionInitiator::Auto);
         CheckpointStage
             .emit_progress(
                 self.ctx,
-                LoopProgressEvent::CompactionStarted {
-                    task_id,
-                    initiator: CompactionInitiator::Auto,
-                },
+                LoopProgressEvent::CompactionStarted { task_id, initiator },
             )
             .await;
         state = match CheckpointStage

@@ -59,6 +59,15 @@ mod tests {
         LoopRunContext::new(scope, TurnId::new(), TurnRunId::new(), resolved)
     }
 
+    fn local_dev_minimal_approval_policy()
+    -> ironclaw_host_api::runtime_policy::EffectiveRuntimePolicy {
+        let mut policy = crate::local_dev_runtime_policy().expect("local-dev policy resolves");
+        policy.requested_profile = ironclaw_host_api::runtime_policy::RuntimeProfile::LocalYolo;
+        policy.resolved_profile = ironclaw_host_api::runtime_policy::RuntimeProfile::LocalYolo;
+        policy.approval_policy = ironclaw_host_api::runtime_policy::ApprovalPolicy::Minimal;
+        policy
+    }
+
     #[tokio::test]
     async fn local_dev_visible_capability_request_uses_run_actor_for_runtime_scope() {
         let run_context = run_context("actor-runtime-scope")
@@ -326,10 +335,14 @@ mod tests {
         extension_state: GsuiteExtensionState,
     ) -> GsuiteSurfaceHarness {
         let dir = tempfile::tempdir().expect("tempdir");
-        let services = crate::build_reborn_services(crate::RebornBuildInput::local_dev(
-            owner,
-            dir.path().join("local-dev"),
-        ))
+        let services = crate::build_reborn_services(
+            crate::RebornBuildInput::local_dev_with_profile(
+                crate::RebornCompositionProfile::LocalDevYolo,
+                owner,
+                dir.path().join("local-dev"),
+            )
+            .with_runtime_policy(local_dev_minimal_approval_policy()),
+        )
         .await
         .expect("local-dev services build");
         let run_context = run_context(label).await;
@@ -442,7 +455,7 @@ mod tests {
         let invocation_id = InvocationId::new();
 
         let capability_id = CapabilityId::new("builtin.echo").expect("capability id");
-        let result_ref = capability_io
+        let (result_ref, _byte_len) = capability_io
             .write_capability_result(CapabilityResultWrite {
                 run_context: &run_context,
                 input_ref: &input_ref,
@@ -512,7 +525,7 @@ mod tests {
         let invocation_id = InvocationId::new();
 
         let capability_id = CapabilityId::new("builtin.echo").expect("capability id");
-        let result_ref = capability_io
+        let (result_ref, _byte_len) = capability_io
             .write_capability_result(CapabilityResultWrite {
                 run_context: &run_context,
                 input_ref: &input_ref,
@@ -772,7 +785,6 @@ mod tests {
 
         for capability_id in [
             EXTENSION_INSTALL_CAPABILITY_ID,
-            EXTENSION_ACTIVATE_CAPABILITY_ID,
             EXTENSION_REMOVE_CAPABILITY_ID,
         ] {
             let grant = grant_for(capability_id);
@@ -780,6 +792,39 @@ mod tests {
             assert!(grant.constraints.mounts.mounts.is_empty());
             assert_eq!(grant.constraints.network, NetworkPolicy::default());
         }
+        let extension_activate_grant = grant_for(EXTENSION_ACTIVATE_CAPABILITY_ID);
+        assert_eq!(
+            extension_activate_grant.constraints.allowed_effects,
+            vec![
+                EffectKind::DispatchCapability,
+                EffectKind::ReadFilesystem,
+                EffectKind::WriteFilesystem,
+                EffectKind::Network
+            ]
+        );
+        assert!(
+            extension_activate_grant
+                .constraints
+                .mounts
+                .mounts
+                .is_empty()
+        );
+        assert_eq!(
+            extension_activate_grant
+                .constraints
+                .network
+                .allowed_targets
+                .iter()
+                .map(|target| target.host_pattern.as_str())
+                .collect::<Vec<_>>(),
+            vec!["*"]
+        );
+        assert!(
+            extension_activate_grant
+                .constraints
+                .network
+                .deny_private_ip_ranges
+        );
 
         let read_file_grant = grant_for(READ_FILE_CAPABILITY_ID);
         assert_eq!(
@@ -843,7 +888,9 @@ mod tests {
         ))
         .await
         .expect("local-dev services build");
-        let skill_path = storage_root.join("skills/unit-activate-helper/SKILL.md");
+        let skill_path = storage_root.join(
+            "tenants/tenant-skill-activate-tool/users/skill-activate-user/skills/unit-activate-helper/SKILL.md",
+        );
         std::fs::create_dir_all(skill_path.parent().expect("skill parent")).expect("skill dir");
         std::fs::write(
             &skill_path,
@@ -881,13 +928,11 @@ mod tests {
             crate::local_dev_capability_policy::local_dev_capability_policy()
                 .expect("policy parses"),
         );
-        let skill_mounts = local_runtime.skill_mounts.clone();
         let factory = LocalDevLoopCapabilityPortFactory {
             runtime,
             fallback_user_id: UserId::new("skill-activate-user").expect("user id"),
             policy,
             workspace_mounts: local_runtime.workspace_mounts.clone(),
-            skill_mounts,
             memory_mounts: local_runtime.memory_mounts.clone(),
             extension_surface_source: LocalDevExtensionSurfaceSource::default(),
             input_resolver,
@@ -946,6 +991,7 @@ mod tests {
                 surface_version: candidate.surface_version,
                 capability_id: candidate.capability_id,
                 input_ref: candidate.input_ref,
+                approval_resume: None,
             })
             .await
             .expect("skill activation invokes");
@@ -1067,7 +1113,6 @@ mod tests {
             .as_ref()
             .expect("local runtime substrate"); // safety: test-only assertion in #[cfg(test)] module.
         let workspace_mounts = local_runtime.workspace_mounts.clone();
-        let skill_mounts = local_runtime.skill_mounts.clone();
         let policy = Arc::new(
             crate::local_dev_capability_policy::local_dev_capability_policy()
                 .expect("policy parses"),
@@ -1080,7 +1125,6 @@ mod tests {
             fallback_user_id: UserId::new("local-yolo-host-user").expect("user id"), // safety: literal test id is valid.
             policy,
             workspace_mounts,
-            skill_mounts,
             memory_mounts: local_runtime.memory_mounts.clone(),
             extension_surface_source: LocalDevExtensionSurfaceSource::default(),
             input_resolver,
@@ -1220,6 +1264,7 @@ mod tests {
                 capability_id: CapabilityId::new(READ_FILE_CAPABILITY_ID)
                     .expect("read_file capability id"), // safety: built-in capability id is a valid literal.
                 input_ref,
+                approval_resume: None,
             })
             .await
             .expect("read_file invocation"); // safety: test-only assertion in #[cfg(test)] module.
@@ -1251,6 +1296,7 @@ mod tests {
                 capability_id: CapabilityId::new(READ_FILE_CAPABILITY_ID)
                     .expect("read_file capability id"), // safety: built-in capability id is a valid literal.
                 input_ref,
+                approval_resume: None,
             })
             .await
             .expect("raw workspace read_file invocation"); // safety: test-only assertion in #[cfg(test)] module.
@@ -1271,10 +1317,14 @@ mod tests {
     async fn local_dev_capability_port_skill_install_writes_user_skill_root() {
         let dir = tempfile::tempdir().expect("tempdir"); // safety: test-only setup in #[cfg(test)] module.
         let storage_root = dir.path().join("local-dev");
-        let services = crate::build_reborn_services(crate::RebornBuildInput::local_dev(
-            "local-dev-skill-port-owner",
-            storage_root.clone(),
-        ))
+        let services = crate::build_reborn_services(
+            crate::RebornBuildInput::local_dev_with_profile(
+                crate::RebornCompositionProfile::LocalDevYolo,
+                "local-dev-skill-port-owner",
+                storage_root.clone(),
+            )
+            .with_runtime_policy(local_dev_minimal_approval_policy()),
+        )
         .await
         .expect("local-dev services build"); // safety: test-only assertion in #[cfg(test)] module.
         let runtime = services.host_runtime.clone().expect("host runtime"); // safety: test-only assertion in #[cfg(test)] module.
@@ -1283,7 +1333,6 @@ mod tests {
             .as_ref()
             .expect("local runtime substrate"); // safety: test-only assertion in #[cfg(test)] module.
         let workspace_mounts = local_runtime.workspace_mounts.clone();
-        let skill_mounts = local_runtime.skill_mounts.clone();
         let policy = Arc::new(
             crate::local_dev_capability_policy::local_dev_capability_policy()
                 .expect("policy parses"),
@@ -1296,7 +1345,6 @@ mod tests {
             fallback_user_id: UserId::new("local-dev-skill-port-user").expect("user id"), // safety: literal test id is valid.
             policy,
             workspace_mounts,
-            skill_mounts,
             memory_mounts: local_runtime.memory_mounts.clone(),
             extension_surface_source: LocalDevExtensionSurfaceSource::default(),
             input_resolver,
@@ -1329,6 +1377,7 @@ mod tests {
                 capability_id: CapabilityId::new(SKILL_INSTALL_CAPABILITY_ID)
                     .expect("skill_install capability id"), // safety: built-in capability id is a valid literal.
                 input_ref,
+                approval_resume: None,
             })
             .await
             .expect("skill_install invocation"); // safety: test-only assertion in #[cfg(test)] module.
@@ -1341,7 +1390,13 @@ mod tests {
             .expect("result output lookup") // safety: test-only assertion in #[cfg(test)] module.
             .expect("result output"); // safety: test-only assertion in #[cfg(test)] module.
         assert_eq!(output["installed"], serde_json::json!(true));
-        assert!(storage_root.join("skills/qa-smoke-skill/SKILL.md").exists());
+        assert!(
+            storage_root
+                .join(
+                    "tenants/tenant-skill-install-write/users/local-dev-skill-port-user/skills/qa-smoke-skill/SKILL.md"
+                )
+                .exists()
+        );
     }
 
     #[tokio::test]
@@ -1369,7 +1424,6 @@ mod tests {
             .as_ref()
             .expect("local runtime substrate"); // safety: test-only assertion in #[cfg(test)] module.
         let workspace_mounts = local_runtime.workspace_mounts.clone();
-        let skill_mounts = local_runtime.skill_mounts.clone();
         let policy = Arc::new(
             crate::local_dev_capability_policy::local_dev_capability_policy()
                 .expect("policy parses"),
@@ -1382,7 +1436,6 @@ mod tests {
             fallback_user_id: UserId::new("local-dev-no-host-user").expect("user id"), // safety: literal test id is valid.
             policy,
             workspace_mounts,
-            skill_mounts,
             memory_mounts: local_runtime.memory_mounts.clone(),
             extension_surface_source: LocalDevExtensionSurfaceSource::default(),
             input_resolver,
@@ -1464,6 +1517,7 @@ mod tests {
                 capability_id: CapabilityId::new(READ_FILE_CAPABILITY_ID)
                     .expect("read_file capability id"), // safety: built-in capability id is a valid literal.
                 input_ref,
+                approval_resume: None,
             })
             .await
             .expect("raw workspace read_file invocation"); // safety: test-only assertion in #[cfg(test)] module.
@@ -1675,6 +1729,7 @@ mod tests {
                 surface_version: candidate.surface_version,
                 capability_id: candidate.capability_id,
                 input_ref: candidate.input_ref,
+                approval_resume: None,
             })
             .await
             .expect("gmail provider tool call invokes");

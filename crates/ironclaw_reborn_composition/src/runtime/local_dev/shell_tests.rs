@@ -80,12 +80,6 @@ async fn local_dev_yolo_shell_translates_workspace_workdir_without_scoped_mounts
         .expect("local runtime substrate")
         .workspace_mounts
         .clone();
-    let skill_mounts = services
-        .local_runtime
-        .as_ref()
-        .expect("local runtime substrate")
-        .skill_mounts
-        .clone();
     let memory_mounts = services
         .local_runtime
         .as_ref()
@@ -103,7 +97,6 @@ async fn local_dev_yolo_shell_translates_workspace_workdir_without_scoped_mounts
         fallback_user_id: UserId::new("local-dev-shell-user").expect("user id"),
         policy,
         workspace_mounts,
-        skill_mounts,
         memory_mounts,
         extension_surface_source: LocalDevExtensionSurfaceSource::default(),
         input_resolver,
@@ -136,6 +129,7 @@ async fn local_dev_yolo_shell_translates_workspace_workdir_without_scoped_mounts
             surface_version: surface.version,
             capability_id: CapabilityId::new(SHELL_CAPABILITY_ID).expect("shell capability id"),
             input_ref,
+            approval_resume: None,
         })
         .await
         .expect("shell invocation");

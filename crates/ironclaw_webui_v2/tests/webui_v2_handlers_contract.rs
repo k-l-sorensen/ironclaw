@@ -28,21 +28,26 @@ use ironclaw_product_adapters::{
 };
 use ironclaw_product_workflow::{
     LifecyclePackageRef, LifecyclePhase, LlmActiveSelection, LlmConfigSnapshot, LlmModelsResult,
-    LlmProbeRequest, LlmProbeResult, LlmProviderView, RebornAutomationInfo, RebornAutomationSource,
+    LlmProbeRequest, LlmProbeResult, LlmProviderView, RebornAutomationInfo,
+    RebornAutomationRecentRunInfo, RebornAutomationRecentRunStatus, RebornAutomationSource,
     RebornAutomationState, RebornCancelRunResponse, RebornChannelConnectAction,
     RebornChannelConnectStrategy, RebornConnectableChannelInfo,
     RebornConnectableChannelListResponse, RebornCreateThreadResponse, RebornDeleteThreadRequest,
     RebornDeleteThreadResponse, RebornExtensionActionResponse, RebornExtensionListResponse,
     RebornExtensionRegistryResponse, RebornGetRunStateRequest, RebornGetRunStateResponse,
-    RebornListAutomationsResponse, RebornListThreadsResponse,
+    RebornListAutomationsResponse, RebornListThreadsResponse, RebornOperatorCommandPlaneResponse,
+    RebornOperatorConfigValidateRequest, RebornOperatorLogsQuery,
+    RebornOperatorServiceLifecycleRequest, RebornOperatorSetupRequest,
     RebornOutboundDeliveryTargetListResponse, RebornOutboundPreferencesResponse,
     RebornResolveGateResponse, RebornResumeGateResponse, RebornServicesApi, RebornServicesError,
     RebornServicesErrorCode, RebornServicesErrorKind, RebornSetOutboundPreferencesRequest,
-    RebornSetupExtensionResponse, RebornStreamEventsRequest, RebornStreamEventsResponse,
-    RebornSubmitTurnResponse, RebornTimelineRequest, RebornTimelineResponse, SetActiveLlmRequest,
-    UpsertLlmProviderRequest, WebUiAuthenticatedCaller, WebUiCancelRunRequest,
-    WebUiCreateThreadRequest, WebUiListAutomationsRequest, WebUiListThreadsRequest,
-    WebUiResolveGateRequest, WebUiSendMessageRequest, WebUiSetupExtensionRequest,
+    RebornSetupExtensionResponse, RebornSkillActionResponse, RebornSkillContentResponse,
+    RebornSkillListResponse, RebornSkillSearchResponse, RebornStreamEventsRequest,
+    RebornStreamEventsResponse, RebornSubmitTurnResponse, RebornTimelineRequest,
+    RebornTimelineResponse, SetActiveLlmRequest, UpsertLlmProviderRequest,
+    WebUiAuthenticatedCaller, WebUiCancelRunRequest, WebUiCreateThreadRequest,
+    WebUiListAutomationsRequest, WebUiListThreadsRequest, WebUiResolveGateRequest,
+    WebUiSendMessageRequest, WebUiSetupExtensionRequest, rejecting_reborn_services_error,
 };
 use ironclaw_threads::SessionThreadRecord;
 use ironclaw_turns::{
@@ -125,6 +130,7 @@ struct StubServices {
     /// branches, or empty drains in a deterministic order.
     next_stream_events: Mutex<VecDeque<Result<RebornStreamEventsResponse, RebornServicesError>>>,
     stream_events_notify: Arc<Notify>,
+    operator_calls: Mutex<Vec<String>>,
 }
 
 impl StubServices {
@@ -389,6 +395,55 @@ impl RebornServicesApi for StubServices {
         })
     }
 
+    async fn list_skills(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+    ) -> Result<RebornSkillListResponse, RebornServicesError> {
+        Err(rejecting_reborn_services_error())
+    }
+
+    async fn search_skills(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _query: String,
+    ) -> Result<RebornSkillSearchResponse, RebornServicesError> {
+        Err(rejecting_reborn_services_error())
+    }
+
+    async fn install_skill(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _name: String,
+        _content: Option<String>,
+    ) -> Result<RebornSkillActionResponse, RebornServicesError> {
+        Err(rejecting_reborn_services_error())
+    }
+
+    async fn read_skill_content(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _name: String,
+    ) -> Result<RebornSkillContentResponse, RebornServicesError> {
+        Err(rejecting_reborn_services_error())
+    }
+
+    async fn update_skill(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _name: String,
+        _content: String,
+    ) -> Result<RebornSkillActionResponse, RebornServicesError> {
+        Err(rejecting_reborn_services_error())
+    }
+
+    async fn remove_skill(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        _name: String,
+    ) -> Result<RebornSkillActionResponse, RebornServicesError> {
+        Err(rejecting_reborn_services_error())
+    }
+
     async fn list_connectable_channels(
         &self,
         _caller: WebUiAuthenticatedCaller,
@@ -505,6 +560,98 @@ impl RebornServicesApi for StubServices {
         })
     }
 
+    async fn get_operator_setup(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+    ) -> Result<RebornOperatorCommandPlaneResponse, RebornServicesError> {
+        self.operator_calls
+            .lock()
+            .expect("lock")
+            .push("get_setup".to_string());
+        Err(service_unavailable_error(false))
+    }
+
+    async fn run_operator_setup(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: RebornOperatorSetupRequest,
+    ) -> Result<RebornOperatorCommandPlaneResponse, RebornServicesError> {
+        self.operator_calls.lock().expect("lock").push(format!(
+            "run_setup:{:?}:{:?}:{:?}",
+            request.provider_id, request.model, request.profile_id
+        ));
+        Err(service_unavailable_error(false))
+    }
+
+    async fn list_operator_config(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+    ) -> Result<RebornOperatorCommandPlaneResponse, RebornServicesError> {
+        self.operator_calls
+            .lock()
+            .expect("lock")
+            .push("list_config".to_string());
+        Err(service_unavailable_error(false))
+    }
+
+    async fn validate_operator_config(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: RebornOperatorConfigValidateRequest,
+    ) -> Result<RebornOperatorCommandPlaneResponse, RebornServicesError> {
+        self.operator_calls
+            .lock()
+            .expect("lock")
+            .push(format!("validate_config:{:?}", request.keys));
+        Err(service_unavailable_error(false))
+    }
+
+    async fn get_operator_diagnostics(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+    ) -> Result<RebornOperatorCommandPlaneResponse, RebornServicesError> {
+        self.operator_calls
+            .lock()
+            .expect("lock")
+            .push("diagnostics".to_string());
+        Err(service_unavailable_error(false))
+    }
+
+    async fn get_operator_status(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+    ) -> Result<RebornOperatorCommandPlaneResponse, RebornServicesError> {
+        self.operator_calls
+            .lock()
+            .expect("lock")
+            .push("status".to_string());
+        Err(service_unavailable_error(false))
+    }
+
+    async fn query_operator_logs(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        query: RebornOperatorLogsQuery,
+    ) -> Result<RebornOperatorCommandPlaneResponse, RebornServicesError> {
+        self.operator_calls
+            .lock()
+            .expect("lock")
+            .push(format!("logs:{:?}:{:?}", query.limit, query.cursor));
+        Err(service_unavailable_error(false))
+    }
+
+    async fn run_operator_service_lifecycle(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: RebornOperatorServiceLifecycleRequest,
+    ) -> Result<RebornOperatorCommandPlaneResponse, RebornServicesError> {
+        self.operator_calls
+            .lock()
+            .expect("lock")
+            .push(format!("service:{:?}", request.action));
+        Err(service_unavailable_error(false))
+    }
+
     async fn get_llm_config(
         &self,
         _caller: WebUiAuthenticatedCaller,
@@ -605,6 +752,16 @@ fn automation_info(automation_id: &str, name: &str, cron: &str) -> RebornAutomat
         next_run_at: None,
         last_run_at: None,
         last_status: None,
+        recent_runs: vec![RebornAutomationRecentRunInfo {
+            run_id: Some(
+                TurnRunId::parse("11111111-1111-1111-1111-111111111111").expect("valid run id"),
+            ),
+            thread_id: ThreadId::new("thread-listed").expect("valid thread id"),
+            fire_slot: None,
+            status: RebornAutomationRecentRunStatus::Running,
+            submitted_at: "2026-06-03T09:00:01Z".parse().expect("submitted at"),
+            completed_at: None,
+        }],
         is_active: true,
         created_at: None,
     }
@@ -964,7 +1121,7 @@ async fn stream_events_last_event_id_header_takes_precedence_over_query() {
 }
 
 #[tokio::test]
-async fn list_automations_forwards_query_limit_to_facade() {
+async fn list_automations_forwards_query_limits_to_facade() {
     let services = Arc::new(StubServices::default());
     let router = router_with(services.clone());
 
@@ -972,7 +1129,7 @@ async fn list_automations_forwards_query_limit_to_facade() {
         .oneshot(
             Request::builder()
                 .method(Method::GET)
-                .uri("/api/webchat/v2/automations?limit=5")
+                .uri("/api/webchat/v2/automations?limit=5&run_limit=7")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -982,6 +1139,14 @@ async fn list_automations_forwards_query_limit_to_facade() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = read_json(response).await;
     assert_eq!(body["automations"][0]["automation_id"], "automation-listed");
+    assert_eq!(
+        body["automations"][0]["recent_runs"][0]["thread_id"],
+        "thread-listed"
+    );
+    assert_eq!(
+        body["automations"][0]["recent_runs"][0]["status"],
+        "running"
+    );
 
     let calls = services
         .list_automations_calls
@@ -990,10 +1155,11 @@ async fn list_automations_forwards_query_limit_to_facade() {
         .clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].limit, Some(5));
+    assert_eq!(calls[0].run_limit, Some(7));
 }
 
 #[tokio::test]
-async fn list_automations_omits_limit_and_forwards_none() {
+async fn list_automations_omits_limits_and_forwards_none() {
     let services = Arc::new(StubServices::default());
     let router = router_with(services.clone());
 
@@ -1019,6 +1185,7 @@ async fn list_automations_omits_limit_and_forwards_none() {
         .clone();
     assert_eq!(calls.len(), 1);
     assert_eq!(calls[0].limit, None);
+    assert_eq!(calls[0].run_limit, None);
 }
 
 #[tokio::test]
@@ -1031,6 +1198,33 @@ async fn list_automations_rejects_invalid_limit_query_with_400() {
             Request::builder()
                 .method(Method::GET)
                 .uri("/api/webchat/v2/automations?limit=not-a-number")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        services
+            .list_automations_calls
+            .lock()
+            .expect("lock")
+            .is_empty(),
+        "invalid query input must be rejected before reaching the facade"
+    );
+}
+
+#[tokio::test]
+async fn list_automations_rejects_invalid_run_limit_query_with_400() {
+    let services = Arc::new(StubServices::default());
+    let router = router_with(services.clone());
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/webchat/v2/automations?run_limit=not-a-number")
                 .body(Body::empty())
                 .expect("request"),
         )
@@ -1161,6 +1355,102 @@ async fn get_session_returns_false_operator_capability_when_capabilities_default
     assert_eq!(body["tenant_id"], "tenant-alpha");
     assert_eq!(body["user_id"], "user-alpha");
     assert_eq!(body["capabilities"]["operator_webui_config"], false);
+}
+
+#[tokio::test]
+async fn operator_route_defaults_to_sanitized_service_unavailable() {
+    let services = Arc::new(StubServices::default());
+    let router = router_with_capabilities(
+        services,
+        WebUiV2Capabilities {
+            operator_webui_config: true,
+        },
+    );
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method(Method::GET)
+                .uri("/api/webchat/v2/operator/status")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("oneshot");
+
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = read_json(response).await;
+    assert_eq!(body["error"], "unavailable");
+    assert_eq!(body["kind"], "service_unavailable");
+    assert_eq!(body["retryable"], false);
+}
+
+#[tokio::test]
+async fn operator_routes_forward_body_and_query_to_facade_before_503() {
+    let services = Arc::new(StubServices::default());
+    let router = router_with_capabilities(
+        services.clone(),
+        WebUiV2Capabilities {
+            operator_webui_config: true,
+        },
+    );
+
+    for (method, uri, body) in [
+        (Method::GET, "/api/webchat/v2/operator/setup", None),
+        (
+            Method::POST,
+            "/api/webchat/v2/operator/setup",
+            Some(r#"{"provider_id":"openai","model":"gpt-4","profile_id":"default"}"#),
+        ),
+        (Method::GET, "/api/webchat/v2/operator/config", None),
+        (
+            Method::POST,
+            "/api/webchat/v2/operator/config/validate",
+            Some(r#"{"keys":["provider.default","model.default"]}"#),
+        ),
+        (Method::GET, "/api/webchat/v2/operator/diagnostics", None),
+        (Method::GET, "/api/webchat/v2/operator/status", None),
+        (
+            Method::GET,
+            "/api/webchat/v2/operator/logs?limit=10&cursor=abc",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/webchat/v2/operator/service",
+            Some(r#"{"action":"start"}"#),
+        ),
+    ] {
+        let mut builder = Request::builder().method(method).uri(uri);
+        if body.is_some() {
+            builder = builder.header("content-type", "application/json");
+        }
+        let response = router
+            .clone()
+            .oneshot(
+                builder
+                    .body(body.map_or_else(Body::empty, Body::from))
+                    .expect("request"),
+            )
+            .await
+            .expect("oneshot");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+    }
+
+    assert_eq!(
+        services.operator_calls.lock().expect("lock").as_slice(),
+        &[
+            String::from("get_setup"),
+            String::from("run_setup:Some(\"openai\"):Some(\"gpt-4\"):Some(\"default\")",),
+            String::from("list_config"),
+            String::from("validate_config:[\"provider.default\", \"model.default\"]"),
+            String::from("diagnostics"),
+            String::from("status"),
+            String::from("logs:Some(10):Some(\"abc\")"),
+            String::from("service:Start"),
+        ]
+    );
 }
 
 #[tokio::test]
@@ -1889,6 +2179,49 @@ async fn stream_events_releases_slot_when_facade_drain_stalls_past_max_lifetime(
             &self,
             _caller: WebUiAuthenticatedCaller,
         ) -> Result<RebornExtensionListResponse, RebornServicesError> {
+            unreachable!("not exercised by this test")
+        }
+        async fn list_skills(
+            &self,
+            _caller: WebUiAuthenticatedCaller,
+        ) -> Result<RebornSkillListResponse, RebornServicesError> {
+            unreachable!("not exercised by this test")
+        }
+        async fn search_skills(
+            &self,
+            _caller: WebUiAuthenticatedCaller,
+            _query: String,
+        ) -> Result<RebornSkillSearchResponse, RebornServicesError> {
+            unreachable!("not exercised by this test")
+        }
+        async fn install_skill(
+            &self,
+            _caller: WebUiAuthenticatedCaller,
+            _name: String,
+            _content: Option<String>,
+        ) -> Result<RebornSkillActionResponse, RebornServicesError> {
+            unreachable!("not exercised by this test")
+        }
+        async fn read_skill_content(
+            &self,
+            _caller: WebUiAuthenticatedCaller,
+            _name: String,
+        ) -> Result<RebornSkillContentResponse, RebornServicesError> {
+            unreachable!("not exercised by this test")
+        }
+        async fn update_skill(
+            &self,
+            _caller: WebUiAuthenticatedCaller,
+            _name: String,
+            _content: String,
+        ) -> Result<RebornSkillActionResponse, RebornServicesError> {
+            unreachable!("not exercised by this test")
+        }
+        async fn remove_skill(
+            &self,
+            _caller: WebUiAuthenticatedCaller,
+            _name: String,
+        ) -> Result<RebornSkillActionResponse, RebornServicesError> {
             unreachable!("not exercised by this test")
         }
         async fn list_extension_registry(

@@ -32,6 +32,12 @@ pub const WEBUI_V2_ROUTE_ACTIVATE_EXTENSION: &str = "webui.v2.activate_extension
 pub const WEBUI_V2_ROUTE_REMOVE_EXTENSION: &str = "webui.v2.remove_extension";
 pub const WEBUI_V2_ROUTE_GET_EXTENSION_SETUP: &str = "webui.v2.get_extension_setup";
 pub const WEBUI_V2_ROUTE_SETUP_EXTENSION: &str = "webui.v2.setup_extension";
+pub const WEBUI_V2_ROUTE_LIST_SKILLS: &str = "webui.v2.list_skills";
+pub const WEBUI_V2_ROUTE_SEARCH_SKILLS: &str = "webui.v2.search_skills";
+pub const WEBUI_V2_ROUTE_INSTALL_SKILL: &str = "webui.v2.install_skill";
+pub const WEBUI_V2_ROUTE_GET_SKILL: &str = "webui.v2.get_skill";
+pub const WEBUI_V2_ROUTE_UPDATE_SKILL: &str = "webui.v2.update_skill";
+pub const WEBUI_V2_ROUTE_REMOVE_SKILL: &str = "webui.v2.remove_skill";
 pub const WEBUI_V2_ROUTE_GET_LLM_CONFIG: &str = "webui.v2.get_llm_config";
 pub const WEBUI_V2_ROUTE_UPSERT_LLM_PROVIDER: &str = "webui.v2.upsert_llm_provider";
 pub const WEBUI_V2_ROUTE_DELETE_LLM_PROVIDER: &str = "webui.v2.delete_llm_provider";
@@ -42,6 +48,14 @@ pub const WEBUI_V2_ROUTE_START_NEARAI_LOGIN: &str = "webui.v2.start_nearai_login
 pub const WEBUI_V2_ROUTE_COMPLETE_NEARAI_WALLET_LOGIN: &str =
     "webui.v2.complete_nearai_wallet_login";
 pub const WEBUI_V2_ROUTE_START_CODEX_LOGIN: &str = "webui.v2.start_codex_login";
+pub const WEBUI_V2_ROUTE_OPERATOR_GET_SETUP: &str = "webui.v2.operator.get_setup";
+pub const WEBUI_V2_ROUTE_OPERATOR_RUN_SETUP: &str = "webui.v2.operator.run_setup";
+pub const WEBUI_V2_ROUTE_OPERATOR_LIST_CONFIG: &str = "webui.v2.operator.list_config";
+pub const WEBUI_V2_ROUTE_OPERATOR_VALIDATE_CONFIG: &str = "webui.v2.operator.validate_config";
+pub const WEBUI_V2_ROUTE_OPERATOR_DIAGNOSTICS: &str = "webui.v2.operator.diagnostics";
+pub const WEBUI_V2_ROUTE_OPERATOR_STATUS: &str = "webui.v2.operator.status";
+pub const WEBUI_V2_ROUTE_OPERATOR_LOGS: &str = "webui.v2.operator.logs";
+pub const WEBUI_V2_ROUTE_OPERATOR_SERVICE_LIFECYCLE: &str = "webui.v2.operator.service_lifecycle";
 
 pub const WEBUI_V2_PATTERN_CREATE_THREAD: &str = "/api/webchat/v2/threads";
 pub const WEBUI_V2_PATTERN_LIST_THREADS: &str = "/api/webchat/v2/threads";
@@ -65,6 +79,10 @@ pub const WEBUI_V2_PATTERN_ACTIVATE_EXTENSION: &str =
 pub const WEBUI_V2_PATTERN_REMOVE_EXTENSION: &str =
     "/api/webchat/v2/extensions/{package_id}/remove";
 pub const WEBUI_V2_PATTERN_SETUP_EXTENSION: &str = "/api/webchat/v2/extensions/{package_id}/setup";
+pub const WEBUI_V2_PATTERN_LIST_SKILLS: &str = "/api/webchat/v2/skills";
+pub const WEBUI_V2_PATTERN_SEARCH_SKILLS: &str = "/api/webchat/v2/skills/search";
+pub const WEBUI_V2_PATTERN_INSTALL_SKILL: &str = "/api/webchat/v2/skills/install";
+pub const WEBUI_V2_PATTERN_SKILL_DETAIL: &str = "/api/webchat/v2/skills/{name}";
 pub const WEBUI_V2_PATTERN_GET_LLM_CONFIG: &str = "/api/webchat/v2/llm/providers";
 pub const WEBUI_V2_PATTERN_UPSERT_LLM_PROVIDER: &str = "/api/webchat/v2/llm/providers";
 pub const WEBUI_V2_PATTERN_DELETE_LLM_PROVIDER: &str =
@@ -75,6 +93,14 @@ pub const WEBUI_V2_PATTERN_LIST_LLM_MODELS: &str = "/api/webchat/v2/llm/list-mod
 pub const WEBUI_V2_PATTERN_START_NEARAI_LOGIN: &str = "/api/webchat/v2/llm/nearai/login";
 pub const WEBUI_V2_PATTERN_COMPLETE_NEARAI_WALLET_LOGIN: &str = "/api/webchat/v2/llm/nearai/wallet";
 pub const WEBUI_V2_PATTERN_START_CODEX_LOGIN: &str = "/api/webchat/v2/llm/codex/login";
+pub const WEBUI_V2_PATTERN_OPERATOR_SETUP: &str = "/api/webchat/v2/operator/setup";
+pub const WEBUI_V2_PATTERN_OPERATOR_CONFIG: &str = "/api/webchat/v2/operator/config";
+pub const WEBUI_V2_PATTERN_OPERATOR_CONFIG_VALIDATE: &str =
+    "/api/webchat/v2/operator/config/validate";
+pub const WEBUI_V2_PATTERN_OPERATOR_DIAGNOSTICS: &str = "/api/webchat/v2/operator/diagnostics";
+pub const WEBUI_V2_PATTERN_OPERATOR_STATUS: &str = "/api/webchat/v2/operator/status";
+pub const WEBUI_V2_PATTERN_OPERATOR_LOGS: &str = "/api/webchat/v2/operator/logs";
+pub const WEBUI_V2_PATTERN_OPERATOR_SERVICE_LIFECYCLE: &str = "/api/webchat/v2/operator/service";
 
 /// Return the canonical [`IngressRouteDescriptor`] set for the WebChat v2
 /// beta route surface.
@@ -103,6 +129,12 @@ pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
         remove_extension_descriptor(),
         get_extension_setup_descriptor(),
         setup_extension_descriptor(),
+        list_skills_descriptor(),
+        search_skills_descriptor(),
+        install_skill_descriptor(),
+        get_skill_descriptor(),
+        update_skill_descriptor(),
+        remove_skill_descriptor(),
         get_llm_config_descriptor(),
         upsert_llm_provider_descriptor(),
         delete_llm_provider_descriptor(),
@@ -112,13 +144,24 @@ pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
         start_nearai_login_descriptor(),
         complete_nearai_wallet_login_descriptor(),
         start_codex_login_descriptor(),
+        operator_get_setup_descriptor(),
+        operator_run_setup_descriptor(),
+        operator_list_config_descriptor(),
+        operator_validate_config_descriptor(),
+        operator_diagnostics_descriptor(),
+        operator_status_descriptor(),
+        operator_logs_descriptor(),
+        operator_service_lifecycle_descriptor(),
     ]
 }
 
-/// Returns whether a route id belongs to the operator-wide LLM config surface.
-/// Host composition uses this to keep route mounting and descriptor policy
-/// filtering in sync when non-operator authenticators leave those routes
-/// unmounted.
+/// Returns whether a route id belongs to the legacy operator-wide LLM config surface.
+///
+/// Prefer [`is_webui_v2_operator_webui_config_route_id`] for host route gating;
+/// this older predicate intentionally excludes newer `operator/*` routes.
+#[deprecated(
+    note = "Use `is_webui_v2_operator_webui_config_route_id`; this predicate misses the operator/* routes."
+)]
 pub fn is_webui_v2_llm_config_route_id(route_id: &str) -> bool {
     matches!(
         route_id,
@@ -132,6 +175,23 @@ pub fn is_webui_v2_llm_config_route_id(route_id: &str) -> bool {
             | WEBUI_V2_ROUTE_COMPLETE_NEARAI_WALLET_LOGIN
             | WEBUI_V2_ROUTE_START_CODEX_LOGIN
     )
+}
+
+/// Returns whether a route id belongs to any operator-wide WebUI config surface.
+#[allow(deprecated)]
+pub fn is_webui_v2_operator_webui_config_route_id(route_id: &str) -> bool {
+    is_webui_v2_llm_config_route_id(route_id)
+        || matches!(
+            route_id,
+            WEBUI_V2_ROUTE_OPERATOR_GET_SETUP
+                | WEBUI_V2_ROUTE_OPERATOR_RUN_SETUP
+                | WEBUI_V2_ROUTE_OPERATOR_LIST_CONFIG
+                | WEBUI_V2_ROUTE_OPERATOR_VALIDATE_CONFIG
+                | WEBUI_V2_ROUTE_OPERATOR_DIAGNOSTICS
+                | WEBUI_V2_ROUTE_OPERATOR_STATUS
+                | WEBUI_V2_ROUTE_OPERATOR_LOGS
+                | WEBUI_V2_ROUTE_OPERATOR_SERVICE_LIFECYCLE
+        )
 }
 
 fn get_session_descriptor() -> IngressRouteDescriptor {
@@ -401,6 +461,90 @@ fn setup_extension_descriptor() -> IngressRouteDescriptor {
     )
 }
 
+fn list_skills_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_LIST_SKILLS,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_LIST_SKILLS,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn search_skills_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_SEARCH_SKILLS,
+        NetworkMethod::Post,
+        WEBUI_V2_PATTERN_SEARCH_SKILLS,
+        mutation_policy(
+            body_limit_kib(4),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+        ),
+    )
+}
+
+fn install_skill_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_INSTALL_SKILL,
+        NetworkMethod::Post,
+        WEBUI_V2_PATTERN_INSTALL_SKILL,
+        mutation_policy(
+            body_limit_kib(128),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+        ),
+    )
+}
+
+fn get_skill_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_GET_SKILL,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_SKILL_DETAIL,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn update_skill_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_UPDATE_SKILL,
+        NetworkMethod::Put,
+        WEBUI_V2_PATTERN_SKILL_DETAIL,
+        mutation_policy(
+            body_limit_kib(128),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+        ),
+    )
+}
+
+fn remove_skill_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_REMOVE_SKILL,
+        NetworkMethod::Delete,
+        WEBUI_V2_PATTERN_SKILL_DETAIL,
+        mutation_policy(
+            body_limit_kib(4),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+        ),
+    )
+}
+
 fn get_llm_config_descriptor() -> IngressRouteDescriptor {
     descriptor(
         WEBUI_V2_ROUTE_GET_LLM_CONFIG,
@@ -518,6 +662,118 @@ fn start_codex_login_descriptor() -> IngressRouteDescriptor {
         WEBUI_V2_ROUTE_START_CODEX_LOGIN,
         NetworkMethod::Post,
         WEBUI_V2_PATTERN_START_CODEX_LOGIN,
+        mutation_policy(
+            body_limit_kib(4),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+        ),
+    )
+}
+
+fn operator_get_setup_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_OPERATOR_GET_SETUP,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_OPERATOR_SETUP,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn operator_run_setup_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_OPERATOR_RUN_SETUP,
+        NetworkMethod::Post,
+        WEBUI_V2_PATTERN_OPERATOR_SETUP,
+        mutation_policy(
+            body_limit_kib(16),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+        ),
+    )
+}
+
+fn operator_list_config_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_OPERATOR_LIST_CONFIG,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_OPERATOR_CONFIG,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn operator_validate_config_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_OPERATOR_VALIDATE_CONFIG,
+        NetworkMethod::Post,
+        WEBUI_V2_PATTERN_OPERATOR_CONFIG_VALIDATE,
+        mutation_policy(
+            body_limit_kib(16),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+        ),
+    )
+}
+
+fn operator_diagnostics_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_OPERATOR_DIAGNOSTICS,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_OPERATOR_DIAGNOSTICS,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn operator_status_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_OPERATOR_STATUS,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_OPERATOR_STATUS,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn operator_logs_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_OPERATOR_LOGS,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_OPERATOR_LOGS,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProjectionOnly,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn operator_service_lifecycle_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_OPERATOR_SERVICE_LIFECYCLE,
+        NetworkMethod::Post,
+        WEBUI_V2_PATTERN_OPERATOR_SERVICE_LIFECYCLE,
         mutation_policy(
             body_limit_kib(4),
             mutation_rate_limit(),

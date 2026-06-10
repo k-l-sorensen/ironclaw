@@ -99,6 +99,7 @@ async fn two_fake_drivers_use_the_same_per_run_agent_loop_host_contract() {
     host.push_capability_outcome(CapabilityOutcome::ApprovalRequired {
         gate_ref: LoopGateRef::new("gate:approval-needed").unwrap(),
         safe_summary: "approval required".to_string(),
+        approval_resume: None,
     });
 
     let reply_exit = ReplyDriver
@@ -1893,6 +1894,7 @@ async fn capability_invocations_must_cite_visible_surface_before_host_dispatch()
             surface_version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
             capability_id: foreign,
             input_ref: CapabilityInputRef::new("input:opaque-agent-loop-host-sentinel").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap_err();
@@ -2032,6 +2034,28 @@ fn capability_denied_reason_kind_is_typed_and_wire_compatible() {
     assert_eq!(constructed_unknown.as_str(), "host_policy_denied");
     assert!(CapabilityDeniedReasonKind::unknown("api_key").is_err());
     assert!(CapabilityDeniedReasonKind::unknown("secret_policy").is_err());
+}
+
+#[test]
+fn capability_result_message_byte_len_round_trips() {
+    let json = serde_json::json!({
+        "result_ref": "result:big",
+        "safe_summary": "big result",
+        "byte_len": 33_001u64
+    });
+    let decoded: CapabilityResultMessage = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.byte_len, 33_001);
+}
+
+#[test]
+fn capability_result_message_byte_len_defaults_to_zero_for_legacy_payload() {
+    // Legacy hosts that don't yet emit byte_len must still decode cleanly.
+    let json = serde_json::json!({
+        "result_ref": "result:legacy",
+        "safe_summary": "no byte_len field"
+    });
+    let decoded: CapabilityResultMessage = serde_json::from_value(json).unwrap();
+    assert_eq!(decoded.byte_len, 0);
 }
 
 #[test]
@@ -2183,6 +2207,7 @@ impl AgentLoopDriver for CapabilityDriver {
                 surface_version: surface.version,
                 capability_id: surface.descriptors[0].capability_id.clone(),
                 input_ref: CapabilityInputRef::new("input:opaque-tool-arguments").unwrap(),
+                approval_resume: None,
             })
             .await
             .map_err(driver_error)?;

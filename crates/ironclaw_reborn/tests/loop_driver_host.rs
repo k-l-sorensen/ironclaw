@@ -652,6 +652,40 @@ async fn progress_port_routes_compaction_progress_milestones() {
 }
 
 #[tokio::test]
+async fn progress_port_routes_capability_result_overflow_initiator() {
+    // Mirror progress_port_routes_compaction_progress_milestones but using
+    // CompactionInitiator::CapabilityResultOverflow to validate the
+    // snake_case serialization ("capability_result_overflow") and the
+    // milestone routing path don't drop the new variant.
+    let fixture = HostFixture::new("thread-progress-overflow-initiator", "hello overflow").await;
+    let host = fixture.build_host().await;
+    let host_dyn: &(dyn AgentLoopDriverHost + Send + Sync) = &host;
+    let started_task = SystemInferenceTaskId::new();
+
+    host_dyn
+        .emit_loop_progress(LoopProgressEvent::CompactionStarted {
+            task_id: started_task,
+            initiator: CompactionInitiator::CapabilityResultOverflow,
+        })
+        .await
+        .unwrap();
+
+    let milestones = fixture.milestones();
+    assert!(matches!(
+        milestones[0].kind,
+        LoopHostMilestoneKind::CompactionStarted {
+            task_id,
+            initiator: CompactionInitiator::CapabilityResultOverflow,
+        } if task_id == started_task
+    ));
+    assert!(milestones.iter().all(|milestone| {
+        milestone.scope == fixture.context.scope
+            && milestone.turn_id == fixture.context.turn_id
+            && milestone.run_id == fixture.context.run_id
+    }));
+}
+
+#[tokio::test]
 async fn progress_port_checkpoint_written_does_not_double_emit() {
     let fixture = HostFixture::new("thread-progress-checkpoint", "hello progress").await;
     let host = fixture.build_host().await;
@@ -2232,6 +2266,7 @@ async fn planned_host_factory_create_host_uses_profiled_capabilities() {
             surface_version: surface.version,
             capability_id: denied_id,
             input_ref: CapabilityInputRef::new("input:denied-from-planned-host").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -2562,6 +2597,7 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
             surface_version: surface.version,
             capability_id: denied_id,
             input_ref: CapabilityInputRef::new("input:runtime-denied").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -2792,6 +2828,7 @@ async fn hooks_flag_off_capability_invocation_is_unaffected() {
             surface_version,
             capability_id: allowed_id.clone(),
             input_ref,
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -2833,6 +2870,7 @@ async fn hooks_flag_on_first_party_only_does_not_change_outcome() {
             surface_version,
             capability_id: allowed_id.clone(),
             input_ref,
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -2867,6 +2905,7 @@ async fn hooks_flag_on_extension_deny_hook_denies_through_composed_runtime() {
             surface_version,
             capability_id: allowed_id.clone(),
             input_ref: CapabilityInputRef::new("input:hooks-deny").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -2901,6 +2940,7 @@ async fn hooks_are_isolated_per_tenant_runtime() {
             surface_version: surface_a,
             capability_id: allowed_id.clone(),
             input_ref: CapabilityInputRef::new("input:tenant-a").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -2928,6 +2968,7 @@ async fn hooks_are_isolated_per_tenant_runtime() {
             surface_version: surface_b,
             capability_id: allowed_id.clone(),
             input_ref: input_ref_b,
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -3058,7 +3099,7 @@ async fn product_live_runtime_builds_when_all_required_adapters_are_present() {
 /// to assert the fail-closed branch fires.
 async fn product_live_parts_for_gate_test(
     thread_label: &'static str,
-) -> DefaultPlannedRuntimeParts<InMemoryTurnStateStore, RecordingGateway> {
+) -> DefaultPlannedRuntimeParts<RecordingGateway> {
     let fixture = HostFixture::new_unsubmitted(thread_label, "hello").await;
     let turn_store = Arc::new(InMemoryTurnStateStore::default());
     let runtime = Arc::new(RecordingHostRuntime::with_surface(host_runtime_surface([
@@ -4408,6 +4449,7 @@ async fn text_only_host_skill_context_does_not_expand_capability_surface() {
                 surface_version: surface.version,
                 capability_id: CapabilityId::new("demo.echo").unwrap(),
                 input_ref: CapabilityInputRef::new("input:opaque-tool-input").unwrap(),
+                approval_resume: None,
             }],
             stop_on_first_suspension: true,
         })
@@ -4533,6 +4575,7 @@ async fn text_only_host_routes_capability_invocation_through_host_runtime() {
             surface_version: surface.version.clone(),
             capability_id: capability_id.clone(),
             input_ref,
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -4596,6 +4639,7 @@ async fn text_only_host_profiled_capabilities_filter_surface_and_invocation() {
             surface_version: surface.version,
             capability_id: denied_id,
             input_ref: CapabilityInputRef::new("input:denied-profile").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -4670,6 +4714,7 @@ async fn default_strategy_filter_all_loses_to_host_profile_filter() {
             surface_version: surface.version,
             capability_id: tool_b_id,
             input_ref: CapabilityInputRef::new("input:tool-b-denied").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -4742,6 +4787,7 @@ async fn text_only_host_uses_fresh_execution_context_per_capability_invocation()
                 surface_version: surface.version.clone(),
                 capability_id: capability_id.clone(),
                 input_ref,
+                approval_resume: None,
             })
             .await
             .unwrap();
@@ -4829,6 +4875,7 @@ async fn text_only_host_rejects_outside_surface_capability_before_host_runtime()
             surface_version: surface.version,
             capability_id: hidden_id,
             input_ref: CapabilityInputRef::new("input:hidden-request").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -4844,6 +4891,7 @@ async fn text_only_host_rejects_outside_surface_capability_before_host_runtime()
             surface_version: CapabilitySurfaceVersion::new("sha256:stale").unwrap(),
             capability_id: visible_id,
             input_ref: CapabilityInputRef::new("input:stale-request").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap_err();
@@ -4897,6 +4945,7 @@ async fn text_only_host_sanitizes_runtime_failure_message_before_driver_output()
             surface_version: surface.version,
             capability_id,
             input_ref,
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -5001,6 +5050,7 @@ async fn text_only_host_maps_runtime_suspension_and_process_outcomes() {
                 surface_version: surface.version.clone(),
                 capability_id,
                 input_ref,
+                approval_resume: None,
             })
             .await
             .unwrap(),
@@ -5009,7 +5059,7 @@ async fn text_only_host_maps_runtime_suspension_and_process_outcomes() {
 
     assert!(matches!(
         &outcomes[0],
-        CapabilityOutcome::ApprovalRequired { gate_ref, safe_summary }
+        CapabilityOutcome::ApprovalRequired { gate_ref, safe_summary, .. }
             if gate_ref.as_str().starts_with("gate:approval-")
                 && safe_summary == "capability requires approval"
     ));
@@ -5085,6 +5135,7 @@ async fn text_only_host_maps_explicit_unknown_runtime_outcome_to_failure() {
             surface_version: surface.version,
             capability_id,
             input_ref,
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -5152,6 +5203,7 @@ async fn text_only_host_preserves_host_runtime_error_kind_and_summary() {
             surface_version: surface.version.clone(),
             capability_id: capability_id.clone(),
             input_ref: first_input,
+            approval_resume: None,
         })
         .await
         .unwrap_err();
@@ -5160,6 +5212,7 @@ async fn text_only_host_preserves_host_runtime_error_kind_and_summary() {
             surface_version: surface.version,
             capability_id,
             input_ref: second_input,
+            approval_resume: None,
         })
         .await
         .unwrap_err();
@@ -5233,11 +5286,13 @@ async fn text_only_host_batch_stops_on_first_suspension_before_later_invocations
                     surface_version: surface.version.clone(),
                     capability_id: approval_id,
                     input_ref: approval_input,
+                    approval_resume: None,
                 },
                 CapabilityInvocation {
                     surface_version: surface.version,
                     capability_id: echo_id,
                     input_ref: echo_input,
+                    approval_resume: None,
                 },
             ],
             stop_on_first_suspension: true,
@@ -5295,6 +5350,7 @@ async fn text_only_host_does_not_reinvoke_runtime_after_failed_outcome_retry() {
         surface_version: surface.version,
         capability_id: capability_id.clone(),
         input_ref,
+        approval_resume: None,
     };
 
     let first = host.invoke_capability(invocation.clone()).await.unwrap();
@@ -5416,6 +5472,7 @@ async fn text_only_host_waits_for_concurrent_duplicate_invocation_result() {
         surface_version: surface.version,
         capability_id: capability_id.clone(),
         input_ref,
+        approval_resume: None,
     };
 
     let (first, second) = tokio::join!(
@@ -5495,6 +5552,7 @@ async fn text_only_host_bounds_completed_dispatch_records() {
                 surface_version: surface.version.clone(),
                 capability_id: capability_id.clone(),
                 input_ref,
+                approval_resume: None,
             })
             .await
             .unwrap();
@@ -5505,6 +5563,7 @@ async fn text_only_host_bounds_completed_dispatch_records() {
             surface_version: surface.version,
             capability_id,
             input_ref: input_refs[0].clone(),
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -5606,6 +5665,7 @@ async fn text_only_host_does_not_reinvoke_runtime_after_result_write_failure_ret
         surface_version: surface.version,
         capability_id: capability_id.clone(),
         input_ref,
+        approval_resume: None,
     };
 
     let first = host
@@ -5673,6 +5733,7 @@ async fn text_only_host_rejects_runtime_outcome_for_different_capability() {
             surface_version: surface.version,
             capability_id: requested_id,
             input_ref,
+            approval_resume: None,
         })
         .await
         .unwrap_err();
@@ -5742,6 +5803,7 @@ async fn text_only_host_rejects_previous_surface_after_refetch() {
             surface_version: first_surface.version,
             capability_id: first_id,
             input_ref,
+            approval_resume: None,
         })
         .await
         .unwrap_err();
@@ -5765,6 +5827,7 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
                 surface_version: surface.version.clone(),
                 capability_id: CapabilityId::new("demo.echo").unwrap(),
                 input_ref: CapabilityInputRef::new("input:opaque-tool-input").unwrap(),
+                approval_resume: None,
             }],
             stop_on_first_suspension: true,
         })
@@ -5781,6 +5844,7 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
             surface_version: CapabilitySurfaceVersion::new("other:v1").unwrap(),
             capability_id: CapabilityId::new("demo.echo").unwrap(),
             input_ref: CapabilityInputRef::new("input:opaque-tool-input").unwrap(),
+            approval_resume: None,
         })
         .await
         .unwrap_err();
@@ -5849,6 +5913,7 @@ async fn text_only_host_e2e_invokes_script_capability_through_real_host_runtime(
             surface_version: surface.version,
             capability_id: e2e_script_capability_id(),
             input_ref,
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -5901,6 +5966,7 @@ async fn text_only_host_denies_capability_without_provider_trust_before_host_run
             surface_version: surface.version,
             capability_id,
             input_ref,
+            approval_resume: None,
         })
         .await
         .unwrap();
@@ -5958,6 +6024,7 @@ async fn text_only_host_allows_retry_after_missing_capability_input_is_staged() 
         surface_version: surface.version,
         capability_id: capability_id.clone(),
         input_ref: input_ref.clone(),
+        approval_resume: None,
     };
 
     let missing = host
@@ -6319,7 +6386,7 @@ impl LoopCapabilityResultWriter for InMemoryCapabilityIo {
     async fn write_capability_result(
         &self,
         write: CapabilityResultWrite<'_>,
-    ) -> Result<LoopResultRef, AgentLoopHostError> {
+    ) -> Result<(LoopResultRef, u64), AgentLoopHostError> {
         let mut remaining_failures = self.fail_result_writes_remaining.lock().unwrap();
         if *remaining_failures > 0 {
             *remaining_failures -= 1;
@@ -6339,12 +6406,13 @@ impl LoopCapabilityResultWriter for InMemoryCapabilityIo {
             write.capability_id.as_str()
         );
         self.result_refs.lock().unwrap().push(result_ref.clone());
-        LoopResultRef::new(result_ref).map_err(|_| {
+        let result_ref = LoopResultRef::new(result_ref).map_err(|_| {
             AgentLoopHostError::new(
                 AgentLoopHostErrorKind::Internal,
                 "capability result ref could not be represented",
             )
-        })
+        })?;
+        Ok((result_ref, 0))
     }
 }
 
@@ -6825,6 +6893,7 @@ impl AgentLoopDriver for ScriptCapabilityFinalReplyDriver {
                 surface_version: surface.version.clone(),
                 capability_id: self.capability_id.clone(),
                 input_ref: self.input_ref.clone(),
+                approval_resume: None,
             })
             .await
             .map_err(driver_host_error)?;

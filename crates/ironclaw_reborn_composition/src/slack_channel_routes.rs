@@ -35,14 +35,16 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 mod allowed;
+mod subjects;
 
 pub const WEBUI_V2_CHANNELS_SLACK_ROUTES_PATH: &str = "/api/webchat/v2/channels/slack/routes";
 pub const WEBUI_V2_CHANNELS_SLACK_ALLOWED_PATH: &str = "/api/webchat/v2/channels/slack/allowed";
+pub const WEBUI_V2_CHANNELS_SLACK_SUBJECTS_PATH: &str = "/api/webchat/v2/channels/slack/subjects";
 
 const SLACK_CHANNEL_ROUTES_LIST_ROUTE_ID: &str = "webui.v2.channels.slack.routes.list";
 const SLACK_CHANNEL_ROUTES_UPSERT_ROUTE_ID: &str = "webui.v2.channels.slack.routes.upsert";
 const SLACK_CHANNEL_ROUTES_DELETE_ROUTE_ID: &str = "webui.v2.channels.slack.routes.delete";
-const SLACK_CHANNEL_ROUTES_BODY_LIMIT_BYTES: NonZeroU64 = NonZeroU64::new(16 * 1024).unwrap(); // safety: 16 KiB is non-zero.
+const SLACK_CHANNEL_ROUTES_BODY_LIMIT_BYTES: NonZeroU64 = NonZeroU64::new(128 * 1024).unwrap(); // safety: 128 KiB is non-zero.
 const SLACK_CHANNEL_ROUTES_MAX_REQUESTS: NonZeroU32 = NonZeroU32::new(60).unwrap(); // safety: 60 is non-zero.
 const SLACK_CHANNEL_ROUTES_RATE_WINDOW_SECONDS: NonZeroU32 = NonZeroU32::new(60).unwrap(); // safety: 60 is non-zero.
 const MANAGED_CHANNEL_SUBJECT_PREFIX: &str = "user:slack-channel:";
@@ -202,6 +204,49 @@ pub(crate) trait SlackChannelRouteStore: Send + Sync + std::fmt::Debug {
         &self,
         key: &SlackChannelRouteKey,
     ) -> Result<Option<UserId>, SlackChannelRouteError>;
+
+    /// List routes that belong to `subject_user_id`, paging through the store
+    /// `limit` entries at a time.  The default implementation re-uses
+    /// `list_routes` and filters each page in memory; it never materialises
+    /// more than `limit` entries at once and returns early once `cap` routes
+    /// have been accumulated.
+    ///
+    /// Implementors whose storage layout is subject-indexed may override this
+    /// with a cheaper query.  A true subject index remains a tracked follow-up
+    /// for stores where full-inventory scans become expensive at scale.
+    async fn list_routes_for_subject(
+        &self,
+        tenant_id: &TenantId,
+        installation_id: &AdapterInstallationId,
+        team_id: &str,
+        subject_user_id: &UserId,
+        page_size: usize,
+        cap: usize,
+    ) -> Result<Vec<SlackChannelRoute>, SlackChannelRouteError> {
+        let mut cursor = 0;
+        let mut result = Vec::new();
+        loop {
+            let page = self
+                .list_routes(tenant_id, installation_id, team_id, cursor, page_size)
+                .await?;
+            for route in page.routes {
+                if route.subject_user_id == subject_user_id.as_str() {
+                    if result.len() >= cap {
+                        return Err(SlackChannelRouteError::StoreUnavailable);
+                    }
+                    result.push(route);
+                }
+            }
+            let Some(next_cursor) = page.next_cursor else {
+                break;
+            };
+            if next_cursor <= cursor {
+                return Err(SlackChannelRouteError::StoreUnavailable);
+            }
+            cursor = next_cursor;
+        }
+        Ok(result)
+    }
 }
 
 #[cfg(test)]
@@ -401,6 +446,7 @@ pub struct SlackChannelRouteAdminRouteConfig {
     team_id: String,
     operator_user_id: UserId,
     allowed_subject_user_ids: HashSet<UserId>,
+    routable_team_subjects: Vec<subjects::SlackRoutableTeamSubject>,
     channel_subject_assigner: SlackChannelSubjectAssigner,
     store: Arc<dyn SlackChannelRouteStore>,
     safety_layer: Arc<SafetyLayer>,
@@ -424,6 +470,7 @@ impl SlackChannelRouteAdminRouteConfig {
             installation_id,
             team_id,
             allowed_subject_user_ids: HashSet::from([operator_user_id.clone()]),
+            routable_team_subjects: Vec::new(),
             operator_user_id,
             channel_subject_assigner,
             store,
@@ -438,8 +485,31 @@ impl SlackChannelRouteAdminRouteConfig {
         mut self,
         subject_user_ids: impl IntoIterator<Item = UserId>,
     ) -> Self {
-        self.allowed_subject_user_ids.extend(subject_user_ids);
+        for subject_user_id in subject_user_ids {
+            self.add_allowed_subject_user(subject_user_id);
+        }
         self
+    }
+
+    fn add_allowed_subject_user(&mut self, subject_user_id: UserId) {
+        self.allowed_subject_user_ids
+            .insert(subject_user_id.clone());
+        if subject_user_id != self.operator_user_id
+            && !self
+                .routable_team_subjects
+                .iter()
+                .any(|subject| subject.subject_user_id == subject_user_id.as_str())
+        {
+            self.routable_team_subjects
+                .push(subjects::SlackRoutableTeamSubject::from_user_id(
+                    subject_user_id,
+                ));
+            self.routable_team_subjects.sort_by(|left, right| {
+                left.display_name
+                    .cmp(&right.display_name)
+                    .then_with(|| left.subject_user_id.cmp(&right.subject_user_id))
+            });
+        }
     }
 
     fn key_for_channel(&self, channel_id: String) -> Result<SlackChannelRouteKey, SlackRouteError> {
@@ -470,6 +540,7 @@ pub(crate) fn slack_channel_route_admin_route_mount(
                     .delete(delete_slack_channel_route_handler),
             )
             .merge(allowed::router())
+            .merge(subjects::router())
             .with_state(config),
         descriptors: slack_channel_route_admin_descriptors(),
     }
@@ -504,6 +575,7 @@ pub(crate) fn slack_channel_route_admin_descriptors() -> Vec<IngressRouteDescrip
         .expect("Slack channel route delete descriptor must validate at startup"), // safety: route id, method, path, and policy are static typed literals.
     ];
     descriptors.extend(allowed::descriptors());
+    descriptors.extend(subjects::descriptors());
     descriptors
 }
 
@@ -999,6 +1071,59 @@ mod tests {
         let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
         assert_eq!(body["routes"], serde_json::json!([]));
         assert_eq!(body["next_cursor"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn route_admin_lists_routable_team_subjects_for_picker() {
+        let config = route_config(Arc::new(InMemorySlackChannelRouteStore::new()))
+            .with_allowed_subject_user_ids([
+                UserId::new("user:product-team-agent").expect("product subject"),
+                UserId::new("user:hr-team-agent").expect("hr subject"),
+                UserId::new("user:finance-team-agent").expect("finance subject"),
+            ]);
+        let mount = slack_channel_route_admin_route_mount(config);
+
+        let response = mount
+            .protected
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(WEBUI_V2_CHANNELS_SLACK_SUBJECTS_PATH)
+                    .header("content-length", "0")
+                    .extension(caller(TENANT, "user:admin"))
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let body: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(body["team_id"], TEAM);
+        assert_eq!(
+            body["subjects"],
+            serde_json::json!([
+                {
+                    "subject_user_id": "user:eng-team-agent",
+                    "display_name": "Eng"
+                },
+                {
+                    "subject_user_id": "user:finance-team-agent",
+                    "display_name": "Finance"
+                },
+                {
+                    "subject_user_id": "user:hr-team-agent",
+                    "display_name": "HR"
+                },
+                {
+                    "subject_user_id": "user:product-team-agent",
+                    "display_name": "Product"
+                }
+            ])
+        );
     }
 
     #[tokio::test]
