@@ -67,6 +67,7 @@ impl std::fmt::Display for SlackPersonalBindingPairingCode {
 pub struct SlackPersonalBindingPairingChallenge {
     pub installation_id: AdapterInstallationId,
     pub slack_user_id: SlackUserId,
+    pub setup_revision: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -207,6 +208,7 @@ impl SlackPersonalBindingPairingService {
             .issue_challenge(SlackPersonalBindingPairingChallenge {
                 installation_id,
                 slack_user_id,
+                setup_revision: None,
             })
             .await?;
         self.notifier
@@ -402,6 +404,7 @@ mod tests {
                 SlackPersonalBindingPairingChallenge {
                     installation_id: installation("install-a"),
                     slack_user_id: SlackUserId::new("U123"),
+                    setup_revision: None,
                 },
             )),
             Arc::new(RecordingNotifier::default()),
@@ -431,6 +434,7 @@ mod tests {
             SlackPersonalBindingPairingChallenge {
                 installation_id: installation("install-a"),
                 slack_user_id: SlackUserId::new("U123"),
+                setup_revision: None,
             },
         ));
         let service = SlackPersonalBindingPairingService::new(

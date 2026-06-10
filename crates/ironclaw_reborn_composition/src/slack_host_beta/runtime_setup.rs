@@ -30,7 +30,9 @@ use crate::slack_personal_binding::{
     SlackPersonalUserBindingService,
 };
 use crate::slack_personal_binding_pairing::{
-    SlackPairingActorResolver, SlackPersonalBindingPairingChallengeStore,
+    IssuedSlackPersonalBindingPairingChallenge, SlackPairingActorResolver,
+    SlackPersonalBindingPairingChallenge, SlackPersonalBindingPairingChallengeStore,
+    SlackPersonalBindingPairingCode, SlackPersonalBindingPairingError,
     SlackPersonalBindingPairingNotifier, SlackPersonalBindingPairingService,
     SlackPersonalUserBinder,
 };
@@ -84,7 +86,9 @@ pub(super) fn build_runtime_mounts(
             )),
             token_handle,
         ));
-    let challenge_store: Arc<dyn SlackPersonalBindingPairingChallengeStore> = state.clone();
+    let challenge_store: Arc<dyn SlackPersonalBindingPairingChallengeStore> = Arc::new(
+        DynamicSlackPairingChallengeStore::new(Arc::clone(&setup_service), state.clone()),
+    );
     let pairing = SlackPersonalBindingPairingService::new_with_binder(
         dynamic_binding_service,
         challenge_store,
@@ -345,6 +349,92 @@ struct DynamicCachedSlackResolver {
 }
 
 #[derive(Clone)]
+struct DynamicSlackPairingChallengeStore {
+    setup_service: Arc<SlackSetupService>,
+    store: Arc<dyn SlackPersonalBindingPairingChallengeStore>,
+}
+
+impl DynamicSlackPairingChallengeStore {
+    fn new(
+        setup_service: Arc<SlackSetupService>,
+        store: Arc<dyn SlackPersonalBindingPairingChallengeStore>,
+    ) -> Self {
+        Self {
+            setup_service,
+            store,
+        }
+    }
+
+    async fn current_setup_revision(
+        &self,
+        challenge: &SlackPersonalBindingPairingChallenge,
+    ) -> Result<u64, SlackPersonalBindingPairingError> {
+        let setup = self
+            .setup_service
+            .current_setup()
+            .await
+            .map_err(|error| SlackPersonalBindingPairingError::Backend(error.to_string()))?
+            .ok_or(SlackPersonalBindingPairingError::ChallengeNotFound)?;
+        let installation_id = setup
+            .installation_id()
+            .map_err(|error| SlackPersonalBindingPairingError::Backend(error.to_string()))?;
+        if installation_id != challenge.installation_id {
+            return Err(SlackPersonalBindingPairingError::ChallengeNotFound);
+        }
+        Ok(setup.revision)
+    }
+
+    async fn bind_to_current_setup(
+        &self,
+        mut challenge: SlackPersonalBindingPairingChallenge,
+    ) -> Result<SlackPersonalBindingPairingChallenge, SlackPersonalBindingPairingError> {
+        challenge.setup_revision = Some(self.current_setup_revision(&challenge).await?);
+        Ok(challenge)
+    }
+
+    async fn require_current_setup(
+        &self,
+        challenge: SlackPersonalBindingPairingChallenge,
+    ) -> Result<SlackPersonalBindingPairingChallenge, SlackPersonalBindingPairingError> {
+        let current_revision = self.current_setup_revision(&challenge).await?;
+        if challenge.setup_revision == Some(current_revision) {
+            Ok(challenge)
+        } else {
+            Err(SlackPersonalBindingPairingError::ChallengeNotFound)
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl SlackPersonalBindingPairingChallengeStore for DynamicSlackPairingChallengeStore {
+    async fn issue_challenge(
+        &self,
+        challenge: SlackPersonalBindingPairingChallenge,
+    ) -> Result<IssuedSlackPersonalBindingPairingChallenge, SlackPersonalBindingPairingError> {
+        let challenge = self.bind_to_current_setup(challenge).await?;
+        self.store.issue_challenge(challenge).await
+    }
+
+    async fn get_challenge(
+        &self,
+        code: &SlackPersonalBindingPairingCode,
+    ) -> Result<SlackPersonalBindingPairingChallenge, SlackPersonalBindingPairingError> {
+        let challenge = self.store.get_challenge(code).await?;
+        self.require_current_setup(challenge).await
+    }
+
+    async fn consume_challenge(
+        &self,
+        code: &SlackPersonalBindingPairingCode,
+    ) -> Result<SlackPersonalBindingPairingChallenge, SlackPersonalBindingPairingError> {
+        let preview = self.store.get_challenge(code).await?;
+        self.require_current_setup(preview).await?;
+        let challenge = self.store.consume_challenge(code).await?;
+        self.require_current_setup(challenge).await
+    }
+}
+
+#[derive(Clone)]
 struct DynamicSlackPersonalUserBinder {
     setup_service: Arc<SlackSetupService>,
     store: Arc<dyn RebornUserIdentityBindingStore>,
@@ -583,5 +673,156 @@ fn map_setup_error_to_egress(
 ) -> ProtocolHttpEgressError {
     ProtocolHttpEgressError::PolicyDenied {
         reason: RedactedString::new(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex as StdMutex;
+
+    use ironclaw_host_api::{SecretHandle, UserId};
+    use ironclaw_secrets::InMemorySecretStore;
+    use tokio::sync::RwLock;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn dynamic_pairing_challenge_store_rejects_stale_setup_revision() {
+        let setup_store = Arc::new(InMemorySetupStore::new(setup_record(1)));
+        let setup_service = Arc::new(SlackSetupService::new(
+            TenantId::new("tenant:slack").unwrap(),
+            AgentId::new("agent:slack").unwrap(),
+            None,
+            UserId::new("user:operator").unwrap(),
+            setup_store.clone(),
+            Arc::new(InMemorySecretStore::default()),
+        ));
+        let store = DynamicSlackPairingChallengeStore::new(
+            setup_service,
+            Arc::new(StaticChallengeStore::default()),
+        );
+        let code = SlackPersonalBindingPairingCode::new("ABC12345").unwrap();
+        let challenge = SlackPersonalBindingPairingChallenge {
+            installation_id: AdapterInstallationId::new("install-a").unwrap(),
+            slack_user_id: SlackUserId::new("U123"),
+            setup_revision: None,
+        };
+
+        let issued = store
+            .issue_challenge(challenge)
+            .await
+            .expect("challenge issued");
+        assert_eq!(issued.challenge.setup_revision, Some(1));
+        assert_eq!(
+            store
+                .get_challenge(&code)
+                .await
+                .expect("challenge is current")
+                .setup_revision,
+            Some(1)
+        );
+
+        setup_store.put(setup_record(2)).await;
+
+        assert!(matches!(
+            store.get_challenge(&code).await,
+            Err(SlackPersonalBindingPairingError::ChallengeNotFound)
+        ));
+        assert!(matches!(
+            store.consume_challenge(&code).await,
+            Err(SlackPersonalBindingPairingError::ChallengeNotFound)
+        ));
+    }
+
+    fn setup_record(revision: u64) -> SlackInstallationSetup {
+        SlackInstallationSetup {
+            installation_id: "install-a".to_string(),
+            team_id: "T123".to_string(),
+            api_app_id: "A123".to_string(),
+            user_id: "user:operator".to_string(),
+            shared_subject_user_id: None,
+            bot_token_handle: SecretHandle::new(format!("bot_{revision}")).unwrap(),
+            signing_secret_handle: SecretHandle::new(format!("signing_{revision}")).unwrap(),
+            revision,
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct InMemorySetupStore {
+        setup: RwLock<SlackInstallationSetup>,
+    }
+
+    impl InMemorySetupStore {
+        fn new(setup: SlackInstallationSetup) -> Self {
+            Self {
+                setup: RwLock::new(setup),
+            }
+        }
+
+        async fn put(&self, setup: SlackInstallationSetup) {
+            *self.setup.write().await = setup;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl SlackInstallationSetupStore for InMemorySetupStore {
+        async fn get_slack_installation_setup(
+            &self,
+        ) -> Result<Option<SlackInstallationSetup>, crate::slack_setup::SlackSetupError> {
+            Ok(Some(self.setup.read().await.clone()))
+        }
+
+        async fn put_slack_installation_setup(
+            &self,
+            setup: &SlackInstallationSetup,
+        ) -> Result<(), crate::slack_setup::SlackSetupError> {
+            self.put(setup.clone()).await;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct StaticChallengeStore {
+        challenge: StdMutex<Option<SlackPersonalBindingPairingChallenge>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SlackPersonalBindingPairingChallengeStore for StaticChallengeStore {
+        async fn issue_challenge(
+            &self,
+            challenge: SlackPersonalBindingPairingChallenge,
+        ) -> Result<IssuedSlackPersonalBindingPairingChallenge, SlackPersonalBindingPairingError>
+        {
+            *self.challenge.lock().unwrap() = Some(challenge.clone());
+            Ok(IssuedSlackPersonalBindingPairingChallenge {
+                code: SlackPersonalBindingPairingCode::new("ABC12345").unwrap(),
+                challenge,
+            })
+        }
+
+        async fn get_challenge(
+            &self,
+            _code: &SlackPersonalBindingPairingCode,
+        ) -> Result<SlackPersonalBindingPairingChallenge, SlackPersonalBindingPairingError>
+        {
+            self.challenge
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or(SlackPersonalBindingPairingError::ChallengeNotFound)
+        }
+
+        async fn consume_challenge(
+            &self,
+            _code: &SlackPersonalBindingPairingCode,
+        ) -> Result<SlackPersonalBindingPairingChallenge, SlackPersonalBindingPairingError>
+        {
+            self.challenge
+                .lock()
+                .unwrap()
+                .take()
+                .ok_or(SlackPersonalBindingPairingError::ChallengeNotFound)
+        }
     }
 }

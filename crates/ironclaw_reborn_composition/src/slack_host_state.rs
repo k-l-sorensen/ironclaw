@@ -1420,6 +1420,8 @@ struct StoredSlackPairingChallenge {
     code: String,
     installation_id: String,
     slack_user_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    setup_revision: Option<u64>,
     status: StoredSlackPairingStatus,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
@@ -1436,6 +1438,7 @@ impl StoredSlackPairingChallenge {
             code: code.as_str().to_string(),
             installation_id: challenge.installation_id.as_str().to_string(),
             slack_user_id: challenge.slack_user_id.as_str().to_string(),
+            setup_revision: challenge.setup_revision,
             status: StoredSlackPairingStatus::Pending,
             created_at: Utc::now(),
             expires_at,
@@ -1622,6 +1625,7 @@ fn active_pairing_challenge(
         installation_id: AdapterInstallationId::new(record.installation_id.clone())
             .map_err(|error| SlackPersonalBindingPairingError::Backend(error.to_string()))?,
         slack_user_id: SlackUserId::new(record.slack_user_id.clone()),
+        setup_revision: record.setup_revision,
     })
 }
 
@@ -2930,6 +2934,7 @@ mod tests {
         SlackPersonalBindingPairingChallenge {
             installation_id: installation(),
             slack_user_id: SlackUserId::new("U123"),
+            setup_revision: None,
         }
     }
 
