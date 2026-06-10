@@ -143,7 +143,7 @@ mod tests {
         );
         assert_eq!(
             channel.action.instructions,
-            "Map Slack channels to the team agents that should answer there."
+            "Configure the Slack app, then map channels to the team agents that should answer there."
         );
         assert!(channel.command_aliases.is_empty());
     }
