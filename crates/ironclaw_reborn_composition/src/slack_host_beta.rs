@@ -1618,7 +1618,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slack_channel_routes_are_not_mounted_for_non_operator_authenticator() {
+    async fn slack_channel_routes_mount_for_sso_operator_authenticator() {
         let (runtime, _root) = runtime().await;
         let mounts = build_slack_host_beta_mounts(&runtime, config_without_channel_routes())
             .expect("mounts");
@@ -1668,47 +1668,18 @@ mod tests {
         )
         .expect("webui app");
 
-        for (method, uri, body) in [
-            ("GET", WEBUI_V2_CHANNELS_SLACK_ROUTES_PATH, ""),
-            (
-                "PUT",
-                WEBUI_V2_CHANNELS_SLACK_ROUTES_PATH,
-                r#"{"channel_id":"C0HOST","subject_user_id":"user:slack-shared-subject"}"#,
-            ),
-            (
-                "DELETE",
-                WEBUI_V2_CHANNELS_SLACK_ROUTES_PATH,
-                r#"{"channel_id":"C0HOST"}"#,
-            ),
-            ("GET", WEBUI_V2_CHANNELS_SLACK_ALLOWED_PATH, ""),
-            (
-                "PUT",
-                WEBUI_V2_CHANNELS_SLACK_ALLOWED_PATH,
-                r#"{"channel_ids":["C0HOST"]}"#,
-            ),
-        ] {
-            let mut builder = Request::builder()
-                .method(method)
-                .uri(uri)
-                .header("authorization", "Bearer operator-token");
-            if method != "GET" {
-                builder = builder.header("content-type", "application/json");
-            }
-            let response = app
-                .clone()
-                .oneshot(
-                    builder
-                        .body(Body::from(body.to_string()))
-                        .expect("request builds"),
-                )
-                .await
-                .expect("route responds");
-            assert_eq!(
-                response.status(),
-                StatusCode::NOT_FOUND,
-                "{method} route must not be mounted for non-operator auth"
-            );
-        }
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(WEBUI_V2_CHANNELS_SLACK_ROUTES_PATH)
+                    .header("authorization", "Bearer operator-token")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("route responds");
+        assert_eq!(response.status(), StatusCode::OK);
 
         runtime.shutdown().await.expect("runtime shuts down");
     }

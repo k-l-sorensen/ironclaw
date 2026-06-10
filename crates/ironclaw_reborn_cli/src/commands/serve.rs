@@ -367,11 +367,7 @@ impl ServeCommand {
                 None
             };
             #[cfg(feature = "slack-v2-host-beta")]
-            let operator_route_visibility = if sso_startup.is_none() {
-                SlackOperatorRouteVisibility::Visible
-            } else {
-                SlackOperatorRouteVisibility::Hidden
-            };
+            let operator_route_visibility = SlackOperatorRouteVisibility::Visible;
             #[cfg(feature = "slack-v2-host-beta")]
             let bundle: RebornWebuiBundle = build_webui_services_with_slack_host_beta_mounts(
                 &runtime,
