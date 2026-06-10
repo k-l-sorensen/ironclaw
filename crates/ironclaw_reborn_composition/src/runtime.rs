@@ -2335,9 +2335,14 @@ pub(crate) struct RebornLlmReloadParts {
 #[cfg(feature = "root-llm-provider")]
 async fn build_llm_gateway(llm: ResolvedRebornLlm) -> Result<LlmGatewayBundle, RebornRuntimeError> {
     let session = ironclaw_llm::create_session_manager(llm.config.session.clone()).await;
-    let raw = ironclaw_llm::build_static_provider_chain(&llm.config, Arc::clone(&session))
-        .await
-        .map_err(|error| RebornRuntimeError::LlmProvider(error.to_string()))?;
+    // A caller-supplied provider (e.g. an instrumented wrapper) takes precedence
+    // over building one from config; only the construction is bypassed.
+    let raw = match llm.provider_override.clone() {
+        Some(provider) => provider,
+        None => ironclaw_llm::build_static_provider_chain(&llm.config, Arc::clone(&session))
+            .await
+            .map_err(|error| RebornRuntimeError::LlmProvider(error.to_string()))?,
+    };
     wrap_swappable_gateway(raw, session)
 }
 

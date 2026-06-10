@@ -123,11 +123,28 @@ pub trait TriggerFireAccessChecker: Send + Sync {
 }
 
 #[cfg(feature = "root-llm-provider")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedRebornLlm {
     provider_id: String,
     model: String,
     pub(crate) config: ironclaw_llm::LlmConfig,
+    /// Optional pre-built provider to use *instead of* building one from
+    /// `config`. Lets a caller wrap the real provider (e.g. for token /
+    /// reasoning instrumentation) and have the runtime drive it. When `None`
+    /// the gateway builds the static provider chain from `config` as usual.
+    pub(crate) provider_override: Option<Arc<dyn ironclaw_llm::LlmProvider>>,
+}
+
+// `LlmProvider` is not `Debug`, so derive can't see through `provider_override`.
+#[cfg(feature = "root-llm-provider")]
+impl std::fmt::Debug for ResolvedRebornLlm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedRebornLlm")
+            .field("provider_id", &self.provider_id)
+            .field("model", &self.model)
+            .field("provider_override", &self.provider_override.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "root-llm-provider")]
@@ -145,7 +162,16 @@ impl ResolvedRebornLlm {
             provider_id: config.active_provider_id(),
             model: config.active_model_name(),
             config,
+            provider_override: None,
         }
+    }
+
+    /// Drive the runtime with `provider` instead of building one from the
+    /// config. The provider must already speak the same model the config
+    /// names; only the construction is bypassed.
+    pub fn with_provider(mut self, provider: Arc<dyn ironclaw_llm::LlmProvider>) -> Self {
+        self.provider_override = Some(provider);
+        self
     }
 }
 
