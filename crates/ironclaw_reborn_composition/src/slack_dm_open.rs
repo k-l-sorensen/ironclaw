@@ -206,6 +206,25 @@ mod tests {
         validate_slack_dm_channel_id("D123").expect("valid DM channel");
     }
 
+    #[test]
+    fn validate_slack_dm_channel_id_accepts_exactly_128_bytes_and_rejects_129() {
+        // Boundary: "D" + 127 ASCII chars = 128 bytes total — must be accepted.
+        let at_limit = format!("D{}", "X".repeat(127));
+        assert_eq!(at_limit.len(), 128, "fixture must be exactly 128 bytes");
+        validate_slack_dm_channel_id(&at_limit).expect("exactly 128-byte id must be valid");
+
+        // One byte over the limit — must be rejected.
+        let over_limit = format!("D{}", "X".repeat(128));
+        assert_eq!(over_limit.len(), 129, "fixture must be exactly 129 bytes");
+        assert!(
+            matches!(
+                validate_slack_dm_channel_id(&over_limit),
+                Err(SlackDmOpenError::InvalidChannel)
+            ),
+            "129-byte id must be rejected"
+        );
+    }
+
     fn credential_handle() -> EgressCredentialHandle {
         EgressCredentialHandle::new("slack_bot_token").expect("credential handle")
     }

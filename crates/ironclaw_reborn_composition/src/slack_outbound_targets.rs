@@ -435,62 +435,6 @@ impl SlackHostBetaOutboundTargetProvider {
             .cloned())
     }
 
-    async fn shared_channel_routes(
-        &self,
-    ) -> Result<Vec<SlackConfiguredChannelRoute>, RebornServicesError> {
-        let mut cursor = 0;
-        let mut stored_channel_ids = HashSet::new();
-        let mut routes = Vec::new();
-        loop {
-            let stored = self
-                .channel_route_store
-                .list_routes(
-                    &self.tenant_id,
-                    &self.installation_id,
-                    self.team_id.as_str(),
-                    cursor,
-                    SLACK_OUTBOUND_TARGET_LIST_PAGE_SIZE,
-                )
-                .await
-                .map_err(map_slack_target_route_error)?;
-            if routes.len() + stored.routes.len() > SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES {
-                return Err(map_slack_target_route_error(
-                    SlackChannelRouteError::StoreUnavailable,
-                ));
-            }
-            for route in stored.routes {
-                stored_channel_ids.insert(route.channel_id.clone());
-                routes.push(SlackConfiguredChannelRoute::new(
-                    route.channel_id,
-                    UserId::new(route.subject_user_id).map_err(|_| slack_target_backend_error())?,
-                ));
-            }
-            let Some(next_cursor) = stored.next_cursor else {
-                break;
-            };
-            if next_cursor <= cursor {
-                return Err(map_slack_target_route_error(
-                    SlackChannelRouteError::StoreUnavailable,
-                ));
-            }
-            cursor = next_cursor;
-        }
-        if routes.len() + self.configured_channel_routes.len()
-            > SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES
-        {
-            return Err(map_slack_target_route_error(
-                SlackChannelRouteError::StoreUnavailable,
-            ));
-        }
-        routes.extend(
-            self.configured_channel_routes
-                .iter()
-                .filter(|route| !stored_channel_ids.contains(&route.channel_id))
-                .cloned(),
-        );
-        Ok(routes)
-    }
-
     fn entry_for_shared_channel_route(
         &self,
         route: &SlackConfiguredChannelRoute,
@@ -658,12 +602,67 @@ impl OutboundDeliveryTargetProvider for SlackHostBetaOutboundTargetProvider {
                 }
             }
         };
-        let (routes, personal_dm_target) =
-            tokio::join!(self.shared_channel_routes(), personal_dm_target);
-        let mut routes = routes?
+        let subject_routes = self.channel_route_store.list_routes_for_subject(
+            &self.tenant_id,
+            &self.installation_id,
+            self.team_id.as_str(),
+            &caller.user_id,
+            SLACK_OUTBOUND_TARGET_LIST_PAGE_SIZE,
+            SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES,
+        );
+        let (stored_routes, personal_dm_target) = tokio::join!(subject_routes, personal_dm_target);
+        let stored_routes = stored_routes.map_err(map_slack_target_route_error)?;
+        // Collect the channel ids returned for this subject so we can skip
+        // static configured routes that the store has already overridden with
+        // any subject (including a different one).  Collect as owned Strings so
+        // `stored_routes` can be moved into the route vec below.
+        let stored_channel_ids: HashSet<String> =
+            stored_routes.iter().map(|r| r.channel_id.clone()).collect();
+        let mut routes: Vec<SlackConfiguredChannelRoute> = stored_routes
             .into_iter()
-            .filter(|route| route.subject_user_id == caller.user_id)
-            .collect::<Vec<_>>();
+            .map(|r| {
+                UserId::new(r.subject_user_id)
+                    .map_err(|_| slack_target_backend_error())
+                    .map(|uid| SlackConfiguredChannelRoute::new(r.channel_id, uid))
+            })
+            .collect::<Result<_, _>>()?;
+        // For each static configured route belonging to this caller that is not
+        // already in the subject-scoped store results, check whether the store
+        // has ANY entry for that channel (even under a different subject).  If
+        // the store has overridden the channel, omit the stale static entry so
+        // the admin-assigned subject wins.  A true subject index remains a
+        // tracked follow-up; for now the N point-lookups over the (typically
+        // small) static route list are cheaper than a full-inventory scan.
+        for static_route in self
+            .configured_channel_routes
+            .iter()
+            .filter(|r| r.subject_user_id == caller.user_id)
+        {
+            if stored_channel_ids.contains(&static_route.channel_id) {
+                // Already present from the subject-scoped store results.
+                continue;
+            }
+            let key = match SlackChannelRouteKey::new(
+                self.tenant_id.clone(),
+                self.installation_id.clone(),
+                self.team_id.as_str().to_string(),
+                static_route.channel_id.clone(),
+            ) {
+                Ok(key) => key,
+                Err(_) => continue,
+            };
+            let store_override = self
+                .channel_route_store
+                .resolve_subject_user_id(&key)
+                .await
+                .map_err(map_slack_target_route_error)?;
+            if store_override.is_none() {
+                // No store entry for this channel — static route is active.
+                routes.push(static_route.clone());
+            }
+            // If the store has an entry for another subject, the static route
+            // is suppressed (admin override takes precedence).
+        }
         routes.sort_by(|left, right| left.channel_id.cmp(&right.channel_id));
         let mut targets = routes
             .into_iter()
@@ -1282,6 +1281,101 @@ mod tests {
         assert_eq!(error.kind, RebornServicesErrorKind::ServiceUnavailable);
         assert_eq!(error.status_code, 503);
         assert!(error.retryable);
+    }
+
+    // ── list_routes_for_subject ───────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_routes_for_subject_returns_only_callers_routes_across_multiple_subjects() {
+        let store = Arc::new(InMemorySlackChannelRouteStore::new());
+        let tenant_id = TenantId::new(TENANT).expect("tenant");
+        let installation_id = AdapterInstallationId::new(INSTALLATION).expect("installation");
+        let alice = UserId::new(USER).expect("alice");
+        let bob = UserId::new(OTHER_USER).expect("bob");
+
+        // Seed: two channels for alice, one for bob.
+        for (channel_id, subject) in [
+            ("C0ALICE1", alice.clone()),
+            ("C0ALICE2", alice.clone()),
+            ("C0BOB1", bob.clone()),
+        ] {
+            let key = SlackChannelRouteKey::new(
+                tenant_id.clone(),
+                installation_id.clone(),
+                TEAM.to_string(),
+                channel_id.to_string(),
+            )
+            .expect("key");
+            store.upsert_route(key, subject).await.expect("upsert");
+        }
+
+        // Alice's scoped listing must return exactly her two routes.
+        let alice_routes = store
+            .list_routes_for_subject(
+                &tenant_id,
+                &installation_id,
+                TEAM,
+                &alice,
+                100,
+                SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES,
+            )
+            .await
+            .expect("listing succeeds");
+        assert_eq!(alice_routes.len(), 2, "alice must see exactly 2 routes");
+        assert!(
+            alice_routes
+                .iter()
+                .all(|r| r.subject_user_id == alice.as_str()),
+            "all returned routes must belong to alice"
+        );
+        assert!(
+            alice_routes.iter().any(|r| r.channel_id == "C0ALICE1"),
+            "C0ALICE1 must be present"
+        );
+        assert!(
+            alice_routes.iter().any(|r| r.channel_id == "C0ALICE2"),
+            "C0ALICE2 must be present"
+        );
+
+        // Bob's listing must return only his route — not alice's.
+        let bob_routes = store
+            .list_routes_for_subject(
+                &tenant_id,
+                &installation_id,
+                TEAM,
+                &bob,
+                100,
+                SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES,
+            )
+            .await
+            .expect("listing succeeds");
+        assert_eq!(bob_routes.len(), 1, "bob must see exactly 1 route");
+        assert_eq!(bob_routes[0].channel_id, "C0BOB1");
+    }
+
+    #[tokio::test]
+    async fn list_routes_for_subject_enforces_cap_on_subject_matching_routes() {
+        // Reuse OversizedPageRouteStore: every route belongs to USER, so the
+        // subject filter won't reduce the count and the cap must still fire.
+        let store = Arc::new(OversizedPageRouteStore);
+        let tenant_id = TenantId::new(TENANT).expect("tenant");
+        let installation_id = AdapterInstallationId::new(INSTALLATION).expect("installation");
+        let alice = UserId::new(USER).expect("alice");
+
+        let result = store
+            .list_routes_for_subject(
+                &tenant_id,
+                &installation_id,
+                TEAM,
+                &alice,
+                SLACK_OUTBOUND_TARGET_LIST_PAGE_SIZE,
+                SLACK_OUTBOUND_TARGET_LIST_MAX_TOTAL_ROUTES,
+            )
+            .await;
+        assert!(
+            matches!(result, Err(SlackChannelRouteError::StoreUnavailable)),
+            "cap guard must fire when subject routes exceed the maximum: {result:?}"
+        );
     }
 
     // ── cross-tenant personal-DM resolve ─────────────────────────────────────
