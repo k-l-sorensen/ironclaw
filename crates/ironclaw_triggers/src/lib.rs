@@ -1581,7 +1581,7 @@ pub(crate) fn reject_failed_result_after_active_run(
 fn parse_timezone(timezone: &str) -> Result<Tz, TriggerError> {
     timezone.parse::<Tz>().map_err(|_| TriggerError::InvalidSchedule {
         reason: format!(
-            "invalid timezone '{timezone}': must be a valid IANA timezone name (e.g. 'America/New_York', 'UTC')"
+            "invalid timezone '{timezone}': must be a valid IANA timezone identifier, for example UTC"
         ),
     })
 }
