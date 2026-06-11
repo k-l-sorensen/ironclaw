@@ -477,6 +477,11 @@ async fn load_delivered_route_for_envelope(
         debug!("delivered gate route fallback skipped expired route");
         return None;
     }
+    // A non-owner actor in a shared conversation (e.g. a third party typing
+    // "approve" in a channel where a gate prompt was delivered) reaches this
+    // lookup and is dropped here without user-facing feedback. That silence
+    // is deliberate: replying "not authorized" to arbitrary channel chatter
+    // would be noise, and the inner interaction services authorize again.
     if route.tenant_id != binding.tenant_id || route.user_id != binding.actor_user_id {
         debug!("delivered gate route fallback skipped route for different tenant or actor");
         return None;
@@ -495,10 +500,24 @@ async fn resolve_via_delivered_approval_route(
     action_fingerprint: &ActionFingerprintKey,
     dispatch_kind: ActionDispatchKind,
     expected_gate_ref: Option<&str>,
+    pre_resolved_binding: Option<&ResolvedBinding>,
 ) -> Option<Result<DispatchedAction, ProductWorkflowError>> {
-    let binding = delivered_route_base_binding(envelope, binding_service).await?;
+    // When the dispatcher already resolved a binding for this envelope (the
+    // MissingGate fallback path), reuse it instead of re-deriving one — two
+    // independent lookups can diverge if route configuration changes between
+    // them, and the dispatcher's binding is the one the actor was admitted
+    // under. Only the BindingRequired path (no binding at all) derives the
+    // topic-stripped base binding here.
+    let derived_binding;
+    let binding = match pre_resolved_binding {
+        Some(binding) => binding,
+        None => {
+            derived_binding = delivered_route_base_binding(envelope, binding_service).await?;
+            &derived_binding
+        }
+    };
     let route =
-        load_delivered_route_for_envelope(envelope, &binding, delivered_gate_routes).await?;
+        load_delivered_route_for_envelope(envelope, binding, delivered_gate_routes).await?;
     if expected_gate_ref.is_some_and(|expected| expected != route.gate_ref) {
         debug!("delivered gate route fallback skipped route with non-matching gate ref");
         return None;
@@ -519,7 +538,7 @@ async fn resolve_via_delivered_approval_route(
     let response = match approval_interaction_service
         .resolve(ResolveApprovalInteractionRequest {
             scope: route.scope,
-            actor: TurnActor::new(binding.actor_user_id),
+            actor: TurnActor::new(binding.actor_user_id.clone()),
             run_id_hint: Some(route.run_id),
             gate_ref,
             decision,
@@ -544,6 +563,8 @@ async fn resolve_via_delivered_approval_route(
     )
 }
 
+// arch-exempt: too_many_args, needs a DeliveredRouteResolutionContext bundle (services + dispatch identity), plan docs/plans/2026-06-10-slack-gate-feedback-and-routing.md Phase C
+#[allow(clippy::too_many_arguments)]
 async fn resolve_via_delivered_auth_route(
     envelope: &ProductInboundEnvelope,
     binding_service: &dyn ConversationBindingService,
@@ -552,10 +573,19 @@ async fn resolve_via_delivered_auth_route(
     decision: AuthInteractionDecision,
     action_fingerprint: &ActionFingerprintKey,
     expected_gate_ref: Option<&str>,
+    pre_resolved_binding: Option<&ResolvedBinding>,
 ) -> Option<Result<DispatchedAction, ProductWorkflowError>> {
-    let binding = delivered_route_base_binding(envelope, binding_service).await?;
+    // Same binding-reuse rule as resolve_via_delivered_approval_route.
+    let derived_binding;
+    let binding = match pre_resolved_binding {
+        Some(binding) => binding,
+        None => {
+            derived_binding = delivered_route_base_binding(envelope, binding_service).await?;
+            &derived_binding
+        }
+    };
     let route =
-        load_delivered_route_for_envelope(envelope, &binding, delivered_gate_routes).await?;
+        load_delivered_route_for_envelope(envelope, binding, delivered_gate_routes).await?;
     if expected_gate_ref.is_some_and(|expected| expected != route.gate_ref) {
         debug!("delivered auth route fallback skipped route with non-matching gate ref");
         return None;
@@ -576,7 +606,7 @@ async fn resolve_via_delivered_auth_route(
     let response = match auth_interaction_service
         .resolve(ResolveAuthInteractionRequest {
             scope: route.scope,
-            actor: TurnActor::new(binding.actor_user_id),
+            actor: TurnActor::new(binding.actor_user_id.clone()),
             run_id_hint: Some(route.run_id),
             gate_ref,
             decision,
@@ -775,6 +805,7 @@ async fn dispatch_approval_resolution(
                 &action_fingerprint,
                 ActionDispatchKind::try_from_payload(envelope.payload())?,
                 Some(payload.gate_ref.as_str()),
+                None,
             )
             .await
             {
@@ -833,6 +864,7 @@ async fn dispatch_scoped_approval_resolution(
                 &action_fingerprint,
                 ActionDispatchKind::ScopedApprovalResolution,
                 None,
+                None,
             )
             .await
             {
@@ -862,6 +894,7 @@ async fn dispatch_scoped_approval_resolution(
                 &action_fingerprint,
                 ActionDispatchKind::ScopedApprovalResolution,
                 None,
+                Some(&binding),
             )
             .await
             {
@@ -941,6 +974,7 @@ async fn dispatch_auth_resolution(
                 decision.clone(),
                 &action_fingerprint,
                 Some(payload.auth_request_ref.as_str()),
+                None,
             )
             .await
             {

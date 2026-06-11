@@ -1214,6 +1214,80 @@ async fn scoped_approval_misses_if_no_route() {
 }
 
 #[tokio::test]
+async fn scoped_approval_missing_gate_fallback_reuses_dispatcher_binding() {
+    // The MissingGate fallback must reuse the binding the dispatcher already
+    // resolved, not re-derive a topic-stripped base binding. Program the two
+    // lookups to diverge: the thread-scoped binding matches the route owner,
+    // the base (topic-stripped) binding belongs to a different actor. Only a
+    // fallback that reuses the dispatcher binding can resolve the gate.
+    let route_store: Arc<dyn ironclaw_outbound::DeliveredGateRouteStore> =
+        Arc::new(ironclaw_outbound::InMemoryDeliveredGateRouteStore::default());
+    let (gate_ref, run_id, _route_scope) =
+        record_scoped_approval_conversation_route(route_store.as_ref(), Utc::now()).await;
+    let binding_service = Arc::new(FakeConversationBindingService::new());
+    let owner_binding = ResolvedBinding {
+        tenant_id: TenantId::new("tenant:install_alpha").expect("tenant"),
+        actor_user_id: UserId::new("user:user1").expect("actor"),
+        subject_user_id: Some(UserId::new("user:user1").expect("subject")),
+        thread_id: ThreadId::new("thread:dm-topic").expect("thread"),
+        agent_id: Some(AgentId::new("agent:fake").expect("agent")),
+        project_id: None,
+    };
+    let divergent_base_binding = ResolvedBinding {
+        actor_user_id: UserId::new("user:someone-else").expect("actor"),
+        subject_user_id: Some(UserId::new("user:someone-else").expect("subject")),
+        ..owner_binding.clone()
+    };
+    let thread_ref = ExternalConversationRef::new(
+        None::<&str>,
+        "conv1",
+        Some("delivered-gate-thread"),
+        None::<&str>,
+    )
+    .expect("thread ref");
+    let base_ref = ExternalConversationRef::new(None::<&str>, "conv1", None::<&str>, None::<&str>)
+        .expect("base ref");
+    binding_service.program_binding(thread_ref.conversation_fingerprint(), owner_binding);
+    binding_service.program_binding(base_ref.conversation_fingerprint(), divergent_base_binding);
+    let approval_service = Arc::new(RecordingApprovalInteractionService::with_pending(Vec::new()));
+    let workflow = DefaultProductWorkflow::new(
+        Arc::new(FakeInboundTurnService::new()),
+        Arc::new(FakeIdempotencyLedger::new()),
+        binding_service.clone(),
+    )
+    .with_approval_interaction_service(approval_service.clone())
+    .with_delivered_gate_routes(route_store);
+
+    let ack = workflow
+        .accept_inbound(scoped_approval_thread_reply_envelope(
+            "scoped-approval-binding-reuse",
+        ))
+        .await
+        .expect("fallback must resolve using the dispatcher's binding");
+
+    assert!(matches!(
+        ack,
+        ProductInboundAck::Accepted {
+            submitted_run_id,
+            ..
+        } if submitted_run_id == run_id
+    ));
+    let resolutions = approval_service.resolutions();
+    assert_eq!(resolutions.len(), 1);
+    assert_eq!(resolutions[0].gate_ref, gate_ref);
+    assert_eq!(
+        resolutions[0].actor,
+        TurnActor::new(UserId::new("user:user1").expect("actor")),
+        "resolution must act as the dispatcher-bound actor, not the re-derived base binding"
+    );
+    assert_eq!(
+        binding_service.resolve_count(),
+        1,
+        "fallback must not perform a second binding lookup"
+    );
+}
+
+#[tokio::test]
 async fn approval_resolution_without_interaction_service_returns_retryable_unavailable() {
     let inbound = Arc::new(FakeInboundTurnService::new());
     let ledger = Arc::new(FakeIdempotencyLedger::new());
