@@ -50,10 +50,10 @@ use ironclaw_network::{
 use ironclaw_resources::{InMemoryResourceGovernor, ResourceAccount};
 use ironclaw_secrets::InMemorySecretStore;
 use ironclaw_triggers::{
-    ClaimDueFireRequest, ClearActiveFireRequest, FireAcceptedRequest, FireTerminalFailedRequest,
-    InMemoryTriggerRepository, MAX_TRIGGER_NAME_BYTES, MAX_TRIGGER_PROMPT_BYTES, TriggerError,
-    TriggerRecord, TriggerRepository, TriggerRunHistoryStatus, TriggerRunRecord, TriggerRunStatus,
-    TriggerState,
+    ClaimDueFireRequest, ClearActiveFireRequest, FireAcceptedRequest, FirePermanentFailedRequest,
+    FireTerminalFailedRequest, InMemoryTriggerRepository, MAX_TRIGGER_NAME_BYTES,
+    MAX_TRIGGER_PROMPT_BYTES, TriggerError, TriggerRecord, TriggerRepository,
+    TriggerRunHistoryStatus, TriggerRunRecord, TriggerRunStatus, TriggerState,
 };
 use ironclaw_trust::{
     AdminConfig, AdminEntry, AuthorityCeiling, EffectiveTrustClass, HostTrustAssignment,
@@ -646,6 +646,95 @@ async fn builtin_trigger_output_enabled_false_and_last_error_present_for_termina
     assert!(
         last_error.contains("recreate"),
         "last_error should guide the user to recreate the trigger, got: {last_error}"
+    );
+}
+
+#[tokio::test]
+async fn builtin_trigger_output_enabled_true_and_last_error_present_for_rescheduled_permanent_failure()
+ {
+    let repository = Arc::new(InMemoryTriggerRepository::default());
+    let runtime = runtime_with_trigger_repository(repository.clone());
+    let context = execution_context([TRIGGER_CREATE_CAPABILITY_ID, TRIGGER_LIST_CAPABILITY_ID]);
+
+    invoke_with_context(
+        &runtime,
+        TRIGGER_CREATE_CAPABILITY_ID,
+        json!({
+            "name": "Rescheduled failure trigger",
+            "prompt": "Will fail but reschedule",
+            "cron": "0 8 * * *",
+            "timezone": "UTC"
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+
+    // Drive the trigger into the Scheduled+Error state via mark_fire_permanently_failed.
+    // This path: claim the fire, then permanently-fail it with a future next_run_at.
+    // The trigger stays Scheduled (not Completed) and will fire again.
+    let records = repository
+        .list_triggers(context.resource_scope.tenant_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    let fire_slot = records[0].next_run_at;
+    // Advance next_run_at by one day so reject_non_future_next_run_at passes.
+    let next_run_at = fire_slot + chrono::Duration::days(1);
+    repository
+        .claim_due_fire(ClaimDueFireRequest {
+            tenant_id: records[0].tenant_id.clone(),
+            trigger_id: records[0].trigger_id,
+            fire_slot,
+            now: fire_slot,
+        })
+        .await
+        .unwrap();
+    repository
+        .mark_fire_permanently_failed(FirePermanentFailedRequest {
+            tenant_id: records[0].tenant_id.clone(),
+            trigger_id: records[0].trigger_id,
+            fire_slot,
+            next_run_at,
+        })
+        .await
+        .unwrap();
+
+    // Verify the repository landed in Scheduled+Error (still active, not terminal).
+    let rescheduled_records = repository
+        .list_triggers(context.resource_scope.tenant_id.clone())
+        .await
+        .unwrap();
+    assert_eq!(rescheduled_records[0].state, TriggerState::Scheduled);
+    assert_eq!(
+        rescheduled_records[0].last_status,
+        Some(TriggerRunStatus::Error)
+    );
+
+    let listed = invoke_with_context(&runtime, TRIGGER_LIST_CAPABILITY_ID, json!({}), context)
+        .await
+        .unwrap();
+    let trigger = &listed["triggers"][0];
+
+    // enabled=true: trigger is still scheduled to fire again.
+    assert_eq!(
+        trigger["enabled"],
+        json!(true),
+        "rescheduled-failure trigger must have enabled=true"
+    );
+    // run_in_flight=false: the failed fire has been cleared.
+    assert_eq!(
+        trigger["run_in_flight"],
+        json!(false),
+        "rescheduled-failure trigger has no active fire after permanent failure"
+    );
+    // last_error must be present and indicate the trigger will retry.
+    let last_error = trigger["last_error"]
+        .as_str()
+        .expect("Scheduled+Error trigger must carry last_error");
+    assert!(
+        last_error.contains("still scheduled"),
+        "last_error should tell the user the trigger will retry, got: {last_error}"
     );
 }
 

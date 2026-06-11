@@ -36,14 +36,14 @@ pub(super) fn manifests() -> Result<Vec<CapabilityManifest>, ExtensionError> {
     Ok(vec![
         first_party_capability_manifest(
             TRIGGER_CREATE_CAPABILITY_ID,
-            "Create a caller-scoped scheduled trigger; output includes run_in_flight (true only while a fire is in progress), enabled (true when scheduled to fire), and last_error (present when permanently failed — recreate to resume)",
+            "Create a caller-scoped scheduled trigger; output includes run_in_flight (true only while a fire is in progress), enabled (true when scheduled to fire), and last_error (present whenever the most recent fire failed; combine with enabled to distinguish failed-but-will-retry on schedule from failed-and-dead — recreate to resume when enabled=false)",
             vec![EffectKind::DispatchCapability, EffectKind::ExternalWrite],
             PermissionMode::Ask,
             resource_profile(),
         )?,
         first_party_capability_manifest(
             TRIGGER_LIST_CAPABILITY_ID,
-            "List scheduled triggers owned by the current caller scope; output fields: run_in_flight is true only while a fire is actively in progress (not an enabled/disabled indicator), enabled is true when the trigger is scheduled to fire again, last_error is present when the trigger has permanently failed and must be recreated",
+            "List scheduled triggers owned by the current caller scope; output fields: run_in_flight is true only while a fire is actively in progress (not an enabled/disabled indicator), enabled is true when the trigger is scheduled to fire again, last_error is present whenever the most recent fire failed — combine with enabled to distinguish failed-but-will-retry (enabled=true) from failed-and-dead (enabled=false, recreate to resume)",
             vec![EffectKind::DispatchCapability],
             PermissionMode::Allow,
             resource_profile(),
@@ -335,13 +335,18 @@ async fn remove_trigger(
 fn trigger_output(record: &TriggerRecord, recent_runs: &[TriggerRunRecord]) -> Value {
     let run_in_flight = record.has_active_fire();
     let enabled = record.state == TriggerState::Scheduled;
-    // Emit a human-readable explanation when a trigger reached terminal Completed state
-    // from a permanent failure so the LLM can advise the user without having to infer
-    // meaning from state=completed + last_status=error alone.
+    // Emit a human-readable explanation whenever the most recent fire failed so the LLM
+    // can advise the user without having to infer meaning from last_status=error alone.
+    // State distinguishes whether the trigger is dead or will retry:
+    //   - Completed (terminal): the trigger will not fire again; recreate it.
+    //   - Scheduled / Paused (non-terminal): the trigger will fire again on the next slot.
     let last_error: Option<&str> = match (record.state, record.last_status) {
-        (TriggerState::Completed, Some(TriggerRunStatus::Error)) => {
-            Some("schedule exhausted or permanently failed; recreate the trigger to resume")
-        }
+        (TriggerState::Completed, Some(TriggerRunStatus::Error)) => Some(
+            "schedule exhausted or permanently failed; trigger will not fire again; recreate it to resume",
+        ),
+        (TriggerState::Scheduled | TriggerState::Paused, Some(TriggerRunStatus::Error)) => Some(
+            "most recent fire failed; the trigger is still scheduled and will fire again at next_run_at",
+        ),
         _ => None,
     };
     json!({
