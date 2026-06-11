@@ -3963,7 +3963,10 @@ pub struct TraceQueueDiagnostics {
 
 pub enum TraceQueueEligibility {
     Submit,
-    Hold { reason: String },
+    Hold {
+        kind: TraceQueueHoldKind,
+        reason: String,
+    },
 }
 
 fn default_submission_status() -> String {
@@ -4182,6 +4185,29 @@ pub fn queue_trace_envelope_for_scope(
 ) -> anyhow::Result<PathBuf> {
     let _guard = lock_trace_scope_for_mutation_blocking(scope);
     queue_trace_envelope_for_scope_unlocked(scope, envelope)
+}
+
+/// Queue an envelope as **held for manual review**: write the envelope into
+/// the scope queue and a `ManualReview` hold sidecar carrying `reason`, under
+/// a single scope lock. The flush worker skips envelopes that have a hold
+/// sidecar, so the trace is durably retained — reviewable and authorizable —
+/// without being submitted until the hold is cleared.
+pub fn queue_trace_envelope_as_held_for_scope(
+    scope: Option<&str>,
+    envelope: &TraceContributionEnvelope,
+    reason: &str,
+) -> anyhow::Result<PathBuf> {
+    let _guard = lock_trace_scope_for_mutation_blocking(scope);
+    let path = queue_trace_envelope_for_scope_unlocked(scope, envelope)?;
+    let hold = TraceQueueHold {
+        submission_id: envelope.submission_id,
+        kind: TraceQueueHoldKind::ManualReview,
+        reason: reason.to_string(),
+        attempts: 0,
+        next_retry_at: None,
+    };
+    write_trace_queue_hold_sidecar_for_path(&path, &hold)?;
+    Ok(path)
 }
 
 fn queue_trace_envelope_for_scope_unlocked(
@@ -5849,10 +5875,10 @@ async fn flush_trace_contribution_queue_for_scope_with_credential_provider(
                 })?;
                 submitted += 1;
             }
-            TraceQueueEligibility::Hold { reason } => {
+            TraceQueueEligibility::Hold { kind, reason } => {
                 let hold = TraceQueueHold {
                     submission_id: envelope.submission_id,
-                    kind: trace_queue_hold_kind_for_policy_reason(&reason),
+                    kind,
                     reason: safe_trace_queue_hold_reason(&reason),
                     attempts: 0,
                     next_retry_at: None,
@@ -6628,6 +6654,7 @@ pub fn trace_autonomous_eligibility(
         && envelope.privacy.residual_pii_risk == ResidualPiiRisk::High
     {
         return TraceQueueEligibility::Hold {
+            kind: TraceQueueHoldKind::ManualReview,
             reason: "manual review required because residual privacy risk is high".to_string(),
         };
     }
@@ -6640,12 +6667,14 @@ pub fn trace_autonomous_eligibility(
             .all(|tool| !policy.selected_tools.contains(tool))
     {
         return TraceQueueEligibility::Hold {
+            kind: TraceQueueHoldKind::PolicyGate,
             reason: "trace does not use any selected auto-submit tools".to_string(),
         };
     }
 
     if envelope.value.submission_score < policy.min_submission_score {
         return TraceQueueEligibility::Hold {
+            kind: TraceQueueHoldKind::PolicyGate,
             reason: format!(
                 "submission score {:.2} is below policy minimum {:.2}",
                 envelope.value.submission_score, policy.min_submission_score
@@ -6665,6 +6694,7 @@ pub fn trace_autonomous_eligibility(
     }
 
     TraceQueueEligibility::Hold {
+        kind: TraceQueueHoldKind::PolicyGate,
         reason: "policy does not allow this autonomous submission class".to_string(),
     }
 }
@@ -9143,6 +9173,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn eligibility_hold_kind_separates_manual_review_from_policy_gate() {
+        // The hold kind must distinguish a PII manual-review hold (which is
+        // retained for the user to authorize) from a policy/value gate (which
+        // is not review-worthy), so the held-review surface is not polluted
+        // with low-value traces.
+        let raw = RawTraceContribution::from_recorded_trace(
+            &sample_trace(),
+            RecordedTraceContributionOptions::default(),
+        );
+        let mut envelope = DeterministicTraceRedactor::default()
+            .redact_trace(raw)
+            .await
+            .expect("redaction should succeed");
+        apply_credit_estimate_to_envelope(&mut envelope);
+
+        // High residual PII risk + manual-approval policy => ManualReview.
+        envelope.privacy.residual_pii_risk = ResidualPiiRisk::High;
+        let manual_policy = StandingTraceContributionPolicy {
+            enabled: true,
+            require_manual_approval_when_pii_detected: true,
+            ..StandingTraceContributionPolicy::default()
+        };
+        assert!(matches!(
+            trace_autonomous_eligibility(&envelope, &manual_policy),
+            TraceQueueEligibility::Hold {
+                kind: TraceQueueHoldKind::ManualReview,
+                ..
+            }
+        ));
+
+        // Below-threshold score (no PII concern) => PolicyGate, not review.
+        envelope.privacy.residual_pii_risk = ResidualPiiRisk::Low;
+        let strict_policy = StandingTraceContributionPolicy {
+            enabled: true,
+            min_submission_score: 1.0,
+            ..StandingTraceContributionPolicy::default()
+        };
+        assert!(matches!(
+            trace_autonomous_eligibility(&envelope, &strict_policy),
+            TraceQueueEligibility::Hold {
+                kind: TraceQueueHoldKind::PolicyGate,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
     async fn derived_artifact_invalidation_marker_uses_hashes_not_raw_handles() {
         let raw = RawTraceContribution::from_recorded_trace(
             &sample_trace(),
@@ -10615,6 +10692,44 @@ mod tests {
             summary.recent_explanations,
             vec!["Expired under retention policy.".to_string()]
         );
+    }
+
+    #[tokio::test]
+    async fn queue_trace_envelope_as_held_retains_envelope_and_manual_review_sidecar() {
+        // A held (e.g. PII-gated) trace must be retained for review, not
+        // dropped: the envelope is queued AND a ManualReview hold sidecar is
+        // written so the flush worker skips it until it is authorized.
+        let scope = format!("trace-held-retain-test-{}", Uuid::new_v4());
+        let raw = RawTraceContribution::from_recorded_trace(
+            &sample_trace(),
+            RecordedTraceContributionOptions::default(),
+        );
+        let mut envelope = DeterministicTraceRedactor::default()
+            .redact_trace(raw)
+            .await
+            .expect("redaction should succeed");
+        apply_credit_estimate_to_envelope(&mut envelope);
+
+        let reason = "manual review required because residual privacy risk is high";
+        let queue_path = queue_trace_envelope_as_held_for_scope(Some(&scope), &envelope, reason)
+            .expect("held envelope queues");
+
+        assert!(
+            queue_path.exists(),
+            "held envelope must be retained on disk"
+        );
+
+        let holds = read_trace_queue_holds_for_scope(Some(&scope)).expect("read holds");
+        assert_eq!(holds.len(), 1, "exactly one hold sidecar");
+        assert_eq!(holds[0].submission_id, envelope.submission_id);
+        assert_eq!(holds[0].kind, TraceQueueHoldKind::ManualReview);
+        assert!(
+            holds[0].reason.contains("residual privacy risk is high"),
+            "hold reason preserved, got {}",
+            holds[0].reason
+        );
+
+        let _ = std::fs::remove_dir_all(trace_contribution_dir_for_scope(Some(&scope)));
     }
 
     #[tokio::test]

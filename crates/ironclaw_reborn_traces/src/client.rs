@@ -53,8 +53,13 @@ pub struct TraceClientAutonomousCaptureRequest<'a> {
 pub enum TraceClientAutonomousCaptureOutcome {
     Skipped,
     Held {
-        submission_id: uuid::Uuid,
+        /// Why the trace was held. `ManualReview` holds are retained for the
+        /// user to authorize; policy/value gates are not surfaced for review.
+        kind: trace::TraceQueueHoldKind,
         reason: String,
+        /// The built (already-redacted) envelope, retained so callers can
+        /// persist it for manual review instead of dropping it.
+        envelope: Box<TraceContributionEnvelope>,
     },
     Submit(Box<TraceContributionEnvelope>),
 }
@@ -165,10 +170,11 @@ impl TraceClientHost {
             trace::TraceQueueEligibility::Submit => Ok(
                 TraceClientAutonomousCaptureOutcome::Submit(Box::new(envelope)),
             ),
-            trace::TraceQueueEligibility::Hold { reason } => {
+            trace::TraceQueueEligibility::Hold { kind, reason } => {
                 Ok(TraceClientAutonomousCaptureOutcome::Held {
-                    submission_id: envelope.submission_id,
+                    kind,
                     reason,
+                    envelope: Box::new(envelope),
                 })
             }
         }
@@ -180,6 +186,17 @@ impl TraceClientHost {
         envelope: &TraceContributionEnvelope,
     ) -> anyhow::Result<PathBuf> {
         trace::queue_trace_envelope_for_scope(Some(scope.as_str()), envelope)
+    }
+
+    /// Retain a held (manual-review) envelope: queue it with a `ManualReview`
+    /// hold sidecar so the flush worker skips it until it is authorized.
+    pub fn queue_held_envelope_for_scope(
+        &self,
+        scope: &TraceClientScope,
+        envelope: &TraceContributionEnvelope,
+        reason: &str,
+    ) -> anyhow::Result<PathBuf> {
+        trace::queue_trace_envelope_as_held_for_scope(Some(scope.as_str()), envelope, reason)
     }
 
     pub async fn flush_scope_queue(

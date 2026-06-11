@@ -236,14 +236,38 @@ pub(crate) async fn capture_turn_trace(
             }
         }
         Ok(TraceClientAutonomousCaptureOutcome::Held {
-            submission_id,
+            kind,
             reason,
+            envelope,
         }) => {
+            let submission_id = envelope.submission_id;
+            // Only manual-review holds (e.g. High residual-PII-risk) are
+            // retained for the user to authorize. Policy/value gates (low
+            // score, disallowed tools) are not review-worthy and are dropped
+            // as before — just logged for diagnostics.
+            if !matches!(kind, trace::TraceQueueHoldKind::ManualReview) {
+                tracing::debug!(
+                    %submission_id,
+                    %reason,
+                    %scope_ref,
+                    "Reborn trace capture held by policy gate (dropped)"
+                );
+                return;
+            }
+            // Retain: queue with a ManualReview hold sidecar so the flush
+            // worker skips it until it is authorized.
+            let trace_scope = TraceClientScope::user(scope.clone());
+            if let Err(error) =
+                TraceClientHost.queue_held_envelope_for_scope(&trace_scope, &envelope, &reason)
+            {
+                tracing::debug!(%error, %scope_ref, "Reborn trace capture failed to retain held envelope");
+                return;
+            }
             tracing::debug!(
                 %submission_id,
                 %reason,
                 %scope_ref,
-                "Reborn trace capture held by contribution policy"
+                "Reborn trace capture held for manual review (retained)"
             );
         }
         Ok(TraceClientAutonomousCaptureOutcome::Skipped) => {}
@@ -873,6 +897,78 @@ mod tests {
         assert_eq!(
             envelope["replay"]["replayable"], true,
             "a tool-using turn must be marked replayable"
+        );
+        cleanup_scope(&scope);
+    }
+
+    #[tokio::test]
+    async fn capture_retains_manual_review_hold_for_high_pii_trace() {
+        // A High residual-PII-risk trace (blocked secret detected) under a
+        // manual-approval policy must be RETAINED as a ManualReview hold for
+        // the user to authorize, not dropped.
+        let scope = unique_scope("manual-review");
+        let mut policy = enabled_policy();
+        policy.require_manual_approval_when_pii_detected = true;
+        policy.include_message_text = true; // so the secret is scanned
+        trace::write_trace_policy_for_scope(Some(&scope), &policy).expect("write policy");
+
+        // The AWS access key triggers a Critical leak detection -> blocked
+        // secret -> High residual PII risk -> ManualReview hold.
+        let history: Arc<dyn TraceCaptureHistorySource> = Arc::new(FixedHistorySource {
+            records: vec![
+                record(
+                    MessageKind::User,
+                    MessageStatus::Accepted,
+                    "deploy using AKIAIOSFODNN7EXAMPLE then report back",
+                ),
+                record(MessageKind::Assistant, MessageStatus::Finalized, "deployed"),
+            ],
+        });
+        capture_turn_trace(
+            history,
+            terminal_event(TurnEventKind::Completed, Some(&scope)),
+            scope.clone(),
+        )
+        .await;
+
+        let holds = trace::read_trace_queue_holds_for_scope(Some(&scope)).expect("read holds");
+        assert_eq!(
+            holds.len(),
+            1,
+            "high-PII trace retained as exactly one hold"
+        );
+        assert_eq!(holds[0].kind, trace::TraceQueueHoldKind::ManualReview);
+        cleanup_scope(&scope);
+    }
+
+    #[tokio::test]
+    async fn capture_drops_policy_gated_hold_without_retaining() {
+        // A low-value (sub-threshold score) hold is a PolicyGate, not
+        // review-worthy: it must NOT be retained, so the held-review surface
+        // stays free of low-value traces.
+        let scope = unique_scope("policy-gated");
+        let mut policy = enabled_policy();
+        policy.min_submission_score = 1.0; // any real trace scores below this
+        trace::write_trace_policy_for_scope(Some(&scope), &policy).expect("write policy");
+
+        let history: Arc<dyn TraceCaptureHistorySource> = Arc::new(FixedHistorySource {
+            records: vec![
+                record(MessageKind::User, MessageStatus::Accepted, "hi there"),
+                record(MessageKind::Assistant, MessageStatus::Finalized, "hello"),
+            ],
+        });
+        capture_turn_trace(
+            history,
+            terminal_event(TurnEventKind::Completed, Some(&scope)),
+            scope.clone(),
+        )
+        .await;
+
+        let holds = trace::read_trace_queue_holds_for_scope(Some(&scope)).expect("read holds");
+        assert!(holds.is_empty(), "policy-gated hold must not be retained");
+        assert!(
+            queued_entries(&scope).is_empty(),
+            "policy-gated trace must not be queued"
         );
         cleanup_scope(&scope);
     }
