@@ -456,8 +456,12 @@ async fn load_delivered_route_for_envelope(
             return None;
         }
     };
+    let conversation_fingerprint = conversation_ref.conversation_fingerprint();
     let route = match delivered_gate_routes
-        .load_delivered_gate_route_by_conversation(&binding.tenant_id, &conversation_ref)
+        .load_delivered_gate_route_by_conversation_fingerprint(
+            &binding.tenant_id,
+            &conversation_fingerprint,
+        )
         .await
     {
         Ok(Some(route)) => route,
@@ -990,16 +994,41 @@ async fn dispatch_auth_resolution(
         }
     })?;
     let idempotency_key = auth_resolution_idempotency_key(&action_fingerprint)?;
-    let response = auth_interaction_service
+    let response = match auth_interaction_service
         .resolve(ResolveAuthInteractionRequest {
             scope,
             actor,
             run_id_hint: None,
             gate_ref,
-            decision,
+            decision: decision.clone(),
             idempotency_key,
         })
-        .await?;
+        .await
+    {
+        Ok(response) => response,
+        Err(
+            error @ ProductWorkflowError::AuthInteractionRejected {
+                kind: AuthInteractionRejectionKind::MissingAuth,
+            },
+        ) => {
+            if let Some(result) = resolve_via_delivered_auth_route(
+                envelope,
+                binding_service,
+                delivered_gate_routes,
+                auth_interaction_service,
+                decision,
+                &action_fingerprint,
+                Some(payload.auth_request_ref.as_str()),
+                Some(&binding),
+            )
+            .await
+            {
+                return result;
+            }
+            return Err(error);
+        }
+        Err(error) => return Err(error),
+    };
     let submitted_run_id = run_id_from_auth_resolution(response);
     Ok(DispatchedAction {
         ack: ProductInboundAck::Accepted {

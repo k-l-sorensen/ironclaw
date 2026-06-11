@@ -264,12 +264,10 @@ where
         };
         let body = serde_json::to_vec(&index_entry)
             .map_err(|e| format!("delivered gate route conversation index serialize: {e}"))?;
-        for conversation_ref in &record.delivered_conversation_refs {
-            let idx_path = delivered_gate_route_conv_idx_path(
-                &record.tenant_id,
-                &conversation_ref.conversation_fingerprint(),
-            )
-            .map_err(|e| format!("delivered gate route conversation index path: {e}"))?;
+        for conversation_fingerprint in &record.delivered_conversation_fingerprints {
+            let idx_path =
+                delivered_gate_route_conv_idx_path(&record.tenant_id, conversation_fingerprint)
+                    .map_err(|e| format!("delivered gate route conversation index path: {e}"))?;
             let entry = Entry::bytes(body.clone()).with_content_type(ContentType::json());
             self.put_with_byte_fallback(&resource_scope, &idx_path, entry, CasExpectation::Any)
                 .await
@@ -280,13 +278,26 @@ where
 
     async fn delete_delivered_gate_route_conversation_indexes(
         &self,
-        tenant_id: &TenantId,
+        record: &DeliveredGateRouteRecord,
         conversation_fingerprints: &[String],
     ) -> Result<(), String> {
         let resource_scope = ResourceScope::system();
+        let expected_entry = DeliveredGateRouteConversationIndexEntry {
+            tenant_id: record.tenant_id.clone(),
+            user_id: record.user_id.clone(),
+            gate_ref: record.gate_ref.clone(),
+        };
         for conversation_fingerprint in conversation_fingerprints {
-            let idx_path = delivered_gate_route_conv_idx_path(tenant_id, conversation_fingerprint)
-                .map_err(|e| format!("delivered gate route conversation index path: {e}"))?;
+            let idx_path =
+                delivered_gate_route_conv_idx_path(&record.tenant_id, conversation_fingerprint)
+                    .map_err(|e| format!("delivered gate route conversation index path: {e}"))?;
+            let current_entry = self
+                .get_json::<DeliveredGateRouteConversationIndexEntry>(&resource_scope, &idx_path)
+                .await
+                .map_err(|e| format!("delivered gate route conversation index read: {e}"))?;
+            if current_entry.as_ref() != Some(&expected_entry) {
+                continue;
+            }
             match self.filesystem.delete(&resource_scope, &idx_path).await {
                 Ok(()) | Err(FilesystemError::NotFound { .. }) => {}
                 Err(e) => {
@@ -717,7 +728,7 @@ fn delivered_gate_route_conv_idx_path(
 /// Value stored in a conversation index file: the identity triple needed to
 /// reload the primary record through `load_delivered_gate_route` with the
 /// same tenant+user resource scope the write path used.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct DeliveredGateRouteConversationIndexEntry {
     tenant_id: TenantId,
     user_id: UserId,
@@ -919,21 +930,18 @@ where
         // conversation index at all, silently disabling bare-reply routing.
         if let Some(old_record) = old_record {
             let new_fingerprints: std::collections::HashSet<String> = record
-                .delivered_conversation_refs
+                .delivered_conversation_fingerprints
                 .iter()
-                .map(|conversation_ref| conversation_ref.conversation_fingerprint())
+                .cloned()
                 .collect();
             let stale_fingerprints: Vec<String> = old_record
-                .delivered_conversation_refs
+                .delivered_conversation_fingerprints
                 .iter()
-                .map(|conversation_ref| conversation_ref.conversation_fingerprint())
+                .cloned()
                 .filter(|fingerprint| !new_fingerprints.contains(fingerprint))
                 .collect();
-            self.delete_delivered_gate_route_conversation_indexes(
-                &record.tenant_id,
-                &stale_fingerprints,
-            )
-            .await?;
+            self.delete_delivered_gate_route_conversation_indexes(&old_record, &stale_fingerprints)
+                .await?;
         }
         Ok(())
     }
@@ -963,13 +971,12 @@ where
         }
     }
 
-    async fn load_delivered_gate_route_by_conversation(
+    async fn load_delivered_gate_route_by_conversation_fingerprint(
         &self,
         tenant_id: &TenantId,
-        conversation_ref: &ironclaw_conversations::ExternalConversationRef,
+        conversation_fingerprint: &str,
     ) -> Result<Option<DeliveredGateRouteRecord>, String> {
-        let conversation_fingerprint = conversation_ref.conversation_fingerprint();
-        let idx_path = delivered_gate_route_conv_idx_path(tenant_id, &conversation_fingerprint)
+        let idx_path = delivered_gate_route_conv_idx_path(tenant_id, conversation_fingerprint)
             .map_err(|e| format!("delivered gate route conversation index path: {e}"))?;
         // Only the index file is read with the system scope (its path hash
         // binds the tenant). The primary record is reloaded through
@@ -1003,9 +1010,9 @@ where
         // conversation. Treat it as a miss rather than routing a reply from
         // a conversation the gate was never delivered to.
         if !record
-            .delivered_conversation_refs
+            .delivered_conversation_fingerprints
             .iter()
-            .any(|delivered| delivered.conversation_fingerprint() == conversation_fingerprint)
+            .any(|delivered| delivered == conversation_fingerprint)
         {
             return Ok(None);
         }
@@ -1027,15 +1034,12 @@ where
             .map_err(|e| format!("delivered gate route read before delete: {e}"))?
         {
             let fingerprints: Vec<String> = old_record
-                .delivered_conversation_refs
+                .delivered_conversation_fingerprints
                 .iter()
-                .map(|conversation_ref| conversation_ref.conversation_fingerprint())
+                .cloned()
                 .collect();
-            self.delete_delivered_gate_route_conversation_indexes(
-                &old_record.tenant_id,
-                &fingerprints,
-            )
-            .await?;
+            self.delete_delivered_gate_route_conversation_indexes(&old_record, &fingerprints)
+                .await?;
         }
         match self.filesystem.delete(&resource_scope, &path).await {
             Ok(()) => Ok(()),
@@ -1126,12 +1130,12 @@ where
                 continue;
             }
             let fingerprints: Vec<String> = record
-                .delivered_conversation_refs
+                .delivered_conversation_fingerprints
                 .iter()
-                .map(|conversation_ref| conversation_ref.conversation_fingerprint())
+                .cloned()
                 .collect();
             if let Err(e) = self
-                .delete_delivered_gate_route_conversation_indexes(&record.tenant_id, &fingerprints)
+                .delete_delivered_gate_route_conversation_indexes(&record, &fingerprints)
                 .await
             {
                 tracing::debug!(
@@ -1294,7 +1298,7 @@ mod tests {
             run_id,
             scope,
             recorded_at: Utc::now(),
-            delivered_conversation_refs: Vec::new(),
+            delivered_conversation_fingerprints: Vec::new(),
         }
     }
 
@@ -1373,16 +1377,8 @@ mod tests {
             .expect("second remove of absent record must be Ok");
     }
 
-    fn gate_route_conversation_ref(
-        thread_id: &str,
-    ) -> ironclaw_conversations::ExternalConversationRef {
-        ironclaw_conversations::ExternalConversationRef::new(
-            Some("space-fs-gate-route"),
-            "conversation-fs-gate-route",
-            Some(thread_id),
-            None,
-        )
-        .unwrap()
+    fn gate_route_conversation_fingerprint(thread_id: &str) -> String {
+        format!("fingerprint:{thread_id}")
     }
 
     #[tokio::test]
@@ -1394,8 +1390,8 @@ mod tests {
         let user_id = UserId::new("fs-conv-idx-user").expect("user");
         let thread_id = ThreadId::new("fs-conv-idx-thread").expect("thread");
         let gate_ref = "gate:fs-conv-idx-001";
-        let conv_a = gate_route_conversation_ref("thread-a");
-        let conv_b = gate_route_conversation_ref("thread-b");
+        let conv_a = gate_route_conversation_fingerprint("thread-a");
+        let conv_b = gate_route_conversation_fingerprint("thread-b");
 
         let store = build_gate_route_store(&tenant_id, &user_id);
         let scope = TurnScope::new_with_owner(
@@ -1412,7 +1408,7 @@ mod tests {
             TurnRunId::new(),
             scope,
         );
-        record.delivered_conversation_refs = vec![conv_a.clone()];
+        record.delivered_conversation_fingerprints = vec![conv_a.clone()];
 
         store
             .record_delivered_gate_route(record.clone())
@@ -1420,7 +1416,7 @@ mod tests {
             .expect("record must succeed");
 
         let hit = store
-            .load_delivered_gate_route_by_conversation(&tenant_id, &conv_a)
+            .load_delivered_gate_route_by_conversation_fingerprint(&tenant_id, &conv_a)
             .await
             .expect("lookup must not error")
             .expect("delivered conversation must resolve to the record");
@@ -1428,7 +1424,7 @@ mod tests {
         assert_eq!(hit.user_id, user_id);
 
         let miss = store
-            .load_delivered_gate_route_by_conversation(&tenant_id, &conv_b)
+            .load_delivered_gate_route_by_conversation_fingerprint(&tenant_id, &conv_b)
             .await
             .expect("lookup must not error");
         assert!(miss.is_none(), "undelivered conversation must miss");
@@ -1438,7 +1434,7 @@ mod tests {
             .await
             .expect("remove must succeed");
         let after_remove = store
-            .load_delivered_gate_route_by_conversation(&tenant_id, &conv_a)
+            .load_delivered_gate_route_by_conversation_fingerprint(&tenant_id, &conv_a)
             .await
             .expect("lookup must not error");
         assert!(after_remove.is_none(), "remove must clean the index");
@@ -1454,8 +1450,8 @@ mod tests {
         let user_id = UserId::new("fs-stale-idx-user").expect("user");
         let thread_id = ThreadId::new("fs-stale-idx-thread").expect("thread");
         let gate_ref = "gate:fs-stale-idx-001";
-        let conv_a = gate_route_conversation_ref("thread-a");
-        let conv_b = gate_route_conversation_ref("thread-b");
+        let conv_a = gate_route_conversation_fingerprint("thread-a");
+        let conv_b = gate_route_conversation_fingerprint("thread-b");
 
         let store = build_gate_route_store(&tenant_id, &user_id);
         let scope = TurnScope::new_with_owner(
@@ -1472,7 +1468,7 @@ mod tests {
             TurnRunId::new(),
             scope,
         );
-        record.delivered_conversation_refs = vec![conv_a.clone()];
+        record.delivered_conversation_fingerprints = vec![conv_a.clone()];
 
         store
             .record_delivered_gate_route(record.clone())
@@ -1482,14 +1478,14 @@ mod tests {
         // Forge a dangling index: same identity triple, but pointing the
         // conv_b fingerprint at a primary record that only lists conv_a.
         let mut doctored = record.clone();
-        doctored.delivered_conversation_refs = vec![conv_b.clone()];
+        doctored.delivered_conversation_fingerprints = vec![conv_b.clone()];
         store
             .write_delivered_gate_route_conversation_indexes(&doctored)
             .await
             .expect("index write must succeed");
 
         let stale = store
-            .load_delivered_gate_route_by_conversation(&tenant_id, &conv_b)
+            .load_delivered_gate_route_by_conversation_fingerprint(&tenant_id, &conv_b)
             .await
             .expect("lookup must not error");
         assert!(
@@ -1499,7 +1495,7 @@ mod tests {
 
         // The legitimate conversation still resolves.
         let hit = store
-            .load_delivered_gate_route_by_conversation(&tenant_id, &conv_a)
+            .load_delivered_gate_route_by_conversation_fingerprint(&tenant_id, &conv_a)
             .await
             .expect("lookup must not error");
         assert!(hit.is_some(), "delivered conversation must still resolve");
@@ -1513,8 +1509,8 @@ mod tests {
         let user_id = UserId::new("fs-overwrite-idx-user").expect("user");
         let thread_id = ThreadId::new("fs-overwrite-idx-thread").expect("thread");
         let gate_ref = "gate:fs-overwrite-idx-001";
-        let conv_a = gate_route_conversation_ref("thread-a");
-        let conv_b = gate_route_conversation_ref("thread-b");
+        let conv_a = gate_route_conversation_fingerprint("thread-a");
+        let conv_b = gate_route_conversation_fingerprint("thread-b");
 
         let store = build_gate_route_store(&tenant_id, &user_id);
         let scope = TurnScope::new_with_owner(
@@ -1531,30 +1527,85 @@ mod tests {
             TurnRunId::new(),
             scope,
         );
-        record.delivered_conversation_refs = vec![conv_a.clone()];
+        record.delivered_conversation_fingerprints = vec![conv_a.clone()];
         store
             .record_delivered_gate_route(record.clone())
             .await
             .expect("first record must succeed");
 
-        record.delivered_conversation_refs = vec![conv_b.clone()];
+        record.delivered_conversation_fingerprints = vec![conv_b.clone()];
         store
             .record_delivered_gate_route(record)
             .await
             .expect("second record must succeed");
 
         let stale = store
-            .load_delivered_gate_route_by_conversation(&tenant_id, &conv_a)
+            .load_delivered_gate_route_by_conversation_fingerprint(&tenant_id, &conv_a)
             .await
             .expect("lookup must not error");
         assert!(stale.is_none(), "replaced conversation index must be gone");
 
         let fresh = store
-            .load_delivered_gate_route_by_conversation(&tenant_id, &conv_b)
+            .load_delivered_gate_route_by_conversation_fingerprint(&tenant_id, &conv_b)
             .await
             .expect("lookup must not error")
             .expect("new conversation must resolve");
         assert_eq!(fresh.gate_ref, gate_ref);
+    }
+
+    #[tokio::test]
+    async fn filesystem_gate_route_cleanup_preserves_reused_conversation_index() {
+        // Cleanup for an old route must not delete a conversation index that has
+        // since been repointed to a newer route for the same conversation.
+        let tenant_id = TenantId::new("fs-reused-idx-tenant").expect("tenant");
+        let user_id = UserId::new("fs-reused-idx-user").expect("user");
+        let thread_id = ThreadId::new("fs-reused-idx-thread").expect("thread");
+        let shared = gate_route_conversation_fingerprint("thread-shared");
+
+        let store = build_gate_route_store(&tenant_id, &user_id);
+        let scope = TurnScope::new_with_owner(
+            tenant_id.clone(),
+            None,
+            None,
+            thread_id,
+            Some(user_id.clone()),
+        );
+        let mut old = gate_route_record(
+            tenant_id.clone(),
+            user_id.clone(),
+            "gate:fs-reused-old",
+            TurnRunId::new(),
+            scope.clone(),
+        );
+        old.delivered_conversation_fingerprints = vec![shared.clone()];
+        let mut new = gate_route_record(
+            tenant_id.clone(),
+            user_id.clone(),
+            "gate:fs-reused-new",
+            TurnRunId::new(),
+            scope,
+        );
+        new.delivered_conversation_fingerprints = vec![shared.clone()];
+
+        store
+            .record_delivered_gate_route(old)
+            .await
+            .expect("old record must succeed");
+        store
+            .record_delivered_gate_route(new.clone())
+            .await
+            .expect("new record must succeed");
+        store
+            .remove_delivered_gate_route(&tenant_id, &user_id, "gate:fs-reused-old")
+            .await
+            .expect("old remove must succeed");
+
+        let loaded = store
+            .load_delivered_gate_route_by_conversation_fingerprint(&tenant_id, &shared)
+            .await
+            .expect("lookup must not error")
+            .expect("shared conversation must still resolve to new route");
+        assert_eq!(loaded.gate_ref, new.gate_ref);
     }
 
     fn tenant() -> TenantId {

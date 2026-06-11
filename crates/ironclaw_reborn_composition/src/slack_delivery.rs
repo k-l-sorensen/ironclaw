@@ -516,7 +516,7 @@ async fn record_gate_route_if_needed(
     // identical (i.e. when `posted_space_id` is None).
     posted_space_id: Option<&str>,
 ) {
-    let mut conversation_refs: Vec<ironclaw_conversations::ExternalConversationRef> = Vec::new();
+    let mut conversation_fingerprints = Vec::new();
 
     for msg in posted_messages {
         // Record a space-qualified ref (matches inbound Slack events that carry team_id).
@@ -528,7 +528,7 @@ async fn record_gate_route_if_needed(
                 None,
             )
         {
-            push_unique_conversation_ref(&mut conversation_refs, conv_ref);
+            push_unique_conversation_fingerprint(&mut conversation_fingerprints, conv_ref);
         }
         // Always record a no-space fallback ref for events that omit team_id.
         if let Ok(conv_ref) = ironclaw_conversations::ExternalConversationRef::new(
@@ -537,7 +537,7 @@ async fn record_gate_route_if_needed(
             Some(&msg.ts),
             None,
         ) {
-            push_unique_conversation_ref(&mut conversation_refs, conv_ref);
+            push_unique_conversation_fingerprint(&mut conversation_fingerprints, conv_ref);
         }
     }
 
@@ -545,18 +545,10 @@ async fn record_gate_route_if_needed(
         && let Ok(env_conv_ref) = conversations_ref_from_product_ref(env_ref)
     {
         let env_no_msg = env_conv_ref.without_message_id();
-        push_unique_conversation_ref(&mut conversation_refs, env_no_msg.clone());
-        if let Ok(base_ref) = ironclaw_conversations::ExternalConversationRef::new(
-            env_no_msg.space_id(),
-            env_no_msg.conversation_id(),
-            None,
-            None,
-        ) {
-            push_unique_conversation_ref(&mut conversation_refs, base_ref);
-        }
+        push_unique_conversation_fingerprint(&mut conversation_fingerprints, env_no_msg);
     }
 
-    if conversation_refs.is_empty() {
+    if conversation_fingerprints.is_empty() {
         return;
     }
 
@@ -567,7 +559,7 @@ async fn record_gate_route_if_needed(
         run_id,
         scope: scope.clone(),
         recorded_at: Utc::now(),
-        delivered_conversation_refs: conversation_refs,
+        delivered_conversation_fingerprints: conversation_fingerprints,
     };
 
     if let Err(error) = route_store.record_delivered_gate_route(record).await {
@@ -594,16 +586,13 @@ async fn record_gate_route_if_needed(
     }
 }
 
-fn push_unique_conversation_ref(
-    refs: &mut Vec<ironclaw_conversations::ExternalConversationRef>,
+fn push_unique_conversation_fingerprint(
+    fingerprints: &mut Vec<String>,
     conv_ref: ironclaw_conversations::ExternalConversationRef,
 ) {
     let fingerprint = conv_ref.conversation_fingerprint();
-    if !refs
-        .iter()
-        .any(|existing| existing.conversation_fingerprint() == fingerprint)
-    {
-        refs.push(conv_ref);
+    if !fingerprints.iter().any(|existing| existing == &fingerprint) {
+        fingerprints.push(fingerprint);
     }
 }
 
@@ -2967,11 +2956,11 @@ mod tests {
 
         assert!(
             route
-                .delivered_conversation_refs
+                .delivered_conversation_fingerprints
                 .iter()
-                .any(|r| r.conversation_fingerprint() == expected_fingerprint),
-            "recorded route must include a ref with space_id=T123 that matches the inbound fingerprint; refs={:?}",
-            route.delivered_conversation_refs,
+                .any(|fingerprint| fingerprint == &expected_fingerprint),
+            "recorded route must include space_id=T123 fingerprint; fingerprints={:?}",
+            route.delivered_conversation_fingerprints,
         );
     }
 
@@ -3147,11 +3136,11 @@ mod tests {
 
         assert!(
             route
-                .delivered_conversation_refs
+                .delivered_conversation_fingerprints
                 .iter()
-                .any(|r| r.conversation_fingerprint() == expected_fingerprint),
-            "recorded route must include a ref with space_id=T999; refs={:?}",
-            route.delivered_conversation_refs,
+                .any(|fingerprint| fingerprint == &expected_fingerprint),
+            "recorded route must include space_id=T999 fingerprint; fingerprints={:?}",
+            route.delivered_conversation_fingerprints,
         );
 
         // Also verify that the no-space fallback variant is present (inbound
@@ -3166,11 +3155,24 @@ mod tests {
         let no_space_fingerprint = no_space_ref.conversation_fingerprint();
         assert!(
             route
-                .delivered_conversation_refs
+                .delivered_conversation_fingerprints
                 .iter()
-                .any(|r| r.conversation_fingerprint() == no_space_fingerprint),
-            "recorded route must include the no-space fallback ref; refs={:?}",
-            route.delivered_conversation_refs,
+                .any(|fingerprint| fingerprint == &no_space_fingerprint),
+            "recorded route must include the no-space fallback fingerprint; fingerprints={:?}",
+            route.delivered_conversation_fingerprints,
+        );
+
+        let channel_root_ref =
+            ironclaw_conversations::ExternalConversationRef::new(Some("T999"), "D789", None, None)
+                .expect("channel root ref");
+        let channel_root_fingerprint = channel_root_ref.conversation_fingerprint();
+        assert!(
+            !route
+                .delivered_conversation_fingerprints
+                .iter()
+                .any(|fingerprint| fingerprint == &channel_root_fingerprint),
+            "recorded route must not include the channel-root fingerprint for a threaded prompt; fingerprints={:?}",
+            route.delivered_conversation_fingerprints,
         );
     }
 }
