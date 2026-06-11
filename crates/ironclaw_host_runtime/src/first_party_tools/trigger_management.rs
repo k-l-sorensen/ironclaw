@@ -337,15 +337,20 @@ fn trigger_output(record: &TriggerRecord, recent_runs: &[TriggerRunRecord]) -> V
     let enabled = record.state == TriggerState::Scheduled;
     // Emit a human-readable explanation whenever the most recent fire failed so the LLM
     // can advise the user without having to infer meaning from last_status=error alone.
-    // State distinguishes whether the trigger is dead or will retry:
+    // State distinguishes what happens next:
     //   - Completed (terminal): the trigger will not fire again; recreate it.
-    //   - Scheduled / Paused (non-terminal): the trigger will fire again on the next slot.
+    //   - Scheduled: the trigger will fire again on the next slot.
+    //   - Paused: the poller only fires Scheduled triggers (is_due_at), so a paused
+    //     trigger must NOT be described as retrying automatically.
     let last_error: Option<&str> = match (record.state, record.last_status) {
         (TriggerState::Completed, Some(TriggerRunStatus::Error)) => Some(
             "schedule exhausted or permanently failed; trigger will not fire again; recreate it to resume",
         ),
-        (TriggerState::Scheduled | TriggerState::Paused, Some(TriggerRunStatus::Error)) => Some(
+        (TriggerState::Scheduled, Some(TriggerRunStatus::Error)) => Some(
             "most recent fire failed; the trigger is still scheduled and will fire again at next_run_at",
+        ),
+        (TriggerState::Paused, Some(TriggerRunStatus::Error)) => Some(
+            "most recent fire failed; the trigger is paused and will not fire again until resumed",
         ),
         _ => None,
     };
@@ -557,5 +562,40 @@ mod tests {
                 assert_eq!(timezone, "America/Los_Angeles");
             }
         }
+    }
+
+    #[test]
+    fn trigger_output_paused_after_failed_fire_does_not_promise_retry() {
+        let record = TriggerRecord {
+            trigger_id: TriggerId::new(),
+            tenant_id: ironclaw_host_api::TenantId::new("tenant-paused").expect("tenant id"),
+            creator_user_id: ironclaw_host_api::UserId::new("user-paused").expect("user id"),
+            agent_id: None,
+            project_id: None,
+            name: "paused-after-error".to_string(),
+            source: TriggerSourceKind::Schedule,
+            schedule: TriggerSchedule::cron_with_timezone("0 9 * * *", "UTC").expect("schedule"),
+            completion_policy: TriggerCompletionPolicy::Recurring,
+            prompt: "p".to_string(),
+            state: TriggerState::Paused,
+            next_run_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            last_run_at: Some(chrono::Utc::now()),
+            last_fired_slot: None,
+            last_status: Some(TriggerRunStatus::Error),
+            active_fire_slot: None,
+            active_run_ref: None,
+            created_at: chrono::Utc::now(),
+        };
+        let output = trigger_output(&record, &[]);
+        assert_eq!(output["enabled"], serde_json::json!(false));
+        let last_error = output["last_error"].as_str().expect("last_error present");
+        assert!(
+            last_error.contains("paused") && last_error.contains("until resumed"),
+            "paused failure text must not promise automatic retry: {last_error}"
+        );
+        assert!(
+            !last_error.contains("will fire again at next_run_at"),
+            "paused trigger must not be described as retrying automatically: {last_error}"
+        );
     }
 }
