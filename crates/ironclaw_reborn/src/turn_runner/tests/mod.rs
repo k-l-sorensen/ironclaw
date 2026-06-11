@@ -1607,13 +1607,10 @@ fn sanitized_driver_failure_returns_credits_exhausted_for_known_category() {
 }
 
 #[test]
-fn sanitized_driver_failure_returns_model_configuration_category() {
-    let result = sanitized_driver_failure(MODEL_CREDENTIALS_OR_CONFIG_INVALID_CATEGORY);
-    let failure = result.expect("should return Some for model configuration category");
-    assert_eq!(
-        failure.category(),
-        MODEL_CREDENTIALS_OR_CONFIG_INVALID_CATEGORY
-    );
+fn sanitized_driver_failure_returns_model_credentials_for_known_category() {
+    let result = sanitized_driver_failure(MODEL_CREDENTIALS_UNAVAILABLE_CATEGORY);
+    let failure = result.expect("should return Some for model credentials category");
+    assert_eq!(failure.category(), MODEL_CREDENTIALS_UNAVAILABLE_CATEGORY);
 }
 
 #[test]

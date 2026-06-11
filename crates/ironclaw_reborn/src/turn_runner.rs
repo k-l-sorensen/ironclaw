@@ -37,7 +37,7 @@ use ironclaw_turns::{
 use crate::{
     driver_registry::{DriverRegistry, LoopDriverRegistryKey},
     failure_categories::{
-        MODEL_CREDENTIALS_OR_CONFIG_INVALID_CATEGORY, MODEL_CREDITS_EXHAUSTED_CATEGORY,
+        MODEL_CREDENTIALS_UNAVAILABLE_CATEGORY, MODEL_CREDITS_EXHAUSTED_CATEGORY,
     },
     loop_exit_applier::LoopExitApplier,
 };
@@ -65,7 +65,7 @@ fn sanitized_failure(category: &'static str) -> Option<SanitizedFailure> {
 fn sanitized_driver_failure(reason_kind: &str) -> Option<SanitizedFailure> {
     if matches!(
         reason_kind,
-        MODEL_CREDITS_EXHAUSTED_CATEGORY | MODEL_CREDENTIALS_OR_CONFIG_INVALID_CATEGORY
+        MODEL_CREDITS_EXHAUSTED_CATEGORY | MODEL_CREDENTIALS_UNAVAILABLE_CATEGORY
     ) {
         return match SanitizedFailure::new(reason_kind.to_string()) {
             Ok(failure) => Some(failure),
@@ -73,7 +73,7 @@ fn sanitized_driver_failure(reason_kind: &str) -> Option<SanitizedFailure> {
                 debug!(
                     reason_kind,
                     %error,
-                    "known model failure category failed validation; using generic driver failure"
+                    "model failure category failed validation; using generic driver failure"
                 );
                 sanitized_failure("driver_failed")
             }
