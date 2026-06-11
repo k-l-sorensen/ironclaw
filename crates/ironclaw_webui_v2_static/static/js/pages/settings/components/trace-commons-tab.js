@@ -85,6 +85,7 @@ export function TraceCommonsTab({ searchQuery = "" }) {
     `;
   } else {
     const explanations = credits.recent_explanations || [];
+    const holds = credits.holds || [];
     body = html`
       <div className="mt-4">
         <${StatRow}
@@ -134,6 +135,34 @@ export function TraceCommonsTab({ searchQuery = "" }) {
           </h4>
           <ul className="ml-4 list-disc space-y-1 text-xs text-[var(--v2-text-muted)]">
             ${explanations.map((line, index) => html`<li key=${index}>${line}</li>`)}
+          </ul>
+        </div>
+      `}
+      ${holds.length > 0 &&
+      html`
+        <div className="mt-5">
+          <h4
+            className="mb-1 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--v2-accent-text)]"
+          >
+            ${t("traceCommons.heldTitle")}
+          </h4>
+          <p className="mb-2 text-xs leading-5 text-[var(--v2-text-muted)]">
+            ${t("traceCommons.heldDescription")}
+          </p>
+          <ul className="space-y-2">
+            ${holds.map(
+              (hold) => html`
+                <li
+                  key=${hold.submission_id}
+                  className="rounded-xl border border-[var(--v2-panel-border)] bg-[var(--v2-surface-soft)] px-3 py-2"
+                >
+                  <div className="text-xs text-[var(--v2-text-strong)]">${hold.reason}</div>
+                  <div className="mt-0.5 font-mono text-[10px] text-[var(--v2-text-faint)]">
+                    ${hold.submission_id}
+                  </div>
+                </li>
+              `
+            )}
           </ul>
         </div>
       `}

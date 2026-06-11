@@ -193,11 +193,24 @@ mod tests {
         // Click-through opens the full Settings -> Trace Commons tab.
         assert!(card.contains("to=\"/settings/traces\""));
         assert!(card.contains("traceCommons.cardAccepted"));
+        // Held-for-review count surfaces only when there are holds.
+        assert!(card.contains("manual_review_hold_count"));
+        assert!(card.contains("heldCount > 0"));
+        assert!(card.contains("traceCommons.cardHeld"));
 
         let sidebar = asset_text("js/components/sidebar.js");
         assert!(sidebar.contains("SidebarTraceCredits"));
         // Mounted between the nav and the threads list.
         assert!(sidebar.contains("<${SidebarTraceCredits} />"));
+
+        // The Settings tab lists held traces (reason + submission id) sourced
+        // from the credits response `holds[]`.
+        let tab = asset_text("js/pages/settings/components/trace-commons-tab.js");
+        assert!(tab.contains("const holds = credits.holds || [];"));
+        assert!(tab.contains("traceCommons.heldTitle"));
+        assert!(tab.contains("traceCommons.heldDescription"));
+        assert!(tab.contains("hold.submission_id"));
+        assert!(tab.contains("hold.reason"));
 
         // The hook refetches so the card and Settings tab reflect new
         // accepted submissions without a manual reload.
@@ -205,10 +218,13 @@ mod tests {
         assert!(hook.contains("refetchInterval: 60_000"));
         assert!(hook.contains("refetchOnWindowFocus: true"));
 
-        // The one new i18n key is present in the eagerly-bundled English pack
-        // (other locales fall back to it if missing, but all 11 carry it).
+        // The new i18n keys are present in the eagerly-bundled English pack
+        // (other locales fall back to it if missing, but all 11 carry them).
         let en = asset_text("js/i18n/en.js");
         assert!(en.contains("\"traceCommons.cardAccepted\""));
+        assert!(en.contains("\"traceCommons.cardHeld\""));
+        assert!(en.contains("\"traceCommons.heldTitle\""));
+        assert!(en.contains("\"traceCommons.heldDescription\""));
     }
 
     #[test]

@@ -28,6 +28,7 @@ export function SidebarTraceCredits() {
   const final = formatSignedCredit(credits.final_credit);
   const accepted = credits.submissions_accepted || 0;
   const submitted = credits.submissions_submitted || 0;
+  const heldCount = credits.manual_review_hold_count || 0;
 
   return html`
     <div className="px-3 pb-1">
@@ -48,6 +49,12 @@ export function SidebarTraceCredits() {
         <div className="mt-0.5 text-[11px] text-[var(--v2-text-muted)]">
           ${t("traceCommons.cardAccepted", { accepted, submitted })}
         </div>
+        ${heldCount > 0 &&
+        html`
+          <div className="mt-1 text-[11px] font-medium text-[var(--v2-accent-text)]">
+            ${t("traceCommons.cardHeld", { count: heldCount })}
+          </div>
+        `}
       <//>
     </div>
   `;
