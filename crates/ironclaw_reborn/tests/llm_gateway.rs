@@ -29,11 +29,12 @@ use ironclaw_turns::{
         AgentLoopHostErrorKind, AgentLoopHostErrorReasonKind, CapabilitySurfaceVersion,
         HostManagedLoopModelPort, HostManagedLoopPromptPort,
         InMemoryInstructionMaterializationStore, InMemoryLoopHostMilestoneSink,
-        InMemoryRunProfileResolver, InstructionSafetyContext, LoopCapabilityPort,
-        LoopHostMilestoneKind, LoopModelGateway, LoopModelGatewayRequest, LoopModelMessage,
-        LoopModelPort, LoopModelRequest, LoopPromptBundleRequest, LoopPromptPort, LoopRunContext,
-        ModelProfileId, ParentLoopOutput, PromptMode, ProviderToolCall, ProviderToolCallReplay,
-        ProviderToolDefinition, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        InMemoryRunProfileResolver, InstructionMaterializationStore, InstructionSafetyContext,
+        LoopCapabilityPort, LoopHostMilestoneKind, LoopModelGateway, LoopModelGatewayRequest,
+        LoopModelMessage, LoopModelPort, LoopModelRequest, LoopPromptBundleRequest, LoopPromptPort,
+        LoopRunContext, LoopRuntimeContext, ModelProfileId, ParentLoopOutput, PromptMode,
+        ProviderToolCall, ProviderToolCallReplay, ProviderToolDefinition, VisibleCapabilityRequest,
+        VisibleCapabilitySurface,
     },
 };
 use rust_decimal::Decimal;
@@ -287,6 +288,7 @@ async fn gateway_with_tool_surface_calls_complete_with_tools_and_returns_capabil
         arguments: serde_json::json!({"message":"hello"}),
         reasoning: None,
         signature: Some("sig-1".to_string()),
+        arguments_parse_error: None,
     }]));
     let gateway = LlmProviderModelGateway::with_provider_identity(
         STATIC_PROVIDER_ID,
@@ -455,6 +457,7 @@ async fn gateway_preserves_structured_tool_calls_when_content_has_legacy_marker(
             arguments: serde_json::json!({"message":"hello"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         }],
         input_tokens: 1,
         output_tokens: 1,
@@ -492,6 +495,7 @@ async fn gateway_rejects_unknown_provider_tool_call_before_registration() {
             arguments: serde_json::json!({"message":"one"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         },
         ToolCall {
             id: "call_2".to_string(),
@@ -499,6 +503,7 @@ async fn gateway_rejects_unknown_provider_tool_call_before_registration() {
             arguments: serde_json::json!({"message":"two"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         },
     ]));
     let gateway = LlmProviderModelGateway::with_provider_identity(
@@ -527,6 +532,7 @@ async fn gateway_rejects_invalid_provider_tool_batch_before_any_registration() {
             arguments: serde_json::json!({"message":"one"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         },
         ToolCall {
             id: "call_2".to_string(),
@@ -534,6 +540,7 @@ async fn gateway_rejects_invalid_provider_tool_batch_before_any_registration() {
             arguments: serde_json::json!({"message":"x".repeat(20 * 1024)}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         },
     ]));
     let gateway = LlmProviderModelGateway::with_provider_identity(
@@ -562,6 +569,7 @@ async fn gateway_with_two_tool_calls_returns_two_candidates() {
             arguments: serde_json::json!({"message":"one"}),
             reasoning: Some("call reasoning".to_string()),
             signature: None,
+            arguments_parse_error: None,
         },
         ToolCall {
             id: "call_2".to_string(),
@@ -569,6 +577,7 @@ async fn gateway_with_two_tool_calls_returns_two_candidates() {
             arguments: serde_json::json!({"message":"two"}),
             reasoning: None,
             signature: None,
+            arguments_parse_error: None,
         },
     ]));
     let gateway = LlmProviderModelGateway::with_provider_identity(
@@ -1555,6 +1564,70 @@ async fn production_loop_model_gateway_resolves_thread_refs_and_emits_milestones
             }
         ] if effective_model_profile_id.as_str() == "interactive_model"
     ));
+}
+
+/// Proves that `HostManagedLoopPromptPort::with_runtime_context` stamps the
+/// loop-start time into the prompt bundle messages and that the materialized
+/// content is resolvable from the shared instruction store. This is
+/// port-level coverage; the caller-path proof that `loop_driver_host.rs`
+/// actually wires `.with_runtime_context(...)` lives in
+/// `tests/loop_driver_host.rs`
+/// (`text_only_model_reply_driver_runs_prompt_model_transcript_path`).
+#[tokio::test]
+async fn production_loop_model_request_includes_runtime_context() {
+    let fixture = ThreadFixture::new().await;
+    let loop_started_at_utc = chrono::Utc::now();
+    let store = Arc::new(InMemoryInstructionMaterializationStore::default());
+    let store_for_port: Arc<dyn InstructionMaterializationStore> = store.clone();
+    let context_port = Arc::new(ThreadBackedLoopContextPort::new(
+        Arc::clone(&fixture.thread_service),
+        fixture.thread_scope.clone(),
+        fixture.run_context.clone(),
+        16,
+    ));
+    let prompt_port = HostManagedLoopPromptPort::new(
+        fixture.run_context.clone(),
+        context_port,
+        Arc::new(InMemoryLoopHostMilestoneSink::default()),
+    )
+    .with_safety_context(local_development_safety_context())
+    .with_instruction_materialization_store(store_for_port)
+    .with_runtime_context(LoopRuntimeContext {
+        loop_started_at_utc,
+        user_timezone: None,
+    });
+
+    let bundle = prompt_port
+        .build_prompt_bundle(LoopPromptBundleRequest {
+            mode: PromptMode::TextOnly,
+            context_cursor: None,
+            surface_version: None,
+            checkpoint_state_ref: None,
+            max_messages: Some(16),
+            inline_messages: Vec::new(),
+            capability_view: None,
+        })
+        .await
+        .expect("test prompt bundle should build");
+
+    // Resolve the runtime section ref from the shared store and verify the
+    // model-visible content contains the expected prefix.
+    let runtime_ref = bundle
+        .messages
+        .iter()
+        .find(|m| m.content_ref.as_str().starts_with("msg:runtime."))
+        .expect("bundle must contain a msg:runtime.* ref after with_runtime_context");
+    let materialized = store
+        .get_materialized_message(&fixture.run_context, &runtime_ref.content_ref)
+        .expect("store must be reachable")
+        .expect("runtime ref must be materialized in the shared store");
+    assert!(
+        materialized
+            .model_content
+            .contains("Current date/time at loop start:"),
+        "model_content must contain the runtime header; got: {:?}",
+        materialized.model_content
+    );
 }
 
 #[tokio::test]
