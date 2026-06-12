@@ -134,9 +134,17 @@ where
     }
 
     /// Run authorization: ship-gate (deciding hot-key vs KMS path), custody
-    /// policy, EXACT chain binding, the one-shot grant claim, and the sign-time
-    /// hash re-check — all BEFORE any key access. Returns the chosen signing
-    /// path and the public keystore binding.
+    /// policy, EXACT chain binding, and the sign-time hash re-check — all BEFORE
+    /// any key access. Returns the chosen signing path and the public keystore
+    /// binding.
+    ///
+    /// NOTE: the one-shot grant claim is deliberately NOT performed here. It is
+    /// the last step before the `Approved -> Signing` ledger transition in each
+    /// `sign_*` method, AFTER all chain-specific pre-flight (digest rebuild,
+    /// address parsing, KMS key_ref resolution) has succeeded. This closes the
+    /// atomicity window where a pre-flight failure after a consumed grant would
+    /// permanently strand the `gate_ref` (grant gone, ledger still `Approved`,
+    /// any retry hitting `AlreadyClaimed`). See `claim_grant`.
     ///
     /// Every early return here happens before any private-key consumption or
     /// KMS sign call, preserving the "no key access on failure" property.
@@ -190,29 +198,23 @@ where
             });
         }
 
-        // --- KMS curve-capability gate (mainnet path only), hoisted ahead of the
-        //     grant claim / ledger advance. This is a pure-configuration check
-        //     (it depends only on the wired backend and the family's native
-        //     curve), so a refusal here must be side-effect-free: it must NOT burn
-        //     the one-shot grant nor wedge the ledger at `Signing`, leaving a
-        //     clean retryable state so the request can succeed after an
-        //     ed25519-capable KMS is wired (Codex P2). The alg is the family's
-        //     native curve — the same one each `sign_*` arm passes to the
-        //     backend, kept in sync via `ChainFamily::signing_alg`. ---
+        // --- KMS curve-capability gate (mainnet path only). This is a
+        //     pure-configuration check (it depends only on the wired backend
+        //     and the family's native curve), so it runs in pre-flight, before
+        //     `claim_grant` and the `Signing` ledger advance: a refusal here is
+        //     side-effect-free — it does NOT burn the one-shot grant nor wedge
+        //     the ledger, leaving a clean retryable state so the request can
+        //     succeed after an ed25519-capable KMS is wired (Codex P2). The alg
+        //     is the family's native curve — the same one each `sign_*` arm
+        //     passes to the backend, kept in sync via
+        //     `ChainFamily::signing_alg`. ---
         if path == SigningPath::Kms
             && let Some(alg) = requested_family.signing_alg()
         {
             self.require_kms_supporting(bound_chain, alg)?;
         }
 
-        // --- Enforcement point #1: claim the sealed one-shot grant. ---
-        // Refuse to sign without a successfully-claimed grant. A second claim
-        // of the same grant fails (one-shot), so a replayed approval cannot
-        // produce a second signature.
-        let grant_key = GrantKey::from_context(&req.context, req.approved_tx_hash);
-        self.grants.claim(&grant_key).await?; // GrantError -> ChainSigningError
-
-        // --- Enforcement point #2: sign-time approved-tx-hash re-check. ---
+        // --- Enforcement point #1: sign-time approved-tx-hash re-check. ---
         // Recompute the binding hash FROM THE PERSISTED decoded tx and compare
         // to the approved hash. Any post-approval mutation of `decoded` diverges
         // the hash and fails closed BEFORE any key access.
@@ -275,10 +277,18 @@ where
         let rebuilt = crate::evm::decode::rebuild_signable(evm)?;
         let digest = rebuilt.signature_hash();
         let bound = bound_evm_address(&authorized.binding)?;
+        // Resolve the KMS key_ref (Kms path) as part of pre-flight so its failure
+        // cannot strand a consumed grant. None on the hot-key path.
+        let kms_ref = match authorized.path {
+            SigningPath::Kms => Some(self.require_kms_ref(&authorized)?.to_string()),
+            SigningPath::HotKey => None,
+        };
 
-        // Advance the ledger into Signing only after authorization succeeds, so
-        // a rejected request never moves the ledger. This happens BEFORE any key
-        // consumption so a stale ledger row fails before private-key access.
+        // Claim the one-shot grant, then advance the ledger into Signing — both
+        // only after all pre-flight has succeeded, so a rejected/erroring request
+        // never moves the ledger and never consumes the grant. Key consumption
+        // follows, so a stale ledger row fails before private-key access.
+        self.claim_grant(req).await?;
         self.ledger
             .advance(&req.context.gate_ref, SigningLedgerState::Signing)
             .await?;
@@ -291,7 +301,12 @@ where
                 crate::evm::sign::sign_prehash_hot(digest, &key, bound)?
             }
             SigningPath::Kms => {
-                let key_ref = self.require_kms_ref(&authorized)?;
+                let key_ref =
+                    kms_ref
+                        .as_deref()
+                        .ok_or_else(|| ChainSigningError::ShipGateRefused {
+                            reason: "internal: missing resolved KMS key_ref".to_string(),
+                        })?;
                 let raw = self
                     .require_kms_supporting(req.chain.as_str(), SignatureAlg::Secp256k1)?
                     .sign_digest(key_ref, &digest.0, SignatureAlg::Secp256k1)
@@ -336,7 +351,14 @@ where
         let signing_bytes = canonical_signing_bytes(&req.decoded, req.schema_version)?;
         let digest = crate::sha256(&signing_bytes);
         let fee_payer = crate::solana::sign::fee_payer_of(sol)?;
+        let kms_ref = match authorized.path {
+            SigningPath::Kms => Some(self.require_kms_ref(&authorized)?.to_string()),
+            SigningPath::HotKey => None,
+        };
 
+        // Claim the one-shot grant then advance the ledger — only after all
+        // pre-flight has succeeded (see `sign_evm` for the atomicity rationale).
+        self.claim_grant(req).await?;
         self.ledger
             .advance(&req.context.gate_ref, SigningLedgerState::Signing)
             .await?;
@@ -349,7 +371,12 @@ where
                 crate::solana::sign::sign_canonical_hot(&digest, fee_payer, &key)?
             }
             SigningPath::Kms => {
-                let key_ref = self.require_kms_ref(&authorized)?;
+                let key_ref =
+                    kms_ref
+                        .as_deref()
+                        .ok_or_else(|| ChainSigningError::ShipGateRefused {
+                            reason: "internal: missing resolved KMS key_ref".to_string(),
+                        })?;
                 let raw = self
                     .require_kms_supporting(req.chain.as_str(), SignatureAlg::Ed25519)?
                     .sign_digest(key_ref, &digest, SignatureAlg::Ed25519)
@@ -385,7 +412,14 @@ where
         let signing_bytes = canonical_signing_bytes(&req.decoded, req.schema_version)?;
         let digest = crate::sha256(&signing_bytes);
         let expected_pubkey = ed25519_pubkey_from_binding(&authorized.binding)?;
+        let kms_ref = match authorized.path {
+            SigningPath::Kms => Some(self.require_kms_ref(&authorized)?.to_string()),
+            SigningPath::HotKey => None,
+        };
 
+        // Claim the one-shot grant then advance the ledger — only after all
+        // pre-flight has succeeded (see `sign_evm` for the atomicity rationale).
+        self.claim_grant(req).await?;
         self.ledger
             .advance(&req.context.gate_ref, SigningLedgerState::Signing)
             .await?;
@@ -397,7 +431,12 @@ where
                 crate::near::sign::sign_canonical_hot(&digest, &key, expected_pubkey)?
             }
             SigningPath::Kms => {
-                let key_ref = self.require_kms_ref(&authorized)?;
+                let key_ref =
+                    kms_ref
+                        .as_deref()
+                        .ok_or_else(|| ChainSigningError::ShipGateRefused {
+                            reason: "internal: missing resolved KMS key_ref".to_string(),
+                        })?;
                 let raw = self
                     .require_kms_supporting(req.chain.as_str(), SignatureAlg::Ed25519)?
                     .sign_digest(key_ref, &digest, SignatureAlg::Ed25519)
@@ -414,6 +453,21 @@ where
             signature: signed.signature.to_vec(),
             signer: alloy_primitives::hex::encode(signed.public_key),
         })
+    }
+
+    /// Claim the sealed one-shot grant (the second enforcement point).
+    ///
+    /// Refuse to sign without a successfully-claimed grant. A second claim of the
+    /// same grant fails (one-shot), so a replayed approval cannot produce a second
+    /// signature. This is invoked as the LAST step before the `Signing` ledger
+    /// transition — after all chain-specific pre-flight has succeeded — so a
+    /// pre-flight failure leaves the grant unclaimed and the `gate_ref`
+    /// retryable (atomicity: claim and ledger advance happen in as tight a window
+    /// as possible).
+    async fn claim_grant(&self, req: &CustodialSignRequest) -> Result<(), ChainSigningError> {
+        let grant_key = GrantKey::from_context(&req.context, req.approved_tx_hash);
+        self.grants.claim(&grant_key).await?; // GrantError -> ChainSigningError
+        Ok(())
     }
 
     /// Borrow the wired KMS backend or fail closed.
@@ -515,6 +569,21 @@ where
 /// Fallible: render / canonicalization can fail (e.g. an unprojectable field).
 /// This is a security path, so the error is propagated and signing fails closed
 /// rather than proceeding against an under-described transaction.
+///
+/// INVARIANT (schema-version coupling, henrypark133 M4): the [`ApprovedTxHash`]
+/// is sealed against `(decoded_tx, signer, schema_version)`. The `schema_version`
+/// is part of the canonical pre-image, so a grant approved under one schema can
+/// ONLY be re-verified under that SAME schema — a hash recomputed under a bumped
+/// schema will (by design) diverge and fail closed at enforcement point #2.
+/// Therefore, when a future schema version is introduced, the
+/// `RenderingSchemaVersion` carried in [`CustodialSignRequest`] MUST be the same
+/// version the approval was sealed under (it is threaded end-to-end for exactly
+/// this reason). When the deferred Solana/NEAR network-wire decoder lands, the
+/// canonical bytes it produces MUST remain a deterministic function of the same
+/// `(decoded_tx, schema_version)` pair so the broadcastable signature and the
+/// approved hash never disagree. The
+/// `recompute_approved_hash_is_stable_for_a_fixed_schema` regression test pins
+/// the same-schema determinism property.
 pub fn recompute_approved_hash(
     tx: &DecodedTransaction,
     signer_account: &str,
@@ -573,6 +642,47 @@ mod tests {
         let bad = binding("not-an-address");
         let err = bound_evm_address(&bad).unwrap_err();
         assert!(matches!(err, ChainSigningError::KeyStore { .. }));
+    }
+
+    /// Schema-version coupling regression pin (henrypark133 M4): the approved
+    /// hash MUST be a deterministic function of `(decoded_tx, signer,
+    /// schema_version)`. This pins same-schema determinism — the property the
+    /// `ApprovedTxHash` re-check at enforcement point #2 relies on. Were a future
+    /// schema bump to change the canonical bytes, the recomputed hash would
+    /// diverge and signing would fail closed (the documented, intended behavior).
+    #[test]
+    fn recompute_approved_hash_is_stable_for_a_fixed_schema() {
+        use alloy_consensus::TxEip1559;
+        use alloy_primitives::{Bytes, TxKind, U256, address};
+
+        let tx = TxEip1559 {
+            chain_id: 1,
+            nonce: 7,
+            gas_limit: 21000,
+            max_fee_per_gas: 100,
+            max_priority_fee_per_gas: 2,
+            to: TxKind::Call(address!("00000000000000000000000000000000000000aa")),
+            value: U256::from(1000u64),
+            access_list: Default::default(),
+            input: Bytes::from(vec![0xde, 0xad]),
+        };
+        let decoded = crate::evm::decode::decode_eip1559(&tx);
+        let schema = RenderingSchemaVersion::CURRENT;
+
+        let a = recompute_approved_hash(&decoded, "custodial", schema).unwrap();
+        let b = recompute_approved_hash(&decoded, "custodial", schema).unwrap();
+        assert_eq!(
+            a, b,
+            "approved hash must be deterministic for a fixed schema"
+        );
+
+        // A different gate-bound signer yields a different hash (WYSIWYS binding),
+        // confirming the signer is folded into the pre-image, not ignored.
+        let other = recompute_approved_hash(&decoded, "other-signer", schema).unwrap();
+        assert_ne!(
+            a, other,
+            "signer account must be bound into the approved hash"
+        );
     }
 
     #[test]
