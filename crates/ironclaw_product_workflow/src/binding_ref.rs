@@ -4,10 +4,15 @@ use uuid::Uuid;
 // Binding/idempotency newtypes cap at 256 bytes. The default leaves room for
 // short product prefixes; auth continuations reserve extra space because their
 // raw material combines flow, run, and gate identifiers.
-pub(crate) const DEFAULT_BINDING_REF_RAW_MAX_BYTES: usize = 240;
+//
+// These constants and helpers are `pub` so the drain observer (in
+// `ironclaw_reborn_composition`) can apply the same bounded conversion that the
+// inbound turn path used when originally persisting the binding ids, ensuring
+// round-trip ref convergence on drain resubmission.
+pub const DEFAULT_BINDING_REF_RAW_MAX_BYTES: usize = 240;
 pub(crate) const AUTH_CONTINUATION_BINDING_REF_RAW_MAX_BYTES: usize = 220;
 
-pub(crate) fn bounded_source_binding_ref(
+pub fn bounded_source_binding_ref(
     prefix: &str,
     raw: &str,
     max_raw_len: usize,
@@ -15,7 +20,7 @@ pub(crate) fn bounded_source_binding_ref(
     SourceBindingRef::new(bounded_binding_ref_value(prefix, raw, max_raw_len))
 }
 
-pub(crate) fn bounded_reply_target_binding_ref(
+pub fn bounded_reply_target_binding_ref(
     prefix: &str,
     raw: &str,
     max_raw_len: usize,
