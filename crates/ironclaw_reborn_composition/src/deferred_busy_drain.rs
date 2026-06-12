@@ -351,19 +351,19 @@ fn thread_scope_from_event(event: &TurnLifecycleEvent) -> Result<ThreadScope, &'
 
 /// Resolve the actor `UserId` for the turn submission.
 ///
-/// Tries `actor_id` from the message record first; falls back to
-/// `thread_scope.owner_user_id`.
+/// The drained message must resubmit as its ORIGINAL sender. The inbound
+/// path always records `actor_id` for user messages; a record without one
+/// is left deferred rather than misattributed to the thread owner.
 fn resolve_actor_user_id(
     message: &ironclaw_threads::ThreadMessageRecord,
-    thread_scope: &ThreadScope,
+    _thread_scope: &ThreadScope,
 ) -> Result<UserId, String> {
-    if let Some(actor_id) = message.actor_id.as_deref() {
-        return UserId::new(actor_id).map_err(|e| format!("invalid actor_id: {e}"));
+    match message.actor_id.as_deref() {
+        Some(actor_id) => UserId::new(actor_id).map_err(|e| format!("invalid actor_id: {e}")),
+        None => Err(
+            "deferred message has no actor_id; refusing to resubmit as thread owner".to_string(),
+        ),
     }
-    thread_scope
-        .owner_user_id
-        .clone()
-        .ok_or_else(|| "deferred message has no actor_id and thread scope has no owner".to_string())
 }
 
 // Tracing macros used in this module come from the `tracing` crate which is
