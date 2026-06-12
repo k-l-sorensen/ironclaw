@@ -1035,6 +1035,13 @@ mod tests {
             unimplemented!("trigger prompt recorder tests do not defer messages")
         }
 
+        async fn list_deferred_busy_messages(
+            &self,
+            _request: ironclaw_threads::ListDeferredBusyMessagesRequest,
+        ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+            unimplemented!("trigger prompt recorder tests do not list deferred messages")
+        }
+
         async fn append_assistant_draft(
             &self,
             _request: AppendAssistantDraftRequest,

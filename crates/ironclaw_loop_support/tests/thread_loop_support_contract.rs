@@ -24,12 +24,13 @@ use ironclaw_threads::{
     AppendAssistantDraftRequest, AppendCapabilityDisplayPreviewRequest,
     AppendToolResultReferenceRequest, ContextMessage, ContextMessages, ContextWindow,
     CreateSummaryArtifactRequest, EnsureThreadRequest, InMemorySessionThreadService,
-    LoadContextMessagesRequest, MessageContent, MessageKind, MessageStatus,
-    ProviderToolCallReferenceEnvelope, RedactMessageRequest, ReplayAcceptedInboundMessageRequest,
-    SessionThreadError, SessionThreadRecord, SessionThreadService, SummaryArtifact,
-    SummaryModelContextPolicy, ThreadHistory, ThreadHistoryRequest, ThreadMessageId,
-    ThreadMessageRecord, ThreadScope, ToolResultReferenceEnvelope, ToolResultSafeSummary,
-    UpdateAssistantDraftRequest, UpdateToolResultReferenceRequest,
+    ListDeferredBusyMessagesRequest, LoadContextMessagesRequest, MessageContent, MessageKind,
+    MessageStatus, ProviderToolCallReferenceEnvelope, RedactMessageRequest,
+    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord,
+    SessionThreadService, SummaryArtifact, SummaryModelContextPolicy, ThreadHistory,
+    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
+    ToolResultReferenceEnvelope, ToolResultSafeSummary, UpdateAssistantDraftRequest,
+    UpdateToolResultReferenceRequest,
 };
 use ironclaw_turns::{
     LoopMessageRef, LoopResultRef, RunProfileResolutionRequest, RunProfileResolver, TurnActor,
@@ -3964,6 +3965,13 @@ impl SessionThreadService for GatedFinalizeThreadService {
             .await
     }
 
+    async fn list_deferred_busy_messages(
+        &self,
+        request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+        self.inner.list_deferred_busy_messages(request).await
+    }
+
     async fn append_assistant_draft(
         &self,
         request: AppendAssistantDraftRequest,
@@ -4141,6 +4149,13 @@ impl SessionThreadService for StaticContextThreadService {
         _message_id: ThreadMessageId,
     ) -> Result<ThreadMessageRecord, SessionThreadError> {
         panic!("static context service does not defer messages")
+    }
+
+    async fn list_deferred_busy_messages(
+        &self,
+        _request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+        panic!("static context service does not list deferred messages")
     }
 
     async fn append_assistant_draft(

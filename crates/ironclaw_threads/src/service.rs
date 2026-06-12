@@ -8,8 +8,8 @@ use crate::{
     AppendAssistantDraftRequest, AppendCapabilityDisplayPreviewRequest,
     AppendToolResultReferenceRequest, ContextMessages, ContextWindow, CreateSummaryArtifactRequest,
     EnsureThreadRequest, FinalizedAssistantMessageByRunRequest, LatestThreadMessageRequest,
-    ListThreadsForScopeRequest, ListThreadsForScopeResponse, LoadContextMessagesRequest,
-    LoadContextWindowRequest, MessageContent, RedactMessageRequest,
+    ListDeferredBusyMessagesRequest, ListThreadsForScopeRequest, ListThreadsForScopeResponse,
+    LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, RedactMessageRequest,
     ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord, SummaryArtifact,
     ThreadGoal, ThreadHistory, ThreadHistoryRequest, ThreadMessageId, ThreadMessageRange,
     ThreadMessageRangeRequest, ThreadMessageRecord, ThreadScope, UpdateAssistantDraftRequest,
@@ -49,6 +49,16 @@ pub trait SessionThreadService: Send + Sync {
         thread_id: &ThreadId,
         message_id: ThreadMessageId,
     ) -> Result<ThreadMessageRecord, SessionThreadError>;
+
+    /// List all `DeferredBusy` inbound user messages for `thread_id` within
+    /// `scope`, ordered ascending by sequence (oldest first).
+    ///
+    /// Returns an empty `Vec` when the thread has no deferred messages or
+    /// does not exist. Callers must not interpret an empty return as an error.
+    async fn list_deferred_busy_messages(
+        &self,
+        request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError>;
 
     async fn append_assistant_draft(
         &self,
@@ -312,6 +322,13 @@ where
         self.as_ref()
             .mark_message_deferred_busy(scope, thread_id, message_id)
             .await
+    }
+
+    async fn list_deferred_busy_messages(
+        &self,
+        request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+        self.as_ref().list_deferred_busy_messages(request).await
     }
 
     async fn append_assistant_draft(

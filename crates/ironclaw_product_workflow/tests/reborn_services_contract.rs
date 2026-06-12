@@ -62,9 +62,9 @@ use ironclaw_threads::{
     AcceptInboundMessageRequest, AcceptedInboundMessage, AcceptedInboundMessageReplay,
     AppendAssistantDraftRequest, AppendCapabilityDisplayPreviewRequest,
     AppendToolResultReferenceRequest, ContextMessages, ContextWindow, CreateSummaryArtifactRequest,
-    EnsureThreadRequest, InMemorySessionThreadService, ListThreadsForScopeRequest,
-    ListThreadsForScopeResponse, LoadContextMessagesRequest, LoadContextWindowRequest,
-    MessageContent, MessageKind, MessageStatus, RedactMessageRequest,
+    EnsureThreadRequest, InMemorySessionThreadService, ListDeferredBusyMessagesRequest,
+    ListThreadsForScopeRequest, ListThreadsForScopeResponse, LoadContextMessagesRequest,
+    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus, RedactMessageRequest,
     ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord,
     SessionThreadService, SummaryArtifact, ThreadHistory, ThreadHistoryRequest, ThreadMessageId,
     ThreadMessageRecord, ThreadScope, UpdateAssistantDraftRequest,
@@ -1292,6 +1292,13 @@ impl SessionThreadService for ScopeMismatchThreadStub {
         panic!("ScopeMismatchThreadStub::mark_message_deferred_busy should not be reached")
     }
 
+    async fn list_deferred_busy_messages(
+        &self,
+        _request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+        panic!("ScopeMismatchThreadStub::list_deferred_busy_messages should not be reached")
+    }
+
     async fn append_assistant_draft(
         &self,
         _request: AppendAssistantDraftRequest,
@@ -1515,6 +1522,13 @@ impl SessionThreadService for ScriptedThreadService {
         _message_id: ThreadMessageId,
     ) -> Result<ThreadMessageRecord, SessionThreadError> {
         scripted_stub_unreachable("mark_message_deferred_busy")
+    }
+
+    async fn list_deferred_busy_messages(
+        &self,
+        _request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+        scripted_stub_unreachable("list_deferred_busy_messages")
     }
 
     async fn append_assistant_draft(
@@ -5611,6 +5625,15 @@ impl SessionThreadService for FirstMissBackendErrorThreadService {
     ) -> Result<ThreadMessageRecord, SessionThreadError> {
         panic!(
             "FirstMissBackendErrorThreadService::mark_message_deferred_busy should not be reached"
+        )
+    }
+
+    async fn list_deferred_busy_messages(
+        &self,
+        _request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+        panic!(
+            "FirstMissBackendErrorThreadService::list_deferred_busy_messages should not be reached"
         )
     }
 

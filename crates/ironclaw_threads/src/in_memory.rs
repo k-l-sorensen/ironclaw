@@ -16,13 +16,14 @@ use crate::{
     AppendAssistantDraftRequest, AppendCapabilityDisplayPreviewRequest,
     AppendToolResultReferenceRequest, CapabilityDisplayPreviewEnvelope, ContextMessage,
     ContextMessages, ContextWindow, CreateSummaryArtifactRequest, EnsureThreadRequest,
-    LatestThreadMessageRequest, ListThreadsForScopeRequest, ListThreadsForScopeResponse,
-    LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, MessageKind,
-    MessageStatus, RedactMessageRequest, ReplayAcceptedInboundMessageRequest, SessionThreadError,
-    SessionThreadRecord, SessionThreadService, SummaryArtifact, SummaryModelContextPolicy,
-    ThreadHistory, ThreadHistoryRequest, ThreadMessageId, ThreadMessageRange,
-    ThreadMessageRangeRequest, ThreadMessageRecord, ThreadScope, ToolResultReferenceEnvelope,
-    UpdateAssistantDraftRequest, UpdateToolResultReferenceRequest,
+    LatestThreadMessageRequest, ListDeferredBusyMessagesRequest, ListThreadsForScopeRequest,
+    ListThreadsForScopeResponse, LoadContextMessagesRequest, LoadContextWindowRequest,
+    MessageContent, MessageKind, MessageStatus, RedactMessageRequest,
+    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord,
+    SessionThreadService, SummaryArtifact, SummaryModelContextPolicy, ThreadHistory,
+    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRange, ThreadMessageRangeRequest,
+    ThreadMessageRecord, ThreadScope, ToolResultReferenceEnvelope, UpdateAssistantDraftRequest,
+    UpdateToolResultReferenceRequest,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -247,6 +248,25 @@ impl SessionThreadService for InMemorySessionThreadService {
         message.turn_id = None;
         message.turn_run_id = None;
         Ok(message.clone())
+    }
+
+    async fn list_deferred_busy_messages(
+        &self,
+        request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+        let state = self.state.lock().await;
+        let thread = match state.threads.get(&request.thread_id) {
+            Some(thread) if thread.record.scope == request.scope => thread,
+            _ => return Ok(Vec::new()),
+        };
+        let mut messages: Vec<ThreadMessageRecord> = thread
+            .messages
+            .iter()
+            .filter(|m| m.status == MessageStatus::DeferredBusy && m.kind == MessageKind::User)
+            .cloned()
+            .collect();
+        messages.sort_by_key(|m| m.sequence);
+        Ok(messages)
     }
 
     async fn append_assistant_draft(

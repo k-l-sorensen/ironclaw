@@ -20,10 +20,10 @@ use ironclaw_threads::{
     AppendCapabilityDisplayPreviewRequest, CapabilityDisplayPreviewEnvelope,
     CapabilityDisplayPreviewEnvelopeInput, CapabilityDisplayPreviewStatus,
     CreateSummaryArtifactRequest, EnsureThreadRequest, FilesystemSessionThreadService,
-    LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, MessageKind,
-    MessageStatus, RedactMessageRequest, ReplayAcceptedInboundMessageRequest, SessionThreadError,
-    SessionThreadService, SummaryKind, SummaryModelContextPolicy, ThreadHistoryRequest,
-    ThreadScope, UpdateAssistantDraftRequest,
+    ListDeferredBusyMessagesRequest, LoadContextMessagesRequest, LoadContextWindowRequest,
+    MessageContent, MessageKind, MessageStatus, RedactMessageRequest,
+    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadService, SummaryKind,
+    SummaryModelContextPolicy, ThreadHistoryRequest, ThreadScope, UpdateAssistantDraftRequest,
 };
 
 #[tokio::test]
@@ -1107,6 +1107,193 @@ fn preview_envelope(invocation_id: InvocationId) -> CapabilityDisplayPreviewEnve
 /// `/threads → /tenants/<tenant>/users/<user>/threads`. Two
 /// `ScopedFilesystem`s built with different `tenant` arguments over the
 /// same `RootFilesystem` cannot see each other's data.
+// ---------------------------------------------------------------------------
+// list_deferred_busy_messages filesystem contract tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn filesystem_list_deferred_busy_messages_empty_when_no_messages() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let scoped = scoped_threads_fs_at(backend, "tenant-ldb-empty", "alice");
+    let service = FilesystemSessionThreadService::new(scoped);
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("ldb-empty"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    let result = service
+        .list_deferred_busy_messages(ListDeferredBusyMessagesRequest {
+            scope: scope("ldb-empty"),
+            thread_id: thread.thread_id,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn filesystem_list_deferred_busy_messages_returns_only_deferred_busy() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let scoped = scoped_threads_fs_at(backend, "tenant-ldb-filter", "alice");
+    let service = FilesystemSessionThreadService::new(scoped);
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("ldb-filter"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    let msg_a = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("ldb-filter"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: None,
+            content: MessageContent::text("deferred-a"),
+        })
+        .await
+        .unwrap();
+    service
+        .mark_message_deferred_busy(&scope("ldb-filter"), &thread.thread_id, msg_a.message_id)
+        .await
+        .unwrap();
+
+    // Second message left in Accepted status
+    let _msg_b = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("ldb-filter"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: None,
+            content: MessageContent::text("still-accepted"),
+        })
+        .await
+        .unwrap();
+
+    let result = service
+        .list_deferred_busy_messages(ListDeferredBusyMessagesRequest {
+            scope: scope("ldb-filter"),
+            thread_id: thread.thread_id,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].status, MessageStatus::DeferredBusy);
+    assert_eq!(result[0].kind, MessageKind::User);
+}
+
+#[tokio::test]
+async fn filesystem_list_deferred_busy_messages_ordered_oldest_first() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let scoped = scoped_threads_fs_at(backend, "tenant-ldb-order", "alice");
+    let service = FilesystemSessionThreadService::new(scoped);
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("ldb-order"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    for label in ["first", "second", "third"] {
+        let msg = service
+            .accept_inbound_message(AcceptInboundMessageRequest {
+                scope: scope("ldb-order"),
+                thread_id: thread.thread_id.clone(),
+                actor_id: "actor-a".into(),
+                source_binding_id: None,
+                reply_target_binding_id: None,
+                external_event_id: None,
+                content: MessageContent::text(label),
+            })
+            .await
+            .unwrap();
+        service
+            .mark_message_deferred_busy(&scope("ldb-order"), &thread.thread_id, msg.message_id)
+            .await
+            .unwrap();
+    }
+
+    let result = service
+        .list_deferred_busy_messages(ListDeferredBusyMessagesRequest {
+            scope: scope("ldb-order"),
+            thread_id: thread.thread_id,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 3);
+    let seqs: Vec<_> = result.iter().map(|m| m.sequence).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "messages not in ascending sequence order: {seqs:?}"
+    );
+}
+
+#[tokio::test]
+async fn filesystem_list_deferred_busy_messages_wrong_scope_returns_empty() {
+    let backend = Arc::new(InMemoryBackend::new());
+    let scoped = scoped_threads_fs_at(backend, "tenant-ldb-scope", "alice");
+    let service = FilesystemSessionThreadService::new(scoped);
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("ldb-scope"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    let msg = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("ldb-scope"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: None,
+            content: MessageContent::text("parked"),
+        })
+        .await
+        .unwrap();
+    service
+        .mark_message_deferred_busy(&scope("ldb-scope"), &thread.thread_id, msg.message_id)
+        .await
+        .unwrap();
+
+    // Query with wrong scope — must return empty, not error
+    let result = service
+        .list_deferred_busy_messages(ListDeferredBusyMessagesRequest {
+            scope: scope("ldb-scope-wrong"),
+            thread_id: thread.thread_id,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.is_empty());
+}
+
 fn scoped_threads_fs_at<F>(backend: Arc<F>, tenant: &str, user: &str) -> Arc<ScopedFilesystem<F>>
 where
     F: RootFilesystem,

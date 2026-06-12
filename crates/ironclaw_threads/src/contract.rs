@@ -419,3 +419,15 @@ pub struct UpdateThreadGoalRequest {
     pub thread_id: ThreadId,
     pub goal: ThreadGoal,
 }
+
+/// Query for inbound user messages with [`MessageStatus::DeferredBusy`] on a
+/// specific thread scope, ordered ascending by sequence (oldest first).
+///
+/// Used by the deferred-busy drain: after the blocking run reaches a terminal
+/// state the drain picks up the oldest waiting message and resubmits it
+/// through the normal inbound path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListDeferredBusyMessagesRequest {
+    pub scope: ThreadScope,
+    pub thread_id: ThreadId,
+}

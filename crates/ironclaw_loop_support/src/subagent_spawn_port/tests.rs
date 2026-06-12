@@ -4,11 +4,11 @@ use ironclaw_threads::{
     AcceptedInboundMessage, AcceptedInboundMessageReplay, AppendAssistantDraftRequest,
     AppendCapabilityDisplayPreviewRequest, AppendToolResultReferenceRequest, ContextMessages,
     ContextWindow, CreateSummaryArtifactRequest, InMemorySessionThreadService,
-    LatestThreadMessageRequest, ListThreadsForScopeRequest, ListThreadsForScopeResponse,
-    LoadContextMessagesRequest, LoadContextWindowRequest, RedactMessageRequest,
-    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord, SummaryArtifact,
-    ThreadHistory, ThreadHistoryRequest, ThreadMessageRecord, UpdateAssistantDraftRequest,
-    UpdateToolResultReferenceRequest,
+    LatestThreadMessageRequest, ListDeferredBusyMessagesRequest, ListThreadsForScopeRequest,
+    ListThreadsForScopeResponse, LoadContextMessagesRequest, LoadContextWindowRequest,
+    RedactMessageRequest, ReplayAcceptedInboundMessageRequest, SessionThreadError,
+    SessionThreadRecord, SummaryArtifact, ThreadHistory, ThreadHistoryRequest, ThreadMessageRecord,
+    UpdateAssistantDraftRequest, UpdateToolResultReferenceRequest,
 };
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunResponse, EventCursor, GetRunStateRequest,
@@ -704,6 +704,13 @@ impl SessionThreadService for FailingMarkThreadService {
         self.inner
             .mark_message_deferred_busy(scope, thread_id, message_id)
             .await
+    }
+
+    async fn list_deferred_busy_messages(
+        &self,
+        request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+        self.inner.list_deferred_busy_messages(request).await
     }
 
     async fn append_assistant_draft(

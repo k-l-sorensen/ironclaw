@@ -58,14 +58,14 @@ use crate::{
     AppendAssistantDraftRequest, AppendCapabilityDisplayPreviewRequest,
     AppendToolResultReferenceRequest, CapabilityDisplayPreviewEnvelope, ContextMessage,
     ContextMessages, ContextWindow, CreateSummaryArtifactRequest, EnsureThreadRequest,
-    LatestThreadMessageRequest, ListThreadsForScopeRequest, ListThreadsForScopeResponse,
-    LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, MessageKind,
-    MessageStatus, ProviderToolCallReferenceEnvelope, RedactMessageRequest,
-    ReplayAcceptedInboundMessageRequest, SessionThreadError, SessionThreadRecord,
-    SessionThreadService, SummaryArtifact, SummaryModelContextPolicy, ThreadHistory,
-    ThreadHistoryRequest, ThreadMessageId, ThreadMessageRange, ThreadMessageRangeRequest,
-    ThreadMessageRecord, ThreadScope, ToolResultReferenceEnvelope, UpdateAssistantDraftRequest,
-    UpdateToolResultReferenceRequest,
+    LatestThreadMessageRequest, ListDeferredBusyMessagesRequest, ListThreadsForScopeRequest,
+    ListThreadsForScopeResponse, LoadContextMessagesRequest, LoadContextWindowRequest,
+    MessageContent, MessageKind, MessageStatus, ProviderToolCallReferenceEnvelope,
+    RedactMessageRequest, ReplayAcceptedInboundMessageRequest, SessionThreadError,
+    SessionThreadRecord, SessionThreadService, SummaryArtifact, SummaryModelContextPolicy,
+    ThreadHistory, ThreadHistoryRequest, ThreadMessageId, ThreadMessageRange,
+    ThreadMessageRangeRequest, ThreadMessageRecord, ThreadScope, ToolResultReferenceEnvelope,
+    UpdateAssistantDraftRequest, UpdateToolResultReferenceRequest,
 };
 use message_sequence_index::MessageSequenceIndexStore;
 
@@ -886,6 +886,29 @@ where
             Ok(())
         })
         .await
+    }
+
+    async fn list_deferred_busy_messages(
+        &self,
+        request: ListDeferredBusyMessagesRequest,
+    ) -> Result<Vec<ThreadMessageRecord>, SessionThreadError> {
+        // Return empty if the thread does not exist — callers must not treat
+        // an absent thread as an error here.
+        let thread_exists = self
+            .read_thread_versioned(&request.scope, &request.thread_id)
+            .await?
+            .is_some();
+        if !thread_exists {
+            return Ok(Vec::new());
+        }
+        let mut messages: Vec<ThreadMessageRecord> = self
+            .list_thread_messages(&request.scope, &request.thread_id)
+            .await?
+            .into_iter()
+            .filter(|m| m.status == MessageStatus::DeferredBusy && m.kind == MessageKind::User)
+            .collect();
+        messages.sort_by_key(|m| m.sequence);
+        Ok(messages)
     }
 
     async fn append_assistant_draft(

@@ -8,9 +8,9 @@ use ironclaw_threads::{
     AppendCapabilityDisplayPreviewRequest, AppendToolResultReferenceRequest,
     CapabilityDisplayPreviewEnvelope, CapabilityDisplayPreviewEnvelopeInput,
     CapabilityDisplayPreviewStatus, CreateSummaryArtifactRequest, EnsureThreadRequest,
-    InMemorySessionThreadService, ListThreadsForScopeRequest, LoadContextMessagesRequest,
-    LoadContextWindowRequest, MessageContent, MessageKind, MessageStatus,
-    ProviderToolCallReferenceEnvelope, RedactMessageRequest, SessionThreadError,
+    InMemorySessionThreadService, ListDeferredBusyMessagesRequest, ListThreadsForScopeRequest,
+    LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, MessageKind,
+    MessageStatus, ProviderToolCallReferenceEnvelope, RedactMessageRequest, SessionThreadError,
     SessionThreadService, SummaryKind, SummaryModelContextPolicy, ThreadHistoryRequest,
     ThreadMessageId, ThreadMessageRangeRequest, ThreadScope, ToolResultReferenceEnvelope,
     ToolResultSafeSummary, UpdateAssistantDraftRequest, UpdateToolResultReferenceRequest,
@@ -2503,4 +2503,187 @@ async fn list_threads_for_scope_title_stays_none_when_user_message_is_whitespace
         title, None,
         "whitespace-only user message must yield `title: None`, not an empty string",
     );
+}
+
+// ---------------------------------------------------------------------------
+// list_deferred_busy_messages contract tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_deferred_busy_messages_empty_when_no_messages() {
+    let service = InMemorySessionThreadService::default();
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("a"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    let result = service
+        .list_deferred_busy_messages(ListDeferredBusyMessagesRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.is_empty());
+}
+
+#[tokio::test]
+async fn list_deferred_busy_messages_returns_only_deferred_busy() {
+    let service = InMemorySessionThreadService::default();
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("a"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    // Accept two messages — mark only the first deferred
+    let msg_a = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: None,
+            content: user_message("first"),
+        })
+        .await
+        .unwrap();
+    service
+        .mark_message_deferred_busy(&scope("a"), &thread.thread_id, msg_a.message_id)
+        .await
+        .unwrap();
+
+    let msg_b = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: None,
+            content: user_message("second — stays accepted"),
+        })
+        .await
+        .unwrap();
+    // msg_b left in Accepted status (not deferred)
+    let _ = msg_b;
+
+    let result = service
+        .list_deferred_busy_messages(ListDeferredBusyMessagesRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0].status, MessageStatus::DeferredBusy);
+    assert_eq!(result[0].kind, MessageKind::User);
+}
+
+#[tokio::test]
+async fn list_deferred_busy_messages_ordered_oldest_first() {
+    let service = InMemorySessionThreadService::default();
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("a"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    // Accept and defer three messages in order
+    for label in ["alpha", "beta", "gamma"] {
+        let msg = service
+            .accept_inbound_message(AcceptInboundMessageRequest {
+                scope: scope("a"),
+                thread_id: thread.thread_id.clone(),
+                actor_id: "actor-a".into(),
+                source_binding_id: None,
+                reply_target_binding_id: None,
+                external_event_id: None,
+                content: user_message(label),
+            })
+            .await
+            .unwrap();
+        service
+            .mark_message_deferred_busy(&scope("a"), &thread.thread_id, msg.message_id)
+            .await
+            .unwrap();
+    }
+
+    let result = service
+        .list_deferred_busy_messages(ListDeferredBusyMessagesRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(result.len(), 3);
+    // Sequence must be strictly ascending (oldest first)
+    let seqs: Vec<_> = result.iter().map(|m| m.sequence).collect();
+    assert!(
+        seqs.windows(2).all(|w| w[0] < w[1]),
+        "messages not in ascending sequence order: {seqs:?}"
+    );
+}
+
+#[tokio::test]
+async fn list_deferred_busy_messages_wrong_scope_returns_empty() {
+    let service = InMemorySessionThreadService::default();
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope("a"),
+            thread_id: None,
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+
+    let msg = service
+        .accept_inbound_message(AcceptInboundMessageRequest {
+            scope: scope("a"),
+            thread_id: thread.thread_id.clone(),
+            actor_id: "actor-a".into(),
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            external_event_id: None,
+            content: user_message("parked"),
+        })
+        .await
+        .unwrap();
+    service
+        .mark_message_deferred_busy(&scope("a"), &thread.thread_id, msg.message_id)
+        .await
+        .unwrap();
+
+    // Query with a different scope — must return empty, not an error
+    let result = service
+        .list_deferred_busy_messages(ListDeferredBusyMessagesRequest {
+            scope: scope("b"),
+            thread_id: thread.thread_id,
+        })
+        .await
+        .unwrap();
+
+    assert!(result.is_empty());
 }

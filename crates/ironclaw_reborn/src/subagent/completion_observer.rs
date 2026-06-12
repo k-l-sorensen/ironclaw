@@ -1454,6 +1454,14 @@ mod tests {
             ))
         }
 
+        async fn list_deferred_busy_messages(
+            &self,
+            _request: ironclaw_threads::ListDeferredBusyMessagesRequest,
+        ) -> Result<Vec<ironclaw_threads::ThreadMessageRecord>, ironclaw_threads::SessionThreadError>
+        {
+            Ok(Vec::new())
+        }
+
         async fn append_assistant_draft(
             &self,
             _request: AppendAssistantDraftRequest,
