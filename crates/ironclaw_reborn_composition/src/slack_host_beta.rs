@@ -1955,6 +1955,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slack_host_beta_connectable_state_is_scoped_to_matching_caller() {
+        let (runtime, _root) = runtime().await;
+        let mounts = build_slack_host_beta_mounts(&runtime, config_without_channel_routes())
+            .expect("mounts");
+        let route_mount = slack_channel_route_admin_route_mount(mounts.channel_routes.clone());
+        let bundle = build_webui_services_with_slack_host_beta_mounts(
+            &runtime,
+            None,
+            Some(&mounts),
+            SlackOperatorRouteVisibility::Hidden,
+        )
+        .expect("webui bundle");
+        upsert_slack_channel_route(&route_mount, "C0DYNAMIC", SHARED_SUBJECT).await;
+
+        let matching = bundle
+            .api
+            .list_connectable_channels(shared_subject_caller())
+            .await
+            .expect("matching caller connectable channels");
+        let matching_slack = matching
+            .channels
+            .iter()
+            .find(|channel| channel.strategy == RebornChannelConnectStrategy::InboundProofCode)
+            .expect("matching personal Slack channel");
+        assert_eq!(
+            matching_slack.connection_status,
+            RebornChannelConnectionStatus::Connected,
+            "stored route owner should see Slack as connected"
+        );
+
+        let unrelated = bundle
+            .api
+            .list_connectable_channels(operator_caller())
+            .await
+            .expect("unrelated caller connectable channels");
+        let unrelated_slack = unrelated
+            .channels
+            .iter()
+            .find(|channel| channel.strategy == RebornChannelConnectStrategy::InboundProofCode)
+            .expect("unrelated personal Slack channel");
+        assert_eq!(
+            unrelated_slack.connection_status,
+            RebornChannelConnectionStatus::Disconnected,
+            "another same-tenant caller must not inherit Slack route state"
+        );
+
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test]
     async fn slack_host_beta_targets_page_multiple_route_store_pages() {
         let store = Arc::new(InMemorySlackChannelRouteStore::new());
         let tenant_id = TenantId::new(TENANT).expect("tenant");

@@ -966,6 +966,15 @@ mod tests {
         )
     }
 
+    fn other_caller() -> WebUiAuthenticatedCaller {
+        WebUiAuthenticatedCaller::new(
+            TenantId::new(TENANT).expect("tenant"),
+            UserId::new(OTHER_USER).expect("other user"),
+            Some(AgentId::new(AGENT).expect("agent")),
+            Some(ProjectId::new(PROJECT).expect("project")),
+        )
+    }
+
     fn provider_config(
         channel_routes: Vec<SlackConfiguredChannelRoute>,
     ) -> SlackOutboundTargetProviderConfig {
@@ -1470,6 +1479,26 @@ mod tests {
         assert!(
             connected,
             "a valid personal DM must keep Slack connected even if shared routes are unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn slack_delivery_connection_is_scoped_to_matching_personal_dm_caller() {
+        let (provider, _store) = provider_with_provisioned_dm().await;
+
+        let connected = provider
+            .has_delivery_connection(&caller())
+            .await
+            .expect("matching personal DM caller resolves");
+        let other_connected = provider
+            .has_delivery_connection(&other_caller())
+            .await
+            .expect("other same-tenant caller resolves");
+
+        assert!(connected, "matching caller must be connected");
+        assert!(
+            !other_connected,
+            "another same-tenant caller must not inherit personal DM state"
         );
     }
 

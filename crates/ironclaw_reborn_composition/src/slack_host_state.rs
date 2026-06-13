@@ -1220,39 +1220,27 @@ where
             return Err(SlackChannelRouteError::StoreUnavailable);
         }
         let page_size = page_size.min(CHANNEL_ROUTE_REPLACE_LIST_LIMIT);
-        let mut cursor = 0;
-        loop {
-            if cursor >= max_total_routes {
-                return Ok(false);
-            }
-            let remaining = max_total_routes - cursor;
-            let page = self
-                .list_routes(
-                    tenant_id,
-                    installation_id,
-                    team_id,
-                    cursor,
-                    page_size.min(remaining),
-                )
-                .await?;
-            if page
-                .routes
+        let paths = self
+            .listed_channel_route_paths_for_team(installation_id, team_id)
+            .await?;
+        let scan_len = paths.len().min(max_total_routes);
+        for chunk in paths[..scan_len].chunks(page_size) {
+            let reads = chunk
                 .iter()
-                .any(|route| route.subject_user_id == subject_user_id.as_str())
-            {
-                return Ok(true);
+                .map(|path| async move { self.read_record::<StoredSlackChannelRoute>(path).await });
+            let records = futures::future::try_join_all(reads)
+                .await
+                .map_err(map_route_fs_error)?;
+            for (record, _) in records.into_iter().flatten() {
+                let Some(route) = stored_channel_route(record)? else {
+                    continue;
+                };
+                if route.subject_user_id == subject_user_id.as_str() {
+                    return Ok(true);
+                }
             }
-            let Some(next_cursor) = page.next_cursor else {
-                return Ok(false);
-            };
-            if next_cursor <= cursor {
-                return Err(SlackChannelRouteError::StoreUnavailable);
-            }
-            if next_cursor >= max_total_routes {
-                return Ok(false);
-            }
-            cursor = next_cursor;
         }
+        Ok(false)
     }
 }
 
