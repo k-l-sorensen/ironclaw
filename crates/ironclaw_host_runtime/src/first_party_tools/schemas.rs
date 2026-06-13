@@ -95,6 +95,28 @@ pub(crate) fn resolve_builtin_input_schema_ref(reference: &str) -> Option<Value>
                     "type": "object",
                     "description": "Optional document metadata such as skip_indexing or skip_versioning"
                 },
+                "key": {
+                    "type": "string",
+                    "description": "Stable learning key. When present, writes replace the memory document derived from key and category."
+                },
+                "category": {
+                    "type": "string",
+                    "description": "Optional learning category used with key to keep stable keys distinct across categories."
+                },
+                "confidence": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10,
+                    "description": "Optional learning confidence from 1 to 10."
+                },
+                "created_at": {
+                    "type": "string",
+                    "description": "Optional learning creation timestamp, preferably RFC 3339."
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Optional source label for a learning."
+                },
                 "old_string": {
                     "type": "string",
                     "description": "Exact text to replace; switches to patch mode"

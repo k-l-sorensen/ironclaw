@@ -11,7 +11,7 @@ use crate::path::{
     MemoryDocumentPath, MemoryDocumentScope, memory_backend_unsupported, memory_error,
     memory_not_found, valid_memory_path,
 };
-use crate::search::{MemorySearchRequest, MemorySearchResult};
+use crate::search::{MemorySearchRequest, MemorySearchResult, apply_learning_decay_to_results};
 
 mod filesystem;
 mod in_memory;
@@ -258,4 +258,24 @@ pub(crate) fn memory_direct_children(
             })
         })
         .collect()
+}
+
+pub(crate) async fn rank_search_results_with_learning_metadata<R>(
+    repository: &R,
+    request: &MemorySearchRequest,
+    results: Vec<MemorySearchResult>,
+) -> Result<Vec<MemorySearchResult>, FilesystemError>
+where
+    R: MemoryDocumentRepository + ?Sized,
+{
+    let mut with_metadata = Vec::with_capacity(results.len());
+    for result in results {
+        let metadata = repository
+            .read_document_metadata(&result.path)
+            .await?
+            .map(|value| crate::metadata::DocumentMetadata::from_value(&value))
+            .unwrap_or_default();
+        with_metadata.push((result, metadata));
+    }
+    Ok(apply_learning_decay_to_results(with_metadata, request))
 }

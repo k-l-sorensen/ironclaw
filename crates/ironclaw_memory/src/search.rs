@@ -1,7 +1,9 @@
 //! Memory search request/result types and rank-fusion helpers.
 
+use chrono::{DateTime, FixedOffset, Utc};
 use ironclaw_host_api::HostApiError;
 
+use crate::metadata::{DocumentMetadata, LearningMetadata};
 use crate::path::MemoryDocumentPath;
 
 /// Upper bound on the requested final result count. Keeps a faulty caller
@@ -193,6 +195,7 @@ pub struct MemorySearchResult {
     pub snippet: String,
     pub full_text_rank: Option<u32>,
     pub vector_rank: Option<u32>,
+    pub learning: Option<LearningSearchSignal>,
 }
 
 impl MemorySearchResult {
@@ -207,6 +210,14 @@ impl MemorySearchResult {
     pub fn is_hybrid(&self) -> bool {
         self.full_text_rank.is_some() && self.vector_rank.is_some()
     }
+}
+
+/// Read-time learning signal attached to a search result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LearningSearchSignal {
+    pub metadata: LearningMetadata,
+    pub is_stale: bool,
+    pub score_factor: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -290,6 +301,7 @@ pub(crate) fn fuse_memory_search_results(
             snippet: result.snippet,
             full_text_rank: result.full_text_rank,
             vector_rank: result.vector_rank,
+            learning: None,
         })
         .collect::<Vec<_>>();
     // Normalize before applying `min_score`: raw RRF/weighted scores are tiny
@@ -316,6 +328,74 @@ pub(crate) fn fuse_memory_search_results(
     });
     fused.truncate(request.limit());
     fused
+}
+
+pub(crate) fn apply_learning_decay_to_results(
+    results: Vec<(MemorySearchResult, DocumentMetadata)>,
+    request: &MemorySearchRequest,
+) -> Vec<MemorySearchResult> {
+    apply_learning_decay_to_results_at(results, request, Utc::now())
+}
+
+fn apply_learning_decay_to_results_at(
+    results: Vec<(MemorySearchResult, DocumentMetadata)>,
+    request: &MemorySearchRequest,
+    now: DateTime<Utc>,
+) -> Vec<MemorySearchResult> {
+    let mut decayed = results
+        .into_iter()
+        .map(|(mut result, metadata)| {
+            if let Some(learning_metadata) = metadata.learning_metadata() {
+                let score = learning_decay_score(&learning_metadata, now);
+                result.score *= score.factor;
+                result.learning = Some(LearningSearchSignal {
+                    metadata: learning_metadata,
+                    is_stale: score.is_stale,
+                    score_factor: score.factor,
+                });
+            }
+            result
+        })
+        .collect::<Vec<_>>();
+    decayed.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.path.relative_path().cmp(right.path.relative_path()))
+    });
+    decayed.truncate(request.limit());
+    decayed
+}
+
+struct LearningDecayScore {
+    factor: f32,
+    is_stale: bool,
+}
+
+fn learning_decay_score(metadata: &LearningMetadata, now: DateTime<Utc>) -> LearningDecayScore {
+    let confidence_factor = metadata
+        .confidence
+        .map(|confidence| confidence.clamp(1, 10) as f32 / 10.0)
+        .unwrap_or(1.0);
+    let age_days = metadata
+        .created_at
+        .as_deref()
+        .and_then(|created_at| DateTime::parse_from_rfc3339(created_at).ok())
+        .map(|created_at: DateTime<FixedOffset>| {
+            now.signed_duration_since(created_at.with_timezone(&Utc))
+                .num_days()
+                .max(0)
+        })
+        .unwrap_or(0);
+    let recency_factor = 1.0 / (1.0 + (age_days as f32 / 90.0));
+    LearningDecayScore {
+        factor: confidence_factor * recency_factor,
+        is_stale: metadata
+            .confidence
+            .is_some_and(|confidence| confidence <= 3)
+            || age_days >= 90,
+    }
 }
 
 #[cfg(test)]

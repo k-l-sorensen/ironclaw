@@ -112,6 +112,7 @@ fn make_result_with_agent(
         snippet: snippet.to_string(),
         full_text_rank: Some(1),
         vector_rank: None,
+        learning: None,
     }
 }
 

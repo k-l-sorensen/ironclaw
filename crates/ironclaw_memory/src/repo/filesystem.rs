@@ -52,7 +52,8 @@ use crate::search::{
 
 use super::{
     MemoryAppendOutcome, MemoryDocumentRepository, MemoryWriteOutcome,
-    ensure_document_path_does_not_conflict, scoped_memory_changed_by_key,
+    ensure_document_path_does_not_conflict, rank_search_results_with_learning_metadata,
+    scoped_memory_changed_by_key,
 };
 
 const DOCUMENT_KIND: &str = "memory_document";
@@ -968,11 +969,9 @@ where
             Vec::new()
         };
 
-        Ok(fuse_memory_search_results(
-            full_text_results,
-            vector_results,
-            request,
-        ))
+        let fusion_request = request.clone().with_limit(request.pre_fusion_limit());
+        let fused = fuse_memory_search_results(full_text_results, vector_results, &fusion_request);
+        rank_search_results_with_learning_metadata(self, request, fused).await
     }
 }
 

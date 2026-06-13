@@ -14,6 +14,7 @@ mod filesystem;
 mod indexer;
 mod metadata;
 mod path;
+mod redaction;
 mod repo;
 mod safety;
 mod schema;
@@ -37,10 +38,11 @@ pub use indexer::{
     MemoryDocumentIndexer,
 };
 pub use metadata::{
-    CONFIG_FILE_NAME, DocumentMetadata, HygieneMetadata, MemoryBackendWriteOptions,
-    MemoryWriteOptions,
+    CONFIG_FILE_NAME, DocumentMetadata, HygieneMetadata, LearningMetadata,
+    MemoryBackendWriteOptions, MemoryWriteOptions,
 };
 pub use path::{MemoryDocumentPath, MemoryDocumentScope};
+pub use redaction::redact_sensitive_memory_content;
 pub use repo::{
     FilesystemMemoryDocumentRepository, InMemoryMemoryDocumentRepository, MemoryAppendOutcome,
     MemoryDocumentRepository, MemoryWriteOutcome,
@@ -53,4 +55,4 @@ pub use safety::{
     PromptWriteSafetyEvent, PromptWriteSafetyEventKind, PromptWriteSafetyEventSink,
     PromptWriteSafetyPolicy, PromptWriteSafetyRequest, PromptWriteSource,
 };
-pub use search::{FusionStrategy, MemorySearchRequest, MemorySearchResult};
+pub use search::{FusionStrategy, LearningSearchSignal, MemorySearchRequest, MemorySearchResult};

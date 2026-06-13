@@ -1241,10 +1241,7 @@ mod tests {
             .unwrap()
             .with_vector(false)
             .with_query_embedding(vec![1.0]);
-        let err = backend.search(&alpha_context(), request).await.unwrap_err();
-        assert!(
-            !err.to_string().contains("dimension"),
-            "full-text-only retry must not validate stale vector dimensions: {err}"
-        );
+        let results = backend.search(&alpha_context(), request).await.unwrap();
+        assert!(results.is_empty());
     }
 }

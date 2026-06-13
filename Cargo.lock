@@ -4689,11 +4689,13 @@ name = "ironclaw_memory"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "ironclaw_filesystem",
  "ironclaw_host_api",
  "ironclaw_memory",
  "ironclaw_safety",
  "jsonschema",
+ "regex",
  "serde",
  "serde_json",
  "sha2 0.10.9",

@@ -1618,6 +1618,171 @@ async fn memory_write_metadata_overlay_can_skip_search_indexing() {
 }
 
 #[tokio::test]
+async fn memory_write_key_overwrites_same_category_without_search_ghosts() {
+    let runtime = runtime_with_filesystem(InMemoryBackend::new());
+    let context = execution_context_with_mounts(
+        [MEMORY_WRITE_CAPABILITY_ID, MEMORY_SEARCH_CAPABILITY_ID],
+        memory_mounts(MountPermissions::read_write_list_delete()),
+    );
+
+    let first = invoke_with_context(
+        &runtime,
+        MEMORY_WRITE_CAPABILITY_ID,
+        json!({
+            "key": "editor preference",
+            "category": "preference",
+            "confidence": 7,
+            "created_at": "2026-06-14T00:00:00Z",
+            "source": "test",
+            "content": "keyed write old_host_marker prefers nano"
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    let second = invoke_with_context(
+        &runtime,
+        MEMORY_WRITE_CAPABILITY_ID,
+        json!({
+            "key": "editor preference",
+            "category": "preference",
+            "confidence": 9,
+            "created_at": "2026-06-14T00:01:00Z",
+            "source": "test",
+            "content": "keyed write new_host_marker prefers helix"
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    let other_key = invoke_with_context(
+        &runtime,
+        MEMORY_WRITE_CAPABILITY_ID,
+        json!({
+            "key": "theme preference",
+            "category": "preference",
+            "content": "keyed write other_key_host_marker prefers dark mode"
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    let other_category = invoke_with_context(
+        &runtime,
+        MEMORY_WRITE_CAPABILITY_ID,
+        json!({
+            "key": "editor preference",
+            "category": "fact",
+            "content": "keyed write category_host_marker names an executable"
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(first["path"], second["path"]);
+    assert_ne!(second["path"], other_key["path"]);
+    assert_ne!(second["path"], other_category["path"]);
+    assert_eq!(second["append"], json!(false));
+
+    let old_search = invoke_with_context(
+        &runtime,
+        MEMORY_SEARCH_CAPABILITY_ID,
+        json!({"query": "old_host_marker", "limit": 5}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(old_search["result_count"], json!(0));
+
+    let new_search = invoke_with_context(
+        &runtime,
+        MEMORY_SEARCH_CAPABILITY_ID,
+        json!({"query": "new_host_marker", "limit": 5}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(new_search["result_count"], json!(1));
+    assert_eq!(new_search["results"][0]["confidence"], json!(9));
+
+    let other_key_search = invoke_with_context(
+        &runtime,
+        MEMORY_SEARCH_CAPABILITY_ID,
+        json!({"query": "other_key_host_marker", "limit": 5}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(other_key_search["result_count"], json!(1));
+
+    let other_category_search = invoke_with_context(
+        &runtime,
+        MEMORY_SEARCH_CAPABILITY_ID,
+        json!({"query": "category_host_marker", "limit": 5}),
+        context,
+    )
+    .await
+    .unwrap();
+    assert_eq!(other_category_search["result_count"], json!(1));
+}
+
+#[tokio::test]
+async fn memory_read_and_search_redact_sensitive_learning_content() {
+    let runtime = runtime_with_filesystem(InMemoryBackend::new());
+    let context = execution_context_with_mounts(
+        [
+            MEMORY_WRITE_CAPABILITY_ID,
+            MEMORY_READ_CAPABILITY_ID,
+            MEMORY_SEARCH_CAPABILITY_ID,
+        ],
+        memory_mounts(MountPermissions::read_write_list_delete()),
+    );
+
+    let write = invoke_with_context(
+        &runtime,
+        MEMORY_WRITE_CAPABILITY_ID,
+        json!({
+            "key": "database access",
+            "category": "fact",
+            "content": "database access marker postgres://app:swordfish@db.example/app region=us-east-1"
+        }),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+
+    let path = write["path"].as_str().expect("written path");
+    let read = invoke_with_context(
+        &runtime,
+        MEMORY_READ_CAPABILITY_ID,
+        json!({"path": path}),
+        context.clone(),
+    )
+    .await
+    .unwrap();
+    let content = read["content"].as_str().expect("read content");
+    assert!(!content.contains("swordfish"));
+    assert!(content.contains("postgres://app:[REDACTED - sensitive]@db.example/app"));
+    assert!(content.contains("region=us-east-1"));
+
+    let search = invoke_with_context(
+        &runtime,
+        MEMORY_SEARCH_CAPABILITY_ID,
+        json!({"query": "database access marker", "limit": 5}),
+        context,
+    )
+    .await
+    .unwrap();
+    let result = search["results"][0]["content"]
+        .as_str()
+        .expect("search result content");
+    assert!(!result.contains("swordfish"));
+    assert!(result.contains("[REDACTED - sensitive]"));
+    assert!(result.contains("region=us-east-1"));
+}
+
+#[tokio::test]
 async fn memory_write_patches_existing_document_and_rejects_missing_old_string() {
     let runtime = runtime_with_filesystem(InMemoryBackend::new());
     let context = execution_context_with_mounts(

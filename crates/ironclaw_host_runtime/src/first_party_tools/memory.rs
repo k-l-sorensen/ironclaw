@@ -16,7 +16,7 @@ use ironclaw_memory::{
     MemoryDocumentPath, MemoryDocumentScope, MemoryEventSinkError, MemorySearchRequest,
     MemoryWriteOutcome, PromptSafetyAllowanceId, PromptSafetyReasonCode, PromptWriteOperation,
     PromptWriteSafetyEvent, PromptWriteSafetyEventKind, PromptWriteSafetyEventSink,
-    RepositoryMemoryBackend, content_bytes_sha256,
+    RepositoryMemoryBackend, content_bytes_sha256, redact_sensitive_memory_content,
 };
 use serde_json::{Value, json};
 
@@ -348,10 +348,16 @@ async fn dispatch_search(
         .into_iter()
         .map(|result| {
             json!({
-                "content": result.snippet,
+                "content": redact_sensitive_memory_content(&result.snippet),
                 "score": result.score,
                 "path": result.path.relative_path(),
                 "is_hybrid_match": result.is_hybrid(),
+                "confidence": result.learning.as_ref().and_then(|learning| learning.metadata.confidence),
+                "created_at": result.learning.as_ref().and_then(|learning| learning.metadata.created_at.clone()),
+                "category": result.learning.as_ref().and_then(|learning| learning.metadata.category.clone()),
+                "key": result.learning.as_ref().and_then(|learning| learning.metadata.key.clone()),
+                "source": result.learning.as_ref().and_then(|learning| learning.metadata.source.clone()),
+                "is_stale": result.learning.as_ref().is_some_and(|learning| learning.is_stale),
             })
         })
         .collect::<Vec<_>>();
@@ -446,6 +452,31 @@ fn parse_write_command(
     scope: &MemoryDocumentScope,
     input: &Value,
 ) -> Result<MemoryWriteCommand, FirstPartyCapabilityError> {
+    let metadata_overlay = metadata_overlay(input)?;
+    if let Some(key) = metadata_overlay
+        .as_ref()
+        .and_then(|metadata| metadata.key.as_deref())
+    {
+        let category = metadata_overlay
+            .as_ref()
+            .and_then(|metadata| metadata.category.as_deref())
+            .unwrap_or("general");
+        let resolved_path = stable_learning_path(category, key)?;
+        let path = document_path(scope, &resolved_path)?;
+        let content = input.get("content").and_then(Value::as_str).unwrap_or("");
+        if content.trim().is_empty() {
+            return Err(input_error());
+        }
+        return Ok(MemoryWriteCommand {
+            resolved_path,
+            path,
+            metadata_overlay,
+            operation: MemoryWriteOperation::Replace {
+                content: content.to_string(),
+            },
+        });
+    }
+
     let target = match input.get("target") {
         Some(Value::String(target)) => target.as_str(),
         Some(_) => return Err(input_error()),
@@ -455,10 +486,6 @@ fn parse_write_command(
 
     let resolved_path = resolve_target_path(target, input)?;
     let path = document_path(scope, &resolved_path)?;
-    let metadata_overlay = input
-        .get("metadata")
-        .filter(|metadata| metadata.is_object())
-        .map(DocumentMetadata::from_value);
 
     let operation = if target == "bootstrap" {
         MemoryWriteOperation::ClearBootstrap
@@ -496,6 +523,85 @@ fn parse_write_command(
         metadata_overlay,
         operation,
     })
+}
+
+fn metadata_overlay(input: &Value) -> Result<Option<DocumentMetadata>, FirstPartyCapabilityError> {
+    let mut metadata = input
+        .get("metadata")
+        .filter(|metadata| metadata.is_object())
+        .map(DocumentMetadata::from_value)
+        .unwrap_or_default();
+    let mut has_overlay = input.get("metadata").is_some_and(Value::is_object);
+
+    if let Some(key) = optional_non_empty_str(input, "key")? {
+        metadata.key = Some(key.to_string());
+        has_overlay = true;
+    }
+    if let Some(category) = optional_non_empty_str(input, "category")? {
+        metadata.category = Some(category.to_string());
+        has_overlay = true;
+    }
+    if let Some(created_at) = optional_non_empty_str(input, "created_at")? {
+        metadata.created_at = Some(created_at.to_string());
+        has_overlay = true;
+    }
+    if let Some(source) = optional_non_empty_str(input, "source")? {
+        metadata.source = Some(source.to_string());
+        has_overlay = true;
+    }
+    if let Some(confidence) = input.get("confidence") {
+        let Some(confidence) = confidence.as_u64() else {
+            return Err(input_error());
+        };
+        if !(1..=10).contains(&confidence) {
+            return Err(input_error());
+        }
+        let confidence = u8::try_from(confidence).map_err(|_| input_error())?;
+        metadata.confidence = Some(confidence);
+        has_overlay = true;
+    }
+
+    Ok(has_overlay.then_some(metadata))
+}
+
+fn optional_non_empty_str<'a>(
+    input: &'a Value,
+    key: &'static str,
+) -> Result<Option<&'a str>, FirstPartyCapabilityError> {
+    match input.get(key) {
+        Some(Value::String(value)) if !value.trim().is_empty() => Ok(Some(value.trim())),
+        Some(Value::String(_)) => Err(input_error()),
+        Some(_) => Err(input_error()),
+        None => Ok(None),
+    }
+}
+
+fn stable_learning_path(category: &str, key: &str) -> Result<String, FirstPartyCapabilityError> {
+    Ok(format!(
+        "keyed/{}/{}.md",
+        encode_learning_path_segment(category)?,
+        encode_learning_path_segment(key)?
+    ))
+}
+
+fn encode_learning_path_segment(raw: &str) -> Result<String, FirstPartyCapabilityError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(input_error());
+    }
+    let mut encoded = String::new();
+    for byte in trimmed.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('_');
+            encoded.push_str(&format!("{byte:02x}"));
+        }
+    }
+    if encoded == "." || encoded == ".." {
+        return Err(input_error());
+    }
+    Ok(encoded)
 }
 
 async fn clear_bootstrap_document(
@@ -618,9 +724,10 @@ async fn dispatch_read(
         return Err(input_error());
     };
     let content = String::from_utf8(bytes).map_err(|_| operation_error())?;
+    let redacted = redact_sensitive_memory_content(&content);
     Ok(json!({
         "path": path.relative_path(),
-        "content": content,
+        "content": redacted,
         "word_count": content.split_whitespace().count(),
     }))
 }

@@ -6,13 +6,17 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use ironclaw_filesystem::{FilesystemError, FilesystemOperation};
 
-use crate::chunking::content_bytes_sha256;
-use crate::metadata::MemoryWriteOptions;
+use crate::chunking::{MemoryChunkWrite, content_bytes_sha256, content_sha256};
+use crate::indexer::{MemoryChunkReplaceOutcome, MemoryDocumentIndexRepository};
+use crate::metadata::{MemoryWriteOptions, resolve_document_metadata};
 use crate::path::{MemoryDocumentPath, MemoryDocumentScope, memory_error, valid_memory_path};
+use crate::search::{
+    MemorySearchRequest, MemorySearchResult, RankedMemorySearchResult, fuse_memory_search_results,
+};
 
 use super::{
     MemoryAppendOutcome, MemoryDocumentRepository, MemoryWriteOutcome,
-    ensure_document_path_does_not_conflict,
+    ensure_document_path_does_not_conflict, rank_search_results_with_learning_metadata,
 };
 
 /// In-memory memory document repository for tests and examples.
@@ -20,6 +24,7 @@ use super::{
 pub struct InMemoryMemoryDocumentRepository {
     documents: Mutex<BTreeMap<MemoryDocumentPath, Vec<u8>>>,
     metadata: Mutex<BTreeMap<MemoryDocumentPath, serde_json::Value>>,
+    chunks: Mutex<BTreeMap<MemoryDocumentPath, Vec<MemoryChunkWrite>>>,
 }
 
 impl InMemoryMemoryDocumentRepository {
@@ -175,5 +180,96 @@ impl MemoryDocumentRepository for InMemoryMemoryDocumentRepository {
             .filter(|path| path.scope() == scope)
             .cloned()
             .collect())
+    }
+
+    async fn search_documents(
+        &self,
+        scope: &MemoryDocumentScope,
+        request: &MemorySearchRequest,
+    ) -> Result<Vec<MemorySearchResult>, FilesystemError> {
+        let documents = {
+            let documents = self.documents.lock().map_err(|_| {
+                memory_error(
+                    scope
+                        .virtual_prefix()
+                        .unwrap_or_else(|_| valid_memory_path()),
+                    FilesystemOperation::Query,
+                    "memory document repository lock poisoned",
+                )
+            })?;
+            documents
+                .iter()
+                .filter(|(path, _bytes)| path.scope() == scope)
+                .map(|(path, bytes)| (path.clone(), bytes.clone()))
+                .collect::<Vec<_>>()
+        };
+
+        let mut full_text_results = Vec::new();
+        if request.full_text() {
+            let query = request.query().to_ascii_lowercase();
+            for (path, bytes) in documents {
+                let metadata = resolve_document_metadata(self, &path).await?;
+                if metadata.skip_indexing == Some(true) {
+                    continue;
+                }
+                let content = String::from_utf8_lossy(&bytes).into_owned();
+                if !content.to_ascii_lowercase().contains(query.as_str()) {
+                    continue;
+                }
+                full_text_results.push(RankedMemorySearchResult {
+                    path,
+                    snippet: content,
+                    rank: (full_text_results.len() as u32).saturating_add(1),
+                });
+                if full_text_results.len() >= request.pre_fusion_limit() {
+                    break;
+                }
+            }
+        }
+
+        let fusion_request = request.clone().with_limit(request.pre_fusion_limit());
+        let fused = fuse_memory_search_results(full_text_results, Vec::new(), &fusion_request);
+        rank_search_results_with_learning_metadata(self, request, fused).await
+    }
+}
+
+#[async_trait]
+impl MemoryDocumentIndexRepository for InMemoryMemoryDocumentRepository {
+    async fn replace_document_chunks_if_current(
+        &self,
+        path: &MemoryDocumentPath,
+        expected_content_hash: &str,
+        chunks: &[MemoryChunkWrite],
+    ) -> Result<MemoryChunkReplaceOutcome, FilesystemError> {
+        let current = self.read_document(path).await?;
+        let Some(bytes) = current else {
+            return Ok(MemoryChunkReplaceOutcome::SkippedMissingDocument);
+        };
+        let current_hash = String::from_utf8(bytes)
+            .map(|content| content_sha256(&content))
+            .map_err(|_| {
+                memory_error(
+                    path.virtual_path().unwrap_or_else(|_| valid_memory_path()),
+                    FilesystemOperation::WriteFile,
+                    "memory document content must be UTF-8",
+                )
+            })?;
+        if current_hash != expected_content_hash {
+            return Ok(MemoryChunkReplaceOutcome::SkippedStaleContentHash);
+        }
+
+        let mut chunk_store = self.chunks.lock().map_err(|_| {
+            memory_error(
+                path.virtual_path().unwrap_or_else(|_| valid_memory_path()),
+                FilesystemOperation::WriteFile,
+                "memory document chunk repository lock poisoned",
+            )
+        })?;
+        if chunks.is_empty() {
+            chunk_store.remove(path);
+        } else {
+            chunk_store.insert(path.clone(), chunks.to_vec());
+        }
+        Ok(MemoryChunkReplaceOutcome::Replaced)
     }
 }

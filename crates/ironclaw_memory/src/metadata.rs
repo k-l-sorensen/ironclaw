@@ -24,6 +24,21 @@ pub struct DocumentMetadata {
     pub skip_versioning: Option<bool>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<u8>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hygiene: Option<HygieneMetadata>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -63,6 +78,43 @@ impl DocumentMetadata {
         }
         serde_json::Value::Object(merged)
     }
+
+    pub fn learning_metadata(&self) -> Option<LearningMetadata> {
+        if self.confidence.is_none()
+            && self.created_at.is_none()
+            && self.category.is_none()
+            && self.key.is_none()
+            && self.source.is_none()
+        {
+            return None;
+        }
+        Some(LearningMetadata {
+            confidence: self.confidence,
+            created_at: self.created_at.clone(),
+            category: self.category.clone(),
+            key: self.key.clone(),
+            source: self.source.clone(),
+        })
+    }
+}
+
+/// Optional learning-specific metadata carried by ordinary memory documents.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LearningMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<u8>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Hygiene metadata preserved from the current workspace metadata model.
