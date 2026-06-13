@@ -11,13 +11,15 @@ use crate::state::LoopExecutionState;
 use super::{AgentLoopExecutorError, StageContext};
 
 /// Best-effort explanation plus state attachment: the only call path stages
-/// should use. Finalizes the explanation (when produced) and records its ref
-/// in `state.assistant_refs` so checkpoint and exit evidence stay consistent.
+/// should use. Records the terminal reason before checkpointing, finalizes the
+/// explanation (when produced), and records its ref in `state.assistant_refs`
+/// so checkpoint and exit evidence stay consistent.
 pub(super) async fn attach_failure_explanation(
     ctx: StageContext<'_>,
     state: &mut LoopExecutionState,
     reason_kind: LoopFailureKind,
 ) -> Result<Option<LoopMessageRef>, AgentLoopExecutorError> {
+    state.recent_failure_kinds.push(reason_kind);
     let explanation_message_ref = explain_failure(ctx, state, reason_kind).await?;
     if let Some(message_ref) = explanation_message_ref.as_ref() {
         state.assistant_refs.push(message_ref.clone());

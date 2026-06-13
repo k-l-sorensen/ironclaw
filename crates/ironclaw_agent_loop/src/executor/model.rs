@@ -196,6 +196,7 @@ impl ExecutorStage<ModelInput> for ModelStage {
                             failure_kind,
                         } => {
                             state.recovery_state = recovery;
+                            state.recent_failure_kinds.push(failure_kind);
                             match CheckpointStage.cancel_if_requested(ctx, state).await? {
                                 CancelCheck::Continue(next) => state = *next,
                                 CancelCheck::Exit(exit) => return Ok(ModelStep::Exit(exit)),
@@ -222,6 +223,7 @@ impl ExecutorStage<ModelInput> for ModelStage {
             }
         }
 
+        state.recent_failure_kinds.push(LoopFailureKind::DriverBug);
         let checked = CheckpointStage
             .write(ctx, state, CheckpointKind::Final)
             .await?;

@@ -760,6 +760,7 @@ impl CapabilityStage {
             capability_batch,
         )
         .await?;
+        state.recent_failure_kinds.push(LoopFailureKind::DriverBug);
         let checked = CheckpointStage
             .write(ctx, state, CheckpointKind::Final)
             .await?;

@@ -180,15 +180,20 @@ impl LoopExecutionState {
         })
     }
 
-    /// Rebinds run-scoped host cursors after loading a checkpoint into a new
-    /// retry run.
+    /// Rebinds run-owned host state after loading a checkpoint into a new retry
+    /// run.
     ///
     /// Retryable failed runs intentionally reuse the source run's checkpoint
     /// payload. The input cursor inside that payload is scoped to the source
-    /// `(scope, run_id)`, so it cannot be submitted to the retry host. Reset it
-    /// to the new run origin and let the host drain fresh queued inputs.
+    /// `(scope, run_id)`, so it cannot be submitted to the retry host. Durable
+    /// transcript/result refs in the payload are also owned by the source run;
+    /// carrying them into the retry would make the retry's terminal exit claim
+    /// foreign-run evidence. Reset these run-owned fields and let the retry host
+    /// produce its own refs.
     pub fn rebase_for_run(mut self, context: &LoopRunContext) -> Self {
         self.input_cursor = LoopInputCursor::origin_for_run(context);
+        self.assistant_refs.clear();
+        self.result_refs.clear();
         self
     }
 }
@@ -568,7 +573,7 @@ mod tests {
     }
 
     #[test]
-    fn rebase_for_run_resets_run_scoped_input_cursor() {
+    fn rebase_for_run_resets_run_owned_refs_and_input_cursor() {
         let source_context = test_run_context();
         let target_context = test_run_context();
         let mut state = LoopExecutionState::initial_for_run(&source_context);
@@ -577,6 +582,12 @@ mod tests {
             ironclaw_turns::run_profile::LoopInputCursorToken::new("input-cursor:source-seen")
                 .unwrap(),
         );
+        state
+            .assistant_refs
+            .push(LoopMessageRef::new("msg:source-run").unwrap());
+        state
+            .result_refs
+            .push(ironclaw_turns::LoopResultRef::new("result:source-run").unwrap());
         state.iteration = 4;
 
         let rebased = state.clone().rebase_for_run(&target_context);
@@ -587,6 +598,8 @@ mod tests {
             rebased.input_cursor,
             LoopInputCursor::origin_for_run(&target_context)
         );
+        assert!(rebased.assistant_refs.is_empty());
+        assert!(rebased.result_refs.is_empty());
     }
 
     #[test]
