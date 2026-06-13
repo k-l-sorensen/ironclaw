@@ -46,8 +46,15 @@ test them reborn-native.
 ### 3.1 The learning unit
 A **learning is a memory document** (existing model — *no parallel `learnings/` format unless the
 existing doc metadata genuinely can't carry these fields*) keyed by a **stable key** and carrying:
-`confidence` (1–10), `created_at`, `category`, `shared` (default false = project-scoped), `source`.
-False-positives are learnings with `category = fp`.
+`confidence` (1–10), `created_at`, `category`, `source`. False-positives are learnings with
+`category = fp`.
+
+**Scope:** learnings are isolated by reborn's **existing memory scope `(tenant, user, agent)`** — no
+new scoping. Reborn does **not** implement projects (`TurnScope.project_id` is an unused optional
+slot, `None` in real runs), so there is **no project/`shared` dimension and no engine-level
+cross-project enforcement** in v1. The benchmark's "cross-project" scenarios are prompt-level
+behaviors (respect a stated scope, don't echo another context's secrets) — handled by the persona
+prompt (WS-2) + secret redaction, not a memory-engine boundary.
 
 - **Correction = overwrite.** Writing a learning with an existing stable key overwrites it. There is
   no second document, therefore **no ghost** — and no `superseded_by` field, no exclusion branch, no
@@ -61,12 +68,12 @@ False-positives are learnings with `category = fp`.
 The agent, during normal turns, uses the existing `memory_*` tools to save/overwrite/search/report
 learnings, driven by a **default learning persona** baked into the reborn system prompt (so baseline
 behavior — empty per-scenario identity — already assigns confidence, surfaces staleness, overwrites
-on correction, scopes per project, tracks FPs, supports `/learn`). Recall is the **existing**
-memory-snippet injection — no second injection path.
+on correction, tracks FPs, supports `/learn`, and doesn't echo secrets from another context). Recall
+is the **existing** memory-snippet injection — no second injection path.
 
-Minimal `ironclaw_memory` additions: the learning frontmatter fields, decay-at-read ranking,
-project-scope default in search/read, and a **secret-redaction export** helper
-(`[REDACTED - sensitive]`).
+Minimal `ironclaw_memory` additions: the learning frontmatter fields, decay-at-read ranking, and a
+**secret-redaction export** helper (`[REDACTED - sensitive]`). Scoping reuses the existing
+`(tenant, user, agent)` memory scope as-is — no new scope code.
 
 ### 3.3 Layer B — lightweight reflection (core, reborn-native)
 A small **reflection service** invoked by the turn-completed observer (best-effort, never blocks or
@@ -92,7 +99,8 @@ claims; store the fix; declarative facts; user-correction is the top signal) —
 ### 3.4 Invariants
 - Reflection is best-effort and must never block, delay, or fail the user-facing turn.
 - Memory writes (in-turn and reflection) go through `PromptWriteSafetyPolicy`; export redacts secrets.
-- Project-scope isolation: search/read never returns another project's private learnings.
+- Scope isolation reuses the existing `(tenant, user, agent)` memory scope; no project dimension
+  (reborn projects are unimplemented). Cross-context non-leakage is a persona + redaction behavior.
 - Deterministic apply (Rule 5): the model judges/extracts; code performs the write.
 - No `.unwrap()`/`.expect()` in prod; both memory backends stay at parity; new wire fields snake_case
   + `#[serde(default)]` + legacy round-trip.
@@ -100,10 +108,10 @@ claims; store the fix; declarative facts; user-correction is the top signal) —
 ## 4. Workstreams (sequential Codex; crate-scoped)
 
 ### WS-1 — Memory learning semantics (`crates/ironclaw_memory` + `…/first_party_tools/memory.rs`)
-Learning frontmatter (confidence/created_at/category/key/shared/source; tolerate docs without it);
+Learning frontmatter (confidence/created_at/category/key/source; tolerate docs without it);
 stable-key overwrite (no-ghost); decay-at-read ranking (confidence × recency, flag-not-delete);
-project-scope default; secret-redaction export. TDD mirroring dedup-correction/*, confidence-decay/*,
-learn-management/export-sanitizes-secrets, cross-project/project-scoped-default.
+secret-redaction export. Reuse the existing `(tenant, user, agent)` memory scope as-is (no project
+dimension). TDD mirroring dedup-correction/*, confidence-decay/*, learn-management/export-sanitizes-secrets.
 
 ### WS-2 — Learning persona + `/learn` surface (prompt file + `crates/ironclaw_host_runtime` wiring)
 Default learning preamble injected as a stable identity candidate (baseline behavior); `/learn`
@@ -127,7 +135,7 @@ scenarios. `cargo fmt`, `cargo clippy --all --tests --all-features` (zero warnin
 1. Baseline agent saves a learning with a confidence score, reports it, recalls it later; old learnings surface as stale (low confidence), never deleted on decay.
 2. Correcting a learning makes the old value unreachable via default search (overwrite = no-ghost).
 3. A dismissed false-positive is not re-flagged for the same pattern; generalizes only on exact match.
-4. Project-scoped by default; no cross-project secret leakage; `/learn export` redacts secrets.
+4. Learnings isolated by the existing `(tenant, user, agent)` memory scope; the agent doesn't echo another context's secrets (persona) and `/learn export` redacts secrets.
 5. On a learnable turn (correction/failure), the reflection service writes/updates a learning via one model call + deterministic safe write; disabled by config → no-op; never blocks the turn.
 6. Never-repeat E2E: correction/failure in turn N → correct behavior in turn N+1 via the recalled learning.
 7. Zero clippy warnings; tests green; reflection feature-flagged off by default; both memory backends at parity.
@@ -140,6 +148,7 @@ scenarios. `cargo fmt`, `cargo clippy --all --tests --all-features` (zero warnin
 - **Pinned active-learnings prompt section** → reuse existing memory-snippet injection.
 
 ## 7. Out of scope (follow-ups)
+- **Engine-level project scoping / cross-project sharing** — reborn does not implement projects; `TurnScope.project_id` is an unused optional slot. Revisit if/when reborn ships a real project feature.
 - Matching the external benchmark harness (targets the v1 library).
 - Superseded-history retention / audit log of overwritten learnings.
 - Vector/embedding episodic search; FTS over full conversation history.
