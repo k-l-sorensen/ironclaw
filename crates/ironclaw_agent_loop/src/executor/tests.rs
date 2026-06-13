@@ -2399,6 +2399,34 @@ async fn cancellation_before_explanation_skips_explanation_model_call() {
 }
 
 #[tokio::test]
+async fn cancellation_during_explanation_model_call_propagates_cancelled() {
+    let script = ScenarioScript {
+        model_responses: VecDeque::from([
+            ScriptedModelResponse::Calls(vec![ScriptedCapabilityCall::new("demo.echo")]),
+            ScriptedModelResponse::Error {
+                kind: AgentLoopHostErrorKind::Cancelled,
+            },
+        ]),
+        capability_outcomes: VecDeque::from([vec![ScriptedCapabilityOutcome::failed("permanent")]]),
+        single_call_retry_outcomes: VecDeque::new(),
+        pending_inputs: VecDeque::new(),
+    };
+    let (host, _) = DriverMockHost::builder().script(script).build();
+    let executor = CanonicalAgentLoopExecutor;
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let result = executor
+        .execute_family(&crate::families::default(), &host, state)
+        .await;
+
+    assert!(
+        matches!(result, Err(AgentLoopExecutorError::Cancelled)),
+        "in-flight cancellation during the explanation call must propagate as Cancelled, not produce a Failed exit: {result:?}"
+    );
+    assert!(host.finalized_assistant_messages().is_empty());
+}
+
+#[tokio::test]
 async fn stale_surface_capability_call_is_policy_denied_before_host_invocation() {
     let host = MockHost::new(vec![stale_surface_calls_response(), reply_response()]);
     let executor = CanonicalAgentLoopExecutor;

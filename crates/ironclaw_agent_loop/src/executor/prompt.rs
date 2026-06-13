@@ -20,8 +20,8 @@ use crate::strategies::CompactionDecision;
 
 use super::{
     AgentLoopExecutorError, CancelCheck, CheckpointStage, ExecutorStage, FailedExitDetails,
-    HostStage, PendingInputAck, StageContext, apply_capability_filter, cancelled_exit,
-    debug_host_unavailable, explain_failure, failed_exit, pending_approval_resume_candidate,
+    HostStage, PendingInputAck, StageContext, apply_capability_filter, attach_failure_explanation,
+    cancelled_exit, debug_host_unavailable, failed_exit, pending_approval_resume_candidate,
     pending_auth_resume_candidate,
 };
 
@@ -600,10 +600,7 @@ async fn compaction_failed_exit(
         .await;
     let mut state = state;
     let explanation_message_ref =
-        explain_failure(ctx, &state, LoopFailureKind::CompactionUnavailable).await;
-    if let Some(message_ref) = explanation_message_ref.as_ref() {
-        state.assistant_refs.push(message_ref.clone());
-    }
+        attach_failure_explanation(ctx, &mut state, LoopFailureKind::CompactionUnavailable).await?;
     let checked = CheckpointStage
         .write(ctx, state, CheckpointKind::Final)
         .await?;

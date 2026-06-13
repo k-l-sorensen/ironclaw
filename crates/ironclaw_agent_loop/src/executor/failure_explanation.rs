@@ -1,45 +1,63 @@
 use ironclaw_turns::{
     LoopFailureKind, LoopMessageRef,
     run_profile::{
-        FinalizeAssistantMessage, LoopInlineMessage, LoopInlineMessageRole, LoopModelRequest,
-        LoopPromptBundleRequest, LoopSafeSummary, ParentLoopOutput,
+        AgentLoopHostErrorKind, FinalizeAssistantMessage, LoopInlineMessage, LoopInlineMessageRole,
+        LoopModelRequest, LoopPromptBundleRequest, LoopSafeSummary, ParentLoopOutput,
     },
 };
 
 use crate::state::LoopExecutionState;
 
-use super::StageContext;
+use super::{AgentLoopExecutorError, StageContext};
+
+/// Best-effort explanation plus state attachment: the only call path stages
+/// should use. Finalizes the explanation (when produced) and records its ref
+/// in `state.assistant_refs` so checkpoint and exit evidence stay consistent.
+pub(super) async fn attach_failure_explanation(
+    ctx: StageContext<'_>,
+    state: &mut LoopExecutionState,
+    reason_kind: LoopFailureKind,
+) -> Result<Option<LoopMessageRef>, AgentLoopExecutorError> {
+    let explanation_message_ref = explain_failure(ctx, state, reason_kind).await?;
+    if let Some(message_ref) = explanation_message_ref.as_ref() {
+        state.assistant_refs.push(message_ref.clone());
+    }
+    Ok(explanation_message_ref)
+}
 
 pub(super) async fn explain_failure(
     ctx: StageContext<'_>,
     state: &LoopExecutionState,
     reason_kind: LoopFailureKind,
-) -> Option<LoopMessageRef> {
+) -> Result<Option<LoopMessageRef>, AgentLoopExecutorError> {
     if !is_explainable(reason_kind) {
-        return None;
+        return Ok(None);
     }
     if ctx.host.observe_cancellation().is_some() {
         tracing::debug!(
             reason_kind = reason_kind.as_str(),
             "skipping failure explanation because cancellation is already requested"
         );
-        return None;
+        return Ok(None);
     }
 
     let request = match build_explanation_prompt_request(ctx, state, reason_kind).await {
         Some(request) => request,
-        None => return None,
+        None => return Ok(None),
     };
     let messages = match ctx.host.build_prompt_bundle(request).await {
         Ok(bundle) => bundle.messages,
         Err(error) => {
+            if error.kind == AgentLoopHostErrorKind::Cancelled {
+                return Err(AgentLoopExecutorError::Cancelled);
+            }
             tracing::debug!(
                 reason_kind = reason_kind.as_str(),
                 error_kind = error.kind.as_str(),
                 safe_summary = error.safe_summary.as_str(),
                 "failure explanation prompt bundle build failed"
             );
-            return None;
+            return Ok(None);
         }
     };
 
@@ -55,13 +73,16 @@ pub(super) async fn explain_failure(
     {
         Ok(response) => response,
         Err(error) => {
+            if error.kind == AgentLoopHostErrorKind::Cancelled {
+                return Err(AgentLoopExecutorError::Cancelled);
+            }
             tracing::debug!(
                 reason_kind = reason_kind.as_str(),
                 error_kind = error.kind.as_str(),
                 safe_summary = error.safe_summary.as_str(),
                 "failure explanation model call failed"
             );
-            return None;
+            return Ok(None);
         }
     };
 
@@ -72,7 +93,7 @@ pub(super) async fn explain_failure(
                 reason_kind = reason_kind.as_str(),
                 "failure explanation model returned capability calls"
             );
-            return None;
+            return Ok(None);
         }
     };
 
@@ -81,15 +102,18 @@ pub(super) async fn explain_failure(
         .finalize_assistant_message(FinalizeAssistantMessage { reply })
         .await
     {
-        Ok(message_ref) => Some(message_ref),
+        Ok(message_ref) => Ok(Some(message_ref)),
         Err(error) => {
+            if error.kind == AgentLoopHostErrorKind::Cancelled {
+                return Err(AgentLoopExecutorError::Cancelled);
+            }
             tracing::debug!(
                 reason_kind = reason_kind.as_str(),
                 error_kind = error.kind.as_str(),
                 safe_summary = error.safe_summary.as_str(),
                 "failure explanation transcript finalize failed"
             );
-            None
+            Ok(None)
         }
     }
 }

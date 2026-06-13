@@ -5960,6 +5960,7 @@ async fn in_memory_event_sink_retains_a_bounded_tail() {
             kind: TurnEventKind::Submitted,
             blocked_gate: None,
             sanitized_reason: None,
+            retryable: None,
         })
         .await
         .unwrap();

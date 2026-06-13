@@ -23,10 +23,10 @@ use super::{
     CancelCheck, CapabilitySurfaceIndex, CheckpointStage, ExecutorStage, FailedExitDetails,
     GateInput, GateStage, MAX_CAPABILITY_RETRIES, StageContext, TurnCompletedStep,
     append_capability_error_ref, append_capability_result_ref, append_capability_safe_summary_ref,
-    batch_policy_kind, cancelled_exit, capability_batch_counts, capability_call_signature,
-    capability_error_class, capability_error_failure_category, capability_failure_kind,
-    capability_host_error, capability_invocation_from_candidate, capability_is_visible,
-    capability_summary, clear_matching_pending_auth_resume, explain_failure, failed_exit,
+    attach_failure_explanation, batch_policy_kind, cancelled_exit, capability_batch_counts,
+    capability_call_signature, capability_error_class, capability_error_failure_category,
+    capability_failure_kind, capability_host_error, capability_invocation_from_candidate,
+    capability_is_visible, capability_summary, clear_matching_pending_auth_resume, failed_exit,
     honor_retry_alteration, model_visible_capability_failure_observation, push_call_signature_once,
     push_completed_result, sanitized_strategy_summary,
 };
@@ -658,10 +658,8 @@ impl CapabilityStage {
                         CancelCheck::Continue(next) => state = *next,
                         CancelCheck::Exit(exit) => return Ok(BatchStep::Exit(exit)),
                     }
-                    let explanation_message_ref = explain_failure(ctx, &state, failure_kind).await;
-                    if let Some(message_ref) = explanation_message_ref.as_ref() {
-                        state.assistant_refs.push(message_ref.clone());
-                    }
+                    let explanation_message_ref =
+                        attach_failure_explanation(ctx, &mut state, failure_kind).await?;
                     let checked = CheckpointStage
                         .write(ctx, state, CheckpointKind::Final)
                         .await?;
@@ -793,10 +791,8 @@ impl CapabilityStage {
         )
         .await?;
         let explanation_message_ref =
-            explain_failure(ctx, &state, LoopFailureKind::CapabilityProtocolError).await;
-        if let Some(message_ref) = explanation_message_ref.as_ref() {
-            state.assistant_refs.push(message_ref.clone());
-        }
+            attach_failure_explanation(ctx, &mut state, LoopFailureKind::CapabilityProtocolError)
+                .await?;
         let checked = CheckpointStage
             .write(ctx, state, CheckpointKind::Final)
             .await?;

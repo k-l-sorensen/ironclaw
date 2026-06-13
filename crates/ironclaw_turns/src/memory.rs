@@ -1538,6 +1538,8 @@ impl Inner {
                         };
                         resume_idempotency_order.push_back(key.clone());
                         resume_idempotency.insert(key, replay);
+                    } else {
+                        warn_malformed_idempotency_record(&record);
                     }
                 }
                 TurnIdempotencyOperationKind::Retry => {
@@ -1549,6 +1551,8 @@ impl Inner {
                         };
                         retry_idempotency_order.push_back(key.clone());
                         retry_idempotency.insert(key, replay);
+                    } else {
+                        warn_malformed_idempotency_record(&record);
                     }
                 }
                 TurnIdempotencyOperationKind::Cancel => {
@@ -1560,6 +1564,8 @@ impl Inner {
                         };
                         cancel_idempotency_order.push_back(key.clone());
                         cancel_idempotency.insert(key, replay);
+                    } else {
+                        warn_malformed_idempotency_record(&record);
                     }
                 }
             }
@@ -1674,6 +1680,7 @@ impl Inner {
         } else {
             None
         };
+        let retryable = (kind == TurnEventKind::Failed).then(|| record.checkpoint_id.is_some());
         self.events.push(TurnLifecycleEvent {
             cursor: record.event_cursor,
             scope: record.scope.clone(),
@@ -1687,6 +1694,7 @@ impl Inner {
             kind,
             blocked_gate,
             sanitized_reason,
+            retryable,
         });
         if self.events.len() > self.limits.max_events {
             let excess = self.events.len() - self.limits.max_events;
@@ -2896,6 +2904,18 @@ fn persisted_key_for_record(record: &TurnIdempotencyRecord) -> PersistedIdempote
         },
         key: record.key.clone(),
     }
+}
+
+/// A persisted record whose replay payload no longer matches its operation
+/// kind (or lacks a run id) cannot be rehydrated; the duplicate-request guard
+/// for that key is lost until the operation is re-recorded. Surface it instead
+/// of dropping silently. Logs metadata only — never the replay payload.
+fn warn_malformed_idempotency_record(record: &TurnIdempotencyRecord) {
+    tracing::warn!(
+        operation = ?record.operation,
+        run_id = ?record.run_id,
+        "skipping malformed idempotency record during snapshot load; replay guard lost for this key"
+    );
 }
 
 fn persisted_submit_key(key: &SubmitIdempotencyKey) -> PersistedIdempotencyKey {

@@ -223,6 +223,11 @@ fn validate_sanitized_category(kind: &'static str, value: &str) -> Result<(), St
             "{kind} must contain only lowercase ASCII letters, digits, underscores, or colons"
         ));
     }
+    if value.split(':').any(str::is_empty) {
+        return Err(format!(
+            "{kind} must not contain empty colon-delimited segments"
+        ));
+    }
     Ok(())
 }
 
@@ -430,6 +435,28 @@ impl TurnError {
             TurnErrorCategory::Unauthorized => 403,
             TurnErrorCategory::InvalidRequest => 400,
             TurnErrorCategory::Unavailable => 503,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SanitizedFailure;
+
+    #[test]
+    fn sanitized_failure_accepts_colon_delimited_category() {
+        let failure = SanitizedFailure::new("host_stage_unavailable:model")
+            .expect("colon-delimited category is valid");
+        assert_eq!(failure.category(), "host_stage_unavailable:model");
+    }
+
+    #[test]
+    fn sanitized_failure_rejects_empty_colon_segments() {
+        for invalid in ["a::b", ":model", "host_stage_unavailable:", ":"] {
+            assert!(
+                SanitizedFailure::new(invalid).is_err(),
+                "category {invalid:?} with an empty colon segment must be rejected"
+            );
         }
     }
 }

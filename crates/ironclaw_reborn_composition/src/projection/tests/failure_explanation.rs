@@ -234,6 +234,10 @@ fn failure_summary_covers_host_stage_unavailable_categories() {
             "host_stage_unavailable:input",
             "The run failed because the host input stage was unavailable. Check the submitted message and try again.",
         ),
+        (
+            "host_stage_unavailable:unknown",
+            "The run failed because a required host stage was unavailable. Retry the run, and contact support if it keeps happening.",
+        ),
     ];
 
     for (category, expected_summary) in expected {
@@ -266,6 +270,72 @@ async fn assert_failed_run_status_summary(
         None,
     )
     .await;
+}
+
+/// A failed-run lifecycle event carrying `retryable = Some(true)` must
+/// surface that flag on the projected `RunStatus` item so the WebUI can
+/// offer a retry affordance. Regression guard for the retry-from-failed
+/// surfacing path.
+#[tokio::test]
+async fn webui_event_stream_projects_retryable_flag_for_failed_run() {
+    let tenant_id = TenantId::new("webui-events-tenant").unwrap();
+    let user_id = UserId::new("webui-events-user").unwrap();
+    let agent_id = AgentId::new("webui-events-agent").unwrap();
+    let thread_id = ThreadId::new("webui-events-retryable-thread").unwrap();
+    let turn_run = TurnRunId::new();
+    let scope = TurnScope::new(tenant_id, Some(agent_id), None, thread_id);
+    let event_log_dyn: Arc<dyn DurableEventLog> = Arc::new(InMemoryDurableEventLog::new());
+    let actor = TurnActor::new(user_id.clone());
+    let services = build_reborn_projection_services(
+        event_log_dyn,
+        ReplyTargetBindingRef::new("webui-events-reply").unwrap(),
+    )
+    .with_turn_events(
+        Arc::new(FakeTurnEventSource {
+            events: vec![TurnLifecycleEvent {
+                cursor: TurnEventCursor(1),
+                scope: scope.clone(),
+                occurred_at: Some(chrono::Utc::now()),
+                owner_user_id: Some(user_id.clone()),
+                run_id: turn_run,
+                status: TurnStatus::Failed,
+                kind: TurnEventKind::Failed,
+                blocked_gate: None,
+                sanitized_reason: Some("lease_expired".to_string()),
+                retryable: Some(true),
+            }],
+        }),
+        Arc::new(FakeTurnCoordinator {
+            state: turn_run_state(&scope, &user_id, turn_run, TurnEventCursor(1)),
+        }),
+    );
+
+    let events = services
+        .webui_event_stream()
+        .drain(ProjectionSubscriptionRequest {
+            actor,
+            scope,
+            after_cursor: None,
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        events.iter().any(|event| match event.payload() {
+            ProductOutboundPayload::ProjectionUpdate { state } => state.items.iter().any(|item| {
+                matches!(
+                    item,
+                    ProductProjectionItem::RunStatus {
+                        run_id,
+                        retryable: Some(true),
+                        ..
+                    } if *run_id == turn_run
+                )
+            }),
+            _ => false,
+        }),
+        "failed-run projection must carry retryable = Some(true)"
+    );
 }
 
 async fn assert_failed_run_status_summary_with_explainer(
@@ -303,6 +373,7 @@ async fn assert_failed_run_status_summary_with_explainer(
                 kind: TurnEventKind::Failed,
                 blocked_gate: None,
                 sanitized_reason: Some(failure_category.to_string()),
+                retryable: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -334,6 +405,7 @@ async fn assert_failed_run_status_summary_with_explainer(
                     status,
                     failure_category: Some(category),
                     failure_summary: Some(summary),
+                    ..
                 } if *run_id == turn_run
                     && status == "failed"
                     && category.category() == failure_category
@@ -408,6 +480,7 @@ async fn webui_event_stream_uses_model_failure_explanation_when_available() {
                 kind: TurnEventKind::Failed,
                 blocked_gate: None,
                 sanitized_reason: Some("driver_invalid_request".to_string()),
+                retryable: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -439,6 +512,7 @@ async fn webui_event_stream_uses_model_failure_explanation_when_available() {
                     status,
                     failure_category: Some(category),
                     failure_summary: Some(summary),
+                    ..
                 } if *run_id == turn_run
                     && status == "failed"
                     && category.category() == "driver_invalid_request"
@@ -482,6 +556,7 @@ async fn webui_event_stream_caches_model_failure_explanation_across_replay() {
                 kind: TurnEventKind::Failed,
                 blocked_gate: None,
                 sanitized_reason: Some("driver_invalid_request".to_string()),
+                retryable: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -556,6 +631,7 @@ async fn webui_event_stream_projects_recovery_required_failure_summary() {
                 kind: TurnEventKind::RecoveryRequired,
                 blocked_gate: None,
                 sanitized_reason: Some("driver_failed".to_string()),
+                retryable: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {
@@ -585,6 +661,7 @@ async fn webui_event_stream_projects_recovery_required_failure_summary() {
                     status,
                     failure_category: Some(category),
                     failure_summary: Some(summary),
+                    ..
                 } if *run_id == turn_run
                     && status == "recovery_required"
                     && category.category() == "driver_failed"
@@ -626,6 +703,7 @@ async fn failure_details_returns_fallback_when_model_gateway_times_out() {
                 kind: TurnEventKind::Failed,
                 blocked_gate: None,
                 sanitized_reason: Some("driver_panic".to_string()),
+                retryable: None,
             }],
         }),
         Arc::new(FakeTurnCoordinator {

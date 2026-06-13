@@ -5,7 +5,7 @@ use crate::state::{CheckpointKind, LoopExecutionState};
 
 use super::{
     AgentLoopExecutorError, CheckpointStage, ExecutorStage, FailedExitDetails, PendingInputAck,
-    StageContext, explain_failure, failed_exit,
+    StageContext, attach_failure_explanation, failed_exit,
 };
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -44,10 +44,7 @@ impl ExecutorStage<BudgetInput> for BudgetStage {
 
         let mut state = state;
         let explanation_message_ref =
-            explain_failure(ctx, &state, LoopFailureKind::IterationLimit).await;
-        if let Some(message_ref) = explanation_message_ref.as_ref() {
-            state.assistant_refs.push(message_ref.clone());
-        }
+            attach_failure_explanation(ctx, &mut state, LoopFailureKind::IterationLimit).await?;
 
         let checked = CheckpointStage
             .write(ctx, state, CheckpointKind::Final)

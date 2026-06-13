@@ -151,6 +151,7 @@ fn projection_state() -> ProductProjectionState {
                 status: "running".to_string(),
                 failure_category: None,
                 failure_summary: None,
+                retryable: None,
             },
             ProductProjectionItem::RunStatus {
                 run_id: run_id(),
@@ -161,6 +162,7 @@ fn projection_state() -> ProductProjectionState {
                 failure_summary: Some(
                     "The run failed because the execution driver reported an error.".to_string(),
                 ),
+                retryable: Some(true),
             },
             ProductProjectionItem::WorkSummary {
                 id: "work-summary-1".to_string(),

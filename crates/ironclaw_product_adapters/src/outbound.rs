@@ -948,6 +948,10 @@ pub enum ProductProjectionItem {
         /// User-facing sanitized explanation for terminal failure states.
         #[serde(skip_serializing_if = "Option::is_none")]
         failure_summary: Option<String>,
+        /// Present only for failed runs: whether the run recorded a resumable
+        /// checkpoint and can be retried via the run retry endpoint.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        retryable: Option<bool>,
     },
     Gate {
         gate_ref: String,
@@ -1084,6 +1088,8 @@ impl<'de> Deserialize<'de> for ProductProjectionItem {
                 failure_category: Option<String>,
                 #[serde(default)]
                 failure_summary: Option<String>,
+                #[serde(default)]
+                retryable: Option<bool>,
             },
             Gate {
                 gate_ref: String,
@@ -1122,6 +1128,7 @@ impl<'de> Deserialize<'de> for ProductProjectionItem {
                 status,
                 failure_category,
                 failure_summary,
+                retryable,
             } => ProductProjectionItem::RunStatus {
                 run_id,
                 status,
@@ -1130,6 +1137,7 @@ impl<'de> Deserialize<'de> for ProductProjectionItem {
                     .transpose()
                     .map_err(serde::de::Error::custom)?,
                 failure_summary,
+                retryable,
             },
             Wire::Gate {
                 gate_ref,
@@ -1415,6 +1423,7 @@ mod tests {
                 failure_summary: Some(
                     "The run failed because its runner lease expired.".to_string(),
                 ),
+                retryable: None,
             }],
         )
         .expect("valid run status projection");
@@ -1454,6 +1463,7 @@ mod tests {
                 status: "failed".to_string(),
                 failure_category: None,
                 failure_summary: None,
+                retryable: None,
             }]
         );
     }

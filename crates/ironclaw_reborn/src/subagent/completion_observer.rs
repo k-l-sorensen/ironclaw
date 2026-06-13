@@ -854,6 +854,8 @@ fn terminal_event_from_lifecycle(event: &TurnLifecycleEvent) -> AwaitedChildTerm
 }
 
 fn terminal_event_from_state(state: &TurnRunState) -> Result<TurnLifecycleEvent, TurnError> {
+    let kind = event_kind_from_terminal_status(state.status)?;
+    let retryable = (kind == TurnEventKind::Failed).then(|| state.checkpoint_id.is_some());
     Ok(TurnLifecycleEvent {
         cursor: state.event_cursor,
         scope: state.scope.clone(),
@@ -861,12 +863,13 @@ fn terminal_event_from_state(state: &TurnRunState) -> Result<TurnLifecycleEvent,
         owner_user_id: state.actor.clone().map(|actor| actor.user_id),
         run_id: state.run_id,
         status: state.status,
-        kind: event_kind_from_terminal_status(state.status)?,
+        kind,
         blocked_gate: None,
         sanitized_reason: state
             .failure
             .as_ref()
             .map(|failure| failure.category().to_string()),
+        retryable,
     })
 }
 
@@ -1916,6 +1919,7 @@ mod tests {
             kind: TurnEventKind::Completed,
             blocked_gate: None,
             sanitized_reason: None,
+            retryable: None,
         }
     }
 
@@ -2563,6 +2567,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap();
@@ -2717,6 +2722,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap();
@@ -2890,6 +2896,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap();
@@ -2997,6 +3004,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap();
@@ -3182,6 +3190,7 @@ mod tests {
                 kind: TurnEventKind::RecoveryRequired,
                 blocked_gate: None,
                 sanitized_reason: Some("driver_bug".to_string()),
+                retryable: None,
             })
             .await
             .unwrap();
@@ -3441,6 +3450,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap();
@@ -3628,6 +3638,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap();
@@ -3645,6 +3656,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap();
@@ -4048,6 +4060,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap();
@@ -4064,6 +4077,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap_err();
@@ -4093,6 +4107,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap();
@@ -4652,6 +4667,7 @@ mod tests {
                 kind: TurnEventKind::Completed,
                 blocked_gate: None,
                 sanitized_reason: None,
+                retryable: None,
             })
             .await
             .unwrap_err();
