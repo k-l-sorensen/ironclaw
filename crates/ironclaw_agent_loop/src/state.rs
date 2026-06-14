@@ -232,18 +232,18 @@ impl LoopExecutionState {
     /// produce its own refs.
     ///
     /// Gate-bound resume state (`last_gate`, `pending_approval_resume`,
-    /// `pending_auth_resume`) is also cleared: a retry can resume from a
-    /// `BeforeBlock` checkpoint, and a stale gate ref / approval-resume token /
-    /// auth-resume record from the source run would otherwise leak across the
-    /// run boundary and be replayed as if it were fresh gate evidence. Fail
-    /// closed — the retry host must re-establish any gate it actually needs.
+    /// `pending_auth_resume`) is deliberately NOT cleared here: this same path
+    /// (`PlannedDriver::resume` -> `from_checkpoint_payload().rebase_for_run()`)
+    /// is what resumes a run after an approval/auth gate is resolved, and the
+    /// pending-resume record is exactly the evidence that tells the loop to
+    /// re-dispatch the gated capability. Clearing it drops the resumed
+    /// invocation (regression: only the pre-gate call runs). The resume host
+    /// re-validates the gate before honoring the record, so this is not a
+    /// trust-boundary leak.
     pub fn rebase_for_run(mut self, context: &LoopRunContext) -> Self {
         self.input_cursor = LoopInputCursor::origin_for_run(context);
         self.assistant_refs.clear();
         self.result_refs.clear();
-        self.last_gate = None;
-        self.pending_approval_resume = None;
-        self.pending_auth_resume = None;
         self
     }
 }
@@ -639,8 +639,9 @@ mod tests {
             .result_refs
             .push(ironclaw_turns::LoopResultRef::new("result:source-run").unwrap());
         state.iteration = 4;
-        // Seed gate-bound resume state from the source run; a retry can resume
-        // from a BeforeBlock checkpoint, so these must not leak into the retry.
+        // Gate-bound resume state must survive the rebase: this path also
+        // resumes a run after an approval/auth gate, where the pending-resume
+        // record drives re-dispatch of the gated capability.
         state.last_gate = Some(LoopGateRef::new("gate:source-run").unwrap());
         state.pending_auth_resume = Some(PendingAuthResume {
             gate_ref: LoopGateRef::new("gate:source-auth").unwrap(),
@@ -663,11 +664,10 @@ mod tests {
         );
         assert!(rebased.assistant_refs.is_empty());
         assert!(rebased.result_refs.is_empty());
-        // Gate-bound resume state from the source run must be cleared so it is
-        // never replayed as fresh gate evidence in the retry run.
-        assert!(rebased.last_gate.is_none());
-        assert!(rebased.pending_approval_resume.is_none());
-        assert!(rebased.pending_auth_resume.is_none());
+        // Gate-bound resume state is preserved so an approval/auth resume can
+        // re-dispatch the gated capability.
+        assert_eq!(rebased.last_gate, state.last_gate);
+        assert_eq!(rebased.pending_auth_resume, state.pending_auth_resume);
     }
 
     #[test]
