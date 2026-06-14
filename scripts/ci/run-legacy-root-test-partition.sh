@@ -25,9 +25,9 @@ if [ "${partition_index_int}" -ge "${partition_count_int}" ]; then
 fi
 
 mapfile -t integration_tests < <(
-  find tests -maxdepth 1 -type f -name '*.rs' -printf '%f\n' \
-    | sed 's/\.rs$//' \
-    | sort
+  find tests -maxdepth 1 -type f -name '*.rs' -print \
+    | sed -E 's#^tests/##; s#\.rs$##' \
+    | LC_ALL=C sort
 )
 
 ran_any=false
