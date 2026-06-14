@@ -48,9 +48,10 @@ if [[ " ${feature_flags} " != *" --no-default-features "* ]]; then
 fi
 
 enabled_feature_csv="$(IFS=,; echo "${enabled_features[*]}")"
+export ENABLED_FEATURES="${enabled_feature_csv}"
 
 mapfile -t integration_tests < <(
-  ENABLED_FEATURES="${enabled_feature_csv}" cargo metadata --no-deps --format-version=1 \
+  cargo metadata --no-deps --format-version=1 \
     | python3 -c '
 import json
 import os
@@ -74,13 +75,14 @@ for package in metadata["packages"]:
             src_path.relative_to(tests_dir)
         except ValueError:
             continue
+        target_name = target["name"]
         required = set(target.get("required_features") or [])
         if required.issubset(enabled):
-            names.append(target["name"])
+            names.append(target_name)
         else:
             missing = ",".join(sorted(required - enabled))
             print(
-                f"Skipping {target['name']} because required features are not enabled: {missing}",
+                f"Skipping {target_name} because required features are not enabled: {missing}",
                 file=sys.stderr,
             )
 
