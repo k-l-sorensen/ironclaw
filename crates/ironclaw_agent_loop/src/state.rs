@@ -643,6 +643,20 @@ mod tests {
         // resumes a run after an approval/auth gate, where the pending-resume
         // record drives re-dispatch of the gated capability.
         state.last_gate = Some(LoopGateRef::new("gate:source-run").unwrap());
+        state.pending_approval_resume = Some(PendingApprovalResume {
+            gate_ref: LoopGateRef::new("gate:source-approval").unwrap(),
+            capability_id: CapabilityId::new("gsuite.calendar.list_events").unwrap(),
+            approval_request_id: ApprovalRequestId::new(),
+            resume_token: CapabilityResumeToken::new("00000000-0000-0000-0000-000000000002")
+                .unwrap(),
+            correlation_id: CorrelationId::new(),
+            surface_version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
+            input_ref: CapabilityInputRef::new("input:source-approval").unwrap(),
+            effective_capability_ids: vec![],
+            provider_replay: None,
+            input: json!({ "k": "v" }),
+            estimate: ResourceEstimate::default(),
+        });
         state.pending_auth_resume = Some(PendingAuthResume {
             gate_ref: LoopGateRef::new("gate:source-auth").unwrap(),
             capability_id: CapabilityId::new("gsuite.calendar.list_events").unwrap(),
@@ -667,6 +681,10 @@ mod tests {
         // Gate-bound resume state is preserved so an approval/auth resume can
         // re-dispatch the gated capability.
         assert_eq!(rebased.last_gate, state.last_gate);
+        assert_eq!(
+            rebased.pending_approval_resume,
+            state.pending_approval_resume
+        );
         assert_eq!(rebased.pending_auth_resume, state.pending_auth_resume);
     }
 
