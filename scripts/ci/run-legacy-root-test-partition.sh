@@ -76,7 +76,7 @@ for package in metadata["packages"]:
         except ValueError:
             continue
         target_name = target["name"]
-        required = set(target.get("required_features") or [])
+        required = set(target.get("required-features") or [])
         if required.issubset(enabled):
             names.append(target_name)
         else:
