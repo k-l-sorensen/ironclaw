@@ -5189,13 +5189,15 @@ async fn read_bounded_trace_upload_claim_response(
             safe_trace_upload_claim_issuer_url_label(issuer_url)
         )
     })? {
-        bytes.extend_from_slice(&chunk);
+        // Check the combined length before extending so a hostile server
+        // cannot force an allocation larger than the cap with a single chunk.
         anyhow::ensure!(
-            bytes.len() <= TRACE_UPLOAD_CLAIM_MAX_RESPONSE_BYTES,
+            bytes.len() + chunk.len() <= TRACE_UPLOAD_CLAIM_MAX_RESPONSE_BYTES,
             "Trace Commons upload claim response from {} exceeded {} bytes",
             safe_trace_upload_claim_issuer_url_label(issuer_url),
             TRACE_UPLOAD_CLAIM_MAX_RESPONSE_BYTES
         );
+        bytes.extend_from_slice(&chunk);
     }
     String::from_utf8(bytes).with_context(|| {
         format!(

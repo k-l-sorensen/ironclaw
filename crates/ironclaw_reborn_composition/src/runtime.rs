@@ -4859,7 +4859,7 @@ mod tests {
 
         runtime.shutdown().await.expect("runtime shutdown");
         let _ = std::fs::remove_dir_all(trace_contribution::trace_contribution_dir_for_scope(
-            Some(&owner),
+            Some(&scope),
         ));
     }
 

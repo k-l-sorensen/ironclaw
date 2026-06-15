@@ -364,12 +364,14 @@ async fn read_bounded_response(mut resp: reqwest::Response) -> Result<Vec<u8>, O
     while let Some(chunk) = resp.chunk().await.map_err(|e| OnboardError::Network {
         reason: format!("reading response body: {e}"),
     })? {
-        bytes.extend_from_slice(&chunk);
-        if bytes.len() > MAX_RESPONSE_BODY {
+        // Check the combined length before extending so a hostile server
+        // cannot force an allocation larger than the cap with a single chunk.
+        if bytes.len() + chunk.len() > MAX_RESPONSE_BODY {
             return Err(OnboardError::MalformedResponse {
                 reason: format!("response body exceeds {MAX_RESPONSE_BODY} bytes"),
             });
         }
+        bytes.extend_from_slice(&chunk);
     }
     Ok(bytes)
 }
