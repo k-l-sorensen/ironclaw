@@ -582,6 +582,236 @@ material is reachable from inside the sandbox.
 
 ---
 
+## Phase 3 Addendum — Selective TLS-MITM Credential-Injection Lane (opt-in)
+
+> **Provenance.** Council-accepted companion design (Opus 4.8 + GPT-5.5 XHigh, both
+> `ACCEPT_WITH_NONBLOCKING_NOTES`, no blockers). Stand-alone copy:
+> `docs/plans/2026-06-14-reborn-sandbox-mitm-injection-lane.md`.
+
+Phase 3 ships the egress broker **credential-free, CONNECT-only**. But cookie-gated
+tools — the motivating case is the Agent-Reach social CLIs (`twitter-cli`,
+`opencli`/Reddit/XHS, `bili-cli`) baked into the base image and driven via the
+sandboxed `shell` capability — authenticate with cookies that must live **where the
+CLI runs**, i.e. inside the container, colliding with **I2**. Every target is HTTPS,
+so the credential cannot be injected on a blind `CONNECT` splice (the v1 proxy's
+plain-HTTP header injection does not apply). This addendum adds an **opt-in** lane
+that, for a small admin-configured set of **exact** inject-hosts, TLS-terminates
+host-side and injects a **staged** credential on the **outer** leg — so the secret
+never enters the sandbox (I2 holds) and all non-inject traffic stays the
+credential-free splice (the "broker compromise = a domain-allowlisted TCP splicer"
+property is preserved for everything else).
+
+### A.0 Verified-seam ledger (facts this addendum is built on)
+
+| Fact | Seam | Consequence |
+|---|---|---|
+| Unix broker sets **no** `http_proxy`/`https_proxy` (only the `HttpProxy` arm does) | `sandbox_process/broker.rs:86-102` | CLIs won't use the mounted socket → **in-container proxy shim required** |
+| Proxy env keys are reserved | `broker.rs:25-28` | Host sets them; agent can't repoint |
+| Staged credential is **one-shot**; `execute()` discards on success+fail | `egress/host_port.rs:100-130` (124-128) | "stage once, many requests" dies on req #2 → **session lifecycle required** |
+| Egress request requires explicit `extension_id`+`trust`+`runtime`; `ExecutionContext` synthesized from `scope`+those three (not derived from scope) | `host_port.rs:73-78,196-219`; `runtime.rs:38-52` | Authority must be **captured at an authorized site**, never minted (I4) |
+| `RuntimeSecretInjectionStore` + `has_for_capability` are `pub(crate)`/private | `obligations.rs:83,184` | Need a **narrow new crate-local view** for broker + tests |
+| `resolve_public_ips`/`is_private_or_loopback_ip` private; `network_target_for_url` public | `resolver.rs:30`, `policy.rs:188`, `url_target.rs:19` | Need a **public `CheckedNetworkTargetResolver`** |
+| Response buffer hard-capped at 10 MiB | `types.rs:6-7`, `transport.rs:287-288` | Heavy media needs a **streaming origin leg** |
+| Scope identity = tenant/user/agent→project→thread→invocation | `scope_key.rs:12-36` | CA/socket/volume key on the **full** `RebornSandboxScopeKey` |
+
+### A.1 Shape
+
+One host module `crates/ironclaw_host_runtime/src/sandbox_broker/` builds the Phase 3
+credential-free broker **and** this lane as one `classify()` switch over a per-scope
+Unix listener. In the container a tiny **`ironclaw-proxy-shim`** (PID-1 supervisor
+child) listens on `127.0.0.1:<port>` (the value of `http_proxy`/`https_proxy`) and
+dumb-relays bytes to the mounted `/tmp/ironclaw-http-broker.sock` — loopback is always
+up under `--network none`, so unmodified CLIs work. Each `CONNECT` classifies to:
+
+- **`Deny`** → 403.
+- **`Splice`** (allowed non-inject host) → blind `copy_bidirectional` to a **checked,
+  pinned** origin IP. Broker never sees plaintext. (Phase 3 default.)
+- **`MitmInject`** (admin-configured **exact** inject-host **with** a staged session
+  credential) → `200`, inner-TLS **server** handshake to the shim with a
+  per-scope-minted leaf, terminate, inject on the **outer** origin leg, stream the
+  response back. Two distinct TLS sessions, never byte-bridged; the secret is added on
+  the outer leg only.
+
+**Honest threat statement.** The broker process transiently holds `SecretMaterial`
+(in `ZeroizeOnDrop` carriers) for the current scope's active inject sessions, between
+inner-TLS termination and origin dispatch (threat table A.8, T1/T6) — not hidden.
+
+### A.2 Module layout
+
+```
+crates/ironclaw_host_runtime/src/sandbox_broker/
+├── mod.rs              // SandboxEgressBroker: per-scope listener lifecycle; BrokerListener
+│                       //   trait (unix now / vsock later); ceilings
+├── connect.rs          // CONNECT parse, blind splice to checked IP, hop-by-hop strip
+├── policy.rs           // EgressDecider: DomainAllowlist (wildcards) + InjectHostTable
+│                       //   (EXACT only) + CheckedNetworkTargetResolver → Deny|Splice|MitmCandidate
+├── inject.rs           // InjectHostTable (admin-owned), InjectPlan, fail-closed gate
+├── mitm.rs             // inner TLS termination; shared injector → {buffered | streaming} origin
+├── credential_session.rs // SandboxBrokerSession + SessionStagedCredential lifecycle
+├── cert.rs             // PerScopeCaRegistry (ephemeral CA, leaf cache, combined-bundle export)
+├── shim.rs             // host-side launch contract for ironclaw-proxy-shim
+├── limits.rs           // per-scope ceilings
+└── test_support.rs     // #[cfg(any(test, feature="test-support"))] harness seams
+
+crates/ironclaw_network/                 // + pub CheckedNetworkTargetResolver { resolve_checked_target -> CheckedResolvedTarget{target, pinned_ips} }
+crates/ironclaw_host_runtime/src/obligations.rs // + pub(crate) RuntimeObligationHandoffView { network_policy(), credential_session(), cleanup }; + cfg(test-support) seedable accessor
+crates/ironclaw_host_runtime/src/sandbox_process/broker.rs // Unix arm emits http(s)_proxy/all_proxy + all CA-trust env keys → combined bundle
+crates/ironclaw_host_api + ironclaw_reborn_config         // serde DTOs: RebornSandboxMitmBindingDto{host:ExactInjectHost,handle,target:RuntimeCredentialTarget,required,stream,max_response_bytes}, SandboxBrokerLimitsDto
+```
+
+New deps: `tokio-rustls`, `rcgen` (reusing workspace `rustls 0.23`). **Nothing added to `src/`.**
+
+### A.3 Data flow
+
+```
+prepare (CapabilityHost, already-authorized ExecutionContext)
+  └ SandboxMitmObligationPlanner: per configured inject-host with a handle, lease secret
+      ONCE, capture {extension_id, trust, runtime}, write a SessionStagedCredential
+      keyed (scope, capability_id, session_id, handle)
+shell dispatch → transport launch with host-only SandboxBrokerLaunchContext{ scope, capability_id, session_id }
+  └ per-scope: SandboxEgressBroker.bind + proxy shim + combined trust bundle (per-scope volume/tmpfs)
+container (--network none, ro rootfs, cap_drop ALL): CLI → http_proxy=127.0.0.1:PORT → shim → unix socket
+host broker: CONNECT host:443 → ceilings → EgressDecider.classify:
+   Deny | Splice(checked pinned IP, opaque) | MitmCandidate
+   MitmCandidate → InjectHostTable.resolve → session.has_staged(handle)?
+      NO  → Deny (fail-closed; never blind fallback)
+      YES → 200 → leaf_for(scope_key,host) → inner TLS → decrypt request R
+            → strip injected slot + hop-by-hop from R
+            → shared injector + CheckedNetworkTargetResolver (deny private, pin IP):
+                 buffered (small API host) → HostRuntimeHttpEgressPort (full scan/redact/zeroize)
+                 streaming (stream=true)   → StreamingInjectedOrigin (bounded buffers, byte cap)
+            → write response back over inner TLS; session credential zeroized on close
+```
+
+### A.4 Credential lifecycle (keep-alive without one-shot depletion)
+
+A `SandboxBrokerSession` is bound to `(scope, capability_id, session_id)`. The
+prepare-time `SandboxMitmObligationPlanner` leases each inject secret **once** under
+the authorized `ExecutionContext` and writes `SessionStagedCredential { material:
+SecretMaterial /*ZeroizeOnDrop*/, target, required, authority:{extension_id,trust,
+runtime} }`. The broker reads it via
+`RuntimeObligationHandoffView::credential_session(...)` — it **never** gets a
+`SecretStore` lease. Per request: the **buffered** path re-stages a fresh
+`SecretMaterial` into the one-shot store immediately before
+`HostRuntimeHttpEgressPort::execute(...)` (which consumes+discards per its existing
+contract), the session-held copy surviving for the next request; the **streaming**
+path takes the session material directly and pipes the body through under a
+`max_response_bytes` running cap. On tunnel close / idle timeout / command end:
+zeroize every held credential and discard residual staged entries.
+
+### A.5 Authority (resolves the launch-context question)
+
+- **Broker launch context = `{ scope, capability_id, session_id }`** (minimal).
+- `{extension_id, trust, runtime}` are **captured at prepare** (the authorized site, by
+  `SandboxMitmObligationPlanner`) and carried **in the session record** — honoring the
+  verified fact that `HostRuntimeHttpEgressRequest` requires them. The broker reads,
+  never mints; `TrustClass::FirstParty/System` are never synthesized (I4).
+- Rejected: full `ProcessInvocationContext` threading (redundant — the egress port
+  re-synthesizes `ExecutionContext`+estimate from scope+three scalars) and
+  "scope+capability alone" (insufficient — needs the three scalars + a `session_id`
+  discriminator). `CommandExecutionRequest` stays unchanged (narrower I3 surface).
+
+### A.6 Ingress · CA trust · scope · ceilings
+
+- **Ingress.** Unix `push_env` additionally sets reserved
+  `http_proxy`/`https_proxy`/`HTTP_PROXY`/`HTTPS_PROXY`/`all_proxy`/`ALL_PROXY =
+  http://127.0.0.1:<shim_port>` and `NO_PROXY=""`. The shim is a ~200-line dumb byte
+  relay, untrusted-by-assumption (adds no authority — it reaches only the already-
+  mounted socket). Interim: host bind-mounts a static shim read-only; long-term baked.
+- **CA trust.** Host materializes a **combined** PEM = base public roots
+  (`rustls-native-certs`/`webpki-roots`) **++** per-scope CA cert (written to per-scope
+  volume/tmpfs; no secret in it). Reserve+push **all**: `SSL_CERT_FILE`,
+  `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, `GIT_SSL_CAINFO`, `PIP_CERT`,
+  `NPM_CONFIG_CAFILE` (replace) + `NODE_EXTRA_CA_CERTS` (additive). Combined ⇒ non-inject
+  public-PKI HTTPS still validates.
+- **Scope/isolation.** Per-scope ephemeral CA keyed on the **full**
+  `RebornSandboxScopeKey`; private key in-process only, never in container/serialized;
+  ECDSA P-256 leaves per host, cached; cross-scope leaf validation fails by construction.
+- **Inject = exact hosts.** `ExactInjectHost` rejects `*` at parse; wildcards only for
+  the blind allowlist. An inject-host must **independently pass the network policy** —
+  the inject table adds a credential, never reachability.
+- **Ceilings.** Per scope: max client conns 32, max MITM conns 16, max requests/tunnel
+  256, CONNECT idle 60 s, TLS handshake 10 s, origin dial 10 s, max header 64 KiB,
+  response streamed with bounded buffers + byte cap, max tunnel lifetime =
+  min(command timeout, broker max). **HTTP/1.1 only** for inner TLS; HTTP/2 deferred.
+
+### A.7 Alternatives rejected
+
+Raw cookie in sandbox env/file (I2); sandbox-callable credential endpoint (I2/I3/I4);
+rely on the Unix socket as `HTTPS_PROXY` (no CLI honors it); Docker-network proxy mode
+(weakens `--network none`); MITM all HTTPS (destroys the splicer property for
+non-inject); broker re-implements SSRF policy (use `CheckedNetworkTargetResolver`);
+route media through `HostRuntimeHttpEgressPort` (10 MiB cap + per-call discard); broker
+as a second `SecretStore` source (duplicate pipeline); one shared/long-lived CA (I5);
+CA-only trust bundle (breaks public PKI); wildcard inject-hosts (cookie scope creep).
+
+### A.8 Threat delta vs the credential-free broker
+
+| # | Threat | Delta | Mitigation / residual |
+|---|---|---|---|
+| T1 | Broker compromise | For **inject-hosts only**: MITM current scope's inject traffic; broker memory transiently holds `SecretMaterial` | Inject table tiny/admin-fixed/**exact**; idle timeout bounds hold window; non-inject stays opaque; `SecretStore` unreachable as bytes. Deliberate documented residual. |
+| T2 | Sandbox reads secret | Still impossible — added on outer leg only; env/fs scrubbed; no retrieval endpoint | E2E secret-absence; I2 preserved |
+| T3 | Sandbox forges host/CA/inject | Could repoint proxy/CA or add host | All proxy + CA env keys reserved; inject table immutable host config; no handle endpoint; CA private key never in container |
+| T4 | DNS-rebind/SSRF (both legs) | Splice could regress | `CheckedNetworkTargetResolver` → deny private/loopback → pin IP on **both** legs |
+| T5 | Cross-scope cert confusion | Leaf reuse across scopes | Per-scope CA on full scope key; A's CA can't validate B's leaf |
+| T6 | Secret lingers in memory | Plaintext transient host-side | `ZeroizeOnDrop` + `Zeroizing<…>`; `session.close()` zeroizes; idle timeout |
+| T7 | Client auth shadows injected | CLI sends own header | Strip injected slot from decrypted request first |
+| T8 | Inner-TLS downgrade | weak params | rustls TLS1.2+/1.3, ALPN http/1.1, both ends host-controlled |
+| T9 | SNI mismatch MITM | leaf reused for other host | exact hosts; SAN == CONNECT authority; non-inject never reaches `leaf_for` |
+| T10 | Streaming response unscanned | can't full-body scan a stream | header + bounded-prefix scan; response flows sandbox-ward (then the normal shell-output safety scan); buffered (full scan) is default |
+| T11 | Malicious shim | runs in compromised sandbox | adds no authority (reaches only the already-mounted socket); host does all policy/TLS/injection |
+
+### A.9 Tests & validation (E2E first-class)
+
+**Harness** (`#[cfg(any(test, feature="test-support"))]`, both tiers): `RecordingHttpsOrigin`
+(rustls server recording method/path/headers/body, supports streaming); `TestCheckedOriginConnector`
+(resolver returns a *checked public* IP, connector maps it to the loopback recorder **without
+disabling private-IP checks**); `DeterministicScopeCaProvider`; `SeededBrokerCredentialSessionStore`
+(stages via the broker-facing session API, not raw store pokes); `ProxyShimHarness`.
+
+**Criterion → test (fast non-Docker / Docker-gated `#[ignore]`):**
+
+| Crit | Fast in-process | Docker-gated |
+|---|---|---|
+| 1 inject + secret absent | `inprocess_mitm_injects_cookie_to_recording_origin` | `docker_shell_curl_requests_node_git_trust_combined_bundle_and_secret_absent` |
+| 2 selective | `inprocess_non_inject_allowed_host_uses_blind_splice` | `docker_non_inject_public_https_remains_blind_and_works` |
+| 3 I2 session lifecycle | `inprocess_session_credential_reused_then_zeroized_on_drop` | `docker_direct_broker_request_never_returns_secret` |
+| 4 I5 isolation | `inprocess_cross_scope_ca_rejects_leaf` | `docker_two_scopes_distinct_ca_socket_volume_credentials` |
+| 5 SSRF | `inprocess_checked_public_target_loopback_but_private_resolution_denied` | `docker_private_rebind_target_denied` |
+| 6 fail-closed | `inprocess_inject_host_missing_session_credential_denies_connect` | `docker_missing_required_cookie_fails_at_connect` |
+| 7 backend-indep | `inprocess_unix_and_mock_vsock_share_policy_path` | `docker_unix_shim_e2e` |
+
+**Invariant → test:** I1 `docker_network_none_reaches_only_shim` + SSRF
+(`splice_leg_denies_private_ip_via_checked_resolver` for the blind leg); I2
+secret-absence + direct-broker; I3 `inprocess_broker_rejects_non_connect_and_fetch_paths`;
+I4 `inprocess_sandbox_env_or_headers_cannot_enable_inject_host` +
+`broker_uses_carried_authority_never_synthesizes_system`; I5 cross-scope CA/socket/volume;
+I6 `inprocess_limits_enforce_conn_header_body_idle_caps` + Docker timeout. **Plus:**
+combined-bundle test (public-PKI leaf **and** scope-CA leaf both validate); streaming
+`max_response_bytes` cap; keep-alive multi-request reuse; injected-slot-shadow strip.
+All driven **through the caller** (`run_command`/dispatch), not helpers.
+
+### A.10 Rollout (extends the Phase 3 sequencing)
+
+1. `CheckedNetworkTargetResolver` + tests. 2. Config DTOs + `ExactInjectHost` validation.
+3. Session-bound credential obligation/store API + `SandboxMitmObligationPlanner` + cleanup
+tests. 4. Broker blind `CONNECT` (checked resolver) — this is the credential-free Phase 3
+broker. 5. Proxy shim + reserved proxy/CA env + combined bundle. 6. Per-scope CA + inner
+TLS + shared injector + buffered & streaming inject paths. 7. Fast E2E, then `#[ignore]`
+Docker E2E. 8. Enable only behind host/admin config. The composition seam that owns
+per-invocation broker + planner wiring is Open-Q1.
+
+### A.11 Open items (non-blocking)
+
+(Q1) which composition seam owns per-invocation broker + planner construction;
+(Q2) the actual Agent-Reach inject-host list + handles are product config, not broker
+design; (Q3) HTTP/2 MITM deferred until a target needs it; (Q4) runtime-editable
+tenant-admin inject config needs PostgreSQL/libSQL parity if it moves beyond static
+`ironclaw_reborn_config`; (Q5) the streaming leg's bounded-prefix-only leak scan is an
+accepted residual (T10).
+
+---
+
 ## Phase 4 — Promotion gate: agent-built software becomes an extension
 
 The promotion pipeline turns "bytes the (assumed-compromised) sandbox produced" into
