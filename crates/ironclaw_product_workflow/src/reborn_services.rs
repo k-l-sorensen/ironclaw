@@ -1802,6 +1802,11 @@ impl RebornServicesApi for RebornServices {
                 event_cursor,
                 ..
             }) => {
+                tracing::debug!(
+                    thread_id = ?scope.thread_id,
+                    run_id = %run_id,
+                    "webui submit_turn accepted: turn run enqueued"
+                );
                 mark_message_submitted_or_replay(
                     &*self.thread_service,
                     &thread_scope,
@@ -1824,6 +1829,11 @@ impl RebornServicesApi for RebornServices {
                 })
             }
             Err(TurnError::ThreadBusy(busy)) => {
+                tracing::debug!(
+                    thread_id = ?scope.thread_id,
+                    active_run_id = ?busy.active_run_id,
+                    "webui submit_turn deferred: thread busy with an active run"
+                );
                 self.clear_skill_activation_message(&scope, &accepted_message_ref)?;
                 mark_message_deferred_busy_or_replay(
                     &*self.thread_service,
@@ -1842,6 +1852,11 @@ impl RebornServicesApi for RebornServices {
                 })
             }
             Err(error) => {
+                tracing::debug!(
+                    thread_id = ?scope.thread_id,
+                    error = ?error,
+                    "webui submit_turn rejected by coordinator; no run enqueued"
+                );
                 self.clear_skill_activation_message(&scope, &accepted_message_ref)?;
                 Err(map_turn_error(error))
             }
@@ -3079,7 +3094,21 @@ impl RebornServices {
                 thread_id: scope.thread_id.clone(),
             })
             .await
-            .map_err(map_ownership_probe_error)?;
+            .map_err(|err| {
+                // Diagnostic for the intermittent "thread stops responding after
+                // a failed run" report: if this probe can't resolve the thread
+                // under the caller-derived scope, submit_turn returns 404 here
+                // and no turn run is ever enqueued (the runner then logs "no
+                // runs available to claim" forever). Capturing the exact scope
+                // turns that intermittent symptom into a one-shot diagnosis.
+                tracing::debug!(
+                    thread_scope = ?thread_scope,
+                    thread_id = ?scope.thread_id,
+                    error = %err,
+                    "webui submit ownership probe failed: thread not resolvable under caller scope; no run will be submitted"
+                );
+                map_ownership_probe_error(err)
+            })?;
         Ok((scope, thread_scope))
     }
 
