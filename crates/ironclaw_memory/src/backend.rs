@@ -13,7 +13,7 @@ use crate::events::{
     MemorySignificantEventSource, record_memory_significant_event,
 };
 use crate::indexer::MemoryDocumentIndexer;
-use crate::metadata::{MemoryBackendWriteOptions, MemoryWriteOptions};
+use crate::metadata::{DocumentMetadata, MemoryBackendWriteOptions, MemoryWriteOptions};
 use crate::path::{
     MemoryDocumentPath, MemoryDocumentScope, memory_backend_unsupported, memory_error,
     valid_memory_path,
@@ -149,6 +149,19 @@ pub trait MemoryBackend: Send + Sync {
             context.scope(),
             FilesystemOperation::ReadFile,
             "memory backend does not support file documents",
+        ))
+    }
+
+    async fn read_document_metadata(
+        &self,
+        context: &MemoryContext,
+        path: &MemoryDocumentPath,
+    ) -> Result<Option<DocumentMetadata>, FilesystemError> {
+        let _ = path;
+        Err(memory_backend_unsupported(
+            context.scope(),
+            FilesystemOperation::ReadFile,
+            "memory backend does not support metadata",
         ))
     }
 
@@ -452,6 +465,27 @@ where
         )?;
         ensure_path_matches_context(context, path, FilesystemOperation::ReadFile)?;
         self.repository.read_document(path).await
+    }
+
+    async fn read_document_metadata(
+        &self,
+        context: &MemoryContext,
+        path: &MemoryDocumentPath,
+    ) -> Result<Option<DocumentMetadata>, FilesystemError> {
+        ensure_file_documents_supported(
+            context,
+            FilesystemOperation::ReadFile,
+            self.capabilities.file_documents,
+        )?;
+        ensure_path_matches_context(context, path, FilesystemOperation::ReadFile)?;
+        if !self.capabilities.metadata {
+            return Ok(None);
+        }
+        Ok(self
+            .repository
+            .read_document_metadata(path)
+            .await?
+            .map(|value| DocumentMetadata::from_value(&value)))
     }
 
     async fn write_document(
@@ -1143,6 +1177,39 @@ mod tests {
             .read_document(&alpha_context(), &alpha_path())
             .await
             .expect("matching scope should not be rejected");
+    }
+
+    #[tokio::test]
+    async fn read_document_metadata_returns_in_memory_learning_overlay() {
+        let backend = make_backend();
+        let path = alpha_path();
+        let metadata = DocumentMetadata {
+            confidence: Some(8),
+            category: Some("preference".to_string()),
+            key: Some("editor".to_string()),
+            source: Some("test".to_string()),
+            ..DocumentMetadata::default()
+        };
+        let options = MemoryBackendWriteOptions {
+            metadata_overlay: Some(metadata),
+        };
+
+        backend
+            .write_document_with_backend_options(&alpha_context(), &path, b"learning", &options)
+            .await
+            .expect("write with metadata");
+
+        let metadata = backend
+            .read_document_metadata(&alpha_context(), &path)
+            .await
+            .expect("read metadata")
+            .expect("metadata exists");
+
+        let learning = metadata.learning_metadata().expect("learning metadata");
+        assert_eq!(learning.confidence, Some(8));
+        assert_eq!(learning.category.as_deref(), Some("preference"));
+        assert_eq!(learning.key.as_deref(), Some("editor"));
+        assert_eq!(learning.source.as_deref(), Some("test"));
     }
 
     #[tokio::test]

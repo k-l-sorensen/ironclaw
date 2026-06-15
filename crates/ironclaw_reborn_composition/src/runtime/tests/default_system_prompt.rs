@@ -10,6 +10,8 @@ use ironclaw_loop_support::{
     HostManagedModelError, HostManagedModelGateway, HostManagedModelMessageRole,
     HostManagedModelRequest, HostManagedModelResponse,
 };
+#[cfg(feature = "root-llm-provider")]
+use ironclaw_reborn_config::{RebornBootConfig, RebornHome, RebornProfile};
 use ironclaw_turns::TurnStatus;
 
 use crate::input::RebornBuildInput;
@@ -74,6 +76,13 @@ async fn local_dev_runtime_injects_default_system_prompt_into_model_request() {
         "local-dev runtime should send the editable default system prompt to the model gateway"
     );
     assert!(
+        recorded_requests[0].messages.iter().all(|message| {
+            message.role != HostManagedModelMessageRole::System
+                || !message.content.contains("Reborn Learning Persona")
+        }),
+        "local-dev runtime should not inject the learning persona without boot-config opt-in"
+    );
+    assert!(
         recorded_requests[0].messages.iter().any(|message| {
             message.role == HostManagedModelMessageRole::User && message.content == "ping"
         }),
@@ -117,6 +126,84 @@ async fn local_dev_runtime_uses_existing_edited_default_system_prompt() {
     runtime.shutdown().await.expect("runtime shutdown");
 }
 
+#[cfg(feature = "root-llm-provider")]
+#[tokio::test]
+async fn local_dev_runtime_injects_learning_persona_when_boot_config_enables_learning() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let storage_root = root.path().join("local-dev");
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let input = runtime_input(storage_root.clone(), Arc::clone(&requests))
+        .with_boot_config(learning_boot(&storage_root, true));
+
+    let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    let conversation = runtime.new_conversation().await.expect("conversation");
+    let reply = tokio::time::timeout(
+        Duration::from_secs(3),
+        runtime.send_user_message(&conversation, "ping"),
+    )
+    .await
+    .expect("runtime send should finish")
+    .expect("runtime send should succeed");
+
+    assert_eq!(reply.status, TurnStatus::Completed);
+    let recorded_requests = recorded_requests(&requests);
+    assert_eq!(recorded_requests.len(), 1);
+    assert!(
+        recorded_requests[0].messages.iter().any(|message| {
+            message.role == HostManagedModelMessageRole::System
+                && message.content.contains("Reborn Learning Persona")
+        }),
+        "boot-config learning_enabled=true should inject the learning persona into the model request"
+    );
+
+    runtime.shutdown().await.expect("runtime shutdown");
+}
+
+#[cfg(feature = "root-llm-provider")]
+#[tokio::test]
+async fn local_dev_runtime_omits_learning_persona_when_boot_config_disables_learning() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let storage_root = root.path().join("local-dev");
+    let requests = Arc::new(StdMutex::new(Vec::new()));
+    let input = runtime_input(storage_root.clone(), Arc::clone(&requests))
+        .with_boot_config(learning_boot(&storage_root, false));
+
+    let runtime = build_reborn_runtime(input).await.expect("runtime builds");
+    let conversation = runtime.new_conversation().await.expect("conversation");
+    let reply = tokio::time::timeout(
+        Duration::from_secs(3),
+        runtime.send_user_message(&conversation, "ping"),
+    )
+    .await
+    .expect("runtime send should finish")
+    .expect("runtime send should succeed");
+
+    assert_eq!(reply.status, TurnStatus::Completed);
+    let recorded_requests = recorded_requests(&requests);
+    assert_eq!(recorded_requests.len(), 1);
+    let system_messages = recorded_requests[0]
+        .messages
+        .iter()
+        .filter(|message| message.role == HostManagedModelMessageRole::System)
+        .collect::<Vec<_>>();
+    let prompt_path = storage_root.join("system/prompts/default-system.md");
+    let prompt = std::fs::read_to_string(prompt_path).expect("seeded prompt");
+    assert!(
+        system_messages
+            .iter()
+            .any(|message| message.content == prompt),
+        "learning disabled should preserve the pre-learning default system prompt byte-for-byte"
+    );
+    assert!(
+        system_messages
+            .iter()
+            .all(|message| !message.content.contains("Reborn Learning Persona")),
+        "learning disabled should not inject the learning persona"
+    );
+
+    runtime.shutdown().await.expect("runtime shutdown");
+}
+
 #[tokio::test]
 async fn local_dev_runtime_rejects_non_file_default_system_prompt() {
     let root = tempfile::tempdir().expect("tempdir");
@@ -142,6 +229,17 @@ async fn local_dev_runtime_rejects_non_file_default_system_prompt() {
         }
         other => panic!("expected build error for non-file default prompt, got {other:?}"),
     }
+}
+
+#[cfg(feature = "root-llm-provider")]
+fn learning_boot(storage_root: &std::path::Path, learning_enabled: bool) -> RebornBootConfig {
+    let home = RebornHome::resolve_from_env_parts(
+        Some(storage_root.as_os_str().to_os_string()),
+        None,
+        None,
+    )
+    .expect("reborn home");
+    RebornBootConfig::new_with_learning_enabled(home, RebornProfile::LocalDev, learning_enabled)
 }
 
 fn runtime_input(

@@ -302,6 +302,7 @@ pub enum RebornConfigError {
     V1StateRoot { name: &'static str, path: PathBuf },
     MissingHome,
     InvalidProfile { name: &'static str, value: String },
+    InvalidBooleanEnv { name: &'static str, value: String },
 }
 
 impl fmt::Display for RebornConfigError {
@@ -329,6 +330,10 @@ impl fmt::Display for RebornConfigError {
             Self::InvalidProfile { name, value } => write!(
                 formatter,
                 "{name} must be one of local-dev, local-dev-yolo, production, migration-dry-run; got {value:?}"
+            ),
+            Self::InvalidBooleanEnv { name, value } => write!(
+                formatter,
+                "{name} must be one of 1, true, on, 0, false, off; got {value:?}"
             ),
         }
     }

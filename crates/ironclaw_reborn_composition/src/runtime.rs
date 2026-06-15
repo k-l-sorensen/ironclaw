@@ -235,6 +235,9 @@ mod auth_interaction_tests;
 #[cfg(test)]
 #[path = "runtime/tests/default_system_prompt.rs"]
 mod default_system_prompt_tests;
+#[cfg(all(test, feature = "root-llm-provider"))]
+#[path = "runtime/tests/learning_persona.rs"]
+mod learning_persona_tests;
 mod local_dev;
 mod production;
 mod skills;
@@ -1745,6 +1748,10 @@ pub async fn build_reborn_runtime(
     let mut services_input = services_input.ok_or(RebornRuntimeError::InvalidArgument {
         reason: "RebornRuntimeInput.services is required".to_string(),
     })?;
+    #[cfg(feature = "root-llm-provider")]
+    let learning_enabled = boot.as_ref().is_some_and(|boot| boot.learning_enabled());
+    #[cfg(not(feature = "root-llm-provider"))]
+    let learning_enabled = false;
 
     let profile = services_input.profile();
     match profile {
@@ -2186,6 +2193,7 @@ pub async fn build_reborn_runtime(
                 DefaultSystemPromptIdentitySource::try_new(
                     local_runtime.local_dev_storage_root.clone(),
                     local_runtime.default_system_prompt_path.clone(),
+                    learning_enabled,
                 )
                 .map_err(|error| RebornRuntimeError::InvalidArgument {
                     reason: error.to_string(),

@@ -16,7 +16,9 @@ use ironclaw_turns::{
 };
 
 const DEFAULT_SYSTEM_PROMPT_NAME: &str = "SYSTEM.md";
-const DEFAULT_SYSTEM_PROMPT_EMBEDDED: &str = include_str!("../assets/prompts/default-system.md");
+const DEFAULT_SYSTEM_PROMPT_EMBEDDED: &str = include_str!("assets/prompts/default-system.md");
+const LEARNING_PERSONA_PROMPT_NAME: &str = "LEARNING.md";
+const LEARNING_PERSONA_PROMPT_EMBEDDED: &str = include_str!("assets/prompts/learning_persona.md");
 const MAX_DEFAULT_SYSTEM_PROMPT_BYTES: u64 = 64 * 1024;
 
 #[derive(Debug, thiserror::Error)]
@@ -39,6 +41,7 @@ pub(crate) enum DefaultSystemPromptError {
 pub(crate) struct DefaultSystemPromptIdentitySource {
     storage_root: PathBuf,
     prompt_path: PathBuf,
+    learning_enabled: bool,
     loaded_identity_content: Arc<RwLock<HashMap<LoopMessageRef, HostIdentityMessageContent>>>,
 }
 
@@ -46,11 +49,13 @@ impl DefaultSystemPromptIdentitySource {
     pub(crate) fn try_new(
         storage_root: PathBuf,
         prompt_path: PathBuf,
+        learning_enabled: bool,
     ) -> Result<Self, DefaultSystemPromptError> {
         read_default_system_prompt(&storage_root, &prompt_path)?;
         Ok(Self {
             storage_root,
             prompt_path,
+            learning_enabled,
             loaded_identity_content: Arc::new(RwLock::new(HashMap::new())),
         })
     }
@@ -59,26 +64,46 @@ impl DefaultSystemPromptIdentitySource {
         read_default_system_prompt(&self.storage_root, &self.prompt_path)
     }
 
-    fn identity_name() -> Result<IdentityFileName, HostIdentityContextBuildError> {
-        IdentityFileName::new(DEFAULT_SYSTEM_PROMPT_NAME)
+    fn identity_name(name: &str) -> Result<IdentityFileName, HostIdentityContextBuildError> {
+        IdentityFileName::new(name)
     }
 
-    fn message_ref_for(content: &str) -> Result<LoopMessageRef, HostIdentityContextBuildError> {
-        let name = Self::identity_name()?;
-        identity_message_ref(&name, content).map_err(|_| HostIdentityContextBuildError::Internal)
+    fn message_ref_for(
+        name: &IdentityFileName,
+        content: &str,
+    ) -> Result<LoopMessageRef, HostIdentityContextBuildError> {
+        identity_message_ref(name, content).map_err(|_| HostIdentityContextBuildError::Internal)
     }
 
     fn cache_identity_content(
         &self,
+        name: IdentityFileName,
         message_ref: LoopMessageRef,
         content: String,
     ) -> Result<(), HostIdentityContextBuildError> {
-        let name = Self::identity_name()?;
         self.loaded_identity_content
             .write()
             .map_err(|_| HostIdentityContextBuildError::Internal)?
             .insert(message_ref, HostIdentityMessageContent { name, content });
         Ok(())
+    }
+
+    fn trusted_identity_candidate(
+        &self,
+        identity_name: &str,
+        content: String,
+    ) -> Result<HostIdentityContextCandidate, HostIdentityContextBuildError> {
+        let name = Self::identity_name(identity_name)?;
+        let message_ref = Self::message_ref_for(&name, &content)?;
+        let model_visible_bytes = content.len();
+        self.cache_identity_content(name.clone(), message_ref.clone(), content)?;
+        Ok(HostIdentityContextCandidate::new_trusted(
+            name,
+            message_ref,
+            format!("identity file {identity_name} available"),
+            IdentityApplicability::Always,
+            model_visible_bytes,
+        ))
     }
 }
 
@@ -250,17 +275,15 @@ impl HostIdentityContextSource for DefaultSystemPromptIdentitySource {
         let content = self
             .prompt_content()
             .map_err(|_| HostIdentityContextBuildError::SourceUnavailable)?;
-        let name = Self::identity_name()?;
-        let message_ref = Self::message_ref_for(&content)?;
-        let model_visible_bytes = content.len();
-        self.cache_identity_content(message_ref.clone(), content)?;
-        Ok(vec![HostIdentityContextCandidate::new_trusted(
-            name,
-            message_ref,
-            format!("identity file {DEFAULT_SYSTEM_PROMPT_NAME} available"),
-            IdentityApplicability::Always,
-            model_visible_bytes,
-        )])
+        let mut candidates =
+            vec![self.trusted_identity_candidate(DEFAULT_SYSTEM_PROMPT_NAME, content)?];
+        if self.learning_enabled {
+            candidates.push(self.trusted_identity_candidate(
+                LEARNING_PERSONA_PROMPT_NAME,
+                LEARNING_PERSONA_PROMPT_EMBEDDED.to_string(),
+            )?);
+        }
+        Ok(candidates)
     }
 
     async fn resolve_identity_message_content(
@@ -305,8 +328,9 @@ mod tests {
         let storage_root = root.path().canonicalize().expect("canonical root");
         let prompt_path = storage_root.join("system/prompts/default-system.md");
         seed_default_system_prompt(&storage_root, &prompt_path).expect("prompt seeds");
-        let source = DefaultSystemPromptIdentitySource::try_new(storage_root, prompt_path.clone())
-            .expect("prompt loads");
+        let source =
+            DefaultSystemPromptIdentitySource::try_new(storage_root, prompt_path.clone(), false)
+                .expect("prompt loads");
         let context = test_run_context().await;
 
         let candidates = source
@@ -341,14 +365,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_system_prompt_reloads_edited_prompt_for_new_candidates() {
+    async fn default_system_prompt_without_learning_emits_only_system_candidate() {
         let root = tempfile::tempdir().expect("tempdir");
         let storage_root = root.path().canonicalize().expect("canonical root");
         let prompt_path = storage_root.join("system/prompts/default-system.md");
         seed_default_system_prompt(&storage_root, &prompt_path).expect("prompt seeds");
         let source =
-            DefaultSystemPromptIdentitySource::try_new(storage_root.clone(), prompt_path.clone())
+            DefaultSystemPromptIdentitySource::try_new(storage_root, prompt_path.clone(), false)
                 .expect("prompt loads");
+        let context = test_run_context().await;
+
+        let candidates = source
+            .load_identity_candidates(&context, PromptMode::TextOnly)
+            .await
+            .expect("load candidates");
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].name.as_str(), DEFAULT_SYSTEM_PROMPT_NAME);
+    }
+
+    #[tokio::test]
+    async fn default_system_prompt_with_learning_emits_system_and_learning_candidates() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().canonicalize().expect("canonical root");
+        let prompt_path = storage_root.join("system/prompts/default-system.md");
+        seed_default_system_prompt(&storage_root, &prompt_path).expect("prompt seeds");
+        let source =
+            DefaultSystemPromptIdentitySource::try_new(storage_root, prompt_path.clone(), true)
+                .expect("prompt loads");
+        let context = test_run_context().await;
+
+        let candidates = source
+            .load_identity_candidates(&context, PromptMode::TextOnly)
+            .await
+            .expect("load candidates");
+
+        let names = candidates
+            .iter()
+            .map(|candidate| candidate.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec![DEFAULT_SYSTEM_PROMPT_NAME, "LEARNING.md"]);
+
+        let learning_candidate = candidates
+            .iter()
+            .find(|candidate| candidate.name.as_str() == "LEARNING.md")
+            .expect("learning candidate");
+        let content = source
+            .resolve_identity_message_content(
+                &context,
+                learning_candidate
+                    .message_ref
+                    .as_ref()
+                    .expect("trusted identity has ref"),
+            )
+            .await
+            .expect("resolve learning content")
+            .expect("learning content exists");
+
+        assert_eq!(content.name.as_str(), "LEARNING.md");
+        assert!(content.content.contains("Reborn Learning Persona"));
+    }
+
+    #[tokio::test]
+    async fn default_system_prompt_reloads_edited_prompt_for_new_candidates() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let storage_root = root.path().canonicalize().expect("canonical root");
+        let prompt_path = storage_root.join("system/prompts/default-system.md");
+        seed_default_system_prompt(&storage_root, &prompt_path).expect("prompt seeds");
+        let source = DefaultSystemPromptIdentitySource::try_new(
+            storage_root.clone(),
+            prompt_path.clone(),
+            false,
+        )
+        .expect("prompt loads");
         let context = test_run_context().await;
         let first_candidates = source
             .load_identity_candidates(&context, PromptMode::TextOnly)

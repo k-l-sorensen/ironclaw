@@ -725,10 +725,21 @@ async fn dispatch_read(
     };
     let content = String::from_utf8(bytes).map_err(|_| operation_error())?;
     let redacted = redact_sensitive_memory_content(&content);
+    let learning = services
+        .backend
+        .read_document_metadata(&services.context, &path)
+        .await
+        .map_err(|_| operation_error())?
+        .and_then(|metadata| metadata.learning_metadata());
     Ok(json!({
         "path": path.relative_path(),
         "content": redacted,
         "word_count": content.split_whitespace().count(),
+        "confidence": learning.as_ref().and_then(|learning| learning.confidence),
+        "created_at": learning.as_ref().and_then(|learning| learning.created_at.clone()),
+        "category": learning.as_ref().and_then(|learning| learning.category.clone()),
+        "key": learning.as_ref().and_then(|learning| learning.key.clone()),
+        "source": learning.as_ref().and_then(|learning| learning.source.clone()),
     }))
 }
 

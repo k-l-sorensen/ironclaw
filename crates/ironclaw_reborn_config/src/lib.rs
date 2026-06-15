@@ -30,7 +30,7 @@ mod home;
 mod profile;
 mod secrets_guard;
 
-pub use boot::RebornBootConfig;
+pub use boot::{LEARNING_ENABLED_ENV, RebornBootConfig};
 pub use budget::{
     BACKGROUND_JOB_DEFAULT_USD_ENV, BUDGET_DEFAULT_TZ_ENV, BUDGET_OVERESTIMATE_FACTOR_ENV,
     BUDGET_PAUSE_AT_ENV, BUDGET_WARN_AT_ENV, BudgetDefaults, BudgetDefaultsError,
