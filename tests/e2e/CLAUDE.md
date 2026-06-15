@@ -56,6 +56,8 @@ HEADED=1 pytest scenarios/
 | `test_extension_uninstall_cleanup.py` | Real install/setup/remove coverage for WASM tools, WASM channels, OAuth-backed shared Google tools, and MCP servers; verifies uninstall deletes stored secrets from the libSQL `secrets` table while preserving shared credentials until the last referencing extension is removed |
 | `test_oauth_refresh.py` | Hosted Gmail OAuth regression: complete setup via `/oauth/callback`, expire the stored access token in libSQL, trigger a real `gmail` tool call through `/api/chat/send`, and verify refresh goes through the mock `/oauth/refresh` proxy without forwarding `client_secret` |
 | `test_dom_resource_limits.py` | DOM pruning at MAX_DOM_MESSAGES cap, no setInterval timer leaks across SSE reconnect cycles, streaming message preservation during pruning |
+| `test_reborn_webui_v2_smoke.py` | Reborn WebChat v2 (`ironclaw-reborn serve`) shell load, bearer/`?token=` auth scope, text turns, timeline pagination, SSE run lifecycle, thread list/delete |
+| `test_reborn_webui_v2_tool_gates.py` | Reborn v2 capability path: tool-turn dispatch + `tool_result_reference`, run cancellation, approval-gate approve/deny via `resolve_gate` |
 
 ## `helpers.py`
 

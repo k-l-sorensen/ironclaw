@@ -163,6 +163,18 @@ TOOL_CALL_PATTERNS = [
             "body": {"label": m.group("label")},
         },
     ),
+    # Deterministic approval-gate trigger for the Reborn WebUI v2 capability
+    # surface: `builtin.shell` carries spawn/execute/network effects, which the
+    # local-dev capability policy routes through the `ask_writes` approval gate
+    # (unlike `builtin.http`, which completes without gating there). The command
+    # is a POSIX no-op so the resumed turn finishes cleanly after approval. The
+    # trigger phrase deliberately avoids the substring "echo" so it does not
+    # collide with the earlier echo pattern.
+    (
+        re.compile(r"make shell approval", re.IGNORECASE),
+        "shell",
+        lambda _: {"command": "true", "timeout": 30},
+    ),
     # Workflow-canary NL-driven routine creation: when a chat message
     # carries the [CANARY-WORKFLOW-NL-CREATE] sentinel, emit a
     # routine_create tool call so the canary can verify the agent's
@@ -789,6 +801,50 @@ TOOL_CALL_PATTERNS = [
 _github_api_url: str = "https://api.github.com"
 _last_chat_request: dict | None = None
 
+# Tool names advertised by the most recent /v1/chat/completions request. The
+# canned `TOOL_CALL_PATTERNS` name tools by their short builtin id (``echo``,
+# ``http``), but different surfaces expose different qualified names for the
+# same capability: the v1 engine advertises ``echo`` while the Reborn WebUI v2
+# capability surface advertises ``builtin__echo`` (OpenAI-function form of the
+# ``builtin.echo`` capability id). The tool-call response builders resolve the
+# canned short name against this set so one mock drives both surfaces without
+# the canned patterns needing to know which one is calling.
+_advertised_tool_names: set[str] = set()
+
+
+def _set_advertised_tool_names(tools: list[dict]) -> None:
+    global _advertised_tool_names
+    names = set()
+    for tool in tools:
+        name = (tool or {}).get("function", {}).get("name")
+        if isinstance(name, str) and name:
+            names.add(name)
+    _advertised_tool_names = names
+
+
+def _resolve_advertised_tool_name(short_name: str) -> str:
+    """Map a canned short tool name onto the advertised qualified name.
+
+    Returns the advertised name when the surface exposed a qualified variant
+    (``builtin__echo`` for ``echo``); otherwise returns the short name
+    unchanged so v1-style surfaces and unknown-tool error paths are untouched.
+    """
+    advertised = _advertised_tool_names
+    if not advertised or short_name in advertised:
+        return short_name
+    # `builtin.echo` capability id -> `builtin__echo` OpenAI function name.
+    qualified = f"builtin__{short_name}"
+    if qualified in advertised:
+        return qualified
+    # Fall back to any advertised name whose trailing segment matches the
+    # short name (e.g. `<provider>__<short>`), without guessing across
+    # ambiguous matches.
+    suffix = f"__{short_name}"
+    candidates = [name for name in advertised if name.endswith(suffix)]
+    if len(candidates) == 1:
+        return candidates[0]
+    return short_name
+
 
 def _new_oauth_state() -> dict:
     return {
@@ -1396,10 +1452,24 @@ def _find_tool_results(messages: list[dict]) -> list[dict]:
             if name == "unknown":
                 name = tool_call_names.get(message.get("tool_call_id", ""), name)
             results.append({
-                "name": name,
+                # Normalize surface-qualified names (`builtin__echo`) back to the
+                # short builtin id (`echo`) so the canned re-dispatch guards and
+                # summary patterns — all written in short-name terms — match
+                # regardless of which surface advertised the tool.
+                "name": _short_builtin_tool_name(name),
                 "content": message.get("content", ""),
             })
     return results
+
+
+def _short_builtin_tool_name(name: str) -> str:
+    """Strip the `builtin__` surface prefix from a qualified tool name.
+
+    Inverse of `_resolve_advertised_tool_name`: `builtin__echo` -> `echo`,
+    leaving v1-style short names (`echo`, `memory_write`) untouched.
+    """
+    prefix = "builtin__"
+    return name[len(prefix):] if name.startswith(prefix) else name
 
 
 def _find_tool_result(messages: list[dict]) -> dict | None:
@@ -1865,6 +1935,11 @@ async def chat_completions(request: web.Request) -> web.StreamResponse:
     messages = body.get("messages", [])
     stream = body.get("stream", False)
     has_tools = bool(body.get("tools"))
+    # Capture the tool names this request actually advertised so the tool-call
+    # response builders can map the canned short name (e.g. ``echo``) onto the
+    # surface-qualified name the caller exposes (e.g. ``builtin__echo`` on the
+    # Reborn WebUI v2 capability surface). See `_resolve_advertised_tool_name`.
+    _set_advertised_tool_names(body.get("tools") or [])
     cid = f"mock-{uuid.uuid4().hex[:8]}"
 
     if _conversation_wants_slow_response(messages):
@@ -2033,7 +2108,7 @@ def _tool_call_response(cid: str, calls: list[dict] | dict) -> web.Response:
             "id": f"call_{uuid.uuid4().hex[:8]}",
             "type": "function",
             "function": {
-                "name": tc["tool_name"],
+                "name": _resolve_advertised_tool_name(tc["tool_name"]),
                 "arguments": json.dumps(tc["arguments"]),
             },
         }
@@ -2118,7 +2193,10 @@ async def _stream_tool_call(
                 "index": idx,
                 "id": call_id,
                 "type": "function",
-                "function": {"name": tc["tool_name"], "arguments": ""},
+                "function": {
+                    "name": _resolve_advertised_tool_name(tc["tool_name"]),
+                    "arguments": "",
+                },
             }],
         }
         if idx == 0:

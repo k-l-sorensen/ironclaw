@@ -360,6 +360,136 @@ def ironclaw_reborn_binary():
     return str(binary)
 
 
+@pytest.fixture(scope="module")
+async def reborn_v2_server(ironclaw_reborn_binary, mock_llm_server, tmp_path_factory):
+    """Start `ironclaw-reborn serve` with the v2 surface against the mock LLM.
+
+    Module-scoped so every test in a v2 scenario file shares one server (startup
+    is expensive) while still isolating thread/config mutations from other files.
+    The `local-dev` boot profile wires the local-dev capability policy, so
+    builtin capabilities (`builtin.echo`, `builtin.shell`, ...) are model-visible
+    and tool turns actually dispatch instead of stalling.
+    """
+    from helpers import REBORN_V2_AUTH_TOKEN
+    from reborn_v2_support import (
+        USER_ID,
+        find_free_port,
+        forward_coverage_env,
+        read_log,
+        stop_process,
+        write_config_toml,
+    )
+
+    home_dir = tmp_path_factory.mktemp("ironclaw-reborn-v2-home")
+    reborn_home = home_dir / "reborn-home"
+    reborn_home.mkdir(parents=True, exist_ok=True)
+    write_config_toml(reborn_home / "config.toml", mock_llm_server)
+
+    proc = None
+    base_url = None
+    last_stderr = ""
+    last_port = None
+
+    for attempt in range(1, 4):
+        port = find_free_port()
+        last_port = port
+        stdout_path = home_dir / f"reborn-v2-attempt-{attempt}.stdout.log"
+        stderr_path = home_dir / f"reborn-v2-attempt-{attempt}.stderr.log"
+
+        env = {
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+            "HOME": str(home_dir),
+            "IRONCLAW_REBORN_HOME": str(reborn_home),
+            "IRONCLAW_REBORN_PROFILE": "local-dev",
+            "IRONCLAW_REBORN_WEBUI_TOKEN": REBORN_V2_AUTH_TOKEN,
+            "IRONCLAW_REBORN_WEBUI_USER_ID": USER_ID,
+            "MOCK_LLM_API_KEY": "mock-api-key",
+            # Keep the provider's reqwest client off any developer-local HTTP
+            # proxy so the loopback mock request is not intercepted (502).
+            "NO_PROXY": "127.0.0.1,localhost,::1",
+            "no_proxy": "127.0.0.1,localhost,::1",
+            "RUST_LOG": "ironclaw=warn,ironclaw_reborn=warn",
+            "RUST_BACKTRACE": "1",
+        }
+        forward_coverage_env(env)
+
+        with stdout_path.open("wb") as out, stderr_path.open("wb") as err:
+            proc = await asyncio.create_subprocess_exec(
+                ironclaw_reborn_binary,
+                "serve",
+                "--host", "127.0.0.1",
+                "--port", str(port),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                env=env,
+            )
+        base_url = f"http://127.0.0.1:{port}"
+
+        try:
+            await wait_for_ready(f"{base_url}/api/health", timeout=60)
+            break
+        except TimeoutError:
+            if proc.returncode is None:
+                await stop_process(proc, timeout=2)
+            last_stderr = read_log(stderr_path)
+            proc = None
+    else:
+        pytest.fail(
+            "Reborn WebUI v2 server failed to start after 3 attempts.\n"
+            f"Last attempted port: {last_port}\n"
+            f"stderr:\n{last_stderr}"
+        )
+
+    try:
+        yield base_url
+    finally:
+        if proc is not None and proc.returncode is None:
+            await stop_process(proc, sig=signal.SIGINT, timeout=10)
+            if proc.returncode is None:
+                await stop_process(proc, sig=signal.SIGTERM, timeout=5)
+
+
+@pytest.fixture(scope="module")
+async def reborn_v2_browser():
+    """Chromium instance for the v2 scenarios (independent of the legacy gateway).
+
+    Chromium's cold start can contend with the binary build and server startup,
+    so launch with a generous timeout and one retry rather than letting the
+    default 30s connect window flake the whole module.
+    """
+    from playwright.async_api import Error as PlaywrightError
+    from playwright.async_api import async_playwright
+
+    headless = os.environ.get("HEADED", "").strip() not in ("1", "true")
+    async with async_playwright() as p:
+        browser = None
+        for attempt in range(3):
+            try:
+                browser = await p.chromium.launch(headless=headless, timeout=60000)
+                break
+            except PlaywrightError:
+                if attempt == 2:
+                    raise
+                await asyncio.sleep(1)
+        yield browser
+        await browser.close()
+
+
+@pytest.fixture
+async def reborn_v2_page(reborn_v2_server, reborn_v2_browser):
+    """Fresh authed page on the v2 SPA, navigated past the login/connect view."""
+    from helpers import REBORN_V2_AUTH_TOKEN, SEL_V2
+
+    context = await reborn_v2_browser.new_context(viewport={"width": 1280, "height": 720})
+    page = await context.new_page()
+    await page.goto(f"{reborn_v2_server}/v2/?token={REBORN_V2_AUTH_TOKEN}")
+    # Authenticated landing route is /chat; the composer is the shell anchor.
+    await page.wait_for_selector(SEL_V2["chat_composer"], timeout=15000)
+    yield page
+    await context.close()
+
+
 @pytest.fixture(scope="session")
 def server_ports():
     """Reserve dynamic ports for the gateway and HTTP webhook channel."""
