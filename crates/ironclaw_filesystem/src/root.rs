@@ -85,6 +85,22 @@ pub trait RootFilesystem: Send + Sync {
     /// materialized entry bodies.
     async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError>;
 
+    /// Lists at most `max_entries` direct children of a canonical virtual
+    /// directory.
+    ///
+    /// Backends that can stop directory enumeration early should override this.
+    /// The default preserves compatibility by delegating to [`Self::list_dir`]
+    /// and truncating the result after materialization.
+    async fn list_dir_bounded(
+        &self,
+        path: &VirtualPath,
+        max_entries: usize,
+    ) -> Result<Vec<DirEntry>, FilesystemError> {
+        let mut entries = self.list_dir(path).await?;
+        entries.truncate(max_entries);
+        Ok(entries)
+    }
+
     /// Filtered query over `prefix`. Returns the materialized entries
     /// matching `filter`. Backends without `query` capability return
     /// [`FilesystemError::Unsupported`].
@@ -181,6 +197,25 @@ pub trait RootFilesystem: Send + Sync {
         unsupported(path, FilesystemOperation::Tail)
     }
 
+    /// Return the highest seq present at `path` with `seq > from`, or `None`
+    /// when no such record exists. This is the head/replay-boundary probe used
+    /// by durable event logs at subscription start.
+    ///
+    /// The default impl is a correctness-preserving fallback that routes
+    /// through [`tail`](Self::tail) and takes the max observed seq, which
+    /// materializes the gap into memory. Backends with a native max-seq query
+    /// (Postgres, libSQL) MUST override this with an O(1) `MAX(seq)` lookup so
+    /// a new subscription (`from = 0`) does not load the whole stream just to
+    /// find its head.
+    async fn head_seq(
+        &self,
+        path: &VirtualPath,
+        from: SeqNo,
+    ) -> Result<Option<SeqNo>, FilesystemError> {
+        let records = self.tail(path, from).await?;
+        Ok(records.into_iter().map(|record| record.seq).max())
+    }
+
     // ─── Legacy bytes plane (DEPRECATED — removed after consumer migration) ─
     //
     // The methods below predate the unified [`put`]/[`get`] surface and exist
@@ -264,4 +299,45 @@ fn unsupported<T>(
         path: path.clone(),
         operation,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct DefaultBoundedBackend;
+
+    #[async_trait::async_trait]
+    impl RootFilesystem for DefaultBoundedBackend {
+        async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+            Ok(["a", "b", "c"]
+                .into_iter()
+                .map(|name| DirEntry {
+                    name: name.to_string(),
+                    path: VirtualPath::new(format!("{}/{}", path.as_str(), name)).unwrap(),
+                    file_type: crate::FileType::File,
+                })
+                .collect())
+        }
+
+        async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+            Err(FilesystemError::NotFound {
+                path: path.clone(),
+                operation: FilesystemOperation::Stat,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn list_dir_bounded_default_truncates_materialized_entries() {
+        let backend = DefaultBoundedBackend;
+        let path = VirtualPath::new("/projects").unwrap();
+
+        let none = backend.list_dir_bounded(&path, 0).await.unwrap();
+        let all = backend.list_dir_bounded(&path, 10).await.unwrap();
+
+        assert!(none.is_empty());
+        assert_eq!(all.len(), 3);
+        assert_eq!(all[2].name, "c");
+    }
 }

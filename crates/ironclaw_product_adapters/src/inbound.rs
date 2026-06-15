@@ -3,6 +3,7 @@
 use chrono::{DateTime, Utc};
 use ironclaw_turns::{AcceptedMessageRef, TurnRunId};
 use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 use crate::auth::{ProtocolAuthEvidence, VerifiedAuthClaim};
 use crate::error::ProductAdapterError;
@@ -42,6 +43,19 @@ fn validate_token_string(
     max: usize,
 ) -> Result<(), ProductAdapterError> {
     validate_bounded_string(kind, value, max, false, false)
+}
+
+fn validate_command_name(value: &str) -> Result<(), ProductAdapterError> {
+    validate_token_string("command", value, COMMAND_MAX_BYTES)?;
+    if value
+        .chars()
+        .any(|c| c.is_whitespace() || c == '/' || c == '\\')
+    {
+        return Err(malformed(
+            "command contains unsupported whitespace or slash characters",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_bounded_string(
@@ -139,7 +153,7 @@ impl InboundCommandPayload {
     ) -> Result<Self, ProductAdapterError> {
         let command = command.into();
         let arguments = arguments.into();
-        validate_token_string("command", &command, COMMAND_MAX_BYTES)?;
+        validate_command_name(&command)?;
         validate_payload_string("command arguments", &arguments, COMMAND_ARGUMENTS_MAX_BYTES)?;
         Ok(Self {
             command,
@@ -147,6 +161,51 @@ impl InboundCommandPayload {
             trigger,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ProductSlashCommandParseError {
+    #[error("slash command is empty")]
+    Empty,
+    #[error("slash command payload is invalid: {0}")]
+    InvalidPayload(String),
+}
+
+/// Parse a raw slash command into a normalized command payload. Returns
+/// `Ok(None)` when the input is ordinary user text.
+pub fn parse_product_slash_command(
+    input: &str,
+    trigger: ProductTriggerReason,
+) -> Result<Option<InboundCommandPayload>, ProductSlashCommandParseError> {
+    let trimmed = input.trim();
+    let Some(without_slash) = trimmed.strip_prefix('/') else {
+        return Ok(None);
+    };
+    let without_slash = without_slash.trim_start();
+    if without_slash.is_empty() {
+        return Err(ProductSlashCommandParseError::Empty);
+    }
+
+    let command_end = without_slash
+        .char_indices()
+        .find_map(|(idx, c)| c.is_whitespace().then_some(idx))
+        .unwrap_or(without_slash.len());
+    let command_slice = &without_slash[..command_end];
+    let arguments_slice = without_slash[command_end..].trim_start();
+    validate_command_name(command_slice)
+        .map_err(|error| ProductSlashCommandParseError::InvalidPayload(error.to_string()))?;
+    validate_payload_string(
+        "command arguments",
+        arguments_slice,
+        COMMAND_ARGUMENTS_MAX_BYTES,
+    )
+    .map_err(|error| ProductSlashCommandParseError::InvalidPayload(error.to_string()))?;
+
+    let command = command_slice.to_ascii_lowercase();
+    let arguments = arguments_slice.to_string();
+    InboundCommandPayload::new(command, arguments, trigger)
+        .map(Some)
+        .map_err(|error| ProductSlashCommandParseError::InvalidPayload(error.to_string()))
 }
 
 #[derive(Deserialize)]
@@ -166,7 +225,7 @@ impl<'de> Deserialize<'de> for InboundCommandPayload {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalDecision {
     ApproveOnce,
@@ -178,6 +237,8 @@ pub enum ApprovalDecision {
 pub struct ApprovalResolutionPayload {
     pub gate_ref: String,
     pub decision: ApprovalDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_trigger: Option<ProductTriggerReason>,
 }
 
 impl ApprovalResolutionPayload {
@@ -187,7 +248,42 @@ impl ApprovalResolutionPayload {
     ) -> Result<Self, ProductAdapterError> {
         let gate_ref = gate_ref.into();
         validate_token_string("gate ref", &gate_ref, INTERACTION_REF_MAX_BYTES)?;
-        Ok(Self { gate_ref, decision })
+        Ok(Self {
+            gate_ref,
+            decision,
+            source_trigger: None,
+        })
+    }
+
+    pub fn with_source_trigger(mut self, source_trigger: ProductTriggerReason) -> Self {
+        self.source_trigger = Some(source_trigger);
+        self
+    }
+}
+
+/// Approval command scoped by the current product conversation/actor binding.
+///
+/// Surfaces use this for thread-local shorthand such as `approve` / `deny`
+/// where the gate reference is intentionally resolved by the trusted workflow
+/// layer instead of being supplied by the adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ScopedApprovalResolutionPayload {
+    pub decision: ApprovalDecision,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_trigger: Option<ProductTriggerReason>,
+}
+
+impl ScopedApprovalResolutionPayload {
+    pub fn new(decision: ApprovalDecision) -> Result<Self, ProductAdapterError> {
+        Ok(Self {
+            decision,
+            source_trigger: None,
+        })
+    }
+
+    pub fn with_source_trigger(mut self, source_trigger: ProductTriggerReason) -> Self {
+        self.source_trigger = Some(source_trigger);
+        self
     }
 }
 
@@ -195,6 +291,7 @@ impl ApprovalResolutionPayload {
 struct ApprovalResolutionPayloadWire {
     gate_ref: String,
     decision: ApprovalDecision,
+    source_trigger: Option<ProductTriggerReason>,
 }
 
 impl<'de> Deserialize<'de> for ApprovalResolutionPayload {
@@ -203,7 +300,31 @@ impl<'de> Deserialize<'de> for ApprovalResolutionPayload {
         D: Deserializer<'de>,
     {
         let wire = ApprovalResolutionPayloadWire::deserialize(deserializer)?;
-        Self::new(wire.gate_ref, wire.decision).map_err(serde::de::Error::custom)
+        let payload = Self::new(wire.gate_ref, wire.decision).map_err(serde::de::Error::custom)?;
+        Ok(match wire.source_trigger {
+            Some(source_trigger) => payload.with_source_trigger(source_trigger),
+            None => payload,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ScopedApprovalResolutionPayloadWire {
+    decision: ApprovalDecision,
+    source_trigger: Option<ProductTriggerReason>,
+}
+
+impl<'de> Deserialize<'de> for ScopedApprovalResolutionPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ScopedApprovalResolutionPayloadWire::deserialize(deserializer)?;
+        let payload = Self::new(wire.decision).map_err(serde::de::Error::custom)?;
+        Ok(match wire.source_trigger {
+            Some(source_trigger) => payload.with_source_trigger(source_trigger),
+            None => payload,
+        })
     }
 }
 
@@ -219,6 +340,8 @@ pub enum AuthResolutionResult {
 pub struct AuthResolutionPayload {
     pub auth_request_ref: String,
     pub result: AuthResolutionResult,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_trigger: Option<ProductTriggerReason>,
 }
 
 impl AuthResolutionPayload {
@@ -236,7 +359,13 @@ impl AuthResolutionPayload {
         Ok(Self {
             auth_request_ref,
             result,
+            source_trigger: None,
         })
+    }
+
+    pub fn with_source_trigger(mut self, source_trigger: ProductTriggerReason) -> Self {
+        self.source_trigger = Some(source_trigger);
+        self
     }
 }
 
@@ -244,6 +373,7 @@ impl AuthResolutionPayload {
 struct AuthResolutionPayloadWire {
     auth_request_ref: String,
     result: AuthResolutionResult,
+    source_trigger: Option<ProductTriggerReason>,
 }
 
 impl<'de> Deserialize<'de> for AuthResolutionPayload {
@@ -252,7 +382,12 @@ impl<'de> Deserialize<'de> for AuthResolutionPayload {
         D: Deserializer<'de>,
     {
         let wire = AuthResolutionPayloadWire::deserialize(deserializer)?;
-        Self::new(wire.auth_request_ref, wire.result).map_err(serde::de::Error::custom)
+        let payload =
+            Self::new(wire.auth_request_ref, wire.result).map_err(serde::de::Error::custom)?;
+        Ok(match wire.source_trigger {
+            Some(source_trigger) => payload.with_source_trigger(source_trigger),
+            None => payload,
+        })
     }
 }
 
@@ -267,6 +402,48 @@ fn validate_auth_resolution_result(
             validate_token_string("callback ref", callback_ref, INTERACTION_REF_MAX_BYTES)
         }
         AuthResolutionResult::Denied => Ok(()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProjectionReadPayload {
+    pub thread_id_hint: Option<String>,
+    pub after_cursor: Option<ProjectionCursor>,
+    pub limit: Option<u16>,
+}
+
+impl ProjectionReadPayload {
+    pub fn new(
+        thread_id_hint: Option<String>,
+        after_cursor: Option<ProjectionCursor>,
+        limit: Option<u16>,
+    ) -> Result<Self, ProductAdapterError> {
+        if let Some(hint) = &thread_id_hint {
+            validate_token_string("thread id hint", hint, THREAD_HINT_MAX_BYTES)?;
+        }
+        Ok(Self {
+            thread_id_hint,
+            after_cursor,
+            limit,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct ProjectionReadPayloadWire {
+    thread_id_hint: Option<String>,
+    after_cursor: Option<ProjectionCursor>,
+    limit: Option<u16>,
+}
+
+impl<'de> Deserialize<'de> for ProjectionReadPayload {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = ProjectionReadPayloadWire::deserialize(deserializer)?;
+        Self::new(wire.thread_id_hint, wire.after_cursor, wire.limit)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -304,6 +481,22 @@ impl<'de> Deserialize<'de> for ProjectionSubscriptionPayload {
     {
         let wire = ProjectionSubscriptionPayloadWire::deserialize(deserializer)?;
         Self::new(wire.thread_id_hint, wire.after_cursor).map_err(serde::de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ProductControlActionPayload {
+    CancelRun { run_id: TurnRunId },
+}
+
+impl ProductControlActionPayload {
+    pub fn cancel_run(run_id: &str) -> Result<Self, ProductAdapterError> {
+        let run_id =
+            TurnRunId::parse(run_id).map_err(|_| ProductAdapterError::MalformedInboundPayload {
+                reason: RedactedString::new("invalid run id"),
+            })?;
+        Ok(Self::CancelRun { run_id })
     }
 }
 
@@ -364,8 +557,11 @@ pub enum ProductInboundPayload {
     UserMessage(UserMessagePayload),
     Command(InboundCommandPayload),
     ApprovalResolution(ApprovalResolutionPayload),
+    ScopedApprovalResolution(ScopedApprovalResolutionPayload),
     AuthResolution(AuthResolutionPayload),
+    ProjectionRead(ProjectionReadPayload),
     SubscriptionRequest(ProjectionSubscriptionPayload),
+    ControlAction(ProductControlActionPayload),
     LinkedThreadAction(LinkedThreadActionPayload),
     NoOp,
 }
@@ -515,7 +711,9 @@ pub enum ProductRejectionKind {
     BindingRequired,
     AccessDenied,
     UnknownInstallation,
+    InvalidRequest,
     PolicyDenied,
+    AmbiguousResolution,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -554,12 +752,68 @@ impl ProductRejection {
     }
 }
 
+impl ProductRejectionKind {
+    /// Returns a sanitized, user-facing hint for this rejection kind.
+    ///
+    /// Never interpolates internal state, reasons, or redacted strings.
+    pub fn user_facing_hint(&self) -> &'static str {
+        match self {
+            Self::BindingRequired => {
+                "I couldn't match this reply to an active conversation. Reply in the approval thread, or use `approve gate:<ref>`."
+            }
+            Self::AccessDenied => "You don't have access to resolve this request.",
+            Self::UnknownInstallation => "This workspace isn't set up with IronClaw yet.",
+            Self::InvalidRequest => {
+                "I couldn't read that request. Use `approve` / `deny`, optionally with `gate:<ref>`."
+            }
+            Self::PolicyDenied => "That request was declined by policy.",
+            Self::AmbiguousResolution => {
+                "Multiple requests are pending in this conversation. Use `approve gate:<ref>` or `deny gate:<ref>` to pick one."
+            }
+        }
+    }
+
+    /// Auth-resolution-flavored variant of [`Self::user_facing_hint`]: kinds whose
+    /// generic hint references approval commands get auth-specific guidance
+    /// (`auth deny <auth-request-ref>`); all other kinds reuse the generic hint.
+    pub fn user_facing_auth_hint(&self) -> &'static str {
+        match self {
+            Self::BindingRequired => {
+                "I couldn't match this reply to an active auth request. Reply in the auth prompt thread, or use `auth deny <auth-request-ref>` to decline."
+            }
+            Self::InvalidRequest => {
+                "I couldn't read that request. Use `auth deny <auth-request-ref>` to decline an auth request."
+            }
+            Self::AmbiguousResolution => {
+                "Multiple auth requests are pending in this conversation. Use `auth deny <auth-request-ref>` to target a specific one."
+            }
+            _ => self.user_facing_hint(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InboundRetryDisposition {
     DoNotRetry,
     Retry,
     ReplayPrior,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ProductCommandResultPayload(Value);
+
+impl Eq for ProductCommandResultPayload {}
+
+impl ProductCommandResultPayload {
+    pub fn new(value: Value) -> Self {
+        Self(value)
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -574,6 +828,10 @@ pub enum ProductInboundAck {
         active_run_id: TurnRunId,
     },
     Rejected(ProductRejection),
+    CommandResult {
+        command: String,
+        payload: ProductCommandResultPayload,
+    },
     Duplicate {
         prior: Box<ProductInboundAck>,
     },
@@ -586,6 +844,7 @@ impl ProductInboundAck {
             Self::Accepted { .. }
             | Self::DeferredBusy { .. }
             | Self::Duplicate { .. }
+            | Self::CommandResult { .. }
             | Self::NoOp => true,
             Self::Rejected(rejection) => {
                 rejection.disposition == ProductRejectionDisposition::Permanent
@@ -681,6 +940,12 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            InboundCommandPayload::new("bad name", "", ProductTriggerReason::BotCommand).is_err()
+        );
+        assert!(
+            InboundCommandPayload::new("bad/name", "", ProductTriggerReason::BotCommand).is_err()
+        );
         let empty_command = serde_json::json!({
             "command": "",
             "arguments": "",
@@ -701,6 +966,13 @@ mod tests {
             "trigger": "bot_command"
         });
         assert!(serde_json::from_value::<InboundCommandPayload>(forged).is_err());
+
+        let forged_slash = serde_json::json!({
+            "command": "bad/name",
+            "arguments": "",
+            "trigger": "bot_command"
+        });
+        assert!(serde_json::from_value::<InboundCommandPayload>(forged_slash).is_err());
     }
 
     #[test]
@@ -760,6 +1032,15 @@ mod tests {
         );
         assert!(ProductInboundAck::NoOp.is_durable_outcome());
         assert!(
+            ProductInboundAck::CommandResult {
+                command: "extension_install".to_string(),
+                payload: ProductCommandResultPayload::new(serde_json::json!({
+                    "phase": "installed",
+                })),
+            }
+            .is_durable_outcome()
+        );
+        assert!(
             ProductInboundAck::Rejected(ProductRejection::permanent(
                 ProductRejectionKind::PolicyDenied,
                 "policy denied",
@@ -780,5 +1061,85 @@ mod tests {
             .retry_disposition(),
             InboundRetryDisposition::ReplayPrior
         );
+    }
+
+    #[test]
+    fn rejection_kind_user_facing_hint_is_exhaustive_and_sanitized() {
+        // Every variant must return a non-empty, static hint with no internal state.
+        let cases = [
+            (ProductRejectionKind::BindingRequired, "approve gate:"),
+            (ProductRejectionKind::AccessDenied, "access"),
+            (ProductRejectionKind::UnknownInstallation, "workspace"),
+            (ProductRejectionKind::InvalidRequest, "approve"),
+            (ProductRejectionKind::PolicyDenied, "policy"),
+            (ProductRejectionKind::AmbiguousResolution, "approve gate:"),
+        ];
+        for (kind, expected_substr) in &cases {
+            let hint = kind.user_facing_hint();
+            assert!(!hint.is_empty(), "{kind:?} hint must not be empty");
+            assert!(
+                hint.contains(expected_substr),
+                "{kind:?} hint '{hint}' must contain '{expected_substr}'"
+            );
+        }
+
+        // Hints must be pairwise distinct — two kinds sharing a hint would
+        // make the user-facing feedback ambiguous about what went wrong.
+        let mut hints: Vec<&str> = cases
+            .iter()
+            .map(|(kind, _)| kind.user_facing_hint())
+            .collect();
+        hints.sort_unstable();
+        hints.dedup();
+        assert_eq!(
+            hints.len(),
+            cases.len(),
+            "every ProductRejectionKind must have a distinct user-facing hint"
+        );
+    }
+
+    #[test]
+    fn rejection_kind_user_facing_auth_hint_overrides_approval_kinds_and_falls_through() {
+        // BindingRequired and InvalidRequest must return auth-specific guidance,
+        // not the approval-command text from user_facing_hint().
+        let binding_hint = ProductRejectionKind::BindingRequired.user_facing_auth_hint();
+        assert!(
+            binding_hint.contains("auth deny"),
+            "BindingRequired auth hint must reference 'auth deny', got: {binding_hint}"
+        );
+        assert!(
+            !binding_hint.contains("approve gate:"),
+            "BindingRequired auth hint must not contain approval command, got: {binding_hint}"
+        );
+
+        let invalid_hint = ProductRejectionKind::InvalidRequest.user_facing_auth_hint();
+        assert!(
+            invalid_hint.contains("auth deny"),
+            "InvalidRequest auth hint must reference 'auth deny', got: {invalid_hint}"
+        );
+        assert!(
+            !invalid_hint.contains("approve"),
+            "InvalidRequest auth hint must not contain approval command, got: {invalid_hint}"
+        );
+
+        // AmbiguousResolution must also return auth-specific guidance, not approval text.
+        let ambiguous_hint = ProductRejectionKind::AmbiguousResolution.user_facing_auth_hint();
+        assert!(
+            ambiguous_hint.contains("auth deny"),
+            "AmbiguousResolution auth hint must reference 'auth deny', got: {ambiguous_hint}"
+        );
+
+        // All other kinds fall through to user_facing_hint().
+        for kind in [
+            ProductRejectionKind::AccessDenied,
+            ProductRejectionKind::UnknownInstallation,
+            ProductRejectionKind::PolicyDenied,
+        ] {
+            assert_eq!(
+                kind.user_facing_auth_hint(),
+                kind.user_facing_hint(),
+                "{kind:?} auth hint must fall through to user_facing_hint()"
+            );
+        }
     }
 }

@@ -165,9 +165,56 @@ pub struct InboundTurnRequest {
     pub requested_run_profile: Option<RunProfileRequest>,
 }
 
+/// Whether a trusted inbound submission came from the trusted-trigger fire
+/// path. Carried as a type so origin classification never re-derives
+/// trigger-ness from the adapter-kind string (see `.claude/rules/types.md`).
+/// Only the trusted-trigger submit seam constructs `Trigger`; every other
+/// trusted ingress is `Other`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TrustedInboundKind {
+    Trigger,
+    // arch-exempt: dead_code, reserved trusted non-trigger ingress — the only
+    // trusted production path today is the trigger submit seam (which builds
+    // `Trigger`); `Other` is exercised by the trusted-non-trigger inbound tests
+    // and becomes live when a trusted non-trigger ingress is added. Until then
+    // it must stay a typed variant so classification cannot silently fall back
+    // to `TrustedTrigger` for a future trusted caller.
+    #[allow(dead_code)]
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TrustedInboundTurnRequest {
+    pub(crate) request: InboundTurnRequest,
+    pub(crate) trusted_agent_id: Option<AgentId>,
+    pub(crate) trusted_project_id: Option<ProjectId>,
+    pub(crate) trusted_owner_user_id: Option<UserId>,
+    pub(crate) kind: TrustedInboundKind,
+}
+
+impl TrustedInboundTurnRequest {
+    pub(crate) fn new(
+        request: InboundTurnRequest,
+        trusted_agent_id: Option<AgentId>,
+        trusted_project_id: Option<ProjectId>,
+        trusted_owner_user_id: Option<UserId>,
+        kind: TrustedInboundKind,
+    ) -> Self {
+        Self {
+            request,
+            trusted_agent_id,
+            trusted_project_id,
+            trusted_owner_user_id,
+            kind,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundTurnResponse {
     pub resolution: ConversationBindingResolution,
     pub accepted_message: AcceptedInboundMessage,
     pub turn_submission: Option<SubmitTurnResponse>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub replayed_turn_submission: bool,
 }

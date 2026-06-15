@@ -366,6 +366,19 @@ where
             }))
     }
 
+    async fn delete(
+        &self,
+        scope: &ResourceScope,
+        handle: &SecretHandle,
+    ) -> Result<bool, SecretStoreError> {
+        let path = secret_path(scope, handle)?;
+        match self.filesystem.delete(scope, &path).await {
+            Ok(()) => Ok(true),
+            Err(error) if is_not_found(&error) => Ok(false),
+            Err(error) => Err(fs_to_secret_store_error(error)),
+        }
+    }
+
     async fn lease_once(
         &self,
         scope: &ResourceScope,
@@ -1517,6 +1530,7 @@ fn sanitize_error_kind(reason: String) -> String {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use chrono::Utc;
     use ironclaw_filesystem::{InMemoryBackend, ScopedFilesystem};
@@ -1607,6 +1621,81 @@ mod tests {
         }
     }
 
+    struct DeleteCountingBackend {
+        inner: Arc<InMemoryBackend>,
+        get_calls: AtomicUsize,
+        delete_calls: AtomicUsize,
+    }
+
+    impl DeleteCountingBackend {
+        fn new(inner: Arc<InMemoryBackend>) -> Self {
+            Self {
+                inner,
+                get_calls: AtomicUsize::new(0),
+                delete_calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn get_calls(&self) -> usize {
+            self.get_calls.load(Ordering::SeqCst)
+        }
+
+        fn delete_calls(&self) -> usize {
+            self.delete_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl RootFilesystem for DeleteCountingBackend {
+        fn capabilities(&self) -> BackendCapabilities {
+            self.inner.capabilities()
+        }
+
+        async fn put(
+            &self,
+            path: &VirtualPath,
+            entry: Entry,
+            cas: CasExpectation,
+        ) -> Result<RecordVersion, FilesystemError> {
+            self.inner.put(path, entry, cas).await
+        }
+
+        async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+            self.get_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.get(path).await
+        }
+
+        async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+            self.inner.list_dir(path).await
+        }
+
+        async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+            self.inner.stat(path).await
+        }
+
+        async fn delete(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+            self.delete_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.delete(path).await
+        }
+
+        async fn query(
+            &self,
+            path: &VirtualPath,
+            filter: &Filter,
+            page: Page,
+        ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+            self.inner.query(path, filter, page).await
+        }
+
+        async fn ensure_index(
+            &self,
+            path: &VirtualPath,
+            spec: &IndexSpec,
+        ) -> Result<(), FilesystemError> {
+            self.inner.ensure_index(path, spec).await
+        }
+    }
+
     #[tokio::test]
     async fn filesystem_secret_store_round_trips_material() {
         let fs = Arc::new(InMemoryBackend::new());
@@ -1632,6 +1721,65 @@ mod tests {
 
         let second = store.consume(&scope, lease.id).await.unwrap_err();
         assert!(second.is_consumed());
+    }
+
+    /// Operator-wide secrets are stored under [`ResourceScope::system`], whose
+    /// reserved tenant/user id carries control bytes that normal `TenantId`
+    /// validation rejects. The persisted `StoredSecret` tags the entry with
+    /// that scope, so a read-back deserializes it — this must round-trip.
+    /// Regression for the WebUI NEAR AI save returning `service_unavailable`:
+    /// the key wrote but every read-back (metadata/lease) errored on the
+    /// system tenant id.
+    #[tokio::test]
+    async fn filesystem_secret_store_round_trips_system_scope() {
+        let fs = Arc::new(InMemoryBackend::new());
+        let scoped = default_scoped_fs(Arc::clone(&fs));
+        let store = FilesystemSecretStore::new(scoped, test_crypto());
+        let scope = ResourceScope::system();
+        let handle = SecretHandle::new("llm_provider_nearai_api_key").unwrap();
+
+        store
+            .put(
+                scope.clone(),
+                handle.clone(),
+                SecretMaterial::from("sk-operator-wide"),
+            )
+            .await
+            .unwrap();
+
+        assert!(store.metadata(&scope, &handle).await.unwrap().is_some());
+        let lease = store.lease_once(&scope, &handle).await.unwrap();
+        let material = store.consume(&scope, lease.id).await.unwrap();
+        assert_eq!(material.expose_secret(), "sk-operator-wide");
+    }
+
+    #[tokio::test]
+    async fn filesystem_secret_store_delete_skips_pre_read() {
+        let backend = Arc::new(DeleteCountingBackend::new(Arc::new(InMemoryBackend::new())));
+        let store =
+            FilesystemSecretStore::new(default_scoped_fs(Arc::clone(&backend)), test_crypto());
+        let scope = sample_scope("tenant-a", "user-a");
+        let handle = SecretHandle::new("api_key").unwrap();
+
+        store
+            .put(
+                scope.clone(),
+                handle.clone(),
+                SecretMaterial::from("super-secret"),
+            )
+            .await
+            .unwrap();
+        let get_calls_before_delete = backend.get_calls();
+
+        let removed = store.delete(&scope, &handle).await.unwrap();
+
+        assert!(removed);
+        assert_eq!(
+            backend.get_calls(),
+            get_calls_before_delete,
+            "delete should not add a pre-read before the backend delete path"
+        );
+        assert_eq!(backend.delete_calls(), 1);
     }
 
     #[tokio::test]
@@ -1906,7 +2054,7 @@ mod tests {
     // second attempt succeeds.
 
     use std::sync::Arc as StdArc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicBool;
 
     use ironclaw_filesystem::{
         BackendCapabilities, DirEntry, FileStat, Filter, IndexSpec, Page, RecordVersion,

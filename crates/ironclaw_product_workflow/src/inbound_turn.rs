@@ -10,25 +10,31 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+#[cfg(test)]
 use ironclaw_host_api::UserId;
 use ironclaw_product_adapters::{
-    ProductInboundAck, ProductInboundEnvelope, ProductInboundPayload, ProductRejection,
+    ProductAdapterId, ProductInboundAck, ProductInboundEnvelope, ProductInboundPayload,
+    ProductRejection,
 };
 use ironclaw_threads::{
     AcceptInboundMessageRequest, AcceptedInboundMessageReplay, EnsureThreadRequest, MessageContent,
     MessageStatus, ReplayAcceptedInboundMessageRequest, SessionThreadService, ThreadMessageId,
     ThreadScope,
 };
-use ironclaw_turns::{AcceptedMessageRef, TurnError, TurnRunId};
 use ironclaw_turns::{
-    IdempotencyKey, ReplyTargetBindingRef, SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse,
-    TurnActor, TurnCoordinator, TurnScope,
+    AcceptedMessageRef, SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator,
+    TurnError, TurnRunId, TurnScope, TurnSurfaceType,
 };
 use uuid::Uuid;
 
 use crate::binding::{
-    ConversationBindingService, ProductConversationRouteKind, ResolveBindingRequest,
-    ResolvedBinding,
+    ConversationBindingService, ProductConversationBindingCreationPolicy,
+    ProductConversationRouteKind, ResolveBindingRequest, ResolvedBinding,
+    binding_profile_for_trigger,
+};
+use crate::binding_ref::{
+    DEFAULT_BINDING_REF_RAW_MAX_BYTES, bounded_idempotency_key, bounded_reply_target_binding_ref,
+    bounded_source_binding_ref,
 };
 use crate::error::ProductWorkflowError;
 use crate::policy::{
@@ -115,6 +121,8 @@ struct PreparedUserMessage {
     thread_scope: ThreadScope,
     source_binding_id: String,
     submit_idempotency_key: String,
+    adapter_id: ProductAdapterId,
+    surface_type: TurnSurfaceType,
 }
 
 /// Port for the inbound turn submission path.
@@ -272,27 +280,40 @@ where
                 kind: "non_user_message".into(),
             });
         };
-        let route_kind = route_kind_for_user_message(payload.trigger);
-        let binding = self
-            .binding_service
-            .resolve_binding(ResolveBindingRequest {
-                adapter_id: envelope.adapter_id().clone(),
-                installation_id: envelope.installation_id().clone(),
-                external_actor_ref: envelope.external_actor_ref().clone(),
-                external_conversation_ref: envelope.external_conversation_ref().clone(),
-                external_event_id: envelope.external_event_id().clone(),
-                route_kind,
-                auth_claim: envelope.auth_claim().clone(),
-            })
-            .await?;
+        let (route_kind, creation_policy) = binding_profile_for_trigger(payload.trigger);
+        let surface_type = match route_kind {
+            ProductConversationRouteKind::Direct => TurnSurfaceType::Direct,
+            ProductConversationRouteKind::Shared => TurnSurfaceType::Channel,
+        };
+        let binding_request = ResolveBindingRequest {
+            adapter_id: envelope.adapter_id().clone(),
+            installation_id: envelope.installation_id().clone(),
+            external_actor_ref: envelope.external_actor_ref().clone(),
+            external_conversation_ref: envelope.external_conversation_ref().clone(),
+            external_event_id: envelope.external_event_id().clone(),
+            route_kind,
+            auth_claim: envelope.auth_claim().clone(),
+        };
+        let binding = match creation_policy {
+            ProductConversationBindingCreationPolicy::CreateAllowed => {
+                self.binding_service
+                    .resolve_binding(binding_request)
+                    .await?
+            }
+            ProductConversationBindingCreationPolicy::ExistingOnly => {
+                self.binding_service.lookup_binding(binding_request).await?
+            }
+        };
         let source_binding_id = product_source_binding_id(envelope, &binding);
         let submit_idempotency_key = submit_idempotency_key(envelope, &binding);
-        let thread_scope = thread_scope_from_binding(&binding, route_kind)?;
+        let thread_scope = thread_scope_from_binding(&binding)?;
         Ok(PreparedUserMessage {
             binding,
             thread_scope,
             source_binding_id,
             submit_idempotency_key,
+            adapter_id: envelope.adapter_id().clone(),
+            surface_type,
         })
     }
 
@@ -305,7 +326,7 @@ where
             .thread_service
             .replay_accepted_inbound_message(ReplayAcceptedInboundMessageRequest {
                 scope: prepared.thread_scope.clone(),
-                actor_id: prepared.binding.user_id.as_str().to_string(),
+                actor_id: prepared.binding.actor_user_id.as_str().to_string(),
                 source_binding_id: prepared.source_binding_id.clone(),
                 external_event_id: envelope.external_event_id().as_str().to_string(),
             })
@@ -323,6 +344,7 @@ where
             replay,
             prepared.submit_idempotency_key.clone(),
             envelope.received_at(),
+            prepared,
         )
         .await
         .map(Some)
@@ -342,7 +364,7 @@ where
             .ensure_thread(EnsureThreadRequest {
                 scope: prepared.thread_scope.clone(),
                 thread_id: Some(prepared.binding.thread_id.clone()),
-                created_by_actor_id: prepared.binding.user_id.as_str().to_string(),
+                created_by_actor_id: prepared.binding.actor_user_id.as_str().to_string(),
                 title: None,
                 metadata_json: None,
             })
@@ -357,7 +379,7 @@ where
             .accept_inbound_message(AcceptInboundMessageRequest {
                 scope: prepared.thread_scope.clone(),
                 thread_id: prepared.binding.thread_id.clone(),
-                actor_id: prepared.binding.user_id.as_str().to_string(),
+                actor_id: prepared.binding.actor_user_id.as_str().to_string(),
                 source_binding_id: Some(prepared.source_binding_id.clone()),
                 reply_target_binding_id: Some(reply_target_binding_id.clone()),
                 external_event_id: Some(envelope.external_event_id().as_str().to_string()),
@@ -368,7 +390,7 @@ where
                 reason: format!("failed to accept inbound message: {e}"),
             })?;
 
-        ProductInboundTurnHandoff::NeedsSubmission(AcceptedProductInboundTurn {
+        ProductInboundTurnHandoff::NeedsSubmission(Box::new(AcceptedProductInboundTurn {
             binding: prepared.binding,
             thread_scope: prepared.thread_scope,
             message_id: accepted.message_id,
@@ -376,25 +398,11 @@ where
             reply_target_binding_id,
             idempotency_key_raw: prepared.submit_idempotency_key,
             received_at: envelope.received_at(),
-        })
+            adapter_id: prepared.adapter_id,
+            surface_type: prepared.surface_type,
+        }))
         .submit_or_replay(&self.thread_service, &self.turn_coordinator)
         .await
-    }
-}
-
-fn route_kind_for_user_message(
-    trigger: ironclaw_product_adapters::ProductTriggerReason,
-) -> ProductConversationRouteKind {
-    match trigger {
-        ironclaw_product_adapters::ProductTriggerReason::DirectChat => {
-            ProductConversationRouteKind::Direct
-        }
-        ironclaw_product_adapters::ProductTriggerReason::BotMention
-        | ironclaw_product_adapters::ProductTriggerReason::ReplyToBot
-        | ironclaw_product_adapters::ProductTriggerReason::BotCommand
-        | ironclaw_product_adapters::ProductTriggerReason::LinkedThreadAction => {
-            ProductConversationRouteKind::Shared
-        }
     }
 }
 
@@ -404,14 +412,20 @@ async fn submit_or_replay_accepted_message<T, C>(
     replay: AcceptedInboundMessageReplay,
     submit_idempotency_key: String,
     received_at: DateTime<Utc>,
+    prepared: &PreparedUserMessage,
 ) -> Result<InboundTurnOutcome, ProductWorkflowError>
 where
     T: SessionThreadService,
     C: TurnCoordinator,
 {
-    ProductInboundTurnHandoff::from_replay(replay, submit_idempotency_key, received_at)?
-        .submit_or_replay(thread_service, turn_coordinator)
-        .await
+    ProductInboundTurnHandoff::from_replay_with_prepared(
+        replay,
+        submit_idempotency_key,
+        received_at,
+        prepared,
+    )?
+    .submit_or_replay(thread_service, turn_coordinator)
+    .await
 }
 
 enum ProductInboundTurnHandoff {
@@ -420,16 +434,57 @@ enum ProductInboundTurnHandoff {
         submitted_run_id: TurnRunId,
         binding: ResolvedBinding,
     },
-    NeedsSubmission(AcceptedProductInboundTurn),
+    NeedsSubmission(Box<AcceptedProductInboundTurn>),
 }
 
 impl ProductInboundTurnHandoff {
+    #[cfg(test)]
     fn from_replay(
         replay: AcceptedInboundMessageReplay,
         submit_idempotency_key: String,
         received_at: DateTime<Utc>,
+        adapter_id: ProductAdapterId,
     ) -> Result<Self, ProductWorkflowError> {
         let binding = binding_from_replay(&replay)?;
+        let thread_scope = replay.scope.clone();
+        Self::from_replay_parts(
+            replay,
+            submit_idempotency_key,
+            received_at,
+            binding,
+            thread_scope,
+            adapter_id,
+            // Surface type is unknown at replay time without the original trigger.
+            TurnSurfaceType::Direct,
+        )
+    }
+
+    fn from_replay_with_prepared(
+        replay: AcceptedInboundMessageReplay,
+        submit_idempotency_key: String,
+        received_at: DateTime<Utc>,
+        prepared: &PreparedUserMessage,
+    ) -> Result<Self, ProductWorkflowError> {
+        Self::from_replay_parts(
+            replay,
+            submit_idempotency_key,
+            received_at,
+            prepared.binding.clone(),
+            prepared.thread_scope.clone(),
+            prepared.adapter_id.clone(),
+            prepared.surface_type,
+        )
+    }
+
+    fn from_replay_parts(
+        replay: AcceptedInboundMessageReplay,
+        submit_idempotency_key: String,
+        received_at: DateTime<Utc>,
+        binding: ResolvedBinding,
+        thread_scope: ThreadScope,
+        adapter_id: ProductAdapterId,
+        surface_type: TurnSurfaceType,
+    ) -> Result<Self, ProductWorkflowError> {
         let accepted_message_ref = accepted_message_ref(replay.message_id)?;
 
         if replay.status == MessageStatus::Submitted {
@@ -473,15 +528,19 @@ impl ProductInboundTurnHandoff {
             }
         })?;
 
-        Ok(Self::NeedsSubmission(AcceptedProductInboundTurn {
-            binding,
-            thread_scope: replay.scope,
-            message_id: replay.message_id,
-            source_binding_id,
-            reply_target_binding_id,
-            idempotency_key_raw: submit_idempotency_key,
-            received_at,
-        }))
+        Ok(Self::NeedsSubmission(Box::new(
+            AcceptedProductInboundTurn {
+                binding,
+                thread_scope,
+                message_id: replay.message_id,
+                source_binding_id,
+                reply_target_binding_id,
+                idempotency_key_raw: submit_idempotency_key,
+                received_at,
+                adapter_id,
+                surface_type,
+            },
+        )))
     }
 
     async fn submit_or_replay<T, C>(
@@ -518,6 +577,8 @@ struct AcceptedProductInboundTurn {
     reply_target_binding_id: String,
     idempotency_key_raw: String,
     received_at: DateTime<Utc>,
+    adapter_id: ProductAdapterId,
+    surface_type: TurnSurfaceType,
 }
 
 impl AcceptedProductInboundTurn {
@@ -538,20 +599,55 @@ impl AcceptedProductInboundTurn {
             reply_target_binding_id,
             idempotency_key_raw,
             received_at,
+            adapter_id,
+            surface_type,
         } = self;
-        let turn_scope = TurnScope::new(
+        let turn_scope = TurnScope::new_with_owner(
             binding.tenant_id.clone(),
             binding.agent_id.clone(),
             binding.project_id.clone(),
             binding.thread_id.clone(),
+            thread_scope.owner_user_id.clone(),
         );
-        let actor = TurnActor::new(binding.user_id.clone());
-        let source_binding_ref = bounded_ref::<SourceBindingRef>("src", &source_binding_id)?;
+        let actor = TurnActor::new(binding.actor_user_id.clone());
+        let source_binding_ref = bounded_source_binding_ref(
+            "src",
+            &source_binding_id,
+            DEFAULT_BINDING_REF_RAW_MAX_BYTES,
+        )
+        .map_err(|e| ProductWorkflowError::TurnSubmissionRejected {
+            reason: format!("invalid src ref: {e}"),
+        })?;
         let accepted_message_ref = accepted_message_ref(message_id)?;
-        let reply_target_binding_ref =
-            bounded_ref::<ReplyTargetBindingRef>("reply", &reply_target_binding_id)?;
-        let idempotency_key = bounded_ref::<IdempotencyKey>("turn", &idempotency_key_raw)?;
+        let reply_target_binding_ref = bounded_reply_target_binding_ref(
+            "reply",
+            &reply_target_binding_id,
+            DEFAULT_BINDING_REF_RAW_MAX_BYTES,
+        )
+        .map_err(|e| ProductWorkflowError::TurnSubmissionRejected {
+            reason: format!("invalid reply ref: {e}"),
+        })?;
+        let idempotency_key = bounded_idempotency_key(
+            "turn",
+            &idempotency_key_raw,
+            DEFAULT_BINDING_REF_RAW_MAX_BYTES,
+        )
+        .map_err(|e| ProductWorkflowError::TurnSubmissionRejected {
+            reason: format!("invalid turn ref: {e}"),
+        })?;
 
+        let run_adapter =
+            ironclaw_turns::RunOriginAdapter::new(adapter_id.as_str()).map_err(|e| {
+                ProductWorkflowError::TurnSubmissionRejected {
+                    reason: e.to_string(),
+                }
+            })?;
+        let product_context = ironclaw_product_context::resolve_inbound(
+            ironclaw_product_context::InboundClassification::Untrusted,
+            run_adapter,
+            Some(surface_type),
+            turn_scope.product_owner(&actor),
+        );
         let request = SubmitTurnRequest {
             scope: turn_scope,
             actor,
@@ -561,6 +657,11 @@ impl AcceptedProductInboundTurn {
             requested_run_profile: None,
             idempotency_key,
             received_at,
+            requested_run_id: None,
+            parent_run_id: None,
+            subagent_depth: 0,
+            spawn_tree_root_run_id: None,
+            product_context: Some(product_context),
         };
 
         match turn_coordinator.submit_turn(request).await {
@@ -613,23 +714,26 @@ fn accepted_message_ref(
     })
 }
 
+#[cfg(test)]
 fn binding_from_replay(
     replay: &AcceptedInboundMessageReplay,
 ) -> Result<ResolvedBinding, ProductWorkflowError> {
-    let user_id = match replay.scope.owner_user_id.clone() {
-        Some(user_id) => user_id,
-        None => UserId::new(replay.actor_id.as_deref().ok_or_else(|| {
+    let actor_user_id = match replay.actor_id.as_deref() {
+        Some(actor_id) => {
+            UserId::new(actor_id).map_err(|e| ProductWorkflowError::BindingResolutionFailed {
+                reason: format!("invalid replay actor user id: {e}"),
+            })?
+        }
+        None => replay.scope.owner_user_id.clone().ok_or_else(|| {
             ProductWorkflowError::BindingResolutionFailed {
-                reason: "accepted replay missing user id".into(),
+                reason: "accepted replay missing actor user id and owner user id".into(),
             }
-        })?)
-        .map_err(|e| ProductWorkflowError::BindingResolutionFailed {
-            reason: format!("invalid replay user id: {e}"),
         })?,
     };
     Ok(ResolvedBinding {
         tenant_id: replay.scope.tenant_id.clone(),
-        user_id,
+        actor_user_id,
+        subject_user_id: replay.scope.owner_user_id.clone(),
         thread_id: replay.thread_id.clone(),
         agent_id: Some(replay.scope.agent_id.clone()),
         project_id: replay.scope.project_id.clone(),
@@ -638,46 +742,19 @@ fn binding_from_replay(
 
 fn thread_scope_from_binding(
     binding: &ResolvedBinding,
-    route_kind: ProductConversationRouteKind,
 ) -> Result<ThreadScope, ProductWorkflowError> {
     let Some(agent_id) = binding.agent_id.clone() else {
         return Err(ProductWorkflowError::BindingResolutionFailed {
             reason: "resolved binding missing agent_id required for thread scope".into(),
         });
     };
-    let owner_user_id = match route_kind {
-        ProductConversationRouteKind::Direct => Some(binding.user_id.clone()),
-        ProductConversationRouteKind::Shared => None,
-    };
     Ok(ThreadScope {
         tenant_id: binding.tenant_id.clone(),
         agent_id,
         project_id: binding.project_id.clone(),
-        owner_user_id,
+        owner_user_id: binding.subject_user_id.clone(),
         mission_id: None,
     })
-}
-
-trait RefFactory: Sized {
-    fn build(value: String) -> Result<Self, String>;
-}
-
-impl RefFactory for SourceBindingRef {
-    fn build(value: String) -> Result<Self, String> {
-        Self::new(value)
-    }
-}
-
-impl RefFactory for ReplyTargetBindingRef {
-    fn build(value: String) -> Result<Self, String> {
-        Self::new(value)
-    }
-}
-
-impl RefFactory for IdempotencyKey {
-    fn build(value: String) -> Result<Self, String> {
-        Self::new(value)
-    }
 }
 
 fn product_source_binding_id(
@@ -721,21 +798,9 @@ fn segment(name: &str, value: &str) -> String {
     format!("{name}:{}:{value};", value.len())
 }
 
-fn bounded_ref<T: RefFactory>(prefix: &str, raw: &str) -> Result<T, ProductWorkflowError> {
-    let value = if raw.len() <= 240 && !raw.chars().any(|c| c == '\0' || c.is_control()) {
-        format!("{prefix}:{raw}")
-    } else {
-        let id = Uuid::new_v5(&Uuid::NAMESPACE_OID, raw.as_bytes());
-        format!("{prefix}:{id}")
-    };
-    T::build(value).map_err(|e| ProductWorkflowError::TurnSubmissionRejected {
-        reason: format!("invalid {prefix} ref: {e}"),
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use std::future::pending;
+    use std::{future::pending, sync::Mutex};
 
     use async_trait::async_trait;
     use chrono::TimeZone;
@@ -744,11 +809,294 @@ mod tests {
         AdapterInstallationId, ExternalActorRef, ExternalConversationRef, ProductAdapterId,
         ProductTriggerReason, UserMessagePayload,
     };
-    use ironclaw_threads::ThreadScope;
+    use ironclaw_threads::{
+        AcceptInboundMessageRequest, AcceptedInboundMessage, AcceptedInboundMessageReplay,
+        AppendAssistantDraftRequest, AppendCapabilityDisplayPreviewRequest,
+        AppendToolResultReferenceRequest, ContextMessages, ContextWindow,
+        CreateSummaryArtifactRequest, EnsureThreadRequest, ListThreadsForScopeRequest,
+        ListThreadsForScopeResponse, LoadContextMessagesRequest, LoadContextWindowRequest,
+        MessageContent, RedactMessageRequest, ReplayAcceptedInboundMessageRequest,
+        SessionThreadError, SessionThreadRecord, SummaryArtifact, ThreadHistory,
+        ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
+        UpdateAssistantDraftRequest, UpdateToolResultReferenceRequest,
+    };
+    use ironclaw_turns::{
+        CancelRunRequest, CancelRunResponse, GetRunStateRequest, ResumeTurnRequest,
+        ResumeTurnResponse, RunProfileId, RunProfileVersion, SubmitTurnRequest, SubmitTurnResponse,
+        TurnCoordinator, TurnError, TurnId, TurnOriginKind, TurnRunId, TurnRunState, TurnScope,
+        TurnStatus, TurnSurfaceType, events::EventCursor,
+    };
 
     use crate::action::SourceBindingKey;
 
     use super::*;
+
+    // --- Minimal stubs for submit path tests ---
+
+    #[derive(Default)]
+    struct CapturingTurnCoordinator {
+        submissions: Mutex<Vec<SubmitTurnRequest>>,
+    }
+
+    impl CapturingTurnCoordinator {
+        fn submissions(&self) -> Vec<SubmitTurnRequest> {
+            self.submissions.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl TurnCoordinator for CapturingTurnCoordinator {
+        async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
+            Ok(TurnRunId::new())
+        }
+
+        async fn submit_turn(
+            &self,
+            request: SubmitTurnRequest,
+        ) -> Result<SubmitTurnResponse, TurnError> {
+            let run_id = TurnRunId::new();
+            let message_ref = request.accepted_message_ref.clone();
+            let reply_ref = request.reply_target_binding_ref.clone();
+            self.submissions.lock().unwrap().push(request);
+            Ok(SubmitTurnResponse::Accepted {
+                turn_id: TurnId::new(),
+                run_id,
+                status: TurnStatus::Completed,
+                resolved_run_profile_id: RunProfileId::default_profile(),
+                resolved_run_profile_version: RunProfileVersion::new(1),
+                event_cursor: EventCursor(0),
+                accepted_message_ref: message_ref,
+                reply_target_binding_ref: reply_ref,
+            })
+        }
+
+        async fn resume_turn(
+            &self,
+            _request: ResumeTurnRequest,
+        ) -> Result<ResumeTurnResponse, TurnError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn cancel_run(
+            &self,
+            _request: CancelRunRequest,
+        ) -> Result<CancelRunResponse, TurnError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn get_run_state(
+            &self,
+            _request: GetRunStateRequest,
+        ) -> Result<TurnRunState, TurnError> {
+            unimplemented!("not used in submit path tests")
+        }
+    }
+
+    struct StubSessionThreadService;
+
+    #[async_trait]
+    impl ironclaw_threads::SessionThreadService for StubSessionThreadService {
+        async fn ensure_thread(
+            &self,
+            _request: EnsureThreadRequest,
+        ) -> Result<SessionThreadRecord, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn accept_inbound_message(
+            &self,
+            _request: AcceptInboundMessageRequest,
+        ) -> Result<AcceptedInboundMessage, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn replay_accepted_inbound_message(
+            &self,
+            _request: ReplayAcceptedInboundMessageRequest,
+        ) -> Result<Option<AcceptedInboundMessageReplay>, SessionThreadError> {
+            Ok(None)
+        }
+
+        async fn mark_message_submitted(
+            &self,
+            _scope: &ThreadScope,
+            _thread_id: &ironclaw_host_api::ThreadId,
+            _message_id: ThreadMessageId,
+            _turn_id: String,
+            _turn_run_id: String,
+        ) -> Result<ThreadMessageRecord, SessionThreadError> {
+            Ok(stub_message_record(_message_id))
+        }
+
+        async fn mark_message_deferred_busy(
+            &self,
+            _scope: &ThreadScope,
+            _thread_id: &ironclaw_host_api::ThreadId,
+            _message_id: ThreadMessageId,
+        ) -> Result<ThreadMessageRecord, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn append_assistant_draft(
+            &self,
+            _request: AppendAssistantDraftRequest,
+        ) -> Result<ThreadMessageRecord, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn append_tool_result_reference(
+            &self,
+            _request: AppendToolResultReferenceRequest,
+        ) -> Result<ThreadMessageRecord, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn append_capability_display_preview(
+            &self,
+            _request: AppendCapabilityDisplayPreviewRequest,
+        ) -> Result<ThreadMessageRecord, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn update_tool_result_reference(
+            &self,
+            _request: UpdateToolResultReferenceRequest,
+        ) -> Result<ThreadMessageRecord, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn update_assistant_draft(
+            &self,
+            _request: UpdateAssistantDraftRequest,
+        ) -> Result<ThreadMessageRecord, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn finalize_assistant_message(
+            &self,
+            _scope: &ThreadScope,
+            _thread_id: &ironclaw_host_api::ThreadId,
+            _message_id: ThreadMessageId,
+            _content: MessageContent,
+        ) -> Result<ThreadMessageRecord, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn redact_message(
+            &self,
+            _request: RedactMessageRequest,
+        ) -> Result<ThreadMessageRecord, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn load_context_window(
+            &self,
+            _request: LoadContextWindowRequest,
+        ) -> Result<ContextWindow, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn load_context_messages(
+            &self,
+            _request: LoadContextMessagesRequest,
+        ) -> Result<ContextMessages, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn list_thread_history(
+            &self,
+            _request: ThreadHistoryRequest,
+        ) -> Result<ThreadHistory, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn create_summary_artifact(
+            &self,
+            _request: CreateSummaryArtifactRequest,
+        ) -> Result<SummaryArtifact, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+
+        async fn list_threads_for_scope(
+            &self,
+            _request: ListThreadsForScopeRequest,
+        ) -> Result<ListThreadsForScopeResponse, SessionThreadError> {
+            unimplemented!("not used in submit path tests")
+        }
+    }
+
+    fn stub_message_record(message_id: ThreadMessageId) -> ThreadMessageRecord {
+        ThreadMessageRecord {
+            message_id,
+            thread_id: thread_id(),
+            sequence: 1,
+            kind: ironclaw_threads::MessageKind::User,
+            status: ironclaw_threads::MessageStatus::Submitted,
+            actor_id: None,
+            source_binding_id: None,
+            reply_target_binding_id: None,
+            turn_id: None,
+            turn_run_id: None,
+            tool_result_ref: None,
+            tool_result_provider_call: None,
+            content: None,
+            attachments: Vec::new(),
+            redaction_ref: None,
+        }
+    }
+
+    /// The legacy `from_replay` path hard-codes `TurnSurfaceType::Direct` and injects the
+    /// adapter id. This test drives the handoff through `submit_or_replay` and asserts
+    /// that the submitted `SubmitTurnRequest.product_context` carries `Direct` surface and
+    /// the adapter from the replay call.
+    #[tokio::test]
+    async fn replay_submit_carries_direct_surface_type_and_adapter_id() {
+        let adapter_id = ProductAdapterId::new("telegram").unwrap();
+        let message_id = ThreadMessageId::new();
+        let handoff = ProductInboundTurnHandoff::from_replay(
+            replay(
+                message_id,
+                MessageStatus::DeferredBusy,
+                Some("src:replay"),
+                Some("reply:replay"),
+                None,
+            ),
+            "turn-key-replay".to_string(),
+            received_at(),
+            adapter_id.clone(),
+        )
+        .expect("replay handoff");
+
+        let coordinator = CapturingTurnCoordinator::default();
+        let thread_service = StubSessionThreadService;
+
+        handoff
+            .submit_or_replay(&thread_service, &coordinator)
+            .await
+            .expect("submit_or_replay succeeds");
+
+        let submissions = coordinator.submissions();
+        assert_eq!(submissions.len(), 1, "one turn must be submitted");
+        let ctx = submissions[0]
+            .product_context
+            .as_ref()
+            .expect("product_context must be set");
+        assert_eq!(
+            ctx.surface_type,
+            Some(TurnSurfaceType::Direct),
+            "replay path must carry Direct surface type"
+        );
+        assert_eq!(
+            ctx.adapter.as_ref().map(|a| a.as_str()),
+            Some(adapter_id.as_str()),
+            "replay path must carry the adapter id"
+        );
+        assert_eq!(
+            ctx.origin,
+            TurnOriginKind::Inbound,
+            "replay path must record Inbound origin (Untrusted classification)"
+        );
+    }
 
     struct PendingBeforeInboundPolicy;
 
@@ -801,6 +1149,7 @@ mod tests {
             ),
             "turn-key".to_string(),
             received_at(),
+            ProductAdapterId::new("test_adapter").unwrap(),
         )
         .expect("submitted replay handoff");
 
@@ -834,6 +1183,7 @@ mod tests {
             ),
             "turn-key".to_string(),
             received_at(),
+            ProductAdapterId::new("test_adapter").unwrap(),
         )
         .expect("deferred replay handoff");
 
@@ -844,6 +1194,155 @@ mod tests {
         assert_eq!(submission.message_id, message_id);
         assert_eq!(submission.source_binding_id, "src:alpha");
         assert_eq!(submission.reply_target_binding_id, "reply:alpha");
+    }
+
+    #[test]
+    fn legacy_replay_without_actor_id_uses_owner_as_actor() {
+        let message_id = ThreadMessageId::new();
+        let mut replay = replay(
+            message_id,
+            MessageStatus::DeferredBusy,
+            Some("src:alpha"),
+            Some("reply:alpha"),
+            None,
+        );
+        replay.actor_id = None;
+
+        let handoff = ProductInboundTurnHandoff::from_replay(
+            replay,
+            "turn-key".to_string(),
+            received_at(),
+            ProductAdapterId::new("test_adapter").unwrap(),
+        )
+        .expect("legacy replay handoff");
+
+        let ProductInboundTurnHandoff::NeedsSubmission(submission) = handoff else {
+            panic!("expected legacy replay to require a new turn submission")
+        };
+
+        assert_eq!(submission.binding.actor_user_id, user_id());
+        assert_eq!(submission.binding.subject_user_id, Some(user_id()));
+        assert_eq!(submission.message_id, message_id);
+    }
+
+    #[test]
+    fn prepared_replay_uses_fresh_binding_scope_over_persisted_scope() {
+        let message_id = ThreadMessageId::new();
+        let mut replay = replay(
+            message_id,
+            MessageStatus::DeferredBusy,
+            Some("src:alpha"),
+            Some("reply:alpha"),
+            None,
+        );
+        replay.scope.owner_user_id = None;
+        let subject_user_id = UserId::new("user:team-subject").unwrap();
+        let prepared = PreparedUserMessage {
+            binding: ResolvedBinding {
+                tenant_id: tenant_id(),
+                actor_user_id: user_id(),
+                subject_user_id: Some(subject_user_id.clone()),
+                thread_id: thread_id(),
+                agent_id: Some(AgentId::new("agent:alpha").unwrap()),
+                project_id: None,
+            },
+            thread_scope: ThreadScope {
+                tenant_id: tenant_id(),
+                agent_id: AgentId::new("agent:alpha").unwrap(),
+                project_id: None,
+                owner_user_id: Some(subject_user_id.clone()),
+                mission_id: None,
+            },
+            source_binding_id: "src:alpha".to_string(),
+            submit_idempotency_key: "turn-key".to_string(),
+            adapter_id: ProductAdapterId::new("test_adapter").unwrap(),
+            surface_type: TurnSurfaceType::Direct,
+        };
+
+        let handoff = ProductInboundTurnHandoff::from_replay_with_prepared(
+            replay,
+            "turn-key".to_string(),
+            received_at(),
+            &prepared,
+        )
+        .expect("prepared replay handoff");
+
+        let ProductInboundTurnHandoff::NeedsSubmission(submission) = handoff else {
+            panic!("expected prepared replay to require a new turn submission")
+        };
+
+        assert_eq!(
+            submission.binding.subject_user_id,
+            Some(subject_user_id.clone())
+        );
+        assert_eq!(submission.thread_scope.owner_user_id, Some(subject_user_id));
+        assert_eq!(submission.message_id, message_id);
+    }
+
+    /// A BotMention shared route must produce `TurnSurfaceType::Channel` in the
+    /// submitted `SubmitTurnRequest.product_context`. This exercises the
+    /// `ProductConversationRouteKind::Shared => TurnSurfaceType::Channel` branch
+    /// in `prepare_user_message` through the replay-with-prepared handoff path,
+    /// which is the same submission seam the full inbound-turn pipeline uses.
+    #[tokio::test]
+    async fn shared_user_message_records_channel_surface_type() {
+        let message_id = ThreadMessageId::new();
+        let prepared = PreparedUserMessage {
+            binding: ResolvedBinding {
+                tenant_id: tenant_id(),
+                actor_user_id: user_id(),
+                subject_user_id: Some(user_id()),
+                thread_id: thread_id(),
+                agent_id: Some(AgentId::new("agent:alpha").unwrap()),
+                project_id: None,
+            },
+            thread_scope: ThreadScope {
+                tenant_id: tenant_id(),
+                agent_id: AgentId::new("agent:alpha").unwrap(),
+                project_id: None,
+                owner_user_id: Some(user_id()),
+                mission_id: None,
+            },
+            source_binding_id: "src:shared".to_string(),
+            submit_idempotency_key: "turn-key-shared".to_string(),
+            adapter_id: ProductAdapterId::new("slack").unwrap(),
+            // BotMention shared route maps to Channel surface type.
+            surface_type: TurnSurfaceType::Channel,
+        };
+
+        let handoff = ProductInboundTurnHandoff::from_replay_with_prepared(
+            replay(
+                message_id,
+                MessageStatus::DeferredBusy,
+                Some("src:shared"),
+                Some("reply:shared"),
+                None,
+            ),
+            "turn-key-shared".to_string(),
+            received_at(),
+            &prepared,
+        )
+        .expect("shared route replay handoff");
+
+        let coordinator = CapturingTurnCoordinator::default();
+        let thread_service = StubSessionThreadService;
+
+        handoff
+            .submit_or_replay(&thread_service, &coordinator)
+            .await
+            .expect("submit_or_replay succeeds");
+
+        let submissions = coordinator.submissions();
+        assert_eq!(submissions.len(), 1, "one turn must be submitted");
+        let ctx = submissions[0]
+            .product_context
+            .as_ref()
+            .expect("product_context must be set");
+        assert_eq!(
+            ctx.surface_type,
+            Some(TurnSurfaceType::Channel),
+            "BotMention shared route must carry Channel surface type"
+        );
     }
 
     fn policy_request() -> BeforeInboundPolicyRequest {
@@ -886,7 +1385,7 @@ mod tests {
             message_id,
             sequence: 1,
             status,
-            actor_id: None,
+            actor_id: Some(user_id().as_str().to_string()),
             source_binding_id: source_binding_id.map(str::to_string),
             reply_target_binding_id: reply_target_binding_id.map(str::to_string),
             turn_run_id,

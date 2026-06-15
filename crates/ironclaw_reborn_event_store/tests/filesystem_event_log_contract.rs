@@ -126,6 +126,55 @@ async fn filesystem_event_log_append_assigns_monotonic_cursors() {
 }
 
 #[tokio::test]
+async fn filesystem_event_log_head_cursor_reports_latest_and_rejects_future() {
+    let fs = build_scoped_fs();
+    let log = FilesystemDurableEventLog::new(Arc::clone(&fs));
+    let scope = scope_for("alice", "project-a");
+    let stream = EventStreamKey::from_scope(&scope);
+
+    // Empty stream: head is origin.
+    assert_eq!(
+        log.head_cursor(&stream, EventCursor::origin())
+            .await
+            .expect("head of empty stream"),
+        EventCursor::origin()
+    );
+
+    for _ in 0..3 {
+        log.append(RuntimeEvent::dispatch_requested(
+            scope.clone(),
+            capability_id(),
+        ))
+        .await
+        .expect("append");
+    }
+
+    // Head is the latest appended cursor, read atomically from the tail.
+    assert_eq!(
+        log.head_cursor(&stream, EventCursor::origin())
+            .await
+            .expect("head after 3 appends"),
+        EventCursor::new(3)
+    );
+    // Probing from a valid mid-stream cursor still returns the true head.
+    assert_eq!(
+        log.head_cursor(&stream, EventCursor::new(2))
+            .await
+            .expect("head from mid-stream cursor"),
+        EventCursor::new(3)
+    );
+    // A cursor beyond head is a foreign/future cursor → ReplayGap.
+    let err = log
+        .head_cursor(&stream, EventCursor::new(99))
+        .await
+        .expect_err("future cursor must be rejected");
+    assert!(
+        matches!(err, EventError::ReplayGap { .. }),
+        "expected ReplayGap, got {err:?}"
+    );
+}
+
+#[tokio::test]
 async fn filesystem_event_log_replay_returns_records_in_order() {
     let fs = build_scoped_fs();
     let log = FilesystemDurableEventLog::new(Arc::clone(&fs));
@@ -149,6 +198,32 @@ async fn filesystem_event_log_replay_returns_records_in_order() {
     assert!(replay.entries[0].cursor < replay.entries[1].cursor);
     assert!(replay.entries[1].cursor < replay.entries[2].cursor);
     assert_eq!(replay.next_cursor, replay.entries[2].cursor);
+}
+
+#[tokio::test]
+async fn filesystem_event_log_replays_host_written_privileged_runtime_kind() {
+    let fs = build_scoped_fs();
+    let log = FilesystemDurableEventLog::new(Arc::clone(&fs));
+    let scope = scope_for("alice", "project-a");
+    let stream = EventStreamKey::from_scope(&scope);
+
+    log.append(RuntimeEvent::dispatch_succeeded(
+        scope,
+        capability_id(),
+        extension_id(),
+        RuntimeKind::System,
+        7,
+    ))
+    .await
+    .expect("append host runtime event");
+
+    let replay = log
+        .read_after_cursor(&stream, &ReadScope::any(), None, 10)
+        .await
+        .expect("trusted runtime replay");
+
+    assert_eq!(replay.entries.len(), 1);
+    assert_eq!(replay.entries[0].record.runtime, Some(RuntimeKind::System));
 }
 
 #[tokio::test]

@@ -282,6 +282,28 @@ impl RuntimeProfile {
             | Self::Experiment => false,
         }
     }
+
+    /// `true` for profiles whose resolved runtime boundary allows
+    /// `ApprovalPolicy::Minimal` to bypass approval gates.
+    ///
+    /// Exhaustive `match` for the same reason as [`Self::is_local`]: a new
+    /// profile variant must be classified at compile time before it can affect
+    /// Minimal approval bypass.
+    pub const fn allows_minimal_approval_bypass(&self) -> bool {
+        match self {
+            Self::LocalYolo | Self::HostedYoloTenantScoped => true,
+            Self::SecureDefault
+            | Self::LocalSafe
+            | Self::LocalDev
+            | Self::HostedSafe
+            | Self::HostedDev
+            | Self::EnterpriseSafe
+            | Self::EnterpriseDev
+            | Self::EnterpriseYoloDedicated
+            | Self::Sandboxed
+            | Self::Experiment => false,
+        }
+    }
 }
 
 impl std::fmt::Display for RuntimeProfile {
@@ -340,8 +362,9 @@ impl std::error::Error for ParseRuntimePolicyEnumError {}
 ///
 /// `ScopedVirtual` is the safe default — declared mounts only, no host paths
 /// reachable. The other variants progressively widen authority and are
-/// only valid in matching deployment modes (`HostWorkspace` for local,
-/// `TenantWorkspace` for hosted, `OrgDedicatedWorkspace` for enterprise).
+/// only valid in matching deployment modes (`HostWorkspace` /
+/// `HostWorkspaceAndHome` for local, `TenantWorkspace` for hosted,
+/// `OrgDedicatedWorkspace` for enterprise).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -350,6 +373,9 @@ pub enum FilesystemBackendKind {
     ScopedVirtual,
     /// Selected host workspace root. Local single-user only.
     HostWorkspace,
+    /// Selected host workspace plus the caller-confirmed host home root.
+    /// Local single-user yolo only.
+    HostWorkspaceAndHome,
     /// Tenant-scoped workspace under hosted multi-tenant boundary.
     TenantWorkspace,
     /// Single-organization dedicated workspace.
@@ -361,6 +387,7 @@ impl FilesystemBackendKind {
         match self {
             Self::ScopedVirtual => "scoped_virtual",
             Self::HostWorkspace => "host_workspace",
+            Self::HostWorkspaceAndHome => "host_workspace_and_home",
             Self::TenantWorkspace => "tenant_workspace",
             Self::OrgDedicatedWorkspace => "org_dedicated_workspace",
         }
@@ -741,6 +768,38 @@ mod tests {
     }
 
     #[test]
+    fn minimal_approval_bypass_is_limited_to_local_and_hosted_yolo() {
+        let bypass = [
+            RuntimeProfile::LocalYolo,
+            RuntimeProfile::HostedYoloTenantScoped,
+        ];
+        let gated = [
+            RuntimeProfile::SecureDefault,
+            RuntimeProfile::LocalSafe,
+            RuntimeProfile::LocalDev,
+            RuntimeProfile::HostedSafe,
+            RuntimeProfile::HostedDev,
+            RuntimeProfile::EnterpriseSafe,
+            RuntimeProfile::EnterpriseDev,
+            RuntimeProfile::EnterpriseYoloDedicated,
+            RuntimeProfile::Sandboxed,
+            RuntimeProfile::Experiment,
+        ];
+        for profile in bypass {
+            assert!(
+                profile.allows_minimal_approval_bypass(),
+                "{profile:?} must allow Minimal approval bypass"
+            );
+        }
+        for profile in gated {
+            assert!(
+                !profile.allows_minimal_approval_bypass(),
+                "{profile:?} must keep approval gates under Minimal"
+            );
+        }
+    }
+
+    #[test]
     fn effective_runtime_policy_round_trips_through_serde() {
         let policy = EffectiveRuntimePolicy {
             deployment: DeploymentMode::LocalSingleUser,
@@ -780,6 +839,7 @@ mod tests {
         for fs in [
             FilesystemBackendKind::ScopedVirtual,
             FilesystemBackendKind::HostWorkspace,
+            FilesystemBackendKind::HostWorkspaceAndHome,
             FilesystemBackendKind::TenantWorkspace,
             FilesystemBackendKind::OrgDedicatedWorkspace,
         ] {

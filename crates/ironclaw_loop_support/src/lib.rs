@@ -14,21 +14,34 @@ use std::{
 };
 
 mod budget_accountant;
+mod budget_cost_table;
+mod budget_seeding;
 mod cancellation_port;
 mod capability_allow_set;
+mod capability_info;
 mod capability_port;
 mod capability_surface_filter;
+mod compaction_task;
+mod context_window_cache;
+mod filesystem_checkpoint_state;
 mod filesystem_skill_bundle_source;
 pub mod identity_context;
 mod input_port;
 mod input_queue;
+mod model_capability_view;
+mod prompt_context_budget;
 mod skill_bundle_context_source;
 mod skill_bundle_source;
 mod skill_context;
+mod subagent_prompt_port;
+mod subagent_spawn_port;
+mod system_inference;
+mod token_estimator;
+mod turn_event_publisher;
 
-pub use budget_accountant::{
-    BudgetSeedingPolicy, GovernorBackedAccountant, ModelCost, ModelCostTable, ZeroCostTable,
-};
+pub use budget_accountant::GovernorBackedAccountant;
+pub use budget_cost_table::{ModelCost, ModelCostTable, StaticModelCostTable, ZeroCostTable};
+pub use budget_seeding::BudgetSeedingPolicy;
 pub use cancellation_port::{
     AlwaysAliveLoopCancellationPort, AlwaysAliveRunCancellationFactory,
     CompositeTurnRunWakeNotifier, ProductLiveCancellationProbe, ProductLiveCancellationReadiness,
@@ -40,13 +53,21 @@ pub use capability_allow_set::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
 };
 pub use capability_port::{
-    HostRuntimeLoopCapabilityPort, HostRuntimeLoopCapabilityPortFactory,
-    LoopCapabilityInputResolver, LoopCapabilityResultWriter, concurrency_hint_from_effects,
+    CapabilityResultWrite, DecoratingLoopCapabilityPortFactory, HostRuntimeLoopCapabilityPort,
+    HostRuntimeLoopCapabilityPortFactory, LoopCapabilityInputResolver, LoopCapabilityPortDecorator,
+    LoopCapabilityPortFactory, LoopCapabilityResultWriter, concurrency_hint_from_effects,
     loop_driver_execution_extension_id,
 };
 pub use capability_surface_filter::{
     CapabilitySurfaceProfileFilter, CapabilitySurfaceVisibleFilter,
 };
+pub use compaction_task::{
+    ACTIVE_TASK_COMPACTION_PROMPT_ID, DEFAULT_COMPACTION_PROMPT_ID, HostManagedLoopCompactionPort,
+    active_task_compaction_prompt_id, default_compaction_prompt_id,
+    default_host_managed_loop_compaction_port, host_managed_loop_compaction_port_with_prompt_id,
+};
+pub use context_window_cache::ThreadContextWindowCache;
+pub use filesystem_checkpoint_state::FilesystemCheckpointStateStore;
 pub use filesystem_skill_bundle_source::{FilesystemSkillBundleRoot, FilesystemSkillBundleSource};
 pub use identity_context::{
     HostIdentityContextBuildError, HostIdentityContextCandidate, HostIdentityContextSource,
@@ -57,15 +78,45 @@ pub use identity_context::{
 };
 pub use input_port::HostQueueLoopInputPort;
 pub use input_queue::{HostInputBatch, HostInputEnvelope, HostInputQueue, HostInputQueueError};
+pub use ironclaw_turns::run_profile::PromptContextTokenBudget;
 pub use skill_bundle_context_source::SkillBundleContextSource;
 pub use skill_bundle_source::{
     SkillBundleDescriptor, SkillBundleId, SkillBundleProvenance, SkillBundleSource,
     SkillBundleSourceError, SkillFilePath, SkillSourceKind, sort_skill_bundle_descriptors,
 };
 pub use skill_context::{
-    HostSkillContextBuildError, HostSkillContextCandidate, HostSkillContextSource,
-    build_skill_run_snapshot,
+    HostSkillContextBuildError, HostSkillContextCandidate, HostSkillContextCandidatePayload,
+    HostSkillContextSource, build_skill_run_snapshot,
 };
+pub use subagent_prompt_port::{
+    DEFAULT_SUBAGENT_GOAL_MAX_BYTES, SubagentLoopPromptPort, SubagentPromptComposer,
+    SubagentPromptGoal, SubagentPromptLimits, SubagentPromptMaterial, SubagentPromptMaterialSource,
+    materialize_direction_message, materialize_goal_framing_message, materialize_goal_message,
+    subagent_run_id_from_context,
+};
+pub use subagent_spawn_port::{
+    AwaitedChildSetRecord, DEFAULT_SPAWN_SUBAGENT_CAPABILITY_ID, DEFAULT_SUBAGENT_MAX_DEPTH,
+    DEFAULT_SUBAGENT_MAX_SPAWN_PER_TURN, DEFAULT_SUBAGENT_MAX_TREE_DESCENDANTS,
+    InMemorySubagentGateResolutionStore, JsonSpawnSubagentInputCodec, SpawnSubagentArgs,
+    SpawnSubagentFlavorDescriptor, SpawnSubagentInputCodec, SpawnSubagentMode, SubagentDefinition,
+    SubagentDefinitionResolver, SubagentGateResolutionStore, SubagentGoalRecord, SubagentKindId,
+    SubagentSpawnCapabilityPort, SubagentSpawnDeps, SubagentSpawnGoalStore, SubagentSpawnLimits,
+    SubagentThreadKind, SubagentThreadMetadata, build_spawn_subagent_parameters_schema,
+};
+pub use system_inference::{GuardedSystemInferencePort, ModelGatewayBackedSystemInferencePort};
+pub const COMPACTION_SYSTEM_PROMPT: &str =
+    include_str!("../prompts/compaction_summarizer_fresh.md");
+pub const ACTIVE_TASK_COMPACTION_SYSTEM_PROMPT: &str = concat!(
+    include_str!("../prompts/compaction_summarizer_fresh.md"),
+    "\n\n",
+    include_str!("../prompts/active_task_compaction_append.md"),
+);
+pub const FAILURE_EXPLANATION_SYSTEM_PROMPT: &str =
+    include_str!("../prompts/failure_explanation.md");
+pub use token_estimator::{
+    CHARS_PER_TOKEN_DEFAULT, EstimatedTokenCount, estimate_tokens_from_chars,
+};
+pub use turn_event_publisher::EventPublishingTurnRunTransitionPort;
 
 use tokio::sync::{Mutex, OnceCell};
 
@@ -75,29 +126,68 @@ use ironclaw_threads::{
     LoadContextMessagesRequest, LoadContextWindowRequest, MessageContent, MessageKind,
     MessageStatus, ProviderToolCallReferenceEnvelope, SessionThreadError, SessionThreadService,
     SummaryArtifact, ThreadHistoryRequest, ThreadMessageId, ThreadMessageRecord, ThreadScope,
-    ToolResultSafeSummary, UpdateAssistantDraftRequest,
+    ToolResultReferenceEnvelope, ToolResultSafeSummary, UpdateAssistantDraftRequest,
 };
 use ironclaw_turns::{
     LoopMessageRef, TurnId, TurnRunId,
     run_profile::ModelProfileId,
     run_profile::{
-        AgentLoopHostError, AgentLoopHostErrorKind, AppendCapabilityResultRef, AssistantReply,
-        BeginAssistantDraft, CapabilityBatchInvocation, CapabilityBatchOutcome, CapabilityDenied,
-        CapabilityDeniedReasonKind, CapabilityInvocation, CapabilityOutcome,
-        CapabilitySurfaceVersion, FinalizeAssistantMessage, InstructionMaterializationStore,
-        LoopCapabilityPort, LoopContextBundle, LoopContextMessage, LoopContextPort,
-        LoopContextRequest, LoopDriverNoteKind, LoopHostMilestoneEmitter, LoopHostMilestoneSink,
-        LoopInputCursor, LoopModelBudgetAccountant, LoopModelMessage, LoopModelPort,
-        LoopModelRequest, LoopModelResponse, LoopPromptBundleAuthority, LoopRunContext,
-        LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ModelCallOutcome, ModelStreamChunk,
-        ParentLoopOutput, PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest,
-        VisibleCapabilitySurface, sanitize_model_visible_text,
-        sort_instruction_snippets_for_prompt,
+        AgentLoopHostError, AgentLoopHostErrorKind, AgentLoopHostErrorReasonKind,
+        AppendCapabilityResultRef, AssistantReply, BeginAssistantDraft, CapabilityBatchInvocation,
+        CapabilityBatchOutcome, CapabilityDenied, CapabilityDeniedReasonKind, CapabilityInvocation,
+        CapabilityOutcome, CapabilitySurfaceVersion, FinalizeAssistantMessage,
+        InstructionMaterializationStore, LoopCapabilityPort, LoopContextBundle,
+        LoopContextCompactionKind, LoopContextCompactionMetadata, LoopContextMessage,
+        LoopContextPort, LoopContextRequest, LoopDriverNoteKind, LoopHostMilestoneEmitter,
+        LoopHostMilestoneSink, LoopInputCursor, LoopModelMessage, LoopModelPort, LoopModelRequest,
+        LoopModelResponse, LoopModelUsage, LoopPromptBundleAuthority, LoopRunContext,
+        LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, ModelStreamChunk, ParentLoopOutput,
+        PromptMode, UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+        sanitize_model_visible_text, sort_instruction_snippets_for_prompt,
     },
 };
 use serde::{Deserialize, Serialize};
+
 const EMPTY_SURFACE_VERSION: &str = "empty:v1";
 const LOOP_SYSTEM_ROLE: &str = "system";
+
+pub fn raw_agent_loop_host_error(
+    component: &'static str,
+    operation: &'static str,
+    kind: AgentLoopHostErrorKind,
+    safe_summary: impl Into<String>,
+    raw_detail: impl std::fmt::Display,
+) -> AgentLoopHostError {
+    let safe_summary = safe_summary.into();
+    tracing::warn!(
+        component,
+        operation,
+        kind = ?kind,
+        safe_summary = %safe_summary,
+        raw_detail = %raw_detail,
+        "agent loop host error mapped to safe summary"
+    );
+    AgentLoopHostError::new(kind, safe_summary)
+}
+
+pub fn raw_host_managed_model_error(
+    component: &'static str,
+    operation: &'static str,
+    kind: HostManagedModelErrorKind,
+    safe_summary: impl Into<String>,
+    raw_detail: impl std::fmt::Display,
+) -> HostManagedModelError {
+    let safe_summary = safe_summary.into();
+    tracing::warn!(
+        component,
+        operation,
+        kind = ?kind,
+        safe_summary = %safe_summary,
+        raw_detail = %raw_detail,
+        "host-managed model error mapped to safe summary"
+    );
+    HostManagedModelError::safe(kind, safe_summary)
+}
 
 /// Thread-backed context adapter for text-only Reborn loops.
 #[derive(Clone)]
@@ -112,6 +202,8 @@ where
     skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
     identity_context_source: Option<Arc<dyn HostIdentityContextSource>>,
     identity_budget: IdentityBudget,
+    prompt_context_budget: PromptContextTokenBudget,
+    context_window_cache: Option<Arc<ThreadContextWindowCache>>,
     identity_candidates: Arc<IdentityCandidateCache>,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
 }
@@ -177,6 +269,8 @@ where
             skill_context_source: None,
             identity_context_source: None,
             identity_budget: IdentityBudget::default(),
+            prompt_context_budget: PromptContextTokenBudget::default(),
+            context_window_cache: None,
             identity_candidates: Arc::new(IdentityCandidateCache::new()),
             milestone_sink: None,
         }
@@ -197,6 +291,16 @@ where
 
     pub fn with_identity_budget(mut self, budget: IdentityBudget) -> Self {
         self.identity_budget = budget;
+        self
+    }
+
+    pub fn with_prompt_context_token_budget(mut self, budget: PromptContextTokenBudget) -> Self {
+        self.prompt_context_budget = budget;
+        self
+    }
+
+    pub fn with_context_window_cache(mut self, cache: Arc<ThreadContextWindowCache>) -> Self {
+        self.context_window_cache = Some(cache);
         self
     }
 
@@ -236,6 +340,11 @@ where
             })
             .await
             .map_err(context_read_error)?;
+        if let Some(cache) = self.context_window_cache.as_ref() {
+            cache
+                .store(self.thread_scope.clone(), max_messages, context.clone())
+                .await;
+        }
 
         let instruction_snippets = match self.skill_context_source.as_deref() {
             Some(source) => {
@@ -271,13 +380,23 @@ where
             None => Vec::new(),
         };
 
+        let compaction_message_index = context
+            .messages
+            .iter()
+            .filter_map(context_message_to_compaction_metadata)
+            .collect();
+        let messages = prompt_context_budget::select_prompt_context_messages(
+            context.messages,
+            self.prompt_context_budget,
+        );
+
         Ok(LoopContextBundle {
             identity_messages,
-            messages: context
-                .messages
+            messages: messages
                 .into_iter()
                 .filter_map(context_message_to_loop_message)
                 .collect(),
+            compaction_message_index,
             instruction_snippets,
             memory_snippets: Vec::new(),
         })
@@ -557,6 +676,27 @@ where
                     "tool result reference summary is not safe",
                 )
             })?;
+        let model_observation = request
+            .model_observation
+            .and_then(|observation| match observation.validate() {
+                Ok(()) => match serde_json::to_value(observation) {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        tracing::warn!(
+                            reason = %error,
+                            "dropping unserializable model-visible tool observation and preserving safe summary"
+                        );
+                        None
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(
+                        reason = %error,
+                        "dropping invalid model-visible tool observation and preserving safe summary"
+                    );
+                    None
+                }
+            });
         let record = self
             .thread_service
             .append_tool_result_reference(AppendToolResultReferenceRequest {
@@ -565,6 +705,7 @@ where
                 turn_run_id: self.run_context.run_id.to_string(),
                 result_ref: request.result_ref.as_str().to_string(),
                 safe_summary,
+                model_observation,
                 provider_call: request
                     .provider_call
                     .map(provider_call_reference_to_envelope),
@@ -739,16 +880,13 @@ where
     gateway: Arc<G>,
     capabilities: Option<Arc<dyn LoopCapabilityPort>>,
     max_messages: usize,
+    prompt_context_budget: PromptContextTokenBudget,
+    context_window_cache: Option<Arc<ThreadContextWindowCache>>,
     prompt_authority: LoopPromptBundleAuthority,
     milestone_sink: Option<Arc<dyn LoopHostMilestoneSink>>,
     skill_context_source: Option<Arc<dyn HostSkillContextSource>>,
     instruction_materialization_store: Option<Arc<dyn InstructionMaterializationStore>>,
     identity_context_source: Option<Arc<dyn HostIdentityContextSource>>,
-    /// Optional budget accountant. When set, every model call goes through
-    /// `pre_model_call` (reserve) → gateway → `post_model_call`
-    /// (reconcile/release). When `None`, no budget enforcement happens —
-    /// this preserves v1-era behavior for hosts that have not opted in.
-    budget_accountant: Option<Arc<dyn LoopModelBudgetAccountant>>,
 }
 
 impl<S, G> ThreadBackedLoopModelPort<S, G>
@@ -770,12 +908,13 @@ where
             gateway,
             capabilities: None,
             max_messages,
+            prompt_context_budget: PromptContextTokenBudget::default(),
+            context_window_cache: None,
             prompt_authority: LoopPromptBundleAuthority::shared(),
             milestone_sink: None,
             skill_context_source: None,
             instruction_materialization_store: None,
             identity_context_source: None,
-            budget_accountant: None,
         }
     }
 
@@ -794,25 +933,14 @@ where
             gateway,
             capabilities: None,
             max_messages,
+            prompt_context_budget: PromptContextTokenBudget::default(),
+            context_window_cache: None,
             prompt_authority: LoopPromptBundleAuthority::shared(),
             milestone_sink: Some(milestone_sink),
             skill_context_source: None,
             instruction_materialization_store: None,
             identity_context_source: None,
-            budget_accountant: None,
         }
-    }
-
-    /// Inject a budget accountant. Each `stream_model` call passes through
-    /// `pre_model_call` and `post_model_call` so a [`GovernorBackedAccountant`]
-    /// (or any custom impl) can reserve/reconcile against the resource
-    /// governor.
-    pub fn with_budget_accountant(
-        mut self,
-        accountant: Arc<dyn LoopModelBudgetAccountant>,
-    ) -> Self {
-        self.budget_accountant = Some(accountant);
-        self
     }
 
     pub fn with_skill_context_source(mut self, source: Arc<dyn HostSkillContextSource>) -> Self {
@@ -825,6 +953,16 @@ where
         prompt_authority: LoopPromptBundleAuthority,
     ) -> Self {
         self.prompt_authority = prompt_authority;
+        self
+    }
+
+    pub fn with_prompt_context_token_budget(mut self, budget: PromptContextTokenBudget) -> Self {
+        self.prompt_context_budget = budget;
+        self
+    }
+
+    pub fn with_context_window_cache(mut self, cache: Arc<ThreadContextWindowCache>) -> Self {
+        self.context_window_cache = Some(cache);
         self
     }
 
@@ -884,22 +1022,14 @@ where
             &request.surface_version,
         )?;
 
-        // Resolve messages *before* the budget reservation so a message-
-        // resolution failure here cannot orphan an active hold. The
-        // reservation must only be taken once we know the call is going
-        // to reach the provider.
+        // Resolve messages *before* the budget reservation in the outer
+        // `HostManagedLoopModelPort` so a message-resolution failure here
+        // cannot orphan a reservation taken by the outer port. The inner
+        // port itself never holds a reservation — budget accounting lives
+        // exclusively in the outer port (see #3841 follow-up "delete dead
+        // with_budget_accountant").
         let resolved_messages = self.resolve_model_messages(prompt_grant.messages).await?;
 
-        // Pre-call budget check: reserve estimated cost against the
-        // governor cascade. A denial here short-circuits before any
-        // provider/credential touch. Anything fallible after this point
-        // must funnel through `finalize_post_model_call` so the hold is
-        // reconciled or released.
-        if let Some(accountant) = &self.budget_accountant
-            && let Err(budget_error) = accountant.pre_model_call(&self.run_context, &request).await
-        {
-            return Err(budget_error.into_host_error());
-        }
         self.emit_model_started(requested_model_profile_id).await;
         let host_request = HostManagedModelRequest {
             model_profile_id: model_profile_id.clone(),
@@ -928,65 +1058,29 @@ where
 
         let host_response_result = match gateway_result {
             Ok(response) => {
+                let HostManagedModelResponse {
+                    safe_text_deltas,
+                    safe_reasoning_deltas,
+                    output,
+                    usage,
+                } = response;
+                let chunks = safe_text_deltas
+                    .into_iter()
+                    .map(|safe_text_delta| ModelStreamChunk {
+                        safe_text_delta: sanitize_model_visible_text(safe_text_delta),
+                    })
+                    .collect::<Vec<_>>();
                 let loop_response = LoopModelResponse {
-                    chunks: response
-                        .safe_text_deltas
-                        .into_iter()
-                        .map(|safe_text_delta| ModelStreamChunk {
-                            safe_text_delta: sanitize_model_visible_text(safe_text_delta),
-                        })
-                        .collect(),
-                    output: response.output,
+                    chunks,
+                    safe_reasoning_deltas,
+                    output,
                     effective_model_profile_id: model_profile_id.clone(),
+                    usage,
                 };
                 Ok(loop_response)
             }
             Err(error) => Err(model_gateway_error(error)),
         };
-
-        // Post-call accounting fires on BOTH success and failure paths so
-        // the in-flight reservation never leaks.
-        if let Some(accountant) = &self.budget_accountant {
-            let outcome = match &host_response_result {
-                Ok(response) => ModelCallOutcome::Success(response),
-                Err(host_error) => {
-                    // Construct a sanitized gateway error mirroring the
-                    // host-error kind for the accountant. We do not expose
-                    // the host_error's full diagnostic_ref to the
-                    // accountant — the accountant only needs the kind.
-                    let gateway_error = ironclaw_turns::run_profile::LoopModelGatewayError::new(
-                        host_error.kind,
-                        host_error.safe_summary.clone(),
-                    )
-                    .unwrap_or_else(|_| {
-                        ironclaw_turns::run_profile::LoopModelGatewayError::new(
-                            AgentLoopHostErrorKind::Internal,
-                            "budget accountant invalid summary",
-                        )
-                        .unwrap_or_else(|_| {
-                            panic!(
-                                "internal budget-accountant invariant: cannot build safe summary"
-                            )
-                        })
-                    });
-                    return self
-                        .finalize_post_model_call(
-                            accountant,
-                            &request,
-                            ModelCallOutcome::Failure(&gateway_error),
-                            host_response_result,
-                        )
-                        .await;
-                }
-            };
-            if let Err(acc_error) = accountant
-                .post_model_call(&self.run_context, &request, outcome)
-                .await
-            {
-                self.emit_model_failed(acc_error.kind).await;
-                return Err(acc_error.into_host_error());
-            }
-        }
 
         match host_response_result {
             Ok(response) => {
@@ -1006,38 +1100,6 @@ where
     S: SessionThreadService + ?Sized + Send + Sync,
     G: HostManagedModelGateway + ?Sized + Send + Sync,
 {
-    async fn finalize_post_model_call(
-        &self,
-        accountant: &Arc<dyn LoopModelBudgetAccountant>,
-        request: &LoopModelRequest,
-        outcome: ModelCallOutcome<'_>,
-        host_response_result: Result<LoopModelResponse, AgentLoopHostError>,
-    ) -> Result<LoopModelResponse, AgentLoopHostError> {
-        // Accountant contract: durable accounting/release failures must fail
-        // closed. Swallowing on the provider-error path would hide stuck
-        // reservations and misreport the failure cause, so the accountant
-        // error takes precedence over the original model error.
-        if let Err(acc_error) = accountant
-            .post_model_call(&self.run_context, request, outcome)
-            .await
-        {
-            tracing::warn!(
-                kind = ?acc_error.kind,
-                diagnostic_ref = ?acc_error.diagnostic_ref,
-                "budget accountant post-call failed during error path; reporting as host error"
-            );
-            self.emit_model_failed(acc_error.kind).await;
-            return Err(acc_error.into_host_error());
-        }
-        match host_response_result {
-            Ok(response) => Ok(response),
-            Err(error) => {
-                self.emit_model_failed(error.kind).await;
-                Err(error)
-            }
-        }
-    }
-
     async fn emit_model_started(&self, requested_model_profile_id: Option<ModelProfileId>) {
         if let Some(milestone_sink) = &self.milestone_sink {
             let milestones =
@@ -1084,30 +1146,27 @@ where
         &self,
         requested_messages: Vec<LoopModelMessage>,
     ) -> Result<Vec<HostManagedModelMessage>, AgentLoopHostError> {
-        let context = self
-            .thread_service
-            .load_context_window(LoadContextWindowRequest {
-                scope: self.thread_scope.clone(),
-                thread_id: self.run_context.thread_id.clone(),
-                max_messages: self.max_messages,
-            })
-            .await
-            .map_err(context_read_error)?;
+        let context = self.load_model_context_window().await?;
 
         if requested_messages.is_empty() {
-            let messages = context
-                .messages
-                .into_iter()
-                .filter_map(|message| {
-                    let content_ref = message_ref_from_context(&message)?;
-                    Some(HostManagedModelMessage {
-                        role: model_role_for_kind(message.kind),
-                        content: message.content,
-                        content_ref,
-                        tool_result_provider_call: message.tool_result_provider_call,
-                    })
-                })
-                .collect();
+            let context_messages = prompt_context_budget::select_prompt_context_messages(
+                context.messages,
+                self.prompt_context_budget,
+            );
+            let mut messages = Vec::with_capacity(context_messages.len());
+            for (message, _) in context_messages {
+                let Some(content_ref) = message_ref_from_context(&message) else {
+                    continue;
+                };
+                let tool_result_content = tool_result_content_for_context_message(&message)?;
+                messages.push(HostManagedModelMessage {
+                    role: model_role_for_kind(message.kind),
+                    content: message.content,
+                    content_ref,
+                    tool_result_provider_call: message.tool_result_provider_call,
+                    tool_result_content,
+                });
+            }
             return Ok(messages);
         }
 
@@ -1202,6 +1261,7 @@ where
                     content: content.content,
                     content_ref: message.content_ref,
                     tool_result_provider_call: None,
+                    tool_result_content: None,
                 });
                 continue;
             }
@@ -1220,9 +1280,10 @@ where
                 }
                 resolved.push(HostManagedModelMessage {
                     role: materialized_role,
-                    content: materialized.safe_content,
+                    content: materialized.model_content,
                     content_ref: message.content_ref,
                     tool_result_provider_call: None,
+                    tool_result_content: None,
                 });
                 continue;
             }
@@ -1260,9 +1321,35 @@ where
                 content: context_message.content.clone(),
                 content_ref: message.content_ref,
                 tool_result_provider_call: context_message.tool_result_provider_call.clone(),
+                tool_result_content: tool_result_content_for_context_message(context_message)?,
             });
         }
         Ok(resolved)
+    }
+
+    async fn load_model_context_window(
+        &self,
+    ) -> Result<ironclaw_threads::ContextWindow, AgentLoopHostError> {
+        if let Some(cache) = self.context_window_cache.as_ref()
+            && let Some(context) = cache
+                .take_matching(
+                    &self.thread_scope,
+                    &self.run_context.thread_id,
+                    self.max_messages,
+                )
+                .await
+        {
+            return Ok(context);
+        }
+
+        self.thread_service
+            .load_context_window(LoadContextWindowRequest {
+                scope: self.thread_scope.clone(),
+                thread_id: self.run_context.thread_id.clone(),
+                max_messages: self.max_messages,
+            })
+            .await
+            .map_err(context_read_error)
     }
 
     async fn instruction_snippet_messages_by_ref(
@@ -1285,9 +1372,10 @@ where
                 content_ref.as_str().to_string(),
                 HostManagedModelMessage {
                     role: HostManagedModelMessageRole::System,
-                    content: snippet.safe_summary,
+                    content: snippet.model_content,
                     content_ref,
                     tool_result_provider_call: None,
+                    tool_result_content: None,
                 },
             );
         }
@@ -1337,6 +1425,18 @@ pub struct HostManagedModelMessage {
     pub content_ref: LoopMessageRef,
     #[serde(default, skip_serializing)]
     pub tool_result_provider_call: Option<ProviderToolCallReferenceEnvelope>,
+    #[serde(default, skip)]
+    pub tool_result_content: Option<HostManagedToolResultContent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostManagedToolResultContent {
+    Reference {
+        envelope: ToolResultReferenceEnvelope,
+    },
+    Resolved {
+        safe_summary: ToolResultSafeSummary,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1366,19 +1466,37 @@ impl HostManagedModelMessageRole {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostManagedModelResponse {
     pub safe_text_deltas: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub safe_reasoning_deltas: Vec<String>,
     pub output: ParentLoopOutput,
+    /// Provider-reported token usage. Forwarded to [`LoopModelResponse::usage`]
+    /// by the inner port wrapper, so the budget accountant can record actual
+    /// USD spend instead of the conservative reservation estimate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<LoopModelUsage>,
 }
 
 impl HostManagedModelResponse {
     pub fn assistant_reply(content: impl Into<String>) -> Self {
         let content = content.into();
-        let safe_content = sanitize_model_visible_text(content);
+        let sanitized_content = sanitize_model_visible_text(content);
         Self {
-            safe_text_deltas: vec![safe_content.clone()],
+            safe_text_deltas: vec![sanitized_content.clone()],
+            safe_reasoning_deltas: Vec::new(),
             output: ParentLoopOutput::AssistantReply(AssistantReply {
-                content: safe_content,
+                content: sanitized_content,
             }),
+            usage: None,
         }
+    }
+
+    pub fn assistant_reply_with_reasoning(
+        content: impl Into<String>,
+        reasoning: Option<String>,
+    ) -> Self {
+        let mut response = Self::assistant_reply(content);
+        response.safe_reasoning_deltas = sanitized_reasoning_deltas(reasoning);
+        response
     }
 
     pub fn capability_calls(
@@ -1392,15 +1510,48 @@ impl HostManagedModelResponse {
             } else {
                 vec![safe_text_delta]
             },
+            safe_reasoning_deltas: Vec::new(),
             output: ParentLoopOutput::CapabilityCalls(calls),
+            usage: None,
         }
     }
+
+    pub fn capability_calls_with_reasoning(
+        calls: Vec<ironclaw_turns::run_profile::CapabilityCallCandidate>,
+        safe_text_delta: impl Into<String>,
+        reasoning: Option<String>,
+    ) -> Self {
+        let mut response = Self::capability_calls(calls, safe_text_delta);
+        response.safe_reasoning_deltas = sanitized_reasoning_deltas(reasoning);
+        response
+    }
+
+    /// Attach provider-reported token usage. Returns the response so call
+    /// sites can chain into [`assistant_reply`] / [`capability_calls`].
+    pub fn with_usage(mut self, usage: LoopModelUsage) -> Self {
+        self.usage = Some(usage);
+        self
+    }
+}
+
+fn sanitized_reasoning_deltas(reasoning: Option<String>) -> Vec<String> {
+    reasoning
+        .map(sanitize_model_visible_text)
+        .filter(|reasoning| !reasoning.is_empty())
+        .into_iter()
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HostManagedModelErrorKind {
+    /// Caller-side misuse of the host model port (unknown tool, malformed request).
     InvalidRequest,
+    /// Provider/model output was structurally invalid for the active loop contract.
+    /// This is model-side bad output, not caller misuse — mapped to Unavailable so
+    /// loops can retry on transient provider anomalies.
+    #[serde(alias = "invalid_output")]
+    InvalidOutput,
     PolicyDenied,
     ConfigurationError,
     BudgetExceeded,
@@ -1415,6 +1566,7 @@ pub enum HostManagedModelErrorKind {
 pub struct HostManagedModelError {
     pub kind: HostManagedModelErrorKind,
     pub safe_summary: String,
+    pub reason_kind: Option<AgentLoopHostErrorReasonKind>,
 }
 
 impl HostManagedModelError {
@@ -1422,6 +1574,7 @@ impl HostManagedModelError {
         Self {
             kind,
             safe_summary: safe_model_summary(kind).to_string(),
+            reason_kind: None,
         }
     }
 
@@ -1429,7 +1582,13 @@ impl HostManagedModelError {
         Self {
             kind,
             safe_summary: safe_summary.into(),
+            reason_kind: None,
         }
+    }
+
+    pub fn with_reason_kind(mut self, reason_kind: AgentLoopHostErrorReasonKind) -> Self {
+        self.reason_kind = Some(reason_kind);
+        self
     }
 }
 
@@ -1444,6 +1603,29 @@ fn validate_thread_scope_for_run(
         return Err(AgentLoopHostError::new(
             AgentLoopHostErrorKind::ScopeMismatch,
             "thread scope does not match loop run scope",
+        ));
+    }
+    // The thread store keys threads by `owner_user_id` (via the MountView in
+    // `ThreadScope::to_resource_scope`), but that axis is absent from the
+    // on-disk thread path, so a wrong owner silently reads an empty subtree
+    // and surfaces as `UnknownThread`. Explicit-owner runs intentionally allow
+    // actor/subject divergence for shared conversation routes, but the explicit
+    // owner must still match the resolved thread owner. Legacy actor-fallback
+    // runs continue to require owner=actor.
+    if run_context.scope.has_explicit_thread_owner() {
+        if run_context.scope.explicit_owner_user_id() != thread_scope.owner_user_id.as_ref() {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::ScopeMismatch,
+                "thread scope owner does not match the explicit loop run subject",
+            ));
+        }
+    } else if let (Some(thread_owner), Some(actor)) =
+        (thread_scope.owner_user_id.as_ref(), run_context.actor())
+        && thread_owner != &actor.user_id
+    {
+        return Err(AgentLoopHostError::new(
+            AgentLoopHostErrorKind::ScopeMismatch,
+            "thread scope owner does not match the loop run actor",
         ));
     }
     Ok(())
@@ -1507,13 +1689,45 @@ fn history_summaries_by_ref(summaries: Vec<SummaryArtifact>) -> HashMap<String, 
         .collect()
 }
 
-fn context_message_to_loop_message(message: ContextMessage) -> Option<LoopContextMessage> {
+fn context_message_to_compaction_metadata(
+    message: &ContextMessage,
+) -> Option<LoopContextCompactionMetadata> {
+    message_ref_from_context(message)?;
+    Some(LoopContextCompactionMetadata {
+        sequence: message.sequence,
+        kind: compaction_kind_for_message(message.kind),
+        estimated_tokens: estimate_tokens_from_chars(&message.content).as_u64(),
+    })
+}
+
+fn context_message_to_loop_message(
+    selected: prompt_context_budget::SelectedPromptContextMessage,
+) -> Option<LoopContextMessage> {
+    let (message, estimated_tokens) = selected;
     let message_ref = message_ref_from_context(&message)?;
+    let compaction = Some(LoopContextCompactionMetadata {
+        sequence: message.sequence,
+        kind: compaction_kind_for_message(message.kind),
+        estimated_tokens,
+    });
     Some(LoopContextMessage {
         message_ref: Some(message_ref),
         role: role_for_kind(message.kind).to_string(),
         safe_summary: safe_context_summary(message.kind).to_string(),
+        compaction,
     })
+}
+
+fn compaction_kind_for_message(kind: MessageKind) -> LoopContextCompactionKind {
+    match kind {
+        MessageKind::User => LoopContextCompactionKind::User,
+        MessageKind::Assistant => LoopContextCompactionKind::Assistant,
+        MessageKind::System => LoopContextCompactionKind::System,
+        MessageKind::Summary => LoopContextCompactionKind::Summary,
+        MessageKind::CheckpointReference
+        | MessageKind::ToolResultReference
+        | MessageKind::CapabilityDisplayPreview => LoopContextCompactionKind::Other,
+    }
 }
 
 fn message_ref_from_context(message: &ContextMessage) -> Option<LoopMessageRef> {
@@ -1582,6 +1796,7 @@ fn role_for_kind(kind: MessageKind) -> &'static str {
             LOOP_SYSTEM_ROLE
         }
         MessageKind::ToolResultReference => "tool_result_reference",
+        MessageKind::CapabilityDisplayPreview => "capability_display_preview",
     }
 }
 
@@ -1593,7 +1808,27 @@ fn model_role_for_kind(kind: MessageKind) -> HostManagedModelMessageRole {
             HostManagedModelMessageRole::System
         }
         MessageKind::ToolResultReference => HostManagedModelMessageRole::ToolResult,
+        MessageKind::CapabilityDisplayPreview => HostManagedModelMessageRole::System,
     }
+}
+
+fn tool_result_content_for_context_message(
+    message: &ContextMessage,
+) -> Result<Option<HostManagedToolResultContent>, AgentLoopHostError> {
+    if message.kind != MessageKind::ToolResultReference {
+        return Ok(None);
+    }
+    let envelope =
+        ToolResultReferenceEnvelope::from_json_str(&message.content).map_err(|error| {
+            raw_agent_loop_host_error(
+                "model_context",
+                "decode_tool_result_reference",
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "tool result reference transcript content is invalid",
+                error,
+            )
+        })?;
+    Ok(Some(HostManagedToolResultContent::Reference { envelope }))
 }
 
 fn safe_context_summary(kind: MessageKind) -> &'static str {
@@ -1604,6 +1839,7 @@ fn safe_context_summary(kind: MessageKind) -> &'static str {
         MessageKind::Summary => "summary artifact available",
         MessageKind::CheckpointReference => "checkpoint reference available",
         MessageKind::ToolResultReference => "tool result reference available",
+        MessageKind::CapabilityDisplayPreview => "capability display preview available",
     }
 }
 
@@ -1623,17 +1859,23 @@ fn empty_capability_error() -> AgentLoopHostError {
     )
 }
 
-fn context_read_error(_error: SessionThreadError) -> AgentLoopHostError {
-    AgentLoopHostError::new(
+fn context_read_error(error: SessionThreadError) -> AgentLoopHostError {
+    raw_agent_loop_host_error(
+        "thread_context",
+        "read_context",
         AgentLoopHostErrorKind::Unavailable,
         "thread context is unavailable",
+        error,
     )
 }
 
-fn transcript_write_error(_error: SessionThreadError) -> AgentLoopHostError {
-    AgentLoopHostError::new(
+fn transcript_write_error(error: SessionThreadError) -> AgentLoopHostError {
+    raw_agent_loop_host_error(
+        "thread_transcript",
+        "write_transcript",
         AgentLoopHostErrorKind::TranscriptWriteFailed,
         "assistant transcript write failed",
+        error,
     )
 }
 
@@ -1643,12 +1885,17 @@ fn model_gateway_error(error: HostManagedModelError) -> AgentLoopHostError {
     } else {
         safe_model_summary(error.kind).to_string()
     };
-    AgentLoopHostError::new(model_error_kind(error.kind), safe_summary)
+    let mut host_error = AgentLoopHostError::new(model_error_kind(error.kind), safe_summary);
+    if let Some(reason_kind) = error.reason_kind {
+        host_error = host_error.with_reason_kind(reason_kind);
+    }
+    host_error
 }
 
 fn model_error_kind(kind: HostManagedModelErrorKind) -> AgentLoopHostErrorKind {
     match kind {
         HostManagedModelErrorKind::InvalidRequest => AgentLoopHostErrorKind::InvalidInvocation,
+        HostManagedModelErrorKind::InvalidOutput => AgentLoopHostErrorKind::Unavailable,
         HostManagedModelErrorKind::PolicyDenied => AgentLoopHostErrorKind::PolicyDenied,
         HostManagedModelErrorKind::ConfigurationError => AgentLoopHostErrorKind::Unavailable,
         HostManagedModelErrorKind::BudgetExceeded => AgentLoopHostErrorKind::BudgetExceeded,
@@ -1663,6 +1910,7 @@ fn model_error_kind(kind: HostManagedModelErrorKind) -> AgentLoopHostErrorKind {
 fn safe_model_summary(kind: HostManagedModelErrorKind) -> &'static str {
     match kind {
         HostManagedModelErrorKind::InvalidRequest => "model request is invalid",
+        HostManagedModelErrorKind::InvalidOutput => "model output was structurally invalid",
         HostManagedModelErrorKind::PolicyDenied => "model profile is not permitted",
         HostManagedModelErrorKind::ConfigurationError => "model route configuration is invalid",
         HostManagedModelErrorKind::BudgetExceeded => "model request exceeded its budget",

@@ -1,11 +1,11 @@
 use std::fs;
-use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Args;
-use ironclaw_reborn_config::REBORN_CONFIG_API_VERSION;
+use ironclaw_reborn_config::{REBORN_CONFIG_API_VERSION, RebornHome};
 
 use crate::context::RebornCliContext;
+use crate::file_write::{FileWriteAction, write_atomic};
 
 /// Write a commented stub `config.toml` and `providers.json` into the
 /// Reborn home directory so an operator has something editable.
@@ -24,44 +24,91 @@ pub(crate) struct ConfigInitCommand {
 impl ConfigInitCommand {
     pub(crate) fn execute(self, context: RebornCliContext) -> anyhow::Result<()> {
         let home = context.boot_config().home();
-        let home_path = home.path();
-        fs::create_dir_all(home_path).map_err(|error| {
-            anyhow::anyhow!("create reborn home {}: {error}", home_path.display())
-        })?;
+        let outcome =
+            write_default_config_files(home, self.force, ExistingConfigPolicy::FailIfPresent)?;
 
-        let config_path = home.config_file_path();
-        let providers_path = home.providers_file_path();
-        preflight_targets(
-            [
-                (&config_path, "config.toml"),
-                (&providers_path, "providers.json"),
-            ],
-            self.force,
-        )?;
-
-        write_atomic(&config_path, &config_stub(), self.force, "config.toml")?;
-        write_atomic(
-            &providers_path,
-            PROVIDERS_STUB,
-            self.force,
-            "providers.json",
-        )?;
-
-        println!("wrote: {}", config_path.display());
-        println!("wrote: {}", providers_path.display());
+        println!("{}", outcome.config.display_line());
+        println!("{}", outcome.providers.display_line());
         println!();
         println!("edit them, then run `ironclaw-reborn run`.");
         Ok(())
     }
 }
 
-fn preflight_targets<const N: usize>(
-    targets: [(&Path, &'static str); N],
-    force: bool,
-) -> anyhow::Result<()> {
-    if force {
-        return Ok(());
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExistingConfigPolicy {
+    FailIfPresent,
+    Preserve,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigFilesWriteOutcome {
+    pub(crate) config: ConfigFileWrite,
+    pub(crate) providers: ConfigFileWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigFileWrite {
+    pub(crate) path: PathBuf,
+    pub(crate) action: FileWriteAction,
+}
+
+impl ConfigFileWrite {
+    pub(crate) fn display_line(&self) -> String {
+        format!("{}: {}", self.action, self.path.display())
     }
+}
+
+pub(crate) fn write_default_config_files(
+    home: &RebornHome,
+    force: bool,
+    existing_policy: ExistingConfigPolicy,
+) -> anyhow::Result<ConfigFilesWriteOutcome> {
+    let home_path = home.path();
+    fs::create_dir_all(home_path)
+        .map_err(|error| anyhow::anyhow!("create reborn home {}: {error}", home_path.display()))?;
+
+    let config_path = home.config_file_path();
+    let providers_path = home.providers_file_path();
+    if existing_policy == ExistingConfigPolicy::FailIfPresent && !force {
+        preflight_targets([
+            (&config_path, "config.toml"),
+            (&providers_path, "providers.json"),
+        ])?;
+    }
+
+    let config =
+        if existing_policy == ExistingConfigPolicy::Preserve && config_path.exists() && !force {
+            ConfigFileWrite {
+                path: config_path,
+                action: FileWriteAction::Preserved,
+            }
+        } else {
+            let action = write_atomic(&config_path, &config_stub(), force, "config.toml")?;
+            ConfigFileWrite {
+                path: config_path,
+                action,
+            }
+        };
+
+    let providers =
+        if existing_policy == ExistingConfigPolicy::Preserve && providers_path.exists() && !force {
+            ConfigFileWrite {
+                path: providers_path,
+                action: FileWriteAction::Preserved,
+            }
+        } else {
+            let action = write_atomic(&providers_path, PROVIDERS_STUB, force, "providers.json")?;
+            ConfigFileWrite {
+                path: providers_path,
+                action,
+            }
+        };
+
+    Ok(ConfigFilesWriteOutcome { config, providers })
+}
+
+fn preflight_targets<const N: usize>(targets: [(&Path, &'static str); N]) -> anyhow::Result<()> {
     let existing = targets
         .into_iter()
         .filter(|(path, _)| path.exists())
@@ -74,50 +121,6 @@ fn preflight_targets<const N: usize>(
     }
 }
 
-fn write_atomic(
-    path: &Path,
-    contents: &str,
-    force: bool,
-    label: &'static str,
-) -> anyhow::Result<()> {
-    if path.exists() && !force {
-        anyhow::bail!(
-            "{label} already exists at {}; pass --force to overwrite",
-            path.display()
-        );
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("{} has no parent directory", path.display()))?;
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)
-        .map_err(|error| anyhow::anyhow!("create temp file in {}: {error}", parent.display()))?;
-    tmp.write_all(contents.as_bytes())
-        .map_err(|error| anyhow::anyhow!("write {}: {error}", tmp.path().display()))?;
-    tmp.flush()
-        .map_err(|error| anyhow::anyhow!("flush {}: {error}", tmp.path().display()))?;
-
-    if force {
-        tmp.persist(path).map_err(|error| {
-            anyhow::anyhow!(
-                "persist {} -> {}: {}",
-                error.file.path().display(),
-                path.display(),
-                error.error
-            )
-        })?;
-    } else {
-        tmp.persist_noclobber(path).map_err(|error| {
-            anyhow::anyhow!(
-                "persist {} -> {}: {}",
-                error.file.path().display(),
-                path.display(),
-                error.error
-            )
-        })?;
-    }
-    Ok(())
-}
-
 /// Build the commented stub TOML with the current API version baked in.
 fn config_stub() -> String {
     format!(
@@ -125,7 +128,7 @@ fn config_stub() -> String {
 #
 # Layout:
 #   - This file (config.toml) carries the SELECTION layer:
-#     identity, policy, drivers, runner timing, and LLM-slot
+#     identity, policy, drivers, runner timing, skills, and LLM-slot
 #     selection by id.
 #   - providers.json (next to this file) carries the CATALOG layer:
 #     provider definitions known to the binary. The compiled-in
@@ -143,8 +146,9 @@ fn config_stub() -> String {
 api_version = "{api_version}"
 
 [boot]
-# Composition profile. One of: local-dev, production, migration-dry-run.
-# Today only local-dev is wired end-to-end.
+# Composition profile. One of: local-dev, local-dev-yolo, production, migration-dry-run.
+# Today local-dev and local-dev-yolo are wired end-to-end.
+# local-dev-yolo also requires --confirm-host-access at runtime.
 profile = "local-dev"
 
 [identity]
@@ -179,6 +183,24 @@ default_owner  = "reborn-cli"
 heartbeat_interval_secs = 5
 poll_interval_ms        = 200
 
+[skills]
+# When false, regex activation criteria do not auto-load full skill
+# context. Keyword/tag activation and explicit skill mentions such as
+# `$code-review` still activate skills.
+regex_activation_enabled = true
+
+# [storage]
+# # Production storage selection. The database URL value is env-only; this
+# # file may name the variable but must never contain the raw URL.
+# # Managed remote Postgres providers must use TLS, e.g. append
+# # `sslmode=require` to IRONCLAW_REBORN_POSTGRES_URL.
+# backend = "postgres"
+# url_env = "IRONCLAW_REBORN_POSTGRES_URL"
+# secret_master_key_env = "IRONCLAW_REBORN_SECRET_MASTER_KEY"
+# # Optional; defaults to 16. Keep below the PostgreSQL server's
+# # max_connections after reserving capacity for migrations/operator sessions.
+# pool_max_size = 16
+
 [llm.default]
 # LLM slot selection. `provider_id` references an entry in
 # providers.json (built-in or user-overlay). `model` / `base_url` /
@@ -192,6 +214,21 @@ api_key_env = "OPENAI_API_KEY"
 # provider_id = "anthropic"
 # model       = "claude-3-5-sonnet-latest"
 # api_key_env = "ANTHROPIC_API_KEY"
+
+# [slack]
+# # Host-beta Slack Events API route for `ironclaw-reborn serve`.
+# # Requires a binary built with `--features slack-v2-host-beta`.
+# enabled = false
+# installation_id = "install-alpha"
+# team_id = "T123"
+# # Required for tenant app-scoped personal-binding pairing.
+# api_app_id = "A123"
+# # Optional legacy static mapping. Omit for the pairing-code flow.
+# slack_user_id = "U123"
+# # Defaults to the WebUI authenticated user when omitted.
+# # user_id = "reborn-cli"
+# signing_secret_env = "IRONCLAW_REBORN_SLACK_SIGNING_SECRET"
+# bot_token_env = "IRONCLAW_REBORN_SLACK_BOT_TOKEN"
 "#,
         api_version = REBORN_CONFIG_API_VERSION,
     )

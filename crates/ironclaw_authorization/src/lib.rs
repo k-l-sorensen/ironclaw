@@ -27,7 +27,8 @@ use ironclaw_host_api::{
     AgentId, CapabilityDescriptor, CapabilityGrant, CapabilityGrantId, Decision, DenyReason,
     EffectKind, ExecutionContext, HostApiError, InvocationFingerprint, InvocationId, MissionId,
     NetworkPolicy, Obligation, Obligations, Principal, ProjectId, ResourceCeiling,
-    ResourceEstimate, ResourceScope, SandboxQuota, ScopedPath, TenantId, ThreadId, UserId,
+    ResourceEstimate, ResourceScope, RuntimeCredentialRequirementSource, RuntimeKind, SandboxQuota,
+    ScopedPath, TenantId, ThreadId, UserId,
 };
 use ironclaw_trust::{AuthorityCeiling, TrustDecision};
 use serde::{Deserialize, Serialize};
@@ -187,6 +188,11 @@ impl CapabilityLease {
 pub enum CapabilityLeaseStatus {
     Active,
     Claimed,
+    /// Transient state set by `begin_dispatch_claimed` to ensure exactly one
+    /// concurrent auth-resume reuses a fingerprinted claimed lease. A second
+    /// caller sees `Dispatching` and gets `InactiveLease` — matching the loser
+    /// path of a concurrent `Active` lease `claim()` race.
+    Dispatching,
     Consumed,
     Revoked,
 }
@@ -254,6 +260,25 @@ pub trait CapabilityLeaseStore: Send + Sync {
 
     /// Consumes or decrements an active/claimed lease after successful dispatch.
     async fn consume(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+    ) -> Result<CapabilityLease, CapabilityLeaseError>;
+
+    /// Atomically transitions a Claimed, fingerprint-matched lease to
+    /// `Dispatching` so exactly one concurrent auth-resume reuses it. A second
+    /// caller sees a non-Claimed status and gets `InactiveLease` — the loser
+    /// bails exactly like a lost Active `claim()`.
+    async fn begin_dispatch_claimed(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+        invocation_fingerprint: &InvocationFingerprint,
+    ) -> Result<CapabilityLease, CapabilityLeaseError>;
+
+    /// Reverts a `Dispatching` lease back to `Claimed` so a later auth-resume
+    /// can reuse it after a non-terminal auth re-bounce. No-op-safe if already Claimed.
+    async fn abort_dispatch_claimed(
         &self,
         scope: &ResourceScope,
         lease_id: CapabilityGrantId,
@@ -353,7 +378,10 @@ impl CapabilityLeaseStore for InMemoryCapabilityLeaseStore {
             .get_mut(&CapabilityLeaseKey::new(scope, lease_id))
             .ok_or(CapabilityLeaseError::UnknownLease { lease_id })?;
 
-        let was_claimed = lease.status == CapabilityLeaseStatus::Claimed;
+        let was_claimed = matches!(
+            lease.status,
+            CapabilityLeaseStatus::Claimed | CapabilityLeaseStatus::Dispatching
+        );
         ensure_consumable(lease)?;
         if lease.invocation_fingerprint.is_some() {
             if let Some(remaining) = lease.grant.constraints.max_invocations.as_mut() {
@@ -370,6 +398,33 @@ impl CapabilityLeaseStore for InMemoryCapabilityLeaseStore {
         } else if was_claimed {
             lease.status = CapabilityLeaseStatus::Active;
         }
+        Ok(lease.clone())
+    }
+
+    async fn begin_dispatch_claimed(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+        invocation_fingerprint: &InvocationFingerprint,
+    ) -> Result<CapabilityLease, CapabilityLeaseError> {
+        let mut leases = self.leases_guard();
+        let lease = leases
+            .get_mut(&CapabilityLeaseKey::new(scope, lease_id))
+            .ok_or(CapabilityLeaseError::UnknownLease { lease_id })?;
+        apply_begin_dispatch_claimed_transition(lease, invocation_fingerprint)?;
+        Ok(lease.clone())
+    }
+
+    async fn abort_dispatch_claimed(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+    ) -> Result<CapabilityLease, CapabilityLeaseError> {
+        let mut leases = self.leases_guard();
+        let lease = leases
+            .get_mut(&CapabilityLeaseKey::new(scope, lease_id))
+            .ok_or(CapabilityLeaseError::UnknownLease { lease_id })?;
+        apply_abort_dispatch_claimed_transition(lease)?;
         Ok(lease.clone())
     }
 
@@ -820,7 +875,10 @@ where
         // authority. The retry re-evaluates `ensure_consumable` against
         // the latest version so the loser sees `InactiveLease`.
         self.update_lease_cas(scope, lease_id, |lease| {
-            let was_claimed = lease.status == CapabilityLeaseStatus::Claimed;
+            let was_claimed = matches!(
+                lease.status,
+                CapabilityLeaseStatus::Claimed | CapabilityLeaseStatus::Dispatching
+            );
             ensure_consumable(lease)?;
             if lease.invocation_fingerprint.is_some() {
                 if let Some(remaining) = lease.grant.constraints.max_invocations.as_mut() {
@@ -838,6 +896,34 @@ where
                 lease.status = CapabilityLeaseStatus::Active;
             }
             Ok(())
+        })
+        .await
+    }
+
+    async fn begin_dispatch_claimed(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+        invocation_fingerprint: &InvocationFingerprint,
+    ) -> Result<CapabilityLease, CapabilityLeaseError> {
+        let lock = self.mutation_lock(scope);
+        let _guard = lock.lock().await;
+        let fingerprint = invocation_fingerprint.clone();
+        self.update_lease_cas(scope, lease_id, |lease| {
+            apply_begin_dispatch_claimed_transition(lease, &fingerprint)
+        })
+        .await
+    }
+
+    async fn abort_dispatch_claimed(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+    ) -> Result<CapabilityLease, CapabilityLeaseError> {
+        let lock = self.mutation_lock(scope);
+        let _guard = lock.lock().await;
+        self.update_lease_cas(scope, lease_id, |lease| {
+            apply_abort_dispatch_claimed_transition(lease)
         })
         .await
     }
@@ -1154,12 +1240,52 @@ fn obligations_for_grant(
         });
     }
 
-    if descriptor.effects.contains(&EffectKind::UseSecret) {
-        match grant.constraints.secrets.as_slice() {
-            [handle] => obligations.push(Obligation::InjectSecretOnce {
-                handle: handle.clone(),
-            }),
-            _ => return None,
+    if !descriptor.runtime_credentials.is_empty() {
+        if !descriptor.effects.contains(&EffectKind::UseSecret) {
+            return None;
+        }
+        for credential in &descriptor.runtime_credentials {
+            match &credential.source {
+                RuntimeCredentialRequirementSource::SecretHandle => {
+                    if grant.constraints.secrets.contains(&credential.handle) {
+                        obligations.push(Obligation::InjectSecretOnce {
+                            handle: credential.handle.clone(),
+                        });
+                    } else if credential.required {
+                        return None;
+                    }
+                }
+                RuntimeCredentialRequirementSource::ProductAuthAccount { provider, setup } => {
+                    // Mirror SecretHandle: only mandate the obligation when the credential is
+                    // required. An optional product-auth credential is skipped rather than
+                    // injected so that a missing account does not hard-fail dispatch.
+                    if credential.required {
+                        obligations.push(Obligation::InjectCredentialAccountOnce {
+                            handle: credential.handle.clone(),
+                            provider: provider.clone(),
+                            setup: setup.clone(),
+                            provider_scopes: credential.provider_scopes.clone(),
+                            requester_extension: descriptor.provider.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    } else if descriptor.effects.contains(&EffectKind::UseSecret) {
+        // Some first-party handlers choose account-scoped credentials at
+        // dispatch time and stage the selected secret through their own
+        // host-runtime port, so there is no static grant handle to inject here.
+        if descriptor.runtime == RuntimeKind::FirstParty && grant.constraints.secrets.is_empty() {
+            obligations.push(Obligation::FirstPartyCredentialStagedViaHostPort {
+                capability_id: descriptor.id.clone(),
+            });
+        } else {
+            match grant.constraints.secrets.as_slice() {
+                [handle] => obligations.push(Obligation::InjectSecretOnce {
+                    handle: handle.clone(),
+                }),
+                _ => return None,
+            }
         }
     }
 
@@ -1422,7 +1548,9 @@ pub(crate) fn ensure_claimable(
 pub(crate) fn ensure_consumable(lease: &CapabilityLease) -> Result<(), CapabilityLeaseError> {
     let lease_id = lease.grant.id;
     match lease.status {
-        CapabilityLeaseStatus::Active | CapabilityLeaseStatus::Claimed => {}
+        CapabilityLeaseStatus::Active
+        | CapabilityLeaseStatus::Claimed
+        | CapabilityLeaseStatus::Dispatching => {}
         CapabilityLeaseStatus::Consumed => {
             return Err(CapabilityLeaseError::ExhaustedLease { lease_id });
         }
@@ -1434,11 +1562,78 @@ pub(crate) fn ensure_consumable(lease: &CapabilityLease) -> Result<(), Capabilit
         }
     }
 
-    if lease.invocation_fingerprint.is_some() && lease.status != CapabilityLeaseStatus::Claimed {
+    // Allow a fingerprinted lease to be consumed when Claimed OR Dispatching.
+    if lease.invocation_fingerprint.is_some()
+        && !matches!(
+            lease.status,
+            CapabilityLeaseStatus::Claimed | CapabilityLeaseStatus::Dispatching
+        )
+    {
         return Err(CapabilityLeaseError::UnclaimedFingerprintLease { lease_id });
     }
 
     ensure_not_expired_or_exhausted(lease)
+}
+
+/// Applies the `begin_dispatch_claimed` state-transition rule to a lease in
+/// place.
+///
+/// Requires `Claimed` status, a matching invocation fingerprint, and that the
+/// lease is neither expired nor exhausted; on success sets status to
+/// `Dispatching`.
+///
+/// Both [`InMemoryCapabilityLeaseStore`] and [`FilesystemCapabilityLeaseStore`]
+/// delegate to this function so the transition predicate has a single source of
+/// truth. Each store handles its own persistence / compare-and-swap mechanics
+/// around the call.
+pub(crate) fn apply_begin_dispatch_claimed_transition(
+    lease: &mut CapabilityLease,
+    invocation_fingerprint: &InvocationFingerprint,
+) -> Result<(), CapabilityLeaseError> {
+    let lease_id = lease.grant.id;
+    if lease.status != CapabilityLeaseStatus::Claimed {
+        return Err(CapabilityLeaseError::InactiveLease {
+            lease_id,
+            status: lease.status,
+        });
+    }
+    if lease.invocation_fingerprint.as_ref() != Some(invocation_fingerprint) {
+        return Err(CapabilityLeaseError::FingerprintMismatch { lease_id });
+    }
+    ensure_not_expired_or_exhausted(lease)?;
+    lease.status = CapabilityLeaseStatus::Dispatching;
+    Ok(())
+}
+
+/// Applies the `abort_dispatch_claimed` state-transition rule to a lease in
+/// place.
+///
+/// `Dispatching → Claimed`; no-op if already `Claimed`; returns
+/// `InactiveLease` for any other status.
+///
+/// Both [`InMemoryCapabilityLeaseStore`] and [`FilesystemCapabilityLeaseStore`]
+/// delegate to this function so the transition predicate has a single source of
+/// truth. Each store handles its own persistence / compare-and-swap mechanics
+/// around the call.
+pub(crate) fn apply_abort_dispatch_claimed_transition(
+    lease: &mut CapabilityLease,
+) -> Result<(), CapabilityLeaseError> {
+    let lease_id = lease.grant.id;
+    match lease.status {
+        CapabilityLeaseStatus::Dispatching => {
+            lease.status = CapabilityLeaseStatus::Claimed;
+        }
+        CapabilityLeaseStatus::Claimed => {
+            // Already Claimed — no-op.
+        }
+        _ => {
+            return Err(CapabilityLeaseError::InactiveLease {
+                lease_id,
+                status: lease.status,
+            });
+        }
+    }
+    Ok(())
 }
 
 fn ensure_not_expired_or_exhausted(lease: &CapabilityLease) -> Result<(), CapabilityLeaseError> {

@@ -10,36 +10,45 @@
 #![warn(unreachable_pub)]
 
 mod anthropic_oauth;
+mod anthropic_thinking;
+pub mod auth;
 #[cfg(feature = "bedrock")]
 mod bedrock;
 pub mod circuit_breaker;
-pub mod codex_auth;
+pub(crate) mod codex_auth;
 mod codex_chatgpt;
 pub mod config;
 pub mod costs;
 pub mod error;
 pub mod failover;
-pub mod gemini_oauth;
+pub(crate) mod gemini_oauth;
 mod github_copilot;
-pub mod github_copilot_auth;
+pub(crate) mod github_copilot_auth;
 pub mod host;
 pub mod nearai_chat;
-pub mod oauth_helpers;
 pub mod openai_codex_provider;
-pub mod openai_codex_session;
+pub(crate) mod openai_codex_session;
 mod provider;
 mod reasoning;
 pub mod recording;
 pub mod registry;
+#[cfg(feature = "registry-provider-factory")]
+mod resolution;
 pub mod response_cache;
+mod responses_reasoning;
 pub mod retry;
 mod rig_adapter;
 pub mod runtime;
 pub mod session;
 pub mod smart_routing;
 mod token_refreshing;
+// arch-exempt: scaffolding, Phase A helpers awaiting first per-provider caller, plan #4522
+// Remove the allow once any production call site references these items.
+#[allow(dead_code)]
+pub(crate) mod tool_args;
 pub mod tool_schema;
 pub mod transcription;
+mod url_check;
 
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
@@ -57,9 +66,9 @@ pub use config::{
     BedrockConfig, CacheRetention, GeminiOauthConfig, LlmBackendKind, LlmConfig, NearAiConfig,
     OAUTH_PLACEHOLDER, OpenAiCodexConfig, RegistryProviderConfig,
 };
-pub use error::LlmError;
+pub use error::{LlmConfigError, LlmError};
 pub use failover::{CooldownConfig, FailoverProvider};
-pub use gemini_oauth::GeminiOauthProvider;
+pub(crate) use gemini_oauth::GeminiOauthProvider;
 pub use host::{
     NoopKeyPersistor, NoopSessionRenewer, SessionDb, SessionKeyPersistor, SessionRenewer,
     SessionSecrets, SharedSessionDb, SharedSessionKeyPersistor, SharedSessionRenewer,
@@ -67,7 +76,7 @@ pub use host::{
 };
 pub use nearai_chat::{DEFAULT_MODEL, ModelInfo, NearAiChatProvider, default_models};
 pub use openai_codex_provider::OpenAiCodexProvider;
-pub use openai_codex_session::{OpenAiCodexSession, OpenAiCodexSessionManager};
+pub use openai_codex_session::{DeviceCodeStart, OpenAiCodexSessionManager};
 pub use provider::sanitize_tool_messages;
 pub use provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, ImageUrl,
@@ -80,14 +89,26 @@ pub use reasoning::{
     TokenUsage, ToolSelection, is_silent_reply, llm_signals_tool_intent,
     user_signals_execution_intent,
 };
-pub use reasoning::{clean_response, recover_tool_calls_from_content};
+pub use reasoning::{
+    clean_response, contains_codex_text_tool_call_syntax,
+    recover_codex_text_tool_calls_from_content, recover_codex_text_tool_calls_from_tool_names,
+    recover_tool_calls_from_content,
+};
 pub use recording::{MemorySnapshotEntry, RecordingLlm};
 pub use registry::{ProviderDefinition, ProviderProtocol, ProviderRegistry};
+#[cfg(feature = "registry-provider-factory")]
+pub use resolution::{
+    ProviderResolutionError, ProviderSelection, ResolvedDedicatedProviderConfig,
+    ResolvedProviderConfig, build_llm_config_from_resolved_provider,
+    build_registry_provider_config_from_resolved_provider, resolve_llm_config_from_env,
+    resolve_llm_config_from_selection, resolve_provider_config_from_env,
+    resolve_provider_config_from_selection,
+};
 pub use response_cache::{CachedProvider, ResponseCacheConfig};
 pub use retry::{RetryConfig, RetryProvider};
 pub use rig_adapter::RigAdapter;
 pub use runtime::{LlmReloadHandle, SwappableLlmProvider};
-pub use session::{SessionConfig, SessionManager, create_session_manager};
+pub use session::{NearWalletSignedMessage, SessionConfig, SessionManager, create_session_manager};
 pub use smart_routing::{SmartRoutingConfig, SmartRoutingProvider, TaskComplexity};
 pub use token_refreshing::TokenRefreshingProvider;
 
@@ -97,8 +118,6 @@ use std::sync::Arc;
 
 use rig::client::CompletionClient;
 use secrecy::ExposeSecret;
-#[cfg(feature = "registry-provider-factory")]
-use secrecy::SecretString;
 
 // LlmConfig, NearAiConfig, RegistryProviderConfig, and LlmError are
 // re-exported via `pub use` above from config and error submodules.
@@ -207,191 +226,9 @@ pub fn create_registry_provider(
 pub fn resolve_registry_provider_from_env(
     user_providers_path: Option<&Path>,
 ) -> Result<Option<RegistryProviderConfig>, LlmError> {
-    if let Some(backend) = nonempty_env("LLM_BACKEND") {
-        if is_openai_codex_backend(&backend) {
-            return resolve_openai_codex_registry_provider_from_env().map(Some);
-        }
-        let registry = try_load_provider_registry(user_providers_path)?;
-        let provider = registry
-            .find(&backend)
-            .ok_or_else(|| LlmError::AuthFailed {
-                provider: backend.clone(),
-            })?;
-        return resolve_registry_provider_definition_from_env(provider).map(Some);
-    }
-
-    if codex_auth_enabled_from_env() {
-        return resolve_openai_codex_registry_provider_from_env().map(Some);
-    }
-
-    let registry = ProviderRegistry::load_from_path(user_providers_path);
-    let Some(provider) = registry
-        .all()
-        .iter()
-        .find(|provider| registry_provider_env_present(provider))
-    else {
-        return Ok(None);
-    };
-    resolve_registry_provider_definition_from_env(provider).map(Some)
-}
-
-#[cfg(feature = "registry-provider-factory")]
-fn try_load_provider_registry(
-    user_providers_path: Option<&Path>,
-) -> Result<ProviderRegistry, LlmError> {
-    ProviderRegistry::try_load_from_path(user_providers_path).map_err(|source| {
-        LlmError::RequestFailed {
-            provider: "provider_registry".to_string(),
-            reason: source.to_string(),
-        }
-    })
-}
-
-#[cfg(feature = "registry-provider-factory")]
-fn registry_provider_env_present(provider: &ProviderDefinition) -> bool {
-    provider
-        .api_key_env
-        .as_deref()
-        .and_then(nonempty_env)
-        .is_some()
-        || provider
-            .base_url_env
-            .as_deref()
-            .and_then(nonempty_env)
-            .is_some()
-}
-
-#[cfg(feature = "registry-provider-factory")]
-fn resolve_registry_provider_definition_from_env(
-    provider: &ProviderDefinition,
-) -> Result<RegistryProviderConfig, LlmError> {
-    let api_key = match provider.api_key_env.as_deref().and_then(nonempty_env) {
-        Some(value) => Some(SecretString::from(value)),
-        None if provider.api_key_required => {
-            return Err(LlmError::AuthFailed {
-                provider: provider.id.clone(),
-            });
-        }
-        None => None,
-    };
-    let base_url = provider
-        .base_url_env
-        .as_deref()
-        .and_then(nonempty_env)
-        .or_else(|| provider.default_base_url.clone())
-        .unwrap_or_default();
-    if provider.base_url_required && base_url.is_empty() {
-        return Err(LlmError::RequestFailed {
-            provider: provider.id.clone(),
-            reason: "base URL is required but no base URL environment variable is set".to_string(),
-        });
-    }
-    let model = nonempty_env(&provider.model_env)
-        .or_else(|| nonempty_env("LLM_MODEL"))
-        .unwrap_or_else(|| provider.default_model.clone());
-    let extra_headers = provider
-        .extra_headers_env
-        .as_deref()
-        .and_then(nonempty_env)
-        .map(|value| parse_registry_extra_headers(&provider.id, &value))
-        .transpose()?;
-
-    Ok(RegistryProviderConfig::generic(
-        provider.protocol,
-        provider.id.clone(),
-        api_key,
-        base_url,
-        model,
-    )
-    .with_extra_headers(extra_headers.unwrap_or_default())
-    .with_unsupported_params(provider.unsupported_params.clone()))
-}
-
-#[cfg(feature = "registry-provider-factory")]
-fn resolve_openai_codex_registry_provider_from_env() -> Result<RegistryProviderConfig, LlmError> {
-    let auth_path = std::env::var_os("CODEX_AUTH_PATH")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(codex_auth::default_codex_auth_path);
-    let credentials =
-        codex_auth::load_codex_credentials(&auth_path).ok_or_else(|| LlmError::AuthFailed {
-            provider: "openai_codex".to_string(),
-        })?;
-    let model = nonempty_env("OPENAI_CODEX_MODEL")
-        .or_else(|| nonempty_env("OPENAI_MODEL"))
-        .or_else(|| nonempty_env("LLM_MODEL"))
-        .unwrap_or_else(|| {
-            if credentials.is_chatgpt_mode {
-                "gpt-5.3-codex".to_string()
-            } else {
-                "gpt-4o-mini".to_string()
-            }
-        });
-    let base_url = credentials.base_url().to_string();
-
-    Ok(RegistryProviderConfig {
-        protocol: ProviderProtocol::OpenAiCompletions,
-        provider_id: if credentials.is_chatgpt_mode {
-            "codex_chatgpt".to_string()
-        } else {
-            "openai".to_string()
-        },
-        api_key: Some(credentials.token),
-        base_url,
-        model,
-        extra_headers: Vec::new(),
-        oauth_token: None,
-        is_codex_chatgpt: credentials.is_chatgpt_mode,
-        refresh_token: credentials.refresh_token,
-        auth_path: credentials.is_chatgpt_mode.then_some(auth_path),
-        cache_retention: CacheRetention::None,
-        unsupported_params: Vec::new(),
-    })
-}
-
-#[cfg(feature = "registry-provider-factory")]
-fn is_openai_codex_backend(backend: &str) -> bool {
-    matches!(backend, "openai_codex" | "openai-codex" | "codex")
-}
-
-#[cfg(feature = "registry-provider-factory")]
-fn codex_auth_enabled_from_env() -> bool {
-    std::env::var("LLM_USE_CODEX_AUTH")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
-        .unwrap_or(false)
-}
-
-#[cfg(feature = "registry-provider-factory")]
-fn nonempty_env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-#[cfg(feature = "registry-provider-factory")]
-fn parse_registry_extra_headers(
-    provider: &str,
-    value: &str,
-) -> Result<Vec<(String, String)>, LlmError> {
-    let mut headers = Vec::new();
-    for part in value.split(',') {
-        let part = part.trim();
-        if part.is_empty() {
-            continue;
-        }
-        let Some((key, header_value)) = part.split_once(':') else {
-            return Err(LlmError::RequestFailed {
-                provider: provider.to_string(),
-                reason: "extra header must use `Name:Value` format".to_string(),
-            });
-        };
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(LlmError::RequestFailed {
-                provider: provider.to_string(),
-                reason: "extra header name must not be empty".to_string(),
-            });
-        }
-        headers.push((key.to_string(), header_value.trim().to_string()));
-    }
-    Ok(headers)
+    resolution::resolve_provider_config_from_env(user_providers_path)?
+        .map(resolution::build_registry_provider_config_from_resolved_provider)
+        .transpose()
 }
 
 fn create_registry_provider_inner(
@@ -421,6 +258,22 @@ fn create_registry_provider_inner(
             );
             Ok(Arc::new(provider))
         }
+        // Protocols with a dedicated config slot on `LlmConfig` are
+        // dispatched in `create_llm_provider` before this function is
+        // reached. They never carry a `RegistryProviderConfig`, so this
+        // arm is only reachable as an internal logic bug.
+        ProviderProtocol::Bedrock
+        | ProviderProtocol::OpenAiCodex
+        | ProviderProtocol::GeminiOauth
+        | ProviderProtocol::NearAi => Err(LlmError::RequestFailed {
+            provider: config.provider_id.clone(),
+            reason: format!(
+                "Provider '{}' uses a dedicated config slot on LlmConfig and \
+                 must be dispatched in create_llm_provider, not via \
+                 RegistryProviderConfig.",
+                config.provider_id
+            ),
+        }),
     }
 }
 
@@ -473,6 +326,18 @@ async fn create_bedrock_provider(config: &LlmConfig) -> Result<Arc<dyn LlmProvid
     Ok(Arc::new(provider))
 }
 
+/// Build the reqwest client a rig-based provider should use for its requests to
+/// `base_url`, bypassing any system/env HTTP proxy when the target is loopback.
+///
+/// A proxy (macOS system proxy, `HTTP_PROXY`, …) cannot reach the caller's own
+/// loopback service and answers the forwarded request with `502 Bad Gateway`,
+/// which is why a self-hosted local provider (Ollama, vLLM, …) fails even
+/// though `curl` to the same URL works. Remote hosts keep default proxy
+/// behavior, so this is a no-op for hosted providers behind a corporate proxy.
+fn provider_http_client(provider_id: &str, base_url: &str) -> Result<reqwest::Client, LlmError> {
+    crate::url_check::build_http_client(provider_id, base_url, reqwest::Client::builder())
+}
+
 fn create_openai_compat_from_registry(
     config: &RegistryProviderConfig,
 ) -> Result<Arc<dyn LlmProvider>, LlmError> {
@@ -521,13 +386,22 @@ fn create_openai_compat_from_registry(
             "no-key".to_string()
         });
 
-    let mut builder = openai::Client::builder().api_key(&api_key);
+    // Default to the public OpenAI endpoint for model discovery when no base
+    // URL is configured; rig-core uses the same default internally.
+    let normalized_base_url = if config.base_url.is_empty() {
+        "https://api.openai.com/v1".to_string()
+    } else {
+        normalize_openai_base_url(&config.base_url)
+    };
+
+    let mut builder = openai::Client::<reqwest::Client>::builder()
+        .api_key(&api_key)
+        .http_client(provider_http_client(&config.provider_id, &config.base_url)?);
     if !config.base_url.is_empty() {
-        let base_url = normalize_openai_base_url(&config.base_url);
-        builder = builder.base_url(&base_url);
+        builder = builder.base_url(&normalized_base_url);
     }
     if !extra_headers.is_empty() {
-        builder = builder.http_headers(extra_headers);
+        builder = builder.http_headers(extra_headers.clone());
     }
 
     let client: openai::Client = builder.build().map_err(|e| LlmError::RequestFailed {
@@ -548,8 +422,16 @@ fn create_openai_compat_from_registry(
         "Using OpenAI-compatible provider"
     );
 
+    let models_endpoint = rig_adapter::ModelsEndpoint {
+        provider_id: config.provider_id.clone(),
+        url: format!("{}/models", normalized_base_url.trim_end_matches('/')),
+        auth: rig_adapter::ModelsAuth::Bearer(api_key),
+        shape: rig_adapter::ModelsShape::OpenAiData,
+        extra_headers,
+    };
     let adapter = RigAdapter::new(model, &config.model)
-        .with_unsupported_params(config.unsupported_params.clone());
+        .with_unsupported_params(config.unsupported_params.clone())
+        .with_model_listing(models_endpoint);
     Ok(Arc::new(adapter))
 }
 
@@ -585,15 +467,17 @@ fn create_anthropic_from_registry(
             provider: config.provider_id.clone(),
         })?;
 
-    let client: anthropic::Client = if config.base_url.is_empty() {
-        anthropic::Client::new(&api_key)
-    } else {
-        anthropic::Client::builder()
-            .api_key(&api_key)
-            .base_url(&config.base_url)
-            .build()
+    // Build with the proxy-aware client (same as the OpenAI-compatible path) so
+    // a localhost/self-hosted Anthropic-compatible endpoint bypasses the system
+    // proxy for live chat too — not just model discovery. Remote hosts keep
+    // default proxy behavior.
+    let mut builder = anthropic::Client::<reqwest::Client>::builder()
+        .api_key(&api_key)
+        .http_client(provider_http_client(&config.provider_id, &config.base_url)?);
+    if !config.base_url.is_empty() {
+        builder = builder.base_url(&config.base_url);
     }
-    .map_err(|e| LlmError::RequestFailed {
+    let client: anthropic::Client = builder.build().map_err(|e| LlmError::RequestFailed {
         provider: config.provider_id.clone(),
         reason: format!("Failed to create Anthropic client: {e}"),
     })?;
@@ -617,10 +501,35 @@ fn create_anthropic_from_registry(
         "Using Anthropic provider"
     );
 
+    // Anthropic model discovery: `GET {base}/v1/models` with `x-api-key` +
+    // `anthropic-version` (the SDK appends `/v1` itself for completions, so we
+    // add it explicitly here only for the discovery URL).
+    let anthropic_base = if config.base_url.is_empty() {
+        "https://api.anthropic.com".to_string()
+    } else {
+        config.base_url.trim_end_matches('/').to_string()
+    };
+    let discovery_base = if anthropic_base.ends_with("/v1") || anthropic_base.contains("/v1/") {
+        anthropic_base
+    } else {
+        format!("{anthropic_base}/v1")
+    };
+    let models_endpoint = rig_adapter::ModelsEndpoint {
+        provider_id: config.provider_id.clone(),
+        url: format!("{discovery_base}/models"),
+        auth: rig_adapter::ModelsAuth::AnthropicKey {
+            api_key,
+            version: "2023-06-01".to_string(),
+        },
+        shape: rig_adapter::ModelsShape::OpenAiData,
+        extra_headers: reqwest::header::HeaderMap::new(),
+    };
+
     Ok(Arc::new(
         RigAdapter::new(model, &config.model)
             .with_cache_retention(cache_retention)
-            .with_unsupported_params(config.unsupported_params.clone()),
+            .with_unsupported_params(config.unsupported_params.clone())
+            .with_model_listing(models_endpoint),
     ))
 }
 
@@ -630,9 +539,10 @@ fn create_ollama_from_registry(
     use rig::client::Nothing;
     use rig::providers::ollama;
 
-    let client: ollama::Client = ollama::Client::builder()
+    let client: ollama::Client = ollama::Client::<reqwest::Client>::builder()
         .base_url(&config.base_url)
         .api_key(Nothing)
+        .http_client(provider_http_client(&config.provider_id, &config.base_url)?)
         .build()
         .map_err(|e| LlmError::RequestFailed {
             provider: config.provider_id.clone(),
@@ -648,12 +558,31 @@ fn create_ollama_from_registry(
         "Using Ollama provider"
     );
 
-    // Ollama's native /api/chat requires `think: true` to enable extended
-    // reasoning for thinking models (Qwen3, DeepSeek-R1, Gemma 4, etc.).
-    // Non-thinking models ignore the parameter harmlessly.
-    let adapter = RigAdapter::new(model, &config.model)
+    // Ollama model discovery: `GET {base}/api/tags`, no auth, `models[].name`.
+    let ollama_base = if config.base_url.trim().is_empty() {
+        "http://localhost:11434".to_string()
+    } else {
+        config.base_url.trim_end_matches('/').to_string()
+    };
+    let models_endpoint = rig_adapter::ModelsEndpoint {
+        provider_id: config.provider_id.clone(),
+        url: format!("{ollama_base}/api/tags"),
+        auth: rig_adapter::ModelsAuth::None,
+        shape: rig_adapter::ModelsShape::OllamaTags,
+        extra_headers: reqwest::header::HeaderMap::new(),
+    };
+
+    let mut adapter = RigAdapter::new(model, &config.model)
         .with_unsupported_params(config.unsupported_params.clone())
-        .with_additional_params(serde_json::json!({ "think": true }));
+        .with_model_listing(models_endpoint);
+    // Ollama's /api/chat enables extended reasoning via `think: true`, but
+    // rejects that parameter with HTTP 400 ("does not support thinking") for
+    // models that have no thinking capability (e.g. llama3). Only send it for
+    // known native-thinking models (Qwen3, DeepSeek-R1, …); everything else
+    // must omit it or every turn fails.
+    if crate::reasoning_models::has_native_thinking(&config.model) {
+        adapter = adapter.with_additional_params(serde_json::json!({ "think": true }));
+    }
     Ok(Arc::new(adapter))
 }
 
@@ -1017,6 +946,14 @@ pub(crate) async fn build_provider_chain_components(
     config: &LlmConfig,
     session: Arc<SessionManager>,
 ) -> Result<ProviderChainComponents, LlmError> {
+    build_provider_chain_components_with_options(config, session, true).await
+}
+
+async fn build_provider_chain_components_with_options(
+    config: &LlmConfig,
+    session: Arc<SessionManager>,
+    include_standalone_cheap: bool,
+) -> Result<ProviderChainComponents, LlmError> {
     let llm: Arc<dyn LlmProvider> = if config.backend == "openai_codex" {
         create_openai_codex_provider(config).await?
     } else {
@@ -1141,7 +1078,11 @@ pub(crate) async fn build_provider_chain_components(
     };
 
     // Standalone cheap LLM for heartbeat/evaluation (not part of the chain)
-    let cheap_llm = create_cheap_llm_provider(config, session)?;
+    let cheap_llm = if include_standalone_cheap {
+        create_cheap_llm_provider(config, session)?
+    } else {
+        None
+    };
     if let Some(ref cheap) = cheap_llm {
         tracing::debug!("Cheap LLM provider initialized: {}", cheap.model_name());
     }
@@ -1149,6 +1090,22 @@ pub(crate) async fn build_provider_chain_components(
     Ok(ProviderChainComponents {
         primary: llm,
         cheap: cheap_llm,
+    })
+}
+
+/// Build a primary provider chain for composition roots that do not own
+/// hot-reload or standalone cheap-provider lifecycle handles.
+pub async fn build_static_provider_chain(
+    config: &LlmConfig,
+    session: Arc<SessionManager>,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    let components = build_provider_chain_components_with_options(config, session, false).await?;
+    let primary = components.primary;
+    let recording_handle = RecordingLlm::from_env(primary.clone());
+    Ok(if let Some(recorder) = recording_handle {
+        recorder as Arc<dyn LlmProvider>
+    } else {
+        primary
     })
 }
 

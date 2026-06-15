@@ -25,6 +25,8 @@ use ironclaw_turns::{
     },
 };
 
+use crate::model_failure_mapping::model_stage_failure_category;
+
 pub const PLANNED_DRIVER_DEFAULT_ID: &str = "reborn:planned-default";
 const PLANNED_DRIVER_VERSION: u64 = 1;
 
@@ -227,6 +229,32 @@ pub(crate) fn map_executor_error(error: AgentLoopExecutorError) -> AgentLoopDriv
         AgentLoopExecutorError::HostUnavailable { stage } => AgentLoopDriverError::Unavailable {
             reason: format!("{}: unavailable", host_stage_name(stage)),
         },
+        AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+            stage,
+            kind,
+            safe_summary,
+            reason_kind,
+            diagnostic_ref,
+        } => {
+            tracing::warn!(
+                stage = ?stage,
+                kind = ?kind,
+                reason_kind = ?reason_kind,
+                diagnostic_ref = ?diagnostic_ref,
+                safe_summary = %safe_summary,
+                "planned driver host stage unavailable"
+            );
+            if let Some(category) =
+                model_stage_failure_category(stage == HostStage::Model, kind, reason_kind)
+            {
+                return AgentLoopDriverError::Failed {
+                    reason_kind: category.to_string(),
+                };
+            }
+            AgentLoopDriverError::Unavailable {
+                reason: format!("{}: {safe_summary}", host_stage_name(stage)),
+            }
+        }
         AgentLoopExecutorError::PlannerContract { detail } => AgentLoopDriverError::Failed {
             reason_kind: format!("driver_bug:{detail}"),
         },
@@ -300,6 +328,10 @@ fn resumable_checkpoint_kind_from_host(kind: LoopCheckpointKind) -> Result<Check
 mod tests {
     use super::*;
     use crate::app_loop_family::build_loop_family_registry;
+    use crate::failure_categories::{
+        MODEL_CREDENTIALS_UNAVAILABLE_CATEGORY, MODEL_CREDITS_EXHAUSTED_CATEGORY,
+        MODEL_CREDITS_EXHAUSTED_REASON_KIND,
+    };
     use ironclaw_agent_loop::test_support::{
         MockAgentLoopDriverHost, MockHostCall, test_run_context,
     };
@@ -311,12 +343,14 @@ mod tests {
             CapabilityInvocation, CapabilityOutcome, CheckpointSchemaId, FinalizeAssistantMessage,
             LoadCheckpointPayloadRequest, LoadedCheckpointPayload, LoopCancellationPort,
             LoopCancellationSignal, LoopCapabilityPort, LoopCheckpointPort, LoopCheckpointRequest,
-            LoopCheckpointStateRef, LoopContextBundle, LoopContextPort, LoopContextRequest,
+            LoopCheckpointStateRef, LoopCompactionError, LoopCompactionOutcome, LoopCompactionPort,
+            LoopCompactionRequest, LoopContextBundle, LoopContextPort, LoopContextRequest,
             LoopDriverId, LoopInputAckToken, LoopInputBatch, LoopInputCursor, LoopInputPort,
             LoopModelPort, LoopModelRequest, LoopModelResponse, LoopProgressEvent,
             LoopProgressPort, LoopPromptBundle, LoopPromptBundleRequest, LoopPromptPort,
-            LoopRunContext, LoopRunInfoPort, LoopTranscriptPort, StageCheckpointPayloadRequest,
-            UpdateAssistantDraft, VisibleCapabilityRequest, VisibleCapabilitySurface,
+            LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort,
+            StageCheckpointPayloadRequest, UpdateAssistantDraft, VisibleCapabilityRequest,
+            VisibleCapabilitySurface,
         },
     };
     use std::sync::Mutex;
@@ -399,6 +433,81 @@ mod tests {
             mapped,
             AgentLoopDriverError::Failed {
                 reason_kind: "interrupted_unexpectedly".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn executor_model_credential_diagnostics_map_to_credentials_category() {
+        let mapped = map_executor_error(AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+            stage: HostStage::Model,
+            kind: AgentLoopHostErrorKind::CredentialUnavailable,
+            safe_summary: LoopSafeSummary::new("model credentials are unavailable").expect("safe"),
+            reason_kind: None,
+            diagnostic_ref: None,
+        });
+
+        assert_eq!(
+            mapped,
+            AgentLoopDriverError::Failed {
+                reason_kind: MODEL_CREDENTIALS_UNAVAILABLE_CATEGORY.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn executor_host_diagnostics_preserve_model_credit_exhaustion_category() {
+        let mapped = map_executor_error(AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+            stage: HostStage::Model,
+            kind: AgentLoopHostErrorKind::CredentialUnavailable,
+            safe_summary: LoopSafeSummary::new("safe summary wording is display-only")
+                .expect("safe"),
+            reason_kind: Some(MODEL_CREDITS_EXHAUSTED_REASON_KIND),
+            diagnostic_ref: None,
+        });
+
+        assert_eq!(
+            mapped,
+            AgentLoopDriverError::Failed {
+                reason_kind: MODEL_CREDITS_EXHAUSTED_CATEGORY.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn non_model_stage_with_credit_reason_maps_to_unavailable() {
+        const CREDIT_SUMMARY: &str = "model provider account is out of credits";
+        let mapped = map_executor_error(AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+            stage: HostStage::Prompt,
+            kind: AgentLoopHostErrorKind::CredentialUnavailable,
+            safe_summary: LoopSafeSummary::new(CREDIT_SUMMARY).expect("safe"),
+            reason_kind: Some(MODEL_CREDITS_EXHAUSTED_REASON_KIND),
+            diagnostic_ref: None,
+        });
+
+        assert_eq!(
+            mapped,
+            AgentLoopDriverError::Unavailable {
+                reason: format!("Prompt: {CREDIT_SUMMARY}")
+            }
+        );
+    }
+
+    #[test]
+    fn non_model_stage_with_credential_unavailable_maps_to_unavailable() {
+        const CREDENTIAL_SUMMARY: &str = "model credentials are unavailable";
+        let mapped = map_executor_error(AgentLoopExecutorError::HostUnavailableWithDiagnostics {
+            stage: HostStage::Prompt,
+            kind: AgentLoopHostErrorKind::CredentialUnavailable,
+            safe_summary: LoopSafeSummary::new(CREDENTIAL_SUMMARY).expect("safe"),
+            reason_kind: None,
+            diagnostic_ref: None,
+        });
+
+        assert_eq!(
+            mapped,
+            AgentLoopDriverError::Unavailable {
+                reason: format!("Prompt: {CREDENTIAL_SUMMARY}")
             }
         );
     }
@@ -702,9 +811,14 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl LoopCancellationPort for ResumePayloadHost {
         fn observe_cancellation(&self) -> Option<LoopCancellationSignal> {
             self.inner.observe_cancellation()
+        }
+
+        async fn cancellation_requested(&self) -> LoopCancellationSignal {
+            self.inner.cancellation_requested().await
         }
     }
 
@@ -753,6 +867,16 @@ mod tests {
             request: LoopModelRequest,
         ) -> Result<LoopModelResponse, AgentLoopHostError> {
             self.inner.stream_model(request).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LoopCompactionPort for ResumePayloadHost {
+        async fn compact_loop_context(
+            &self,
+            request: LoopCompactionRequest,
+        ) -> Result<LoopCompactionOutcome, LoopCompactionError> {
+            self.inner.compact_loop_context(request).await
         }
     }
 

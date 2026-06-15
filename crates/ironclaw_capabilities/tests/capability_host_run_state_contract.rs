@@ -857,11 +857,18 @@ async fn capability_host_revokes_claimed_lease_when_dispatch_fails_after_resume(
     assert!(matches!(
         err,
         CapabilityInvocationError::Dispatch {
-            kind: DispatchFailureKind::Runtime(RuntimeDispatchErrorKind::Backend)
+            kind: DispatchFailureKind::Runtime(RuntimeDispatchErrorKind::Backend),
+            safe_summary: None,
         }
     ));
+    // Per PR #4236 disposition policy, the capability host no longer
+    // transitions run state on dispatch failures — the higher host_runtime
+    // layer consults `capability_failure_disposition` and either retries
+    // (for `Backend`/`RetrySameCall`) or surfaces the failure to the model
+    // (`ModelVisibleToolError`). The run therefore stays in its prior state
+    // (`BlockedApproval`, set by the initial invoke).
     let run = run_state.get(&scope, invocation_id).await.unwrap().unwrap();
-    assert_eq!(run.status, RunStatus::Failed);
+    assert_eq!(run.status, RunStatus::BlockedApproval);
     let revoked = leases.get(&scope, lease.grant.id).await.unwrap();
     assert_eq!(revoked.status, CapabilityLeaseStatus::Revoked);
 }
@@ -1903,6 +1910,25 @@ impl CapabilityLeaseStore for CoordinatedClaimConflictLeaseStore {
         self.inner.consume(scope, lease_id).await
     }
 
+    async fn begin_dispatch_claimed(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+        invocation_fingerprint: &InvocationFingerprint,
+    ) -> Result<CapabilityLease, CapabilityLeaseError> {
+        self.inner
+            .begin_dispatch_claimed(scope, lease_id, invocation_fingerprint)
+            .await
+    }
+
+    async fn abort_dispatch_claimed(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+    ) -> Result<CapabilityLease, CapabilityLeaseError> {
+        self.inner.abort_dispatch_claimed(scope, lease_id).await
+    }
+
     async fn leases_for_scope(&self, scope: &ResourceScope) -> Vec<CapabilityLease> {
         self.inner.leases_for_scope(scope).await
     }
@@ -1965,6 +1991,25 @@ impl CapabilityLeaseStore for ConsumeFailingLeaseStore {
         Err(CapabilityLeaseError::Persistence {
             reason: format!("consume failed for {lease_id}"),
         })
+    }
+
+    async fn begin_dispatch_claimed(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+        invocation_fingerprint: &InvocationFingerprint,
+    ) -> Result<CapabilityLease, CapabilityLeaseError> {
+        self.inner
+            .begin_dispatch_claimed(scope, lease_id, invocation_fingerprint)
+            .await
+    }
+
+    async fn abort_dispatch_claimed(
+        &self,
+        scope: &ResourceScope,
+        lease_id: CapabilityGrantId,
+    ) -> Result<CapabilityLease, CapabilityLeaseError> {
+        self.inner.abort_dispatch_claimed(scope, lease_id).await
     }
 
     async fn leases_for_scope(&self, scope: &ResourceScope) -> Vec<CapabilityLease> {

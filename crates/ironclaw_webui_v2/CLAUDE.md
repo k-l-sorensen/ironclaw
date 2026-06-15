@@ -25,8 +25,9 @@ owns:
    the same path prefix the descriptors declare.
 2. **Bearer-token middleware.** Authenticate `Authorization: Bearer
    …` (or the matching session form) and inject a
-   `WebUiAuthenticatedCaller` as an `axum::Extension` *before* the
-   handler runs. The handlers fail closed (`500`) when this layer is
+   `WebUiAuthenticatedCaller` and request-scoped
+   `WebUiV2Capabilities` as `axum::Extension`s *before* the handler
+   runs. The handlers fail closed (`500`) when this layer is
    missing — verified by
    `missing_caller_extension_returns_500`.
 3. **Query-token path for the SSE route.** The browser's
@@ -50,20 +51,77 @@ browser-reachable.
 
 | Route ID | Method | Pattern | Streaming | Effect path |
 |---|---|---|---|---|
+| `webui.v2.get_session` | GET | `/api/webchat/v2/session` | None | `ProjectionOnly` |
 | `webui.v2.create_thread` | POST | `/api/webchat/v2/threads` | None | `ProductWorkflow` |
 | `webui.v2.list_threads` | GET | `/api/webchat/v2/threads` (optional `?limit=N&cursor=...`) | None | `ProjectionOnly` |
+| `webui.v2.delete_thread` | DELETE | `/api/webchat/v2/threads/{thread_id}` | None | `ProductWorkflow` |
 | `webui.v2.send_message` | POST | `/api/webchat/v2/threads/{thread_id}/messages` | None | `TurnCoordinator` |
 | `webui.v2.get_timeline` | GET | `/api/webchat/v2/threads/{thread_id}/timeline` (optional `?limit=N&cursor=...`) | None | `ProjectionOnly` |
 | `webui.v2.stream_events` | GET | `/api/webchat/v2/threads/{thread_id}/events` | SSE | `ProjectionOnly` |
 | `webui.v2.stream_events_ws` | GET | `/api/webchat/v2/threads/{thread_id}/ws` | WebSocket | `ProjectionOnly` |
 | `webui.v2.cancel_run` | POST | `/api/webchat/v2/threads/{thread_id}/runs/{run_id}/cancel` | None | `TurnCoordinator` |
 | `webui.v2.resolve_gate` | POST | `/api/webchat/v2/threads/{thread_id}/runs/{run_id}/gates/{gate_ref}/resolve` | None | `TurnCoordinator` |
-| `webui.v2.setup_extension` | POST | `/api/webchat/v2/extensions/{extension_name}/setup` | None | `ProductWorkflow` |
+| `webui.v2.list_automations` | GET | `/api/webchat/v2/automations` (optional `?limit=N&run_limit=N`) | None | `ProductWorkflow` |
+| `webui.v2.list_connectable_channels` | GET | `/api/webchat/v2/channels/connectable` | None | `ProjectionOnly` |
+| `webui.v2.list_extensions` | GET | `/api/webchat/v2/extensions` | None | `ProjectionOnly` |
+| `webui.v2.list_extension_registry` | GET | `/api/webchat/v2/extensions/registry` | None | `ProjectionOnly` |
+| `webui.v2.install_extension` | POST | `/api/webchat/v2/extensions/install` | None | `ProductWorkflow` |
+| `webui.v2.activate_extension` | POST | `/api/webchat/v2/extensions/{package_id}/activate` | None | `ProductWorkflow` |
+| `webui.v2.remove_extension` | POST | `/api/webchat/v2/extensions/{package_id}/remove` | None | `ProductWorkflow` |
+| `webui.v2.get_extension_setup` | GET | `/api/webchat/v2/extensions/{package_id}/setup` | None | `ProjectionOnly` |
+| `webui.v2.setup_extension` | POST | `/api/webchat/v2/extensions/{package_id}/setup` | None | `ProductWorkflow` |
+| `webui.v2.get_llm_config` | GET | `/api/webchat/v2/llm/providers` | None | `ProjectionOnly` |
+| `webui.v2.upsert_llm_provider` | POST | `/api/webchat/v2/llm/providers` | None | `ProductWorkflow` |
+| `webui.v2.delete_llm_provider` | POST | `/api/webchat/v2/llm/providers/{provider_id}/delete` | None | `ProductWorkflow` |
+| `webui.v2.set_active_llm` | POST | `/api/webchat/v2/llm/active` | None | `ProductWorkflow` |
+| `webui.v2.test_llm_connection` | POST | `/api/webchat/v2/llm/test-connection` | None | `ProductWorkflow` |
+| `webui.v2.list_llm_models` | POST | `/api/webchat/v2/llm/list-models` | None | `ProductWorkflow` |
+| `webui.v2.operator.get_setup` | GET | `/api/webchat/v2/operator/setup` | None | `ProjectionOnly` |
+| `webui.v2.operator.run_setup` | POST | `/api/webchat/v2/operator/setup` | None | `ProductWorkflow` |
+| `webui.v2.operator.list_config` | GET | `/api/webchat/v2/operator/config` | None | `ProjectionOnly` |
+| `webui.v2.operator.get_config_key` | GET | `/api/webchat/v2/operator/config/{key}` | None | `ProjectionOnly` |
+| `webui.v2.operator.set_config_key` | POST | `/api/webchat/v2/operator/config/{key}` | None | `ProductWorkflow` |
+| `webui.v2.operator.validate_config` | POST | `/api/webchat/v2/operator/config/validate` | None | `ProductWorkflow` |
+| `webui.v2.operator.diagnostics` | GET | `/api/webchat/v2/operator/diagnostics` | None | `ProjectionOnly` |
+| `webui.v2.operator.status` | GET | `/api/webchat/v2/operator/status` | None | `ProjectionOnly` |
+| `webui.v2.operator.logs` | GET | `/api/webchat/v2/operator/logs` | None | `ProjectionOnly` |
+| `webui.v2.operator.service_lifecycle` | POST | `/api/webchat/v2/operator/service` | None | `ProductWorkflow` |
 
-All nine routes require `BearerToken` auth with `AuthenticatedCaller`
+`webui.v2.operator.logs` accepts bounded `limit`, `cursor`, `level`, and `target`
+query parameters, the existing boolean `tail` flag from `RebornOperatorLogsQuery`,
+plus optional scoped filters for `thread_id`, `run_id`, `turn_id`, `tool_call_id`,
+`tool_name`, and `source`. Responses include the same correlation fields when the
+captured tracing context provides them and expose tail/follow capability through
+`tail_supported` and `follow_supported`.
+
+All routes require `BearerToken` auth with `AuthenticatedCaller`
 scope source. The host's bearer middleware is responsible for
-constructing the `WebUiAuthenticatedCaller` and injecting it as an
-axum `Extension` before the handler runs.
+constructing the `WebUiAuthenticatedCaller`, carrying the matched
+token's `WebUiV2Capabilities`, and injecting both as axum
+`Extension`s before the handler runs.
+
+The LLM configuration and operator command-plane routes are operator-wide. Host
+composition mounts them only when the authenticator says the deployment
+has an operator configuration surface, and must still authorize each
+request from the matched token's `operator_webui_config` capability.
+Multi-user session/OIDC authenticators should leave those routes
+unmounted or return non-operator capabilities until an admin role
+boundary exists. The route handlers also reject mounted operator
+requests with `403` when the injected `WebUiV2Capabilities` lacks
+`operator_webui_config`, so host composition and handler dispatch share
+the same fail-closed capability boundary.
+Unwired operator command-plane write, setup, log, and
+service-control methods fail closed with sanitized `503 service_unavailable`
+responses. Config validation plus read-only config, status, and diagnostics
+surfaces may instead return unavailable command-plane payloads with redacted
+diagnostics so operators can see why a setting is ignored. Stable
+unsupported-config reason codes currently include
+`operator_config_service_not_wired`, `operator_config_secret_not_wired`,
+`operator_config_deprecated`, `operator_config_immutable`,
+`operator_config_not_wired`, and `operator_config_unknown_key`.
+`POST /api/webchat/v2/operator/setup` uses the typed LLM config service
+for provider/model setup; profile and WebUI access setup return redacted
+not-yet-wired diagnostics until those owning services are exposed.
 
 ### List-threads
 
@@ -83,6 +141,15 @@ not implement enumeration surface a retryable
 silently returning an empty list. The contract is locked by
 `list_threads_unimplemented_backend_returns_service_unavailable` in
 `crates/ironclaw_product_workflow/tests/reborn_services_contract.rs`.
+
+### Delete-thread
+
+`delete_thread` removes a caller-owned thread and transcript via
+`SessionThreadService::delete_thread`. The facade constructs the same
+owner-bound `(tenant, agent, project, owner_user_id)` scope used by timeline,
+stream, cancel, and gate-resolution probes. Missing and cross-owner thread ids
+both surface as `404 not_found` so callers cannot use deletion attempts as an
+existence oracle.
 
 ### Stream-events (WebSocket)
 
@@ -106,23 +173,26 @@ Every `socket.send` is bounded by the remaining
 backpressuring client cannot pin the slot past the configured
 stream lifetime.
 
-### Setup-extension (skeleton)
+### Setup-extension lifecycle projection
 
 `setup_extension` is the v2 entrypoint for extension onboarding.
-The native facade exposes the route surface but the underlying
-extension lifecycle is still v1-only — the default
-`RebornServices::setup_extension` returns
-`RebornSetupExtensionStatus::NotImplemented` until a v2-aware
-extension lifecycle lands. The route exists so the v2 inventory is
-complete and so future onboarding port work has a stable surface.
+The native facade exposes the route surface as a lifecycle
+projection: responses carry `phase`, `blockers`, optional
+payload, and the lifecycle `package_ref`. Auth, pairing, approval,
+policy, credential, and runtime requirements must be represented
+as blockers owned by their dedicated services, not as legacy
+setup status aliases or lifecycle phases. The route still does
+not perform production setup/configure/activate side effects.
 
-The path segment is validated at the handler/facade boundary via
-`ExtensionName::new(...)`. A malformed identifier returns
-`400 invalid_request` with `field: "extension_name"` and
-`validation_code: "invalid_id"` before the facade is called; the
-typed value is threaded through the facade argument so the
-internal request/response contract never carries a raw `String`
-extension name (see `.claude/rules/types.md`).
+Extension lifecycle side effects use `LifecyclePackageRef`
+end-to-end. Install accepts a JSON `package_ref` body; activate,
+remove, and setup lift `{package_id}` path segments into
+`LifecyclePackageRef { kind: extension, id: ... }` at the
+handler/facade boundary. A malformed package id returns
+`400 invalid_request` with `field: "package_id"` and
+`validation_code: "invalid_id"` before the facade is called.
+Browsers should render registry `display_name` for users and send
+`package_ref` for lifecycle operations.
 
 ## Boundary rules
 
@@ -147,6 +217,28 @@ schema.
 The per-poll ownership probe goes through `SessionThreadService::read_thread`
 (metadata-only) rather than `list_thread_history`, so an active stream does
 not reload the full message transcript every second.
+
+`capability_activity` SSE frames are projection-derived lifecycle metadata for
+tool/capability execution. They expose only the safe activity DTO
+(`invocation_id`, `capability_id`, status, provider/runtime/process metadata,
+byte counts, sanitized error kind, timestamp) and must not carry raw tool
+arguments, raw results, command strings, host paths, or provider payloads.
+
+`capability_display_preview` SSE frames are separate sanitized display artifacts
+for WebUI tool blocks. They may carry bounded summaries/previews only: summaries
+are capped at 2 KiB and output previews at 16 KiB. They are not source-of-truth
+tool results. Full output remains behind the
+scoped `result_ref` fetch path; SSE must never carry raw unbounded args/results.
+Preview generation belongs in the Reborn product/composition layer, using
+staged input/result-ref or transcript evidence where available, not in low-level
+capability ports.
+
+Snapshot/replay drains bound activity fan-out per projection item so every
+emitted SSE cursor remains resumable through `Last-Event-ID`; when the folded
+activity set is larger than the bound, the stream splits the overflow across
+resumable projection cursors. Partial cursors carry the runtime item watermark
+and delivered payload count, so reconnect drains continue from the same folded
+item when it is stable and restart that item when the folded head changes.
 
 The browser resumes via `Last-Event-ID` on auto-reconnect; the handler
 prefers that header over the `?after_cursor=` query parameter, falling

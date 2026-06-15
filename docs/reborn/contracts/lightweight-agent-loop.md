@@ -118,6 +118,14 @@ while run is active:
     stop
 ```
 
+Capability-result transcript records carry a strict safe summary for portable
+metadata, logs, checkpoints, and fallback replay. When the host has richer
+model-facing recovery information, it may attach a bounded
+`ModelVisibleToolObservation` side channel to the tool-result reference. That
+observation is model-visible untrusted tool output, not a replacement for
+`LoopSafeSummary`, and must be validated/redacted before it can be replayed to
+the model.
+
 Equivalent pseudocode:
 
 ```rust
@@ -176,7 +184,7 @@ This facade composes lower-level services but does not move ownership into the l
 
 ## 6. Capability tool wrappers
 
-Visible capabilities become model-visible tool schemas for the current run.
+Visible capabilities become compact model-visible tool schemas for the current run.
 
 ```rust
 CapabilityDescriptor
@@ -186,6 +194,12 @@ CapabilityDescriptor
   -> concurrency policy
   -> result shaping hints
 ```
+
+The loop also exposes `capability_info` as a synthetic read-only provider tool.
+Use it for progressive disclosure when the model needs names, required fields,
+effect notes, or the full input schema for a currently visible capability. It
+does not dispatch through `HostRuntime` and cannot inspect capabilities outside
+the current visible surface.
 
 Tool execution is a wrapper around `CapabilityHost`:
 
