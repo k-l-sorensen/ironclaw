@@ -2154,6 +2154,12 @@ impl RebornServicesApi for RebornServices {
         let access = self
             .resolve_thread_access_for_caller(caller_for_fallback, scope, &actor)
             .await?;
+        // Serialize retry admission with thread deletion. `delete_thread` holds
+        // this same per-thread lock across its active-run probe + delete; taking
+        // it here closes the window where a concurrent delete passes its probe
+        // (the failed run is terminal) and then deletes the thread while
+        // `retry_turn` enqueues a replacement run against it.
+        let _thread_operation_guard = self.lock_thread_operation(&access.scope).await;
         let binding_id = webui_retry_binding_id(&access.scope, run_id, &client_action_id);
         let response = self
             .turn_coordinator

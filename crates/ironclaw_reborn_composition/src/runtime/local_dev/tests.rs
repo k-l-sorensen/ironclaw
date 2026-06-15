@@ -1653,17 +1653,9 @@ mod tests {
         let expected_provider_caller =
             expected_outbound_delivery_caller(&run_context, owner_user_id.clone());
         slack_provider.expect_caller(expected_provider_caller.clone());
-        let thread_scope = ThreadScope {
-            tenant_id: run_context.scope.tenant_id.clone(),
-            agent_id: run_context.scope.agent_id.clone().expect("agent id"),
-            project_id: run_context.scope.project_id.clone(),
-            owner_user_id: Some(owner_user_id.clone()),
-            mission_id: None,
-        };
         let wiring = capability_wiring(
             &services,
             Arc::new(InMemorySessionThreadService::default()),
-            thread_scope,
             UserId::new("local-yolo-outbound-fallback").expect("user id"),
             Arc::clone(&local_runtime.capability_policy),
             Arc::new(UnavailableModelGateway),
