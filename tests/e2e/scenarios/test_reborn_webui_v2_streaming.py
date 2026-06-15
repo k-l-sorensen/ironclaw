@@ -189,6 +189,41 @@ async def test_reborn_v2_sse_resumes_after_last_event_id(reborn_v2_server):
     )
 
 
+async def test_reborn_v2_sse_multi_tab_fanout(reborn_v2_server):
+    """Two concurrent SSE streams for one caller both observe the same run.
+
+    Within the per-caller cap (3), opening two streams on a thread and then
+    submitting a turn must fan the run lifecycle out to both — the multi-tab
+    case the single-stream lifecycle test does not cover.
+    """
+    async with httpx.AsyncClient(headers=_BEARER) as client:
+        thread_id = await create_thread(client, reborn_v2_server)
+    url = _events_url(reborn_v2_server, thread_id)
+
+    async def drain_until_completed(response):
+        async with asyncio.timeout(45):
+            async for raw in response.content:
+                line = raw.decode("utf-8", errors="replace")
+                if '"status":"completed"' in line:
+                    return True
+        return False
+
+    async with aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=60, sock_read=60)
+    ) as session:
+        async with session.get(url, headers={"Accept": "text/event-stream"}) as tab_a, \
+                session.get(url, headers={"Accept": "text/event-stream"}) as tab_b:
+            assert tab_a.status == 200 and tab_b.status == 200, (tab_a.status, tab_b.status)
+
+            async with httpx.AsyncClient(headers=_BEARER) as client:
+                await send_message(client, reborn_v2_server, thread_id, "echo hello world")
+
+            results = await asyncio.gather(
+                drain_until_completed(tab_a), drain_until_completed(tab_b)
+            )
+            assert results == [True, True], "both tabs must observe the run completing"
+
+
 async def test_reborn_v2_sse_concurrency_cap_returns_429(reborn_v2_server):
     """A 4th concurrent SSE stream for one caller is rejected with 429.
 

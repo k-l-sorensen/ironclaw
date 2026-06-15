@@ -60,7 +60,10 @@ HEADED=1 pytest scenarios/
 | `test_reborn_webui_v2_tool_gates.py` | Reborn v2 capability path: tool-turn dispatch + `tool_result_reference`, run cancellation, approval-gate approve/deny via `resolve_gate` |
 | `test_reborn_webui_v2_streaming.py` | Reborn v2 transports/protocol edges: WebSocket fanout + same-origin/bearer gate, SSE `Last-Event-ID` resume, per-caller SSE concurrency-cap 429, oversized-body 413, malformed-id 400 |
 | `test_reborn_webui_v2_management.py` | Reborn v2 management surfaces: extension list/registry/setup/install-activate-remove, skills list/search/install round-trip, LLM provider upsert/set-active/test-connection/list-models/delete against the mock, automations + connectable-channels read projections |
-| `test_reborn_webui_v2_sso.py` | Reborn v2 SSO login surface (`reborn_v2_sso_server` fixture): `/auth/providers`, login redirect with OIDC+PKCE params, login-ticket exchange rejection, logout, public-vs-bearer boundary. Full callback→session→multi-user isolation is covered in-process by `signed_session_multi_user.rs` |
+| `test_reborn_webui_v2_sso.py` | Reborn v2 SSO login surface (`reborn_v2_sso_server` fixture): `/auth/providers`, login redirect with OIDC+PKCE params, callback rejects unknown CSRF state, login-ticket exchange rejection, logout, public-vs-bearer boundary. Full callback→session→multi-user isolation is covered in-process by `signed_session_multi_user.rs` |
+| `test_reborn_webui_v2_operator.py` | Reborn v2 operator read projections (`/operator/status,diagnostics,setup,logs,service`) and outbound preference/target reads (`/outbound/*`) |
+| `test_reborn_webui_v2_gateway.py` | Reborn v2 gateway hardening over TCP: static security headers, fail-closed CORS, embedded SPA shell + client-routed deep link, `?token=` shim scoped to the events route only |
+| `test_reborn_webui_v2_turns.py` | Reborn v2 turn idempotency (replayed create-thread/send does not duplicate state) and inline base64 attachment landing on the timeline |
 
 ## `helpers.py`
 

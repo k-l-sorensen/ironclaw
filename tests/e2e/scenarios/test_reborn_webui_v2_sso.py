@@ -79,6 +79,32 @@ async def test_reborn_v2_session_exchange_rejects_unknown_ticket(reborn_v2_sso_s
         assert response.status_code == 401, response.text
 
 
+async def test_reborn_v2_auth_callback_rejects_unknown_state(reborn_v2_sso_server):
+    """A callback with an unrecognized CSRF state is rejected before any exchange.
+
+    State is validated against the server-minted pending-login set first, so a
+    forged/expired `state` is refused without ever contacting the IdP — no real
+    OAuth provider is needed to exercise this guard.
+    """
+    async with httpx.AsyncClient(
+        base_url=reborn_v2_sso_server, follow_redirects=False
+    ) as client:
+        response = await client.get(
+            "/auth/callback/google",
+            params={"state": "forged-unknown-state", "code": "irrelevant"},
+            timeout=15,
+        )
+        # Rejected outright (4xx) or bounced to an error landing — never a 200
+        # success and never a 5xx (the guard must fail cleanly, not crash).
+        assert response.status_code != 200, response.status_code
+        assert response.status_code < 500, response.status_code
+        if response.status_code in (302, 303, 307):
+            location = response.headers.get("location", "")
+            assert "accounts.google.com" not in location, (
+                f"a forged state must not proceed to the IdP: {location}"
+            )
+
+
 async def test_reborn_v2_logout_is_idempotent_without_session(reborn_v2_sso_server):
     """Logout without a session is a no-op success (no bearer to revoke)."""
     async with httpx.AsyncClient(base_url=reborn_v2_sso_server) as client:
