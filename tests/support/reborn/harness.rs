@@ -11,6 +11,10 @@
 //! - the model gateway is scripted trace replay;
 //! - the capability port is a local recording echo/approval port;
 //! - external internet, delivery, and OAuth are not exercised by this harness.
+//!
+//! TODO(provider-tool-auth-resume-e2e): extend this harness with a first-party
+//! OAuth-gated capability path so provider tool-call inputs can be asserted
+//! across BlockedAuth resume without faking OAuth or capability reads.
 
 #![allow(dead_code)] // Shared by staged Reborn binary-E2E validation ports.
 

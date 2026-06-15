@@ -78,6 +78,20 @@ async fn write_capability_result_for_test(
     Ok(result_ref)
 }
 
+fn provider_tool_call(name: impl Into<String>, arguments: serde_json::Value) -> ProviderToolCall {
+    ProviderToolCall {
+        provider_id: "nearai".to_string(),
+        provider_model_id: "qwen3-coder".to_string(),
+        turn_id: Some("provider-turn:product-live".to_string()),
+        id: "call_provider_echo".to_string(),
+        name: name.into(),
+        arguments,
+        response_reasoning: Some("model selected capability".to_string()),
+        reasoning: None,
+        signature: Some("sig-provider-tool".to_string()),
+    }
+}
+
 #[tokio::test]
 async fn capability_io_resolves_staged_inputs_and_materializes_run_scoped_results() {
     let io = ProductLiveCapabilityIo::default();
@@ -130,6 +144,56 @@ async fn capability_io_resolves_staged_inputs_and_materializes_run_scoped_result
     assert_eq!(
         io.result_for_ref(&run_context, &result_ref).unwrap(),
         serde_json::json!({ "reply": "terminal" })
+    );
+}
+
+#[tokio::test]
+async fn register_provider_tool_call_input_on_product_live() {
+    let io = ProductLiveCapabilityIo::default();
+    let run_context = loop_run_context("provider-input-product-live").await;
+    let call = provider_tool_call(
+        "builtin__echo",
+        serde_json::json!({ "message": "hello product live" }),
+    );
+
+    let input_ref = io
+        .register_provider_tool_call_input(&run_context, &call)
+        .await
+        .unwrap();
+    assert!(
+        input_ref
+            .as_str()
+            .starts_with(&format!("input:{}:", run_context.run_id)),
+        "product-live provider input refs must be scoped to the loop run: {}",
+        input_ref.as_str()
+    );
+    assert!(
+        !input_ref.as_str().starts_with("input:provider-tool-"),
+        "product-live provider input refs must not use obsolete provider-tool refs"
+    );
+    assert_eq!(
+        io.resolve_capability_input(&run_context, &input_ref)
+            .await
+            .unwrap(),
+        serde_json::json!({ "message": "hello product live" })
+    );
+    io.resolve_capability_input(&run_context, &input_ref)
+        .await
+        .expect_err("product-live input refs are consumed on read");
+
+    let replay_ref = io
+        .register_provider_tool_call_input(&run_context, &call)
+        .await
+        .unwrap();
+    assert_ne!(
+        input_ref, replay_ref,
+        "auth resume should use provider replay to register a fresh input ref"
+    );
+    assert_eq!(
+        io.resolve_capability_input(&run_context, &replay_ref)
+            .await
+            .unwrap(),
+        serde_json::json!({ "message": "hello product live" })
     );
 }
 
@@ -469,6 +533,7 @@ async fn local_dev_adapter_invokes_builtin_echo_through_host_runtime_port() {
             surface_version: surface.version,
             capability_id: capability_id.clone(),
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -585,6 +650,7 @@ async fn local_dev_adapter_invokes_builtin_shell_through_product_live_surface() 
             surface_version: surface.version,
             capability_id: capability_id.clone(),
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -672,6 +738,7 @@ async fn local_dev_adapter_invokes_extension_scoped_grants_with_loop_driver_prin
             surface_version: surface.version,
             capability_id,
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -750,17 +817,10 @@ async fn local_dev_adapter_registers_provider_tool_calls_as_run_scoped_inputs() 
         "provider tool definitions should receive resolved built-in input schemas"
     );
 
-    let provider_tool_call = ProviderToolCall {
-        provider_id: "nearai".to_string(),
-        provider_model_id: "qwen3-coder".to_string(),
-        turn_id: Some("provider-turn:provider-tool".to_string()),
-        id: "call_provider_echo".to_string(),
-        name: tool_definition.name,
-        arguments: serde_json::json!({ "message": "hello from provider tool" }),
-        response_reasoning: Some("model selected echo".to_string()),
-        reasoning: None,
-        signature: Some("sig-provider-tool".to_string()),
-    };
+    let provider_tool_call = provider_tool_call(
+        tool_definition.name,
+        serde_json::json!({ "message": "hello from provider tool" }),
+    );
     let candidate = capability_port
         .register_provider_tool_call(provider_tool_call.clone())
         .await
@@ -771,9 +831,16 @@ async fn local_dev_adapter_registers_provider_tool_calls_as_run_scoped_inputs() 
         candidate
             .input_ref
             .as_str()
-            .starts_with("input:provider-tool-"),
-        "provider tool inputs should use opaque provider-tool refs: {}",
+            .starts_with(&format!("input:{}:", run_context.run_id)),
+        "provider tool inputs should use run-scoped refs: {}",
         candidate.input_ref.as_str()
+    );
+    assert!(
+        !candidate
+            .input_ref
+            .as_str()
+            .starts_with("input:provider-tool-"),
+        "provider tool inputs must not use obsolete provider-tool refs"
     );
     let other_run_context = loop_run_context("provider-tool-other-run").await;
     let other_capability_port = adapters
@@ -803,6 +870,7 @@ async fn local_dev_adapter_registers_provider_tool_calls_as_run_scoped_inputs() 
             surface_version: candidate.surface_version,
             capability_id,
             input_ref: candidate.input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -1044,6 +1112,7 @@ async fn local_dev_adapter_invokes_read_file_with_configured_mounts() {
             surface_version: surface.version,
             capability_id,
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })

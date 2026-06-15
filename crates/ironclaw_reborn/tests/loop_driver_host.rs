@@ -2346,6 +2346,7 @@ async fn planned_host_factory_create_host_uses_profiled_capabilities() {
             surface_version: surface.version,
             capability_id: denied_id,
             input_ref: CapabilityInputRef::new("input:denied-from-planned-host").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -2678,6 +2679,7 @@ async fn default_planned_runtime_composes_no_profile_coordinator_and_profiled_ho
             surface_version: surface.version,
             capability_id: denied_id,
             input_ref: CapabilityInputRef::new("input:runtime-denied").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -2910,6 +2912,7 @@ async fn hooks_flag_off_capability_invocation_is_unaffected() {
             surface_version,
             capability_id: allowed_id.clone(),
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -2953,6 +2956,7 @@ async fn hooks_flag_on_first_party_only_does_not_change_outcome() {
             surface_version,
             capability_id: allowed_id.clone(),
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -2989,6 +2993,7 @@ async fn hooks_flag_on_extension_deny_hook_denies_through_composed_runtime() {
             surface_version,
             capability_id: allowed_id.clone(),
             input_ref: CapabilityInputRef::new("input:hooks-deny").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -3025,6 +3030,7 @@ async fn hooks_are_isolated_per_tenant_runtime() {
             surface_version: surface_a,
             capability_id: allowed_id.clone(),
             input_ref: CapabilityInputRef::new("input:tenant-a").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -3054,6 +3060,7 @@ async fn hooks_are_isolated_per_tenant_runtime() {
             surface_version: surface_b,
             capability_id: allowed_id.clone(),
             input_ref: input_ref_b,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -4536,6 +4543,7 @@ async fn text_only_host_skill_context_does_not_expand_capability_surface() {
                 surface_version: surface.version,
                 capability_id: CapabilityId::new("demo.echo").unwrap(),
                 input_ref: CapabilityInputRef::new("input:opaque-tool-input").unwrap(),
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             }],
@@ -4663,6 +4671,7 @@ async fn text_only_host_routes_capability_invocation_through_host_runtime() {
             surface_version: surface.version.clone(),
             capability_id: capability_id.clone(),
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -4728,6 +4737,7 @@ async fn text_only_host_profiled_capabilities_filter_surface_and_invocation() {
             surface_version: surface.version,
             capability_id: denied_id,
             input_ref: CapabilityInputRef::new("input:denied-profile").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -4804,6 +4814,7 @@ async fn default_strategy_filter_all_loses_to_host_profile_filter() {
             surface_version: surface.version,
             capability_id: tool_b_id,
             input_ref: CapabilityInputRef::new("input:tool-b-denied").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -4878,6 +4889,7 @@ async fn text_only_host_uses_fresh_execution_context_per_capability_invocation()
                 surface_version: surface.version.clone(),
                 capability_id: capability_id.clone(),
                 input_ref,
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -4967,6 +4979,7 @@ async fn text_only_host_rejects_outside_surface_capability_before_host_runtime()
             surface_version: surface.version,
             capability_id: hidden_id,
             input_ref: CapabilityInputRef::new("input:hidden-request").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -4984,6 +4997,7 @@ async fn text_only_host_rejects_outside_surface_capability_before_host_runtime()
             surface_version: CapabilitySurfaceVersion::new("sha256:stale").unwrap(),
             capability_id: visible_id,
             input_ref: CapabilityInputRef::new("input:stale-request").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -5039,6 +5053,7 @@ async fn text_only_host_sanitizes_runtime_failure_message_before_driver_output()
             surface_version: surface.version,
             capability_id,
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -5145,6 +5160,7 @@ async fn text_only_host_maps_runtime_suspension_and_process_outcomes() {
                 surface_version: surface.version.clone(),
                 capability_id,
                 input_ref,
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -5231,6 +5247,7 @@ async fn text_only_host_maps_explicit_unknown_runtime_outcome_to_failure() {
             surface_version: surface.version,
             capability_id,
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -5300,6 +5317,7 @@ async fn text_only_host_preserves_invalid_request_and_returns_unavailable_as_fai
             surface_version: surface.version.clone(),
             capability_id: capability_id.clone(),
             input_ref: first_input,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -5310,6 +5328,7 @@ async fn text_only_host_preserves_invalid_request_and_returns_unavailable_as_fai
             surface_version: surface.version,
             capability_id,
             input_ref: second_input,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -5386,6 +5405,7 @@ async fn text_only_host_batch_stops_on_first_suspension_before_later_invocations
                     surface_version: surface.version.clone(),
                     capability_id: approval_id,
                     input_ref: approval_input,
+                    is_provider_call: false,
                     approval_resume: None,
                     auth_resume: None,
                 },
@@ -5393,6 +5413,7 @@ async fn text_only_host_batch_stops_on_first_suspension_before_later_invocations
                     surface_version: surface.version,
                     capability_id: echo_id,
                     input_ref: echo_input,
+                    is_provider_call: false,
                     approval_resume: None,
                     auth_resume: None,
                 },
@@ -5452,6 +5473,7 @@ async fn text_only_host_does_not_reinvoke_runtime_after_failed_outcome_retry() {
         surface_version: surface.version,
         capability_id: capability_id.clone(),
         input_ref,
+        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     };
@@ -5575,6 +5597,7 @@ async fn text_only_host_waits_for_concurrent_duplicate_invocation_result() {
         surface_version: surface.version,
         capability_id: capability_id.clone(),
         input_ref,
+        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     };
@@ -5656,6 +5679,7 @@ async fn text_only_host_bounds_completed_dispatch_records() {
                 surface_version: surface.version.clone(),
                 capability_id: capability_id.clone(),
                 input_ref,
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -5668,6 +5692,7 @@ async fn text_only_host_bounds_completed_dispatch_records() {
             surface_version: surface.version,
             capability_id,
             input_ref: input_refs[0].clone(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -5771,6 +5796,7 @@ async fn text_only_host_does_not_reinvoke_runtime_after_result_write_failure_ret
         surface_version: surface.version,
         capability_id: capability_id.clone(),
         input_ref,
+        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     };
@@ -5840,6 +5866,7 @@ async fn text_only_host_rejects_runtime_outcome_for_different_capability() {
             surface_version: surface.version,
             capability_id: requested_id,
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -5911,6 +5938,7 @@ async fn text_only_host_rejects_previous_surface_after_refetch() {
             surface_version: first_surface.version,
             capability_id: first_id,
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -5936,6 +5964,7 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
                 surface_version: surface.version.clone(),
                 capability_id: CapabilityId::new("demo.echo").unwrap(),
                 input_ref: CapabilityInputRef::new("input:opaque-tool-input").unwrap(),
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             }],
@@ -5954,6 +5983,7 @@ async fn text_only_host_empty_capability_surface_denies_invocation() {
             surface_version: CapabilitySurfaceVersion::new("other:v1").unwrap(),
             capability_id: CapabilityId::new("demo.echo").unwrap(),
             input_ref: CapabilityInputRef::new("input:opaque-tool-input").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -6024,6 +6054,7 @@ async fn text_only_host_e2e_invokes_script_capability_through_real_host_runtime(
             surface_version: surface.version,
             capability_id: e2e_script_capability_id(),
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -6078,6 +6109,7 @@ async fn text_only_host_denies_capability_without_provider_trust_before_host_run
             surface_version: surface.version,
             capability_id,
             input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -6137,6 +6169,7 @@ async fn text_only_host_allows_retry_after_missing_capability_input_is_staged() 
         surface_version: surface.version,
         capability_id: capability_id.clone(),
         input_ref: input_ref.clone(),
+        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     };
@@ -7007,6 +7040,7 @@ impl AgentLoopDriver for ScriptCapabilityFinalReplyDriver {
                 surface_version: surface.version.clone(),
                 capability_id: self.capability_id.clone(),
                 input_ref: self.input_ref.clone(),
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })

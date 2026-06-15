@@ -609,6 +609,7 @@ mod tests {
                     .expect("valid surface version"),
                 capability_id: cap(capability),
                 input_ref: CapabilityInputRef::new("input:test").expect("valid input ref"),
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             }

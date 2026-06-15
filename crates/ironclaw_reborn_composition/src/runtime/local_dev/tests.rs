@@ -627,6 +627,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_provider_tool_call_input_on_local_dev() {
+        let capability_io = LocalDevCapabilityIo::default();
+        let run_context = run_context("provider-input-local-dev").await;
+        let input_ref = capability_io
+            .register_provider_tool_call_input(
+                &run_context,
+                &provider_tool_call(serde_json::json!({"message": "hello local dev"})),
+            )
+            .await
+            .expect("provider input stages");
+
+        assert!(
+            input_ref
+                .as_str()
+                .starts_with(&format!("input:{}:", run_context.run_id)),
+            "local-dev provider input refs must be scoped to the loop run: {}",
+            input_ref.as_str()
+        );
+        let resolved = capability_io
+            .resolve_capability_input(&run_context, &input_ref)
+            .await
+            .expect("provider input resolves");
+        assert_eq!(resolved, serde_json::json!({"message": "hello local dev"}));
+    }
+
+    #[tokio::test]
+    async fn ensure_local_dev_ref_scope_rejects_provider_prefixed_ref() {
+        let run_context = run_context("provider-prefixed-ref").await;
+        let error =
+            ensure_local_dev_ref_scope("input", "input:provider-tool-deadbeef", &run_context)
+                .expect_err("obsolete provider-prefixed refs must be rejected");
+
+        assert_eq!(error.kind, AgentLoopHostErrorKind::ScopeMismatch);
+    }
+
+    #[tokio::test]
+    async fn ensure_local_dev_ref_scope_rejects_cross_run_ref() {
+        let current_context = run_context("scope-current").await;
+        let other_context = run_context("scope-other").await;
+        let cross_run_ref = format!("input:{}:deadbeef", other_context.run_id);
+        let error = ensure_local_dev_ref_scope("input", &cross_run_ref, &current_context)
+            .expect_err("cross-run refs must be rejected");
+
+        assert_eq!(error.kind, AgentLoopHostErrorKind::ScopeMismatch);
+    }
+
+    #[tokio::test]
     async fn capability_io_rejects_cross_run_and_unstaged_input_refs() {
         let capability_io = LocalDevCapabilityIo::default();
         let current_context = run_context("input-scope-a").await;
@@ -1043,6 +1090,7 @@ mod tests {
                 surface_version: candidate.surface_version,
                 capability_id: candidate.capability_id,
                 input_ref: candidate.input_ref,
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -1317,6 +1365,7 @@ mod tests {
                 capability_id: CapabilityId::new(READ_FILE_CAPABILITY_ID)
                     .expect("read_file capability id"), // safety: built-in capability id is a valid literal.
                 input_ref,
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -1350,6 +1399,7 @@ mod tests {
                 capability_id: CapabilityId::new(READ_FILE_CAPABILITY_ID)
                     .expect("read_file capability id"), // safety: built-in capability id is a valid literal.
                 input_ref,
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -1432,6 +1482,7 @@ mod tests {
                 capability_id: CapabilityId::new(SKILL_INSTALL_CAPABILITY_ID)
                     .expect("skill_install capability id"), // safety: built-in capability id is a valid literal.
                 input_ref,
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -1573,6 +1624,7 @@ mod tests {
                 capability_id: CapabilityId::new(READ_FILE_CAPABILITY_ID)
                     .expect("read_file capability id"), // safety: built-in capability id is a valid literal.
                 input_ref,
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -1894,6 +1946,7 @@ mod tests {
                         surface_version: candidate1.surface_version,
                         capability_id: candidate1.capability_id,
                         input_ref: candidate1.input_ref,
+                        is_provider_call: false,
                         approval_resume: None,
                         auth_resume: None,
                     },
@@ -1901,6 +1954,7 @@ mod tests {
                         surface_version: candidate2.surface_version,
                         capability_id: candidate2.capability_id,
                         input_ref: candidate2.input_ref,
+                        is_provider_call: false,
                         approval_resume: None,
                         auth_resume: None,
                     },
@@ -1974,6 +2028,7 @@ mod tests {
                 surface_version: candidate.surface_version,
                 capability_id: candidate.capability_id,
                 input_ref: candidate.input_ref,
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })

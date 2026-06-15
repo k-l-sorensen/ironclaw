@@ -2201,6 +2201,7 @@ async fn capability_invocations_must_cite_visible_surface_before_host_dispatch()
             surface_version: CapabilitySurfaceVersion::new("surface-v1").unwrap(),
             capability_id: foreign,
             input_ref: CapabilityInputRef::new("input:opaque-agent-loop-host-sentinel").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -2515,6 +2516,7 @@ impl AgentLoopDriver for CapabilityDriver {
                 surface_version: surface.version,
                 capability_id: surface.descriptors[0].capability_id.clone(),
                 input_ref: CapabilityInputRef::new("input:opaque-tool-arguments").unwrap(),
+                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })

@@ -45,6 +45,7 @@ async fn cancel_after_capability_batch_is_consumed_once() {
             surface_version: surface_version(),
             capability_id: capability_id("demo.echo"),
             input_ref: CapabilityInputRef::new("input:one-shot").unwrap(),
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         }],

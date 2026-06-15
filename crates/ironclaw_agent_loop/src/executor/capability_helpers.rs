@@ -31,10 +31,12 @@ pub(super) fn capability_invocation_from_candidate(
     call: CapabilityCallCandidate,
     approval_resume: Option<CapabilityApprovalResume>,
 ) -> CapabilityInvocation {
+    let is_provider_call = call.provider_replay.is_some();
     CapabilityInvocation {
         surface_version: call.surface_version,
         capability_id: call.capability_id,
         input_ref: call.input_ref,
+        is_provider_call,
         approval_resume,
         auth_resume: None,
     }
@@ -50,6 +52,7 @@ pub(super) fn capability_invocation_from_auth_resume_candidate(
     call: CapabilityCallCandidate,
     pending_auth: &PendingAuthResume,
 ) -> CapabilityInvocation {
+    let is_provider_call = call.provider_replay.is_some();
     let auth_resume = pending_auth
         .resume_token
         .as_ref()
@@ -66,6 +69,7 @@ pub(super) fn capability_invocation_from_auth_resume_candidate(
         surface_version: call.surface_version,
         capability_id: call.capability_id,
         input_ref: call.input_ref,
+        is_provider_call,
         approval_resume: None,
         auth_resume,
     }

@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
 };
@@ -76,11 +76,11 @@ async fn host_capability_port_composition_factory_builds_loop_capability_port() 
     let factory = HostRuntimeLoopCapabilityPortFactory::new(
         Arc::new(EmptyHostRuntime),
         visible_request,
-        Arc::new(UnusedInputResolver),
+        Arc::new(TestInputResolver::default()),
         Arc::new(UnusedResultWriter),
         Arc::new(InMemoryLoopHostMilestoneSink::default()),
     );
-    let port: Arc<dyn LoopCapabilityPort> = factory.for_run_context(run_context);
+    let port: Arc<dyn LoopCapabilityPort> = factory.for_run_context(run_context.clone());
 
     let surface = port
         .visible_capabilities(VisibleCapabilityRequest)
@@ -121,7 +121,7 @@ async fn visible_capability_request_rejects_caller_supplied_mounts() {
     let factory = HostRuntimeLoopCapabilityPortFactory::new(
         Arc::new(EmptyHostRuntime),
         visible_request,
-        Arc::new(UnusedInputResolver),
+        Arc::new(TestInputResolver::default()),
         Arc::new(UnusedResultWriter),
         Arc::new(InMemoryLoopHostMilestoneSink::default()),
     );
@@ -141,7 +141,7 @@ async fn visible_capability_request_rejects_caller_supplied_mounts() {
 }
 
 #[tokio::test]
-async fn factory_stages_provider_tool_call_arguments_without_custom_resolver_override() {
+async fn factory_stages_provider_tool_call_arguments_through_injected_resolver() {
     let thread_id = ThreadId::new("thread-provider-tool-input").unwrap();
     let mut context = ExecutionContext::local_default(
         UserId::new("user-provider-tool-input").unwrap(),
@@ -166,11 +166,11 @@ async fn factory_stages_provider_tool_call_arguments_without_custom_resolver_ove
     let factory = HostRuntimeLoopCapabilityPortFactory::new(
         runtime.clone(),
         visible_request,
-        Arc::new(UnusedInputResolver),
+        Arc::new(TestInputResolver::default()),
         Arc::new(UnusedResultWriter),
         Arc::new(InMemoryLoopHostMilestoneSink::default()),
     );
-    let port: Arc<dyn LoopCapabilityPort> = factory.for_run_context(run_context);
+    let port: Arc<dyn LoopCapabilityPort> = factory.for_run_context(run_context.clone());
 
     port.visible_capabilities(VisibleCapabilityRequest)
         .await
@@ -201,6 +201,12 @@ async fn factory_stages_provider_tool_call_arguments_without_custom_resolver_ove
         candidate
             .input_ref
             .as_str()
+            .starts_with(&format!("input:{}:", run_context.run_id))
+    );
+    assert!(
+        !candidate
+            .input_ref
+            .as_str()
             .starts_with("input:provider-tool-")
     );
     assert_eq!(
@@ -216,6 +222,7 @@ async fn factory_stages_provider_tool_call_arguments_without_custom_resolver_ove
             surface_version: candidate.surface_version,
             capability_id: candidate.capability_id,
             input_ref: candidate.input_ref,
+            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -392,19 +399,58 @@ impl HostRuntime for SingleToolHostRuntime {
     }
 }
 
-struct UnusedInputResolver;
+#[derive(Default)]
+struct TestInputResolver {
+    inputs: Mutex<HashMap<String, serde_json::Value>>,
+}
 
 #[async_trait]
-impl LoopCapabilityInputResolver for UnusedInputResolver {
+impl LoopCapabilityInputResolver for TestInputResolver {
     async fn resolve_capability_input(
         &self,
-        _run_context: &LoopRunContext,
-        _input_ref: &ironclaw_turns::run_profile::CapabilityInputRef,
+        run_context: &LoopRunContext,
+        input_ref: &ironclaw_turns::run_profile::CapabilityInputRef,
     ) -> Result<serde_json::Value, AgentLoopHostError> {
-        Err(AgentLoopHostError::new(
-            AgentLoopHostErrorKind::InvalidInvocation,
-            "not used in this test",
+        let expected_prefix = format!("input:{}:", run_context.run_id);
+        if !input_ref.as_str().starts_with(&expected_prefix) {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::ScopeMismatch,
+                "capability input ref is not scoped to this loop run",
+            ));
+        }
+        self.inputs
+            .lock()
+            .expect("input resolver lock")
+            .get(input_ref.as_str())
+            .cloned()
+            .ok_or_else(|| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::InvalidInvocation,
+                    "capability input ref was not staged",
+                )
+            })
+    }
+
+    async fn register_provider_tool_call_input(
+        &self,
+        run_context: &LoopRunContext,
+        tool_call: &ProviderToolCall,
+    ) -> Result<ironclaw_turns::run_profile::CapabilityInputRef, AgentLoopHostError> {
+        let input_ref = ironclaw_turns::run_profile::CapabilityInputRef::new(format!(
+            "input:{}:{}",
+            run_context.run_id, tool_call.id
         ))
+        .map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Internal,
+                "capability input ref could not be represented",
+            )
+        })?;
+        self.inputs
+            .lock()
+            .expect("input resolver lock")
+            .insert(input_ref.as_str().to_string(), tool_call.arguments.clone());
+        Ok(input_ref)
     }
 }
 

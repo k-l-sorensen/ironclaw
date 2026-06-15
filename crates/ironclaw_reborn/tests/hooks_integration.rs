@@ -1190,6 +1190,7 @@ fn invocation(
         capability_id: CapabilityId::new(capability_id).expect("capability id literal is valid"),
         input_ref: CapabilityInputRef::new(format!("input:{capability_id}"))
             .expect("input ref literal is valid"),
+        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     }
