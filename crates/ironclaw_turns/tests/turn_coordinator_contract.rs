@@ -17,20 +17,21 @@ use ironclaw_turns::{
     InMemoryRunProfileResolver, InMemoryTurnEventSink, InMemoryTurnStateStore,
     InMemoryTurnStateStoreLimits, LifecyclePublicationErrorPort, LifecyclePublishingTurnStateStore,
     LoopBlockedKind, LoopCheckpointStateRef, LoopExitMapping, LoopGateRef, LoopResultRef,
-    ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnRequest, RunProfileId, RunProfileRequest,
-    RunProfileResolutionError, RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion,
-    SanitizedCancelReason, SanitizedFailure, SourceBindingRef, StaticTurnAdmissionLimitProvider,
-    SubmitChildRunRequest, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor,
-    TurnAdmissionAxisKind, TurnAdmissionBucketKind, TurnAdmissionBucketScope,
-    TurnAdmissionCapacityDenial, TurnAdmissionClass, TurnAdmissionPolicy, TurnCapacityResource,
-    TurnCheckpointId, TurnCommittedEventObserver, TurnCoordinator, TurnError, TurnErrorCategory,
-    TurnEventKind, TurnEventProjectionCursor, TurnEventProjectionError, TurnEventProjectionRequest,
+    ProductTurnContext, ReplyTargetBindingRef, ResolvedRunProfile, ResumeTurnRequest,
+    RunOriginAdapter, RunProfileId, RunProfileRequest, RunProfileResolutionError,
+    RunProfileResolutionRequest, RunProfileResolver, RunProfileVersion, SanitizedCancelReason,
+    SanitizedFailure, SourceBindingRef, StaticTurnAdmissionLimitProvider, SubmitChildRunRequest,
+    SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor, TurnAdmissionAxisKind,
+    TurnAdmissionBucketKind, TurnAdmissionBucketScope, TurnAdmissionCapacityDenial,
+    TurnAdmissionClass, TurnAdmissionPolicy, TurnCapacityResource, TurnCheckpointId,
+    TurnCommittedEventObserver, TurnCoordinator, TurnError, TurnErrorCategory, TurnEventKind,
+    TurnEventProjectionCursor, TurnEventProjectionError, TurnEventProjectionRequest,
     TurnEventProjectionService, TurnEventSink, TurnIdempotencyErrorReplay,
     TurnIdempotencyOperationKind, TurnIdempotencyOutcomeKind, TurnIdempotencyRecord,
     TurnIdempotencyReplay, TurnLeaseToken, TurnLifecycleEvent, TurnLifecycleEventBus,
-    TurnLockVersion, TurnRunId, TurnRunProfile, TurnRunState, TurnRunWake, TurnRunWakeNotifier,
-    TurnRunWakeNotifyError, TurnRunnerId, TurnScope, TurnSpawnTreePort, TurnSpawnTreeStateStore,
-    TurnStateStore, TurnStatus,
+    TurnLockVersion, TurnOriginKind, TurnOwner, TurnRunId, TurnRunProfile, TurnRunState,
+    TurnRunWake, TurnRunWakeNotifier, TurnRunWakeNotifyError, TurnRunnerId, TurnScope,
+    TurnSpawnTreePort, TurnSpawnTreeStateStore, TurnStateStore, TurnStatus, TurnSurfaceType,
     events::EventCursor,
     run_profile::{CapabilityOutcome, LoopGateKind, LoopModelRouteSnapshot},
     runner::{
@@ -149,15 +150,21 @@ fn subagent_capability_outcomes_round_trip_with_suspension_semantics() {
         child_run_id,
         result_ref: result_ref.clone(),
         safe_summary: "spawned in background".to_string(),
+        byte_len: 0,
     };
     let spawned_json = serde_json::to_value(&spawned).unwrap();
+    // #[serde(default)] ensures legacy wire payloads (without byte_len) decode
+    // cleanly with byte_len = 0. Non-zero values must always round-trip through
+    // serialize→deserialize since byte_len has no skip_serializing_if attribute
+    // (so 0 is also always present on the wire, as this assertion verifies).
     assert_eq!(
         spawned_json,
         serde_json::json!({
             "spawned_child_run": {
                 "child_run_id": child_run_id,
                 "result_ref": result_ref,
-                "safe_summary": "spawned in background"
+                "safe_summary": "spawned in background",
+                "byte_len": 0
             }
         })
     );
@@ -173,6 +180,7 @@ fn subagent_capability_outcomes_round_trip_with_suspension_semantics() {
         gate_ref: gate_ref.clone(),
         result_ref: result_ref.clone(),
         safe_summary: "waiting on child".to_string(),
+        byte_len: 0,
     };
     let awaiting_json = serde_json::to_value(&awaiting).unwrap();
     assert_eq!(
@@ -181,7 +189,8 @@ fn subagent_capability_outcomes_round_trip_with_suspension_semantics() {
             "await_dependent_run": {
                 "gate_ref": gate_ref,
                 "result_ref": result_ref,
-                "safe_summary": "waiting on child"
+                "safe_summary": "waiting on child",
+                "byte_len": 0
             }
         })
     );
@@ -190,6 +199,45 @@ fn subagent_capability_outcomes_round_trip_with_suspension_semantics() {
         serde_json::from_value::<CapabilityOutcome>(awaiting_json).unwrap(),
         awaiting
     );
+}
+
+#[test]
+fn subagent_capability_outcomes_round_trip_with_non_zero_byte_len() {
+    // Verify byte_len survives serde round-trip for BOTH AwaitDependentRun
+    // and SpawnedChildRun (each variant). A regression that silently
+    // decoded byte_len: 0 from the wire would defeat ByteCapStrategy for
+    // exactly these paths.
+    let gate_ref = LoopGateRef::new("gate:test-bytes").expect("valid");
+    let result_ref = LoopResultRef::new("result:test-bytes").expect("valid");
+    let await_dep = CapabilityOutcome::AwaitDependentRun {
+        gate_ref,
+        result_ref,
+        safe_summary: "await large".to_string(),
+        byte_len: 48_500,
+    };
+    let json = serde_json::to_value(&await_dep).expect("serialize");
+    let decoded: CapabilityOutcome = serde_json::from_value(json).expect("decode");
+    if let CapabilityOutcome::AwaitDependentRun { byte_len, .. } = decoded {
+        assert_eq!(byte_len, 48_500);
+    } else {
+        panic!("expected AwaitDependentRun variant");
+    }
+
+    let child_run_id = TurnRunId::new();
+    let result_ref = LoopResultRef::new("result:child-bytes").expect("valid");
+    let spawn = CapabilityOutcome::SpawnedChildRun {
+        child_run_id,
+        result_ref,
+        safe_summary: "spawn large".to_string(),
+        byte_len: 60_000,
+    };
+    let json = serde_json::to_value(&spawn).expect("serialize");
+    let decoded: CapabilityOutcome = serde_json::from_value(json).expect("decode");
+    if let CapabilityOutcome::SpawnedChildRun { byte_len, .. } = decoded {
+        assert_eq!(byte_len, 60_000);
+    } else {
+        panic!("expected SpawnedChildRun variant");
+    }
 }
 
 #[test]
@@ -6154,6 +6202,7 @@ fn submit_request(thread: &str, idempotency_key: &str) -> SubmitTurnRequest {
         parent_run_id: None,
         subagent_depth: 0,
         spawn_tree_root_run_id: None,
+        product_context: None,
     }
 }
 
@@ -6545,6 +6594,7 @@ impl TurnRunTransitionPort for AtomicLoopExitPort {
             credential_requirements: Vec::new(),
             failure: None,
             event_cursor: EventCursor(1),
+            product_context: None,
         })
     }
 }
@@ -7128,6 +7178,55 @@ async fn cancel_on_legacy_recovery_required_run_reports_already_terminal() {
     assert!(
         cancel_response.already_terminal,
         "cancel on a terminal RecoveryRequired-turned-Failed run should report already_terminal"
+    );
+}
+
+// Regression: child run must inherit parent's product_context verbatim.
+// submit_child_turn copies parent.product_context → child RunRecord at line 1044 of memory.rs;
+// if that assignment were dropped the child record would silently carry None and no existing
+// lineage/reservation assertion would catch it.
+#[tokio::test]
+async fn submit_child_run_inherits_parent_product_context() {
+    let (coordinator, store) = coordinator();
+
+    let product_context = ProductTurnContext::new(
+        TurnOriginKind::Inbound,
+        Some(TurnSurfaceType::Channel),
+        Some(RunOriginAdapter::new("telegram").unwrap()),
+        TurnOwner::Personal {
+            user: UserId::new("user-ctx-inherit").unwrap(),
+        },
+    );
+
+    let mut parent_request = submit_request("thread-ctx-parent", "idem-ctx-parent");
+    parent_request.product_context = Some(product_context.clone());
+    let parent = accepted_run_id(&coordinator.submit_turn(parent_request).await.unwrap());
+
+    let child_id = coordinator
+        .prepare_turn(scope("thread-ctx-child"))
+        .await
+        .unwrap();
+    coordinator
+        .submit_child_run(child_run_request(
+            scope("thread-ctx-parent"),
+            parent,
+            "thread-ctx-child",
+            child_id,
+            "idem-ctx-child",
+            2,
+        ))
+        .await
+        .unwrap();
+
+    let child_record = store
+        .get_run_record(&scope("thread-ctx-child"), child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        child_record.product_context,
+        Some(product_context),
+        "child run record must carry the parent's product_context verbatim"
     );
 }
 
