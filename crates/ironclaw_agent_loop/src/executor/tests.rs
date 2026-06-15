@@ -5,7 +5,7 @@ use ironclaw_turns::{
     LoopCancelledReasonKind, LoopCompletionKind, LoopDiagnosticRef, LoopExit, LoopFailureKind,
     LoopGateRef, LoopResultRef, TurnRunId,
     run_profile::{
-        AgentLoopHostError, AgentLoopHostErrorKind, CapabilityApprovalResume,
+        AgentLoopHostError, AgentLoopHostErrorKind, CapabilityApprovalResume, CapabilityAuthResume,
         CapabilityCallCandidate, CapabilityFailureDetail, CapabilityFailureKind,
         CapabilityInputIssue, CapabilityInputIssueCode, CapabilityInputRef, CapabilityInputRepair,
         CapabilityOutcome, CapabilityRecoveryHint, CapabilityResultMessage, CapabilityResumeToken,
@@ -2031,6 +2031,7 @@ async fn gate_stage_skips_and_continues_records_skipped_summary() {
                 gate_ref,
                 credential_requirements: Vec::new(),
                 approval_resume: None,
+                auth_resume: None,
             },
         )
         .await
@@ -2075,6 +2076,7 @@ async fn gate_stage_aborts_returns_failed_exit() {
                 gate_ref,
                 credential_requirements: Vec::new(),
                 approval_resume: None,
+                auth_resume: None,
             },
         )
         .await
@@ -4179,6 +4181,7 @@ async fn auth_gate_block_stores_pending_auth_resume() {
                 gate_ref: gate_ref.clone(),
                 credential_requirements: Vec::new(),
                 safe_summary: "auth required".to_string(),
+                auth_resume: None,
             }],
             stopped_on_suspension: true,
         },
@@ -4268,6 +4271,7 @@ async fn non_auth_gate_block_preserves_pending_auth_resume() {
         provider_replay: None,
         resume_token: None,
         prior_approval: None,
+        replay: None,
     };
     let mut initial_state = LoopExecutionState::initial_for_run(host.run_context());
     initial_state.pending_auth_resume = Some(seeded_auth_resume.clone());
@@ -4312,6 +4316,7 @@ async fn resume_after_auth_gate_redispatches_original_call_without_model_turn() 
                 gate_ref: gate_ref.clone(),
                 credential_requirements: Vec::new(),
                 safe_summary: "auth required".to_string(),
+                auth_resume: None,
             }],
             stopped_on_suspension: true,
         },
@@ -4468,6 +4473,7 @@ async fn auth_resume_provider_registration_failure_fails_before_invocation() {
                     gate_ref: gate_ref.clone(),
                     credential_requirements: Vec::new(),
                     safe_summary: "auth required".to_string(),
+                    auth_resume: None,
                 }],
                 stopped_on_suspension: true,
             },
@@ -4537,6 +4543,7 @@ async fn resume_with_still_missing_credentials_blocks_again_without_model_turn()
                 gate_ref: gate_ref.clone(),
                 credential_requirements: Vec::new(),
                 safe_summary: "auth required (phase 1)".to_string(),
+                auth_resume: None,
             }],
             stopped_on_suspension: true,
         },
@@ -4546,6 +4553,7 @@ async fn resume_with_still_missing_credentials_blocks_again_without_model_turn()
                 gate_ref: LoopGateRef::new("gate:auth-still-missing-2").expect("valid"),
                 credential_requirements: Vec::new(),
                 safe_summary: "auth required (phase 2 — still missing)".to_string(),
+                auth_resume: None,
             }],
             stopped_on_suspension: true,
         },
@@ -4677,6 +4685,7 @@ async fn gate_stage_skip_and_continue_clears_stale_pending_auth_resume() {
         provider_replay: None,
         resume_token: None,
         prior_approval: None,
+        replay: None,
     });
     let call = match provider_calls_response().output {
         ParentLoopOutput::CapabilityCalls(mut calls) => calls.remove(0),
@@ -4694,6 +4703,7 @@ async fn gate_stage_skip_and_continue_clears_stale_pending_auth_resume() {
                 gate_ref,
                 credential_requirements: Vec::new(),
                 approval_resume: None,
+                auth_resume: None,
             },
         )
         .await
@@ -4737,6 +4747,7 @@ async fn gate_stage_abort_clears_stale_pending_auth_resume() {
         provider_replay: None,
         resume_token: None,
         prior_approval: None,
+        replay: None,
     });
     let call = match provider_calls_response().output {
         ParentLoopOutput::CapabilityCalls(mut calls) => calls.remove(0),
@@ -4754,6 +4765,7 @@ async fn gate_stage_abort_clears_stale_pending_auth_resume() {
                 gate_ref,
                 credential_requirements: Vec::new(),
                 approval_resume: None,
+                auth_resume: None,
             },
         )
         .await
@@ -4800,6 +4812,7 @@ async fn gate_stage_skip_does_not_clear_auth_resume_for_different_capability() {
         provider_replay: None,
         resume_token: None,
         prior_approval: None,
+        replay: None,
     });
     // The call being dispatched through GateStage is capability_id() ("demo.echo"),
     // not the seeded "other.cap".
@@ -4819,6 +4832,7 @@ async fn gate_stage_skip_does_not_clear_auth_resume_for_different_capability() {
                 gate_ref,
                 credential_requirements: Vec::new(),
                 approval_resume: None,
+                auth_resume: None,
             },
         )
         .await
@@ -4932,6 +4946,7 @@ async fn auth_resume_after_approval_carries_resume_token_and_approval_request_id
                 gate_ref: auth_gate_ref.clone(),
                 credential_requirements: Vec::new(),
                 safe_summary: "auth required after approval".to_string(),
+                auth_resume: None,
             }],
             stopped_on_suspension: true,
         },
@@ -5133,6 +5148,8 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
     let approval_request_id = ApprovalRequestId::new();
     let resume_token =
         CapabilityResumeToken::new("resume-token:corr-id-test").expect("valid token");
+    let auth_gate_resume_token =
+        CapabilityResumeToken::new("resume-token:corr-id-auth-gate").expect("valid token");
     let correlation_id = CorrelationId::new();
     let original_input_ref = CapabilityInputRef::new("input:corr-id-original").expect("valid");
     let completed_ref = LoopResultRef::new("result:corr-id-done").expect("valid");
@@ -5162,6 +5179,11 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
                 gate_ref: LoopGateRef::new("gate:corr-id-auth").expect("valid"),
                 credential_requirements: Vec::new(),
                 safe_summary: "auth required".to_string(),
+                auth_resume: Some(CapabilityAuthResume {
+                    resume_token: auth_gate_resume_token,
+                    prior_approval: None,
+                    replay: None,
+                }),
             }],
             stopped_on_suspension: true,
         },
@@ -5213,6 +5235,11 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
         .pending_auth_resume
         .as_ref()
         .expect("phase 2 BeforeBlock must carry pending_auth_resume");
+    assert_eq!(
+        pending_auth.resume_token.as_ref(),
+        Some(&resume_token),
+        "pending_auth_resume.resume_token must preserve the original approval invocation token"
+    );
     let pending_pa = pending_auth
         .prior_approval
         .as_ref()
@@ -5220,6 +5247,14 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
     assert_eq!(
         pending_pa.correlation_id, correlation_id,
         "pending_auth_resume.prior_approval.correlation_id must equal the approval's correlation_id"
+    );
+    let pending_replay = pending_auth
+        .replay
+        .as_ref()
+        .expect("pending_auth_resume.replay must be set when approval preceded auth");
+    assert_eq!(
+        pending_replay.input, approval_resume.input,
+        "pending_auth_resume.replay.input must preserve the approval replay input"
     );
 
     // Phase 3: auth-resume → Completed.
@@ -5236,6 +5271,10 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
         .auth_resume
         .as_ref()
         .expect("phase 3 invocation must carry auth_resume");
+    assert_eq!(
+        phase3_ar.resume_token, resume_token,
+        "phase 3 auth_resume.resume_token must preserve the original approval invocation token"
+    );
     let phase3_pa = phase3_ar
         .prior_approval
         .as_ref()
@@ -5243,6 +5282,14 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
     assert_eq!(
         phase3_pa.correlation_id, correlation_id,
         "phase 3 auth_resume.prior_approval.correlation_id must match the original approval correlation_id"
+    );
+    let phase3_replay = phase3_ar
+        .replay
+        .as_ref()
+        .expect("phase 3 auth_resume.replay must be set");
+    assert_eq!(
+        phase3_replay.input, approval_resume.input,
+        "phase 3 auth_resume.replay.input must match the original approval input"
     );
 }
 
@@ -5319,6 +5366,7 @@ async fn auth_resume_slot_consumed_on_first_batch_match_not_reused_for_second_ca
             approval_request_id,
             correlation_id,
         }),
+        replay: None,
     });
 
     // Two calls to the same capability_id — extracted from the two_calls_response fixture.
@@ -5639,6 +5687,7 @@ async fn auth_resume_origin_backend_failure_does_not_die_as_scope_mismatch() {
                 gate_ref: LoopGateRef::new("gate:auth-sm-test-cap1").expect("valid"),
                 credential_requirements: Vec::new(),
                 safe_summary: "cap1 needs auth".to_string(),
+                auth_resume: None,
             }],
             stopped_on_suspension: true,
         },

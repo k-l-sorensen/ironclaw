@@ -1086,6 +1086,7 @@ fn scripted_capability_outcome(
                 gate_ref: loop_gate_ref(&gate_ref),
                 credential_requirements: Vec::new(),
                 safe_summary: "auth required".to_string(),
+                auth_resume: None,
             })
         }
         ScriptedCapabilityOutcome::ResourceBlocked { gate_ref } => {
