@@ -46,6 +46,15 @@ pub(super) const REASON_PLACEHOLDER_NOT_FOUND: &str =
 pub(super) const REASON_PLACEHOLDER_NOT_UNIQUE: &str =
     "credential injection path placeholder must appear exactly once";
 pub(super) const REASON_TARGET_URL_INVALID: &str = "credential injection target URL is invalid";
+/// Reason carried when the host-mediated egress port rejects a request that
+/// carries caller-provided credential injections. The host-mediated port stages
+/// host-held material itself and never accepts caller-supplied injections, so
+/// this is an early credential-boundary block before delegating into the
+/// shared `RuntimeHttpEgress::execute` pipeline. Produced in
+/// `super::host_port::HostRuntimeHttpEgressPort::execute` and matched by
+/// `super::credential_channel_audit_code`.
+pub(super) const REASON_HOST_MEDIATED_INJECTIONS_DENIED: &str =
+    "host-mediated HTTP egress does not accept caller-provided credential injections";
 
 #[derive(Clone, PartialEq, Eq)]
 enum CredentialCacheKey {

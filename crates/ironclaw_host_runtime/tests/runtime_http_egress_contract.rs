@@ -1902,6 +1902,14 @@ async fn host_http_egress_borrows_staged_network_policy_before_transport() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].policy, staged_policy);
     drop(requests);
+
+    // A successful egress is not a blocked security boundary crossing, so the
+    // registered sink must record nothing.
+    assert!(
+        security_audit_sink.is_empty(),
+        "successful egress must not record any security audit events, got {:?}",
+        security_audit_sink.snapshot()
+    );
 }
 
 #[tokio::test]

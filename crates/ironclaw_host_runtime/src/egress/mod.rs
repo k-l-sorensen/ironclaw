@@ -26,6 +26,8 @@ const CREDENTIAL_CHANNEL_CAPABILITY_MISMATCH_CODE: &str = "credential_channel_ca
 const CREDENTIAL_CHANNEL_UNAVAILABLE_CODE: &str = "credential_channel_unavailable";
 const CREDENTIAL_CHANNEL_BACKEND_UNAVAILABLE_CODE: &str = "credential_channel_backend_unavailable";
 const CREDENTIAL_CHANNEL_TARGET_INVALID_CODE: &str = "credential_channel_target_invalid";
+const CREDENTIAL_CHANNEL_HOST_MEDIATED_INJECTIONS_DENIED_CODE: &str =
+    "credential_channel_host_mediated_injections_denied";
 
 pub use host_port::{
     HostRuntimeCredentialMaterial, HostRuntimeHttpEgressPort, HostRuntimeHttpEgressRequest,
@@ -186,16 +188,11 @@ impl<N, S> HostHttpEgressService<N, S> {
         scope: &ResourceScope,
         capability_id: &CapabilityId,
     ) {
-        let Some(sink) = &self.security_audit_sink else {
-            return;
-        };
-        let Some((boundary, code)) = egress_block_audit(error) else {
-            return;
-        };
-        sink.record(
-            SecurityAuditEvent::new(boundary, SecurityDecision::Blocked, code)
-                .with_capability_id(capability_id.clone())
-                .with_scope(scope.clone()),
+        record_egress_block_to_sink(
+            self.security_audit_sink.as_deref(),
+            error,
+            scope,
+            capability_id,
         );
     }
 }
@@ -348,6 +345,32 @@ fn egress_block_audit(error: &RuntimeHttpEgressError) -> Option<(SecurityBoundar
     credential_channel_audit_code(error).map(|code| (SecurityBoundary::CredentialChannel, code))
 }
 
+/// Record a blocked egress attempt to the given security audit sink, when the
+/// error maps to an audit code and a sink is wired.
+///
+/// Shared by `HostHttpEgressService::record_egress_block` (in-`execute` blocks)
+/// and `host_port::HostRuntimeHttpEgressPort` (host-mediated early credential
+/// rejections), so both paths record identical credential-boundary audit
+/// events from the same boundary/code resolver.
+pub(super) fn record_egress_block_to_sink(
+    sink: Option<&dyn SecurityAuditSink>,
+    error: &RuntimeHttpEgressError,
+    scope: &ResourceScope,
+    capability_id: &CapabilityId,
+) {
+    let Some(sink) = sink else {
+        return;
+    };
+    let Some((boundary, code)) = egress_block_audit(error) else {
+        return;
+    };
+    sink.record(
+        SecurityAuditEvent::new(boundary, SecurityDecision::Blocked, code)
+            .with_capability_id(capability_id.clone())
+            .with_scope(scope.clone()),
+    );
+}
+
 /// Map a pipeline error to a credential-channel security-audit code.
 ///
 /// The variant match is exhaustive on purpose: adding a new
@@ -387,6 +410,9 @@ fn credential_channel_audit_code(error: &RuntimeHttpEgressError) -> Option<&'sta
             | credential::REASON_PLACEHOLDER_NOT_FOUND
             | credential::REASON_PLACEHOLDER_NOT_UNIQUE
             | credential::REASON_TARGET_URL_INVALID => Some(CREDENTIAL_CHANNEL_TARGET_INVALID_CODE),
+            credential::REASON_HOST_MEDIATED_INJECTIONS_DENIED => {
+                Some(CREDENTIAL_CHANNEL_HOST_MEDIATED_INJECTIONS_DENIED_CODE)
+            }
             other => {
                 tracing::debug!(
                     reason = other,
