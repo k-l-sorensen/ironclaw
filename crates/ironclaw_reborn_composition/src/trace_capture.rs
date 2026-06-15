@@ -165,10 +165,13 @@ impl TurnEventSink for TraceCaptureTurnEventSink {
         else {
             return Ok(());
         };
-        record_observed_scope(&self.observed_scopes, owner_user_id.as_str());
+        // Tenant-scope the persisted trace state key so the same user id in two
+        // tenants does not share policy / device-key / credit / profile state.
+        let scope = trace::trace_scope_key(event.scope.tenant_id.as_str(), owner_user_id.as_str());
+        record_observed_scope(&self.observed_scopes, &scope);
         let history = Arc::clone(&self.history);
         tokio::spawn(async move {
-            capture_turn_trace(history, event, owner_user_id.as_str().to_string()).await;
+            capture_turn_trace(history, event, scope).await;
         });
         Ok(())
     }
@@ -475,10 +478,23 @@ pub(crate) fn spawn_trace_queue_flush_worker(
                 continue;
             }
             if let Err(error) = TraceClientHost
-                .flush_queue_worker_tick(scopes, TRACE_QUEUE_WORKER_FLUSH_LIMIT)
+                .flush_queue_worker_tick(scopes.clone(), TRACE_QUEUE_WORKER_FLUSH_LIMIT)
                 .await
             {
                 tracing::debug!(%error, "Reborn trace queue worker tick failed");
+            }
+            // Prune drained scopes so the observed set stays bounded by actual
+            // pending backlog, not by every caller ever seen on this runtime. A
+            // scope with no flushable queue entries is dropped; its next turn
+            // re-adds it via `record_observed_scope`. Scopes that still hold
+            // pending work (e.g. a flush that hit the per-tick limit, or an
+            // endpoint that's down) are retained so the next tick retries them.
+            {
+                let mut observed = match observed_scopes.lock() {
+                    Ok(observed) => observed,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                observed.retain(|scope| trace::trace_scope_has_pending_queue(scope.as_str()));
             }
         }
     });
@@ -1069,8 +1085,15 @@ mod tests {
 
     #[tokio::test]
     async fn sink_records_scope_and_spawns_capture_for_terminal_events() {
-        let scope = unique_scope("sink-spawn");
-        trace::write_trace_policy_for_scope(Some(&scope), &enabled_policy()).expect("write policy");
+        // The owner here is a non-runtime-owner caller (this sink serves many
+        // WebUI users). Capture must attribute the trace to the EVENT's
+        // tenant+owner composite — `trace_scope_key(tenant, owner)` — NOT the
+        // bare owner id and NOT any runtime-wide owner. Enroll, observe, and
+        // assert the queue all under that composite key.
+        let owner = unique_scope("sink-spawn-owner");
+        let capture_key = trace::trace_scope_key("trace-capture-test-tenant", &owner);
+        trace::write_trace_policy_for_scope(Some(&capture_key), &enabled_policy())
+            .expect("write policy");
         let scopes: ObservedTraceScopes = Arc::new(Mutex::new(BTreeSet::new()));
         let sink = TraceCaptureTurnEventSink::with_history_source(
             Arc::new(FixedHistorySource {
@@ -1081,25 +1104,38 @@ mod tests {
             }),
             Arc::clone(&scopes),
         );
-        sink.publish(terminal_event(TurnEventKind::Completed, Some(&scope)))
+        sink.publish(terminal_event(TurnEventKind::Completed, Some(&owner)))
             .await
             .expect("terminal event accepted");
-        assert!(
-            scopes.lock().expect("scope set lock").contains(&scope),
-            "terminal event records the owner scope for the flush worker"
-        );
+        {
+            let observed = scopes.lock().expect("scope set lock");
+            assert!(
+                observed.contains(&capture_key),
+                "terminal event records the tenant-scoped composite key for the flush worker"
+            );
+            assert!(
+                !observed.contains(&owner),
+                "the bare owner id must NOT be used as the trace scope key"
+            );
+        }
         // The capture task is detached; poll briefly for the queued envelope.
         for _ in 0..100 {
-            if !queued_entries(&scope).is_empty() {
+            if !queued_entries(&capture_key).is_empty() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         assert_eq!(
-            queued_entries(&scope).len(),
+            queued_entries(&capture_key).len(),
             1,
-            "spawned capture queues the envelope"
+            "spawned capture queues the envelope under the tenant-scoped key"
         );
-        cleanup_scope(&scope);
+        // Nothing was written under the bare owner id.
+        assert!(
+            queued_entries(&owner).is_empty(),
+            "no trace state may be written under the un-tenant-scoped owner id"
+        );
+        cleanup_scope(&capture_key);
+        cleanup_scope(&owner);
     }
 }

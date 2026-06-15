@@ -3996,6 +3996,20 @@ pub fn trace_contribution_dir_for_scope(scope: Option<&str>) -> PathBuf {
     }
 }
 
+/// Canonical per-scope key for Trace Commons local state (policy, device keys,
+/// credits, profile tokens).
+///
+/// Composite of `tenant_id` + `user_id` so the same user id in two tenants does
+/// NOT share local state — Trace Commons state is tenant-scoped, and keying on
+/// the user alone would collapse cross-tenant isolation. The returned string is
+/// opaque: callers hand it to `trace_contribution_dir_for_scope` /
+/// `read_*_for_scope`, which hash it, so only stability and cross-tenant
+/// distinctness matter (the `/` separator can't collide because `TenantId`
+/// validation forbids it).
+pub fn trace_scope_key(tenant_id: &str, user_id: &str) -> String {
+    format!("{tenant_id}/{user_id}")
+}
+
 pub fn local_pseudonymous_contributor_id(scope: &str) -> String {
     format!("sha256:{}", scope_hash(scope))
 }
@@ -8170,6 +8184,26 @@ fn trace_policy_path(scope: Option<&str>) -> PathBuf {
 
 fn trace_queue_dir(scope: Option<&str>) -> PathBuf {
     trace_contribution_dir_for_scope(scope).join("queue")
+}
+
+/// Whether `scope` has any pending (flushable) queue entries on disk.
+///
+/// Lets the periodic flush worker prune drained scopes from its in-memory
+/// observed-scope set instead of retaining one entry per historical caller
+/// forever. A `.held.json` sidecar is a manual-review hold (not flushable until
+/// authorized) and does not count; only a queued envelope (`<id>.json` with no
+/// `.held.json` peer that is awaiting authorization) keeps a scope "pending".
+pub fn trace_scope_has_pending_queue(scope: &str) -> bool {
+    let dir = trace_queue_dir(Some(scope));
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.ends_with(".json") && !name.ends_with(".held.json"))
+    })
 }
 
 fn trace_queue_malformed_dir(scope: Option<&str>) -> PathBuf {

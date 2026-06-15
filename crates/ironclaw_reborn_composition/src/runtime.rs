@@ -4772,6 +4772,10 @@ mod tests {
         use ironclaw_reborn_traces::contribution as trace_contribution;
 
         let owner = format!("runtime-trace-capture-owner-{}", uuid::Uuid::new_v4());
+        // Trace state is keyed by the tenant-scoped composite, so enroll (and
+        // later read the queue) under `trace_scope_key(tenant, owner)`, not the
+        // bare owner id.
+        let scope = trace_contribution::trace_scope_key("runtime-trace-capture-tenant", &owner);
         let policy = trace_contribution::StandingTraceContributionPolicy {
             enabled: true,
             // Closed loopback port: the immediate flush fails fast and
@@ -4782,7 +4786,7 @@ mod tests {
             auto_submit_high_value_traces: true,
             ..trace_contribution::StandingTraceContributionPolicy::default()
         };
-        trace_contribution::write_trace_policy_for_scope(Some(&owner), &policy)
+        trace_contribution::write_trace_policy_for_scope(Some(&scope), &policy)
             .expect("write trace policy");
 
         let root = tempfile::tempdir().expect("tempdir");
@@ -4819,7 +4823,7 @@ mod tests {
 
         // The capture task is detached from the lifecycle path; poll briefly.
         let queue_dir =
-            trace_contribution::trace_contribution_dir_for_scope(Some(&owner)).join("queue");
+            trace_contribution::trace_contribution_dir_for_scope(Some(&scope)).join("queue");
         let queued =
             |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
                 std::fs::read_dir(dir)

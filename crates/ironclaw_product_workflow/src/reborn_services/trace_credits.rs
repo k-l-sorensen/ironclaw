@@ -4,7 +4,8 @@
 //! view of Trace Commons credit as of the last credit sync. The
 //! authoritative ledger lives server-side; nothing here mutates trace
 //! state or accepts a scope from request input — the trace scope is
-//! always derived from the authenticated caller's user id.
+//! always derived from the authenticated caller's tenant + user id (see
+//! [`ironclaw_reborn_traces::contribution::trace_scope_key`]).
 
 use chrono::{DateTime, Utc};
 use ironclaw_reborn_traces::contribution::{
@@ -75,63 +76,46 @@ pub struct RebornTraceHoldAuthorizeResponse {
 
 /// Authorize the caller-scoped held manual-review trace for submission.
 ///
-/// The trace scope is the caller's user id; the submission id is never an
-/// authority to cross scopes. Returns whether a matching `ManualReview` hold
-/// was found and promoted.
+/// The trace `scope` is the caller's tenant-scoped key (see
+/// [`ironclaw_reborn_traces::contribution::trace_scope_key`]); the submission id
+/// is never an authority to cross scopes. Returns whether a matching
+/// `ManualReview` hold was found and promoted.
 pub(super) fn authorize_trace_hold_for_user(
-    user_id: &str,
+    scope: &str,
     submission_id: uuid::Uuid,
 ) -> Result<bool, String> {
-    authorize_manual_review_hold_for_scope(Some(user_id), submission_id)
+    authorize_manual_review_hold_for_scope(Some(scope), submission_id)
         .map_err(|error| error.to_string())
 }
 
 /// Build the caller-scoped local Trace Commons credit view.
 ///
-/// Missing or unreadable local state is the normal "not enrolled /
-/// nothing submitted yet" state and soft-falls back to the zero
-/// response — it is never surfaced as an error (mirrors the
-/// `builtin.trace_commons.credits` first-party capability).
-pub(super) fn local_trace_credits_for_user(user_id: &str) -> RebornTraceCreditsResponse {
-    let scope = Some(user_id);
-    let enrolled = match read_trace_policy_for_scope(scope) {
-        Ok(policy) => policy.enabled,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "failed to read Trace Commons policy for WebUI credits; treating as not enrolled"
-            );
-            false
-        }
-    };
-    let records = match read_local_trace_records_for_scope(scope) {
-        Ok(records) => records,
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "failed to read local Trace Commons records for WebUI credits; treating as empty"
-            );
-            Vec::new()
-        }
-    };
+/// A MISSING local state is the normal "not enrolled / nothing submitted yet"
+/// state and is softened to the default/empty value by the underlying
+/// `read_*_for_scope` helpers (they return `Ok` when the file is absent). A
+/// genuine read/parse failure (unreadable or corrupt local state) is NOT masked
+/// as the zero-state response — it propagates so the caller can surface it
+/// instead of telling an enrolled user they have nothing.
+pub(super) fn local_trace_credits_for_user(
+    scope: &str,
+) -> Result<RebornTraceCreditsResponse, String> {
+    let scope = Some(scope);
+    // `{:#}` preserves the underlying error chain so the caller's sanitized 500
+    // still leaves a useful server-side trail.
+    let enrolled = read_trace_policy_for_scope(scope)
+        .map_err(|e| format!("{e:#}"))?
+        .enabled;
+    let records = read_local_trace_records_for_scope(scope).map_err(|e| format!("{e:#}"))?;
     let report = trace_credit_report(&records);
-    let holds: Vec<RebornTraceHold> = match manual_review_holds_for_scope(scope) {
-        Ok(holds) => holds
-            .into_iter()
-            .map(|hold| RebornTraceHold {
-                submission_id: hold.submission_id.to_string(),
-                reason: hold.reason,
-            })
-            .collect(),
-        Err(error) => {
-            tracing::debug!(
-                %error,
-                "failed to read Trace Commons manual-review holds for WebUI credits; treating as none"
-            );
-            Vec::new()
-        }
-    };
-    RebornTraceCreditsResponse {
+    let holds: Vec<RebornTraceHold> = manual_review_holds_for_scope(scope)
+        .map_err(|e| format!("{e:#}"))?
+        .into_iter()
+        .map(|hold| RebornTraceHold {
+            submission_id: hold.submission_id.to_string(),
+            reason: hold.reason,
+        })
+        .collect();
+    Ok(RebornTraceCreditsResponse {
         enrolled,
         manual_review_hold_count: holds.len() as u32,
         holds,
@@ -148,7 +132,7 @@ pub(super) fn local_trace_credits_for_user(user_id: &str) -> RebornTraceCreditsR
         last_credit_sync_at: report.last_credit_sync_at,
         recent_explanations: report.explanation_lines,
         note: TRACE_CREDITS_NOTE.to_string(),
-    }
+    })
 }
 
 #[cfg(test)]
@@ -177,7 +161,7 @@ mod tests {
     #[test]
     fn fresh_scope_yields_unenrolled_zero_state() {
         let scope = unique_scope("pw-trace-credits-fresh");
-        let response = local_trace_credits_for_user(&scope);
+        let response = local_trace_credits_for_user(&scope).expect("local credits read");
         assert!(!response.enrolled);
         assert_eq!(response.submissions_total, 0);
         assert_eq!(response.submissions_submitted, 0);
@@ -212,7 +196,7 @@ mod tests {
         };
         write_trace_policy_for_scope(Some(scope.as_str()), &policy).expect("write policy");
 
-        let response = local_trace_credits_for_user(&scope);
+        let response = local_trace_credits_for_user(&scope).expect("local credits read");
         assert!(response.enrolled);
         assert_eq!(response.submissions_total, 0);
         assert_eq!(response.pending_credit, 0.0);

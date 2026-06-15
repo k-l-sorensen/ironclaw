@@ -973,9 +973,17 @@ pub trait RebornServicesApi: Send + Sync {
         caller: WebUiAuthenticatedCaller,
     ) -> Result<RebornTraceCreditsResponse, RebornServicesError> {
         let actor = caller.actor();
-        Ok(trace_credits::local_trace_credits_for_user(
+        // Tenant-scope the local state key so the same user id in two tenants
+        // does not share Trace Commons credit/hold state.
+        let scope = ironclaw_reborn_traces::contribution::trace_scope_key(
+            caller.tenant_id.as_str(),
             actor.user_id.as_str(),
-        ))
+        );
+        // A genuine local-state read failure must surface as a sanitized 500,
+        // not a misleading zero/not-enrolled view (carry the cause for the
+        // server-side trail per error-handling.md).
+        trace_credits::local_trace_credits_for_user(&scope)
+            .map_err(RebornServicesError::internal_from)
     }
 
     /// Authorize the caller's held manual-review trace for submission
@@ -995,12 +1003,15 @@ pub trait RebornServicesApi: Send + Sync {
                 WebUiInboundValidationCode::InvalidId,
             ))
         })?;
+        let scope = ironclaw_reborn_traces::contribution::trace_scope_key(
+            caller.tenant_id.as_str(),
+            actor.user_id.as_str(),
+        );
         let authorized =
-            trace_credits::authorize_trace_hold_for_user(actor.user_id.as_str(), submission)
-                .map_err(|error| {
-                    tracing::debug!(%error, "failed to authorize Trace Commons held trace");
-                    RebornServicesError::internal_invariant()
-                })?;
+            trace_credits::authorize_trace_hold_for_user(&scope, submission).map_err(|error| {
+                tracing::debug!(%error, "failed to authorize Trace Commons held trace");
+                RebornServicesError::internal_invariant()
+            })?;
         Ok(RebornTraceHoldAuthorizeResponse { authorized })
     }
 

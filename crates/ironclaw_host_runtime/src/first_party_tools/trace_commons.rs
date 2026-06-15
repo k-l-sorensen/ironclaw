@@ -8,7 +8,11 @@
 //!
 //! All five are model-visible.
 
-use std::{panic::AssertUnwindSafe, sync::Arc};
+use std::{
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use futures_util::FutureExt as _;
@@ -21,7 +25,7 @@ use ironclaw_host_api::{
 use ironclaw_reborn_traces::contribution::{
     ProfileAttributionToken, StandingTraceContributionPolicy, TraceCreditReport,
     TraceUploadAuthMode, mint_profile_attribution_token_for_scope, read_trace_policy_for_scope,
-    set_community_profile_for_scope,
+    set_community_profile_for_scope, trace_contribution_dir_for_scope, trace_scope_key,
 };
 use ironclaw_reborn_traces::onboarding::{
     OnboardConsents, OnboardError, OnboardHttpResponse, OnboardOutcome, OnboardingHttpSink,
@@ -328,7 +332,10 @@ pub(super) async fn dispatch_onboard(
         .ok_or_else(|| FirstPartyCapabilityError::new(RuntimeDispatchErrorKind::NetworkDenied))?
         .clone();
 
-    let scope = request.scope.user_id.as_str().to_string();
+    let scope = trace_scope_key(
+        request.scope.tenant_id.as_str(),
+        request.scope.user_id.as_str(),
+    );
     let host_sink = HostEgressOnboardingSink {
         egress,
         scope: request.scope.clone(),
@@ -434,15 +441,22 @@ it's safe to retry.",
 pub(super) async fn dispatch_status(
     request: &FirstPartyCapabilityRequest,
 ) -> Result<Value, FirstPartyCapabilityError> {
-    let scope = request.scope.user_id.as_str().to_string();
-    // A missing or unreadable policy is a normal "not enrolled" state — map
-    // read errors to a soft fallback value, not a FirstPartyCapabilityError.
+    let scope = trace_scope_key(
+        request.scope.tenant_id.as_str(),
+        request.scope.user_id.as_str(),
+    );
+    // A MISSING policy is already softened to the not-enrolled default inside
+    // `read_trace_policy_for_scope`, so an `Err` here is a genuine read/parse
+    // failure (unreadable or corrupt policy file). Do NOT mask that as
+    // `enrolled: false` — a user who IS enrolled would be told they are not.
+    // Report the read failure honestly without asserting an enrollment state.
     let policy = match read_trace_policy_for_scope(Some(scope.as_str())) {
         Ok(p) => p,
-        Err(_) => {
+        Err(error) => {
+            tracing::debug!(%error, "trace commons status: local policy read failed");
             return Ok(json!({
-                "enrolled": false,
-                "error": "could not read policy"
+                "error_code": "PolicyReadFailed",
+                "message": "Could not read local Trace Commons enrollment state; the policy file may be unreadable or corrupt."
             }));
         }
     };
@@ -469,7 +483,10 @@ fn format_status(policy: &StandingTraceContributionPolicy) -> Value {
 pub(super) async fn dispatch_credits(
     request: &FirstPartyCapabilityRequest,
 ) -> Result<Value, FirstPartyCapabilityError> {
-    let scope = request.scope.user_id.as_str().to_string();
+    let scope = trace_scope_key(
+        request.scope.tenant_id.as_str(),
+        request.scope.user_id.as_str(),
+    );
     // A missing or unreadable submissions file is a normal "nothing submitted yet"
     // state — map read errors to a soft fallback value, not a FirstPartyCapabilityError.
     match ironclaw_reborn_traces::contribution::read_local_trace_records_for_scope(Some(
@@ -518,26 +535,72 @@ pub(crate) fn format_credits(report: &TraceCreditReport) -> Value {
 pub(super) async fn dispatch_profile_token(
     request: &FirstPartyCapabilityRequest,
 ) -> Result<Value, FirstPartyCapabilityError> {
-    let scope = request.scope.user_id.as_str().to_string();
+    let scope = trace_scope_key(
+        request.scope.tenant_id.as_str(),
+        request.scope.user_id.as_str(),
+    );
     match mint_profile_attribution_token_for_scope(Some(scope.as_str())).await {
-        Ok(token) => Ok(format_profile_token(&token)),
+        Ok(token) => match persist_profile_token(&scope, &token) {
+            Ok(path) => Ok(format_profile_token(&path, &token)),
+            Err(error) => {
+                tracing::debug!(%error, "failed to persist Trace Commons profile token");
+                Ok(profile_token_error_value(
+                    "could not write the profile token to local state".to_string(),
+                ))
+            }
+        },
         Err(error) => Ok(profile_token_error_value(error.to_string())),
     }
 }
 
-fn format_profile_token(token: &ProfileAttributionToken) -> Value {
+/// Write the raw bearer token to a 0600 file in the scope's local state dir and
+/// return its path. The token is a credential: it must NOT be returned in the
+/// model-visible tool result (that copies it into the LLM transcript/history
+/// and any downstream persistence). Delivering it out-of-band via a private
+/// file keeps the secret off the model surface while the manual browser-setup
+/// flow can still read it.
+fn persist_profile_token(scope: &str, token: &ProfileAttributionToken) -> std::io::Result<PathBuf> {
+    let dir = trace_contribution_dir_for_scope(Some(scope));
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("profile_token.jwt");
+    // Create with 0600 so the credential is not world-readable.
+    #[cfg(unix)]
+    {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt as _;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&path)?;
+        file.write_all(token.access_token.as_bytes())?;
+        file.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(&path, token.access_token.as_bytes())?;
+    }
+    Ok(path)
+}
+
+fn format_profile_token(token_path: &Path, token: &ProfileAttributionToken) -> Value {
     json!({
         "minted": true,
         "token_type": "Bearer",
-        "access_token": token.access_token.as_str(),
+        // The raw access_token is deliberately NOT included here — it is a
+        // bearer credential and must not enter the model transcript. It is
+        // written to `token_file` (0600) for out-of-band manual use.
+        "token_file": token_path.display().to_string(),
         "expires_at": token.expires_at.as_ref().map(|dt| dt.to_rfc3339()),
         "expires_in": token.expires_in,
         "consent_scope": "public_attribution",
         "allowed_uses": [],
         "profile_url": "https://tracecommons.ai/profile",
         "message": "Prefer asking the agent to set your public profile directly with a pseudonymous handle. \
-    For browser/manual setup only, paste access_token exactly as shown into https://tracecommons.ai/profile \
-    without adding a Bearer prefix. This token is short-lived and only authorizes public profile management."
+    For browser/manual setup only, the short-lived profile token was written to the file shown in token_file; \
+    open that file and paste its contents into https://tracecommons.ai/profile without a Bearer prefix. \
+    The token is not shown here because it is a credential and must not appear in the conversation."
     })
 }
 
@@ -599,7 +662,10 @@ pub(super) async fn dispatch_profile_set(
         }));
     }
 
-    let scope = request.scope.user_id.as_str().to_string();
+    let scope = trace_scope_key(
+        request.scope.tenant_id.as_str(),
+        request.scope.user_id.as_str(),
+    );
     match read_trace_policy_for_scope(Some(scope.as_str())) {
         Ok(policy) if policy.enabled => {}
         Ok(_) => {
@@ -962,7 +1028,7 @@ mod tests {
     }
 
     #[test]
-    fn format_profile_token_reports_raw_token_and_scope_boundary() {
+    fn format_profile_token_never_exposes_raw_token_on_model_surface() {
         let expires_at: DateTime<Utc> = DateTime::parse_from_rfc3339("2026-06-09T20:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
@@ -971,21 +1037,37 @@ mod tests {
             expires_at: Some(expires_at),
             expires_in: Some(300),
         };
-        let v = format_profile_token(&token);
+        let token_path = std::path::Path::new("/some/scope/profile_token.jwt");
+        let v = format_profile_token(token_path, &token);
         assert_eq!(v["minted"], json!(true));
         assert_eq!(v["token_type"], json!("Bearer"));
-        assert_eq!(v["access_token"], json!("eyJ.profile.token"));
+        // The raw bearer credential must NOT appear in the model-visible result
+        // (it is a secret; the model transcript would otherwise persist it).
+        assert!(
+            v.get("access_token").is_none(),
+            "access_token must not be in the model-visible result"
+        );
+        assert!(
+            !serde_json::to_string(&v)
+                .unwrap()
+                .contains("eyJ.profile.token"),
+            "raw token must not appear anywhere in the serialized output"
+        );
+        // The token is delivered out-of-band via a private file path instead.
+        assert_eq!(
+            v["token_file"],
+            json!("/some/scope/profile_token.jwt"),
+            "the out-of-band token file path is surfaced instead of the token"
+        );
         assert_eq!(v["consent_scope"], json!("public_attribution"));
-        assert_eq!(v["allowed_uses"], json!([]));
-        assert_eq!(v["profile_url"], json!("https://tracecommons.ai/profile"));
         let message = v["message"].as_str().unwrap();
         assert!(
             message.contains("agent to set your public profile directly"),
             "message must prefer direct agent profile setup"
         );
         assert!(
-            message.contains("without adding a Bearer prefix"),
-            "message must still preserve the browser/manual token fallback"
+            message.contains("token_file"),
+            "message must point the user at the out-of-band token file"
         );
     }
 
