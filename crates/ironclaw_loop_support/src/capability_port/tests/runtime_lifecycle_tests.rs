@@ -341,7 +341,6 @@ async fn runtime_capability_batch_continues_after_runtime_failure_outcome() {
                     surface_version: first.surface_version,
                     capability_id: first.capability_id,
                     input_ref: first.input_ref,
-                    is_provider_call: false,
                     approval_resume: None,
                     auth_resume: None,
                 },
@@ -349,7 +348,6 @@ async fn runtime_capability_batch_continues_after_runtime_failure_outcome() {
                     surface_version: second.surface_version,
                     capability_id: second.capability_id,
                     input_ref: second.input_ref,
-                    is_provider_call: false,
                     approval_resume: None,
                     auth_resume: None,
                 },
@@ -791,7 +789,6 @@ async fn visible_runtime_invocation(port: &HostRuntimeLoopCapabilityPort) -> Cap
         surface_version: surface.version,
         capability_id: candidate.capability_id,
         input_ref: candidate.input_ref,
-        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     }
@@ -860,7 +857,6 @@ async fn approval_resume_metadata_invokes_runtime_resume_with_original_invocatio
                 "input:approval-resume-replayed-call",
             )
             .expect("valid input ref"),
-            is_provider_call: false,
             approval_resume: Some(resume.clone()),
             auth_resume: None,
         })
@@ -955,7 +951,6 @@ async fn auth_resume_after_approval_reuses_original_invocation_identity() {
             surface_version: surface.version.clone(),
             capability_id: capability_id.clone(),
             input_ref: first_invocation.input_ref.clone(),
-            is_provider_call: false,
             approval_resume: Some(resume.clone()),
             auth_resume: None,
         })
@@ -975,7 +970,6 @@ async fn auth_resume_after_approval_reuses_original_invocation_identity() {
             surface_version: surface.version,
             capability_id: capability_id.clone(),
             input_ref: first_invocation.input_ref.clone(),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: Some(CapabilityAuthResume {
                 resume_token: resume.resume_token.clone(),
@@ -1078,7 +1072,6 @@ async fn approval_resume_host_error_returns_failed_outcome_and_emits_failure_mil
             capability_id: capability_id.clone(),
             input_ref: CapabilityInputRef::new("input:approval-resume-host-error")
                 .expect("valid input ref"),
-            is_provider_call: false,
             approval_resume: Some(resume),
             auth_resume: None,
         })

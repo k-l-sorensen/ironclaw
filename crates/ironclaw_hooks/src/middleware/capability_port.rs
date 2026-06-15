@@ -848,7 +848,6 @@ mod tests {
                 "input:cap.snapshot.fixture",
             )
             .expect("input ref literal is valid"),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         }
@@ -896,7 +895,6 @@ mod tests {
                 "input:cap.snapshot.fixture",
             )
             .expect("input ref literal is valid"),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         };
@@ -959,7 +957,6 @@ mod tests {
                 "input:cap.snapshot.fixture",
             )
             .expect("input ref literal is valid"),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         };
@@ -1056,7 +1053,6 @@ mod tests {
             surface_version: surface.clone(),
             capability_id: cap_id.clone(),
             input_ref: ironclaw_turns::run_profile::CapabilityInputRef::new("input:a").expect("ok"),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         };
@@ -1064,7 +1060,6 @@ mod tests {
             surface_version: surface,
             capability_id: cap_id,
             input_ref: ironclaw_turns::run_profile::CapabilityInputRef::new("input:b").expect("ok"),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         };
@@ -1079,7 +1074,6 @@ mod tests {
             surface_version: CapabilitySurfaceVersion::new("v1").expect("ok"),
             capability_id: CapabilityId::new(capability).expect("ok"),
             input_ref: CapabilityInputRef::new(format!("input:{capability}")).expect("ok"),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         }

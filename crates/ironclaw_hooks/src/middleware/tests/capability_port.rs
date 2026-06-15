@@ -238,7 +238,6 @@ fn snapshot_fixture_invocation() -> CapabilityInvocation {
             "input:cap.snapshot.fixture",
         )
         .expect("input ref literal is valid"),
-        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     }
@@ -370,7 +369,6 @@ fn invocation_arguments_digest_differs_for_different_input_refs() {
         surface_version: surface.clone(),
         capability_id: cap_id.clone(),
         input_ref: ironclaw_turns::run_profile::CapabilityInputRef::new("input:a").expect("ok"),
-        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     };
@@ -378,7 +376,6 @@ fn invocation_arguments_digest_differs_for_different_input_refs() {
         surface_version: surface,
         capability_id: cap_id,
         input_ref: ironclaw_turns::run_profile::CapabilityInputRef::new("input:b").expect("ok"),
-        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     };
@@ -398,7 +395,6 @@ fn invocation_arguments_digest_differs_for_different_capability_ids() {
         surface_version: surface.clone(),
         capability_id: CapabilityId::new("cap.alpha").expect("ok"),
         input_ref: input_ref.clone(),
-        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     };
@@ -406,7 +402,6 @@ fn invocation_arguments_digest_differs_for_different_capability_ids() {
         surface_version: surface,
         capability_id: CapabilityId::new("cap.beta").expect("ok"),
         input_ref,
-        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     };
@@ -424,7 +419,6 @@ fn invocation(capability: &str) -> CapabilityInvocation {
         surface_version: CapabilitySurfaceVersion::new("v1").expect("ok"),
         capability_id: CapabilityId::new(capability).expect("ok"),
         input_ref: CapabilityInputRef::new(format!("input:{capability}")).expect("ok"),
-        is_provider_call: false,
         approval_resume: None,
         auth_resume: None,
     }

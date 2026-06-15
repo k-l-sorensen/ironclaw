@@ -1390,8 +1390,6 @@ pub struct CapabilityInvocation {
     pub surface_version: CapabilitySurfaceVersion,
     pub capability_id: CapabilityId,
     pub input_ref: CapabilityInputRef,
-    #[serde(default)]
-    pub is_provider_call: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub approval_resume: Option<CapabilityApprovalResume>,
     /// Set when the invocation was previously auth-blocked and the auth

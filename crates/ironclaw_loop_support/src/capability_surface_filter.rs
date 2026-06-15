@@ -635,7 +635,6 @@ mod tests {
             surface_version: surface_version(),
             capability_id: capability_id(capability),
             input_ref: input_ref(input),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         }
@@ -1068,7 +1067,6 @@ mod tests {
                 surface_version: candidate.surface_version,
                 capability_id: candidate.capability_id,
                 input_ref: candidate.input_ref,
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -1121,7 +1119,6 @@ mod tests {
                     surface_version: candidate.surface_version,
                     capability_id: candidate.capability_id,
                     input_ref: candidate.input_ref,
-                    is_provider_call: false,
                     approval_resume: None,
                     auth_resume: None,
                 }],

@@ -53,6 +53,7 @@ use self::surface_snapshot::{
 // snapshot logic in `capability_port/surface_snapshot.rs` while preserving the
 // existing adapter boundary.
 const PROVIDER_TOOL_NAME_DIGEST_BYTES: usize = 32;
+const PROVIDER_TOOL_CALL_INPUT_REF_PREFIX: &str = "input:provider-tool-";
 const MAX_IN_MEMORY_PROVIDER_TOOL_CALL_EFFECTIVE_CAPABILITY_IDS: usize = 128;
 
 #[async_trait]
@@ -72,6 +73,72 @@ pub trait LoopCapabilityInputResolver: Send + Sync {
             AgentLoopHostErrorKind::InvalidInvocation,
             "provider tool-call input registration is not supported",
         ))
+    }
+}
+
+struct ProviderToolCallInputResolver {
+    inner: Arc<dyn LoopCapabilityInputResolver>,
+    provider_inputs: Mutex<HashMap<String, serde_json::Value>>,
+}
+
+impl ProviderToolCallInputResolver {
+    fn new(inner: Arc<dyn LoopCapabilityInputResolver>) -> Self {
+        Self {
+            inner,
+            provider_inputs: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+#[async_trait]
+impl LoopCapabilityInputResolver for ProviderToolCallInputResolver {
+    async fn resolve_capability_input(
+        &self,
+        run_context: &LoopRunContext,
+        input_ref: &CapabilityInputRef,
+    ) -> Result<serde_json::Value, AgentLoopHostError> {
+        if let Some(input) = self
+            .provider_inputs
+            .lock()
+            .map_err(|_| {
+                AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Unavailable,
+                    "provider tool-call input store is unavailable",
+                )
+            })?
+            .get(input_ref.as_str())
+            .cloned()
+        {
+            return Ok(input);
+        }
+        self.inner
+            .resolve_capability_input(run_context, input_ref)
+            .await
+    }
+
+    async fn register_provider_tool_call_input(
+        &self,
+        run_context: &LoopRunContext,
+        tool_call: &ProviderToolCall,
+    ) -> Result<CapabilityInputRef, AgentLoopHostError> {
+        let input_ref = provider_tool_call_input_ref(run_context, tool_call)?;
+        let mut provider_inputs = self.provider_inputs.lock().map_err(|_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Unavailable,
+                "provider tool-call input store is unavailable",
+            )
+        })?;
+        if let Some(existing) = provider_inputs.get(input_ref.as_str()) {
+            if existing != &tool_call.arguments {
+                return Err(AgentLoopHostError::new(
+                    AgentLoopHostErrorKind::Internal,
+                    "provider tool-call input ref collision",
+                ));
+            }
+        } else {
+            provider_inputs.insert(input_ref.as_str().to_string(), tool_call.arguments.clone());
+        }
+        Ok(input_ref)
     }
 }
 
@@ -552,6 +619,8 @@ impl HostRuntimeLoopCapabilityPort {
         result_writer: Arc<dyn LoopCapabilityResultWriter>,
         milestone_sink: Arc<dyn LoopHostMilestoneSink>,
     ) -> Self {
+        let input_resolver: Arc<dyn LoopCapabilityInputResolver> =
+            Arc::new(ProviderToolCallInputResolver::new(input_resolver));
         Self {
             runtime,
             run_context,
@@ -1213,7 +1282,7 @@ impl LoopCapabilityPort for HostRuntimeLoopCapabilityPort {
                 Ok(input) => input,
                 Err(error)
                     if error.error.kind == AgentLoopHostErrorKind::InvalidInvocation
-                        && request.is_provider_call =>
+                        && is_provider_tool_call_input_ref(effective_input_ref) =>
                 {
                     let result = Ok(CapabilityOutcome::Failed(CapabilityFailure {
                         error_kind: CapabilityFailureKind::InvalidInput,
@@ -1823,6 +1892,54 @@ fn invocation_idempotency_key(
         sha256_digest_token(payload.as_bytes())
     ))
     .map_err(host_runtime_error)
+}
+
+fn provider_tool_call_input_ref(
+    run_context: &LoopRunContext,
+    tool_call: &ProviderToolCall,
+) -> Result<CapabilityInputRef, AgentLoopHostError> {
+    let turn_id = tool_call.turn_id.as_deref().ok_or_else(|| {
+        AgentLoopHostError::new(
+            AgentLoopHostErrorKind::InvalidInvocation,
+            "provider tool call is missing a provider turn id",
+        )
+    })?;
+    let arguments = serde_json::to_string(&tool_call.arguments).map_err(|error| {
+        let safe_summary = error.to_string();
+        crate::raw_agent_loop_host_error(
+            "capability_provider_tool_call",
+            "serialize_arguments",
+            AgentLoopHostErrorKind::InvalidInvocation,
+            safe_summary,
+            error,
+        )
+    })?;
+    let payload = format!(
+        "provider-tool-input\nrun={}\nprovider={}\nmodel={}\nturn={}\ncall={}\ntool={}\narguments={}",
+        run_context.run_id,
+        tool_call.provider_id,
+        tool_call.provider_model_id,
+        turn_id,
+        tool_call.id,
+        tool_call.name,
+        arguments
+    );
+    let digest = sha256_digest_token(payload.as_bytes());
+    let digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
+    CapabilityInputRef::new(format!("{PROVIDER_TOOL_CALL_INPUT_REF_PREFIX}{digest}")).map_err(
+        |_| {
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::Internal,
+                "provider tool-call input ref could not be represented",
+            )
+        },
+    )
+}
+
+fn is_provider_tool_call_input_ref(input_ref: &CapabilityInputRef) -> bool {
+    input_ref
+        .as_str()
+        .starts_with(PROVIDER_TOOL_CALL_INPUT_REF_PREFIX)
 }
 
 fn loop_surface_version(
@@ -3318,147 +3435,39 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn provider_originated_invocation_with_schema_invalid_args_resolves_to_failed_invalid_input()
-     {
-        let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
-        let provider_id = ExtensionId::new("demo").expect("valid provider id");
-        let context = execution_context("thread-provider-invalid-input");
-        let run_context = loop_run_context(&context).await;
-        let mut capability = visible_capability(capability_id.clone(), provider_id.clone());
-        capability.descriptor.parameters_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                "message": { "type": "integer" }
-            },
-            "required": ["message"]
-        });
-        let runtime = Arc::new(RecordingHostRuntime::new(vec![capability]));
-        let input_resolver = Arc::new(NoopCapabilityIo::default());
-        let input_ref = input_resolver
-            .stage_input(
-                &run_context,
-                "provider-invalid-input",
-                serde_json::json!({ "message": "not-an-integer" }),
-            )
-            .expect("invalid input stages");
-        let input_resolver_trait: Arc<dyn LoopCapabilityInputResolver> = input_resolver.clone();
-        let result_writer = Arc::new(RecordingResultWriter::default());
-        let port = HostRuntimeLoopCapabilityPortFactory::new(
-            runtime.clone(),
-            visible_request(context).with_provider_trust(std::collections::BTreeMap::from([(
-                provider_id,
-                dispatch_trust_decision(),
-            )])),
-            input_resolver_trait,
-            result_writer,
-            dummy_milestone_sink(),
-        )
-        .port_for_run_context(run_context);
-        let surface = port
-            .visible_capabilities(VisibleCapabilityRequest {})
-            .await
-            .expect("visible capabilities load");
+    struct FallbackInputResolver;
 
-        let outcome = port
-            .invoke_capability(CapabilityInvocation {
-                surface_version: surface.version,
-                capability_id,
-                input_ref,
-                is_provider_call: true,
-                approval_resume: None,
-                auth_resume: None,
-            })
-            .await
-            .expect("provider-origin invalid input maps to capability outcome");
-
-        let CapabilityOutcome::Failed(failure) = outcome else {
-            panic!("expected invalid input failure outcome");
-        };
-        assert_eq!(failure.error_kind, CapabilityFailureKind::InvalidInput);
-        assert!(
-            runtime.take_requests().is_empty(),
-            "schema-invalid provider input must not dispatch to the host runtime"
-        );
+    #[async_trait]
+    impl LoopCapabilityInputResolver for FallbackInputResolver {
+        async fn resolve_capability_input(
+            &self,
+            _run_context: &LoopRunContext,
+            _input_ref: &CapabilityInputRef,
+        ) -> Result<serde_json::Value, AgentLoopHostError> {
+            Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "fallback input resolver should not be used",
+            ))
+        }
     }
 
     #[tokio::test]
-    async fn register_then_resolve_survives_surface_refresh() {
-        let capability_id = CapabilityId::new("demo.echo").expect("valid capability id");
-        let provider_id = ExtensionId::new("demo").expect("valid provider id");
-        let mut context = execution_context("thread-provider-refresh");
-        let run_context = loop_run_context(&context).await;
-        let loop_driver_extension =
-            loop_driver_execution_extension_id(&run_context).expect("valid extension id");
-        context.grants.grants.push(dispatch_capability_grant(
-            &capability_id,
-            &loop_driver_extension,
-        ));
-        let runtime = Arc::new(RecordingHostRuntime::new(vec![visible_capability(
-            capability_id.clone(),
-            provider_id.clone(),
-        )]));
-        let input_resolver: Arc<dyn LoopCapabilityInputResolver> =
-            Arc::new(NoopCapabilityIo::default());
-        let result_writer = Arc::new(RecordingResultWriter::default());
-        let factory = HostRuntimeLoopCapabilityPortFactory::new(
-            runtime,
-            visible_request(context).with_provider_trust(std::collections::BTreeMap::from([(
-                provider_id,
-                dispatch_trust_decision(),
-            )])),
-            input_resolver,
-            result_writer.clone(),
-            dummy_milestone_sink(),
-        );
-        let first_port = factory.port_for_run_context(run_context.clone());
-        first_port
-            .visible_capabilities(VisibleCapabilityRequest {})
-            .await
-            .expect("initial surface loads");
-        let candidate = first_port
-            .register_provider_tool_call(provider_tool_call())
-            .await
-            .expect("provider input registers");
-        assert!(
-            candidate
-                .input_ref
-                .as_str()
-                .starts_with(&format!("input:{}:", run_context.run_id)),
-            "provider tool-call input ref must be run-scoped: {}",
-            candidate.input_ref.as_str()
-        );
-        assert!(
-            !candidate
-                .input_ref
-                .as_str()
-                .starts_with("input:provider-tool-"),
-            "provider tool-call input ref must not use the obsolete provider-tool prefix"
-        );
+    async fn provider_tool_call_input_resolver_stages_arguments() {
+        let run_context = loop_run_context(&execution_context("thread-provider-input")).await;
+        let resolver = ProviderToolCallInputResolver::new(Arc::new(FallbackInputResolver));
+        let call = provider_tool_call();
 
-        let second_port = factory.port_for_run_context(run_context.clone());
-        second_port
-            .visible_capabilities(VisibleCapabilityRequest {})
+        let input_ref = resolver
+            .register_provider_tool_call_input(&run_context, &call)
             .await
-            .expect("refreshed surface loads");
-        let outcome = second_port
-            .invoke_capability(CapabilityInvocation {
-                surface_version: candidate.surface_version,
-                capability_id: candidate.capability_id,
-                input_ref: candidate.input_ref,
-                is_provider_call: false,
-                approval_resume: None,
-                auth_resume: None,
-            })
+            .expect("provider input should stage");
+        let resolved = resolver
+            .resolve_capability_input(&run_context, &input_ref)
             .await
-            .expect("second port resolves provider input");
+            .expect("provider input should resolve");
 
-        assert!(matches!(outcome, CapabilityOutcome::Completed(_)));
-        assert_eq!(result_writer.records().len(), 1);
-        assert_eq!(
-            result_writer.records()[0].1,
-            serde_json::json!({"ok": true})
-        );
+        assert!(input_ref.as_str().starts_with("input:provider-tool-"));
+        assert_eq!(resolved, serde_json::json!({"message":"hello"}));
     }
 
     #[tokio::test]
@@ -3843,7 +3852,6 @@ mod tests {
             surface_version: surface.version,
             capability_id: candidate.capability_id,
             input_ref: candidate.input_ref,
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         };
@@ -3856,7 +3864,6 @@ mod tests {
                 surface_version: invocation.surface_version,
                 capability_id: invocation.capability_id,
                 input_ref: invocation.input_ref,
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -3909,7 +3916,6 @@ mod tests {
             surface_version: surface.version,
             capability_id: candidate.capability_id,
             input_ref: candidate.input_ref,
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         };
@@ -3980,7 +3986,6 @@ mod tests {
             surface_version: surface.version,
             capability_id: candidate.capability_id,
             input_ref: candidate.input_ref,
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -4058,7 +4063,6 @@ mod tests {
                     surface_version: surface.version.clone(),
                     capability_id: candidate.capability_id,
                     input_ref: candidate.input_ref,
-                    is_provider_call: false,
                     approval_resume: None,
                     auth_resume: None,
                 })
@@ -4141,7 +4145,6 @@ mod tests {
                     surface_version: surface.version.clone(),
                     capability_id: candidate.capability_id,
                     input_ref: candidate.input_ref,
-                    is_provider_call: false,
                     approval_resume: None,
                     auth_resume: None,
                 })
@@ -4223,7 +4226,6 @@ mod tests {
                 surface_version: surface.version,
                 capability_id: candidate.capability_id,
                 input_ref: candidate.input_ref,
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -4289,7 +4291,6 @@ mod tests {
                     .expect("synthetic capability id"),
                 input_ref: CapabilityInputRef::new("input:direct-capability-info")
                     .expect("test input ref"),
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -4370,7 +4371,6 @@ mod tests {
                 capability_id: CapabilityId::new(capability_info::CAPABILITY_ID)
                     .expect("synthetic capability id"),
                 input_ref,
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -4517,7 +4517,6 @@ mod tests {
                 surface_version: surface.version.clone(),
                 capability_id: candidate.capability_id,
                 input_ref: candidate.input_ref,
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -4584,7 +4583,6 @@ mod tests {
             capability_id: capability_id.clone(),
             input_ref: CapabilityInputRef::new("input:old-builtin-capability-info")
                 .expect("valid input ref"),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -4704,7 +4702,6 @@ mod tests {
             surface_version: surface.version.clone(),
             capability_id: override_id.clone(),
             input_ref: input_ref.clone(),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -4714,7 +4711,6 @@ mod tests {
             surface_version: surface.version,
             capability_id: default_id.clone(),
             input_ref,
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -4776,7 +4772,6 @@ mod tests {
                 capability_id: capability_id.clone(),
                 input_ref: CapabilityInputRef::new("input:process-sandbox-plan")
                     .expect("valid input ref"),
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -4876,7 +4871,6 @@ mod tests {
                 capability_id,
                 input_ref: CapabilityInputRef::new("input:direct-invalid")
                     .expect("valid input ref"),
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -4943,12 +4937,6 @@ mod tests {
             candidate
                 .input_ref
                 .as_str()
-                .starts_with(&format!("input:{}:", port.run_context.run_id))
-        );
-        assert!(
-            !candidate
-                .input_ref
-                .as_str()
                 .starts_with("input:provider-tool-")
         );
 
@@ -4957,7 +4945,6 @@ mod tests {
                 surface_version: surface.version,
                 capability_id,
                 input_ref: candidate.input_ref,
-                is_provider_call: true,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -5053,7 +5040,6 @@ mod tests {
                 surface_version: surface.version,
                 capability_id,
                 input_ref: candidate.input_ref,
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -5149,7 +5135,6 @@ mod tests {
                 surface_version: surface.version,
                 capability_id,
                 input_ref: candidate.input_ref,
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -5227,7 +5212,6 @@ mod tests {
             surface_version: surface.version,
             capability_id,
             input_ref: CapabilityInputRef::new("input:direct-normalized").expect("valid input ref"),
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         })
@@ -5285,7 +5269,6 @@ mod tests {
                 capability_id,
                 input_ref: CapabilityInputRef::new("input:invalid-process-sandbox-plan")
                     .expect("valid input ref"),
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -5343,7 +5326,6 @@ mod tests {
                 capability_id,
                 input_ref: CapabilityInputRef::new("input:malformed-process-sandbox-plan")
                     .expect("valid input ref"),
-                is_provider_call: false,
                 approval_resume: None,
                 auth_resume: None,
             })
@@ -5672,7 +5654,6 @@ mod tests {
             surface_version: invocation.surface_version,
             capability_id: invocation.capability_id,
             input_ref: invocation.input_ref,
-            is_provider_call: false,
             approval_resume: Some(CapabilityApprovalResume {
                 approval_request_id: ApprovalRequestId::new(),
                 resume_token: resume_token.clone(),
@@ -5952,11 +5933,11 @@ mod tests {
     }
 
     fn dummy_input_resolver() -> Arc<dyn LoopCapabilityInputResolver> {
-        Arc::new(NoopCapabilityIo::default())
+        Arc::new(NoopCapabilityIo)
     }
 
     fn dummy_result_writer() -> Arc<dyn LoopCapabilityResultWriter> {
-        Arc::new(NoopCapabilityIo::default())
+        Arc::new(NoopCapabilityIo)
     }
 
     fn dummy_milestone_sink() -> Arc<dyn LoopHostMilestoneSink> {
@@ -6009,7 +5990,6 @@ mod tests {
             surface_version: surface.version,
             capability_id: candidate.capability_id,
             input_ref: candidate.input_ref,
-            is_provider_call: false,
             approval_resume: None,
             auth_resume: None,
         }
@@ -6441,75 +6421,16 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct NoopCapabilityIo {
-        inputs: Mutex<HashMap<String, serde_json::Value>>,
-    }
-
-    impl NoopCapabilityIo {
-        fn stage_input(
-            &self,
-            run_context: &LoopRunContext,
-            label: &str,
-            input: serde_json::Value,
-        ) -> Result<CapabilityInputRef, AgentLoopHostError> {
-            let serialized = serde_json::to_string(&input).expect("test input serializes");
-            let payload = format!(
-                "test-input\nrun={}\nlabel={label}\ninput={serialized}",
-                run_context.run_id
-            );
-            let digest = sha256_digest_token(payload.as_bytes());
-            let digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
-            let input_ref =
-                CapabilityInputRef::new(format!("input:{}:{digest}", run_context.run_id)).map_err(
-                    |_| {
-                        AgentLoopHostError::new(
-                            AgentLoopHostErrorKind::Internal,
-                            "test capability input ref could not be represented",
-                        )
-                    },
-                )?;
-            self.inputs
-                .lock()
-                .expect("test input store lock")
-                .insert(input_ref.as_str().to_string(), input);
-            Ok(input_ref)
-        }
-    }
+    struct NoopCapabilityIo;
 
     #[async_trait]
     impl LoopCapabilityInputResolver for NoopCapabilityIo {
         async fn resolve_capability_input(
             &self,
-            run_context: &LoopRunContext,
-            input_ref: &CapabilityInputRef,
+            _run_context: &LoopRunContext,
+            _input_ref: &CapabilityInputRef,
         ) -> Result<serde_json::Value, AgentLoopHostError> {
-            let expected_prefix = format!("input:{}:", run_context.run_id);
-            if !input_ref.as_str().starts_with(&expected_prefix) {
-                return Err(AgentLoopHostError::new(
-                    AgentLoopHostErrorKind::ScopeMismatch,
-                    "test capability input ref is not scoped to this loop run",
-                ));
-            }
-            self.inputs
-                .lock()
-                .expect("test input store lock")
-                .get(input_ref.as_str())
-                .cloned()
-                .ok_or_else(|| {
-                    AgentLoopHostError::new(
-                        AgentLoopHostErrorKind::InvalidInvocation,
-                        "test capability input ref was not staged for this loop run",
-                    )
-                })
-        }
-
-        async fn register_provider_tool_call_input(
-            &self,
-            run_context: &LoopRunContext,
-            tool_call: &ProviderToolCall,
-        ) -> Result<CapabilityInputRef, AgentLoopHostError> {
-            self.stage_input(run_context, &tool_call.id, tool_call.arguments.clone())
+            unreachable!("noop capability io should not be called")
         }
     }
 
