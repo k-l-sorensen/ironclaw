@@ -3,7 +3,8 @@ use ironclaw_turns::{
     LoopCancelledReasonKind, LoopCompletionKind, LoopDiagnosticRef, LoopExit, LoopFailureKind,
     LoopGateRef, LoopResultRef, TurnRunId,
     run_profile::{
-        AgentLoopHostError, AgentLoopHostErrorKind, CapabilityApprovalResume, CapabilityAuthResume,
+        AgentLoopHostError, AgentLoopHostErrorKind, AuthResumeApprovalIdentity,
+        CapabilityApprovalResume, CapabilityAuthResume, CapabilityAuthResumeReplay,
         CapabilityCallCandidate, CapabilityFailureDetail, CapabilityFailureKind,
         CapabilityInputIssue, CapabilityInputIssueCode, CapabilityInputRef, CapabilityInputRepair,
         CapabilityOutcome, CapabilityRecoveryHint, CapabilityResultMessage, CapabilityResumeToken,
@@ -4749,6 +4750,8 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
     let auth_gate_resume_token =
         CapabilityResumeToken::new("resume-token:corr-id-auth-gate").expect("valid token");
     let correlation_id = CorrelationId::new();
+    let auth_gate_approval_request_id = ApprovalRequestId::new();
+    let auth_gate_correlation_id = CorrelationId::new();
     let original_input_ref = CapabilityInputRef::new("input:corr-id-original").expect("valid");
     let completed_ref = LoopResultRef::new("result:corr-id-done").expect("valid");
 
@@ -4779,8 +4782,14 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
                 safe_summary: "auth required".to_string(),
                 auth_resume: Some(CapabilityAuthResume {
                     resume_token: auth_gate_resume_token,
-                    prior_approval: None,
-                    replay: None,
+                    prior_approval: Some(AuthResumeApprovalIdentity {
+                        approval_request_id: auth_gate_approval_request_id,
+                        correlation_id: auth_gate_correlation_id,
+                    }),
+                    replay: Some(CapabilityAuthResumeReplay {
+                        input: serde_json::json!({ "message": "wrong-source" }),
+                        estimate: ResourceEstimate::default(),
+                    }),
                 }),
             }],
             stopped_on_suspension: true,
@@ -4843,6 +4852,10 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
         .as_ref()
         .expect("pending_auth_resume.prior_approval must be set when approval preceded auth");
     assert_eq!(
+        pending_pa.approval_request_id, approval_request_id,
+        "pending_auth_resume.prior_approval.approval_request_id must equal the approval's id"
+    );
+    assert_eq!(
         pending_pa.correlation_id, correlation_id,
         "pending_auth_resume.prior_approval.correlation_id must equal the approval's correlation_id"
     );
@@ -4877,6 +4890,10 @@ async fn auth_resume_after_approval_carries_original_correlation_id() {
         .prior_approval
         .as_ref()
         .expect("phase 3 auth_resume.prior_approval must be set");
+    assert_eq!(
+        phase3_pa.approval_request_id, approval_request_id,
+        "phase 3 auth_resume.prior_approval.approval_request_id must match the original approval id"
+    );
     assert_eq!(
         phase3_pa.correlation_id, correlation_id,
         "phase 3 auth_resume.prior_approval.correlation_id must match the original approval correlation_id"
