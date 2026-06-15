@@ -32,6 +32,8 @@ pub const WEBUI_V2_ROUTE_GET_TIMELINE: &str = "webui.v2.get_timeline";
 pub const WEBUI_V2_ROUTE_STREAM_EVENTS: &str = "webui.v2.stream_events";
 pub const WEBUI_V2_ROUTE_STREAM_EVENTS_WS: &str = "webui.v2.stream_events_ws";
 pub const WEBUI_V2_ROUTE_LIST_AUTOMATIONS: &str = "webui.v2.list_automations";
+pub const WEBUI_V2_ROUTE_TRACE_CREDITS: &str = "webui.v2.trace_credits";
+pub const WEBUI_V2_ROUTE_TRACE_HOLD_AUTHORIZE: &str = "webui.v2.authorize_trace_hold";
 pub const WEBUI_V2_ROUTE_GET_OUTBOUND_PREFERENCES: &str = "webui.v2.get_outbound_preferences";
 pub const WEBUI_V2_ROUTE_SET_OUTBOUND_PREFERENCES: &str = "webui.v2.set_outbound_preferences";
 pub const WEBUI_V2_ROUTE_LIST_OUTBOUND_DELIVERY_TARGETS: &str =
@@ -80,6 +82,9 @@ pub const WEBUI_V2_PATTERN_GET_TIMELINE: &str = "/api/webchat/v2/threads/{thread
 pub const WEBUI_V2_PATTERN_STREAM_EVENTS: &str = "/api/webchat/v2/threads/{thread_id}/events";
 pub const WEBUI_V2_PATTERN_STREAM_EVENTS_WS: &str = "/api/webchat/v2/threads/{thread_id}/ws";
 pub const WEBUI_V2_PATTERN_LIST_AUTOMATIONS: &str = "/api/webchat/v2/automations";
+pub const WEBUI_V2_PATTERN_TRACE_CREDITS: &str = "/api/webchat/v2/traces/credit";
+pub const WEBUI_V2_PATTERN_TRACE_HOLD_AUTHORIZE: &str =
+    "/api/webchat/v2/traces/holds/{submission_id}/authorize";
 pub const WEBUI_V2_PATTERN_OUTBOUND_PREFERENCES: &str = "/api/webchat/v2/outbound/preferences";
 pub const WEBUI_V2_PATTERN_OUTBOUND_DELIVERY_TARGETS: &str = "/api/webchat/v2/outbound/targets";
 pub const WEBUI_V2_PATTERN_LIST_CONNECTABLE_CHANNELS: &str = "/api/webchat/v2/channels/connectable";
@@ -135,6 +140,8 @@ pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
         resolve_gate_descriptor(),
         retry_run_descriptor(),
         list_automations_descriptor(),
+        trace_credits_descriptor(),
+        authorize_trace_hold_descriptor(),
         get_outbound_preferences_descriptor(),
         set_outbound_preferences_descriptor(),
         list_outbound_delivery_targets_descriptor(),
@@ -340,6 +347,35 @@ fn list_automations_descriptor() -> IngressRouteDescriptor {
             AuditTraceClass::UserAction,
             AllowedEffectPath::ProductWorkflow,
             StreamingMode::None,
+        ),
+    )
+}
+
+fn trace_credits_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_TRACE_CREDITS,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_TRACE_CREDITS,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn authorize_trace_hold_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_TRACE_HOLD_AUTHORIZE,
+        NetworkMethod::Post,
+        WEBUI_V2_PATTERN_TRACE_HOLD_AUTHORIZE,
+        mutation_policy(
+            // The submission id is in the path; no request body.
+            BodyLimitPolicy::NoBody,
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
         ),
     )
 }
