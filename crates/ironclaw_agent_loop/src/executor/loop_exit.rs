@@ -2,8 +2,9 @@ use async_trait::async_trait;
 use ironclaw_turns::{
     LoopExit, LoopMessageRef,
     run_profile::{
-        AssistantReply, FinalizeAssistantMessage, LoopInlineMessage, LoopInlineMessageRole,
-        LoopModelCapabilityView, LoopModelRequest, LoopSafeSummary, ParentLoopOutput,
+        AgentLoopHostError, AgentLoopHostErrorKind, AssistantReply, FinalizeAssistantMessage,
+        LoopInlineMessage, LoopInlineMessageRole, LoopModelCapabilityView, LoopModelRequest,
+        LoopSafeSummary, ParentLoopOutput,
     },
 };
 
@@ -14,7 +15,7 @@ use crate::{
 
 use super::{
     AgentLoopExecutorError, CancelCheck, CheckpointStage, ExecutorStage, FailedExitDetails,
-    HostStage, StageContext, attach_failure_explanation, completed_exit, failed_exit,
+    StageContext, attach_failure_explanation, completed_exit, failed_exit,
     model_preference_to_host,
 };
 
@@ -70,13 +71,14 @@ pub(super) async fn try_final_answer_nudge(
         role: LoopInlineMessageRole::User,
         safe_body,
     });
-    let bundle = ctx.host.build_prompt_bundle(request).await.map_err(|_| {
-        AgentLoopExecutorError::HostUnavailable {
-            stage: HostStage::Prompt,
-        }
-    })?;
-    // Count it before the call so a failure can't be retried into a loop.
+    // Count the attempt before any host call so a failure can't be retried into
+    // a loop, and so the best-effort nudge is bounded even when its own
+    // infrastructure is the thing failing.
     state.final_answer_nudges_used += 1;
+    let bundle = match ctx.host.build_prompt_bundle(request).await {
+        Ok(bundle) => bundle,
+        Err(error) => return nudge_bail("prompt", error),
+    };
 
     let model_preference = model_preference_to_host(ctx.planner.model().preference(state).await)?;
     // An *empty* capability view (not `None`) is what actually forces a tool-free
@@ -93,11 +95,10 @@ pub(super) async fn try_final_answer_nudge(
             visible_capability_ids: Vec::new(),
         }),
     };
-    let response = ctx.host.stream_model(model_request).await.map_err(|_| {
-        AgentLoopExecutorError::HostUnavailable {
-            stage: HostStage::Model,
-        }
-    })?;
+    let response = match ctx.host.stream_model(model_request).await {
+        Ok(response) => response,
+        Err(error) => return nudge_bail("model", error),
+    };
 
     let usage = response.usage;
     match response.output {
@@ -120,13 +121,14 @@ pub(super) async fn try_final_answer_nudge(
                     let output_tokens = usage
                         .map(|u| u.output_tokens)
                         .unwrap_or_else(|| estimate_output_tokens(&reply.content));
-                    let reply_ref = ctx
+                    let reply_ref = match ctx
                         .host
                         .finalize_assistant_message(FinalizeAssistantMessage { reply })
                         .await
-                        .map_err(|_| AgentLoopExecutorError::HostUnavailable {
-                            stage: HostStage::Transcript,
-                        })?;
+                    {
+                        Ok(reply_ref) => reply_ref,
+                        Err(error) => return nudge_bail("transcript", error),
+                    };
                     state.recent_output_token_counts.push(output_tokens);
                     Ok(Some(reply_ref))
                 }
@@ -138,6 +140,28 @@ pub(super) async fn try_final_answer_nudge(
         // Model emitted capability calls despite the tool-free surface — give up.
         _ => Ok(None),
     }
+}
+
+/// Best-effort nudge host-call failures must NOT bork the run: the nudge exists
+/// to rescue an otherwise-empty turn ending, so when its own prompt/model/
+/// transcript host call fails we fall back (`Ok(None)`) and let the caller keep
+/// its normal exit. Only explicit cancellation is propagated. The underlying
+/// cause is logged (never erased) — this is the fail-open counterpart to the
+/// `map_err(|_| ...)?` pattern the executor otherwise forbids.
+fn nudge_bail(
+    stage: &'static str,
+    error: AgentLoopHostError,
+) -> Result<Option<LoopMessageRef>, AgentLoopExecutorError> {
+    if error.kind == AgentLoopHostErrorKind::Cancelled {
+        return Err(AgentLoopExecutorError::Cancelled);
+    }
+    tracing::debug!(
+        nudge_stage = stage,
+        error_kind = ?error.kind,
+        detail = %error.safe_summary,
+        "final-answer nudge host call failed; falling back to normal exit"
+    );
+    Ok(None)
 }
 
 /// Fallback output-token estimate when the provider reports no usage, mirroring

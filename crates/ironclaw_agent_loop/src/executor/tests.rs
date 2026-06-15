@@ -1797,6 +1797,118 @@ async fn nudge_respects_one_shot_cap() {
 }
 
 #[tokio::test]
+async fn no_progress_nudge_model_failure_falls_back_to_canned_reply() {
+    // Gate ON but the nudge's OWN model call fails (non-cancel host error). The
+    // nudge is best-effort: it must NOT bork the run — the no-progress exit
+    // falls back to its canned reply instead of propagating the failure.
+    let host = MockHost::new(Vec::new())
+        .with_driver_nudges_enabled()
+        .with_model_errors(vec![AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "nudge model call failed",
+        )]);
+    let family = crate::families::default();
+    let ctx = StageContext {
+        planner: family.planner(),
+        host: &host,
+    };
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let exit = ExitStage
+        .process(
+            ctx,
+            ExitInput {
+                state,
+                kind: StopKind::NoProgressDetected,
+            },
+        )
+        .await
+        .expect("nudge model failure must not propagate out of the exit stage");
+
+    assert_eq!(
+        host.model_requests().len(),
+        1,
+        "nudge attempted exactly one model call before failing open"
+    );
+    assert!(
+        matches!(exit, LoopExit::Completed(_)),
+        "nudge model failure must fall back to the canned no-progress reply, got {exit:?}"
+    );
+}
+
+#[tokio::test]
+async fn budget_nudge_model_failure_falls_back_to_failed_exit() {
+    // Gate ON at the iteration-limit boundary, but the nudge's model call fails.
+    // The budget stage must fall through to its normal explained-failure exit
+    // (also fail-open) rather than propagating the nudge host error.
+    let host = MockHost::new(Vec::new())
+        .with_driver_nudges_enabled()
+        .with_model_errors(vec![AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Unavailable,
+            "nudge model call failed",
+        )]);
+    let family = family_with_compaction_strategy(DefaultCompactionStrategy {
+        deadline_ms: 1,
+        ..Default::default()
+    });
+    let ctx = StageContext {
+        planner: family.planner(),
+        host: &host,
+    };
+    let mut state = LoopExecutionState::initial_for_run(host.run_context());
+    state.iteration = family.planner().budget().iteration_limit(&state);
+
+    let step = BudgetStage
+        .process(
+            ctx,
+            BudgetInput {
+                state,
+                pending_input_ack: PendingInputAck::default(),
+            },
+        )
+        .await
+        .expect("nudge model failure must not propagate out of the budget stage");
+
+    assert!(
+        matches!(step, BudgetStep::Exit(LoopExit::Failed(_))),
+        "budget nudge model failure must fall back to the failed exit"
+    );
+}
+
+#[tokio::test]
+async fn nudge_model_cancellation_propagates() {
+    // A cancellation surfaced during the nudge model call MUST propagate (the
+    // run is being cancelled), unlike other host failures which fall open.
+    let host = MockHost::new(Vec::new())
+        .with_driver_nudges_enabled()
+        .with_model_errors(vec![AgentLoopHostError::new(
+            AgentLoopHostErrorKind::Cancelled,
+            "cancelled during nudge",
+        )]);
+    let family = crate::families::default();
+    let ctx = StageContext {
+        planner: family.planner(),
+        host: &host,
+    };
+    let state = LoopExecutionState::initial_for_run(host.run_context());
+
+    let result = ExitStage
+        .process(
+            ctx,
+            ExitInput {
+                state,
+                kind: StopKind::NoProgressDetected,
+            },
+        )
+        .await;
+
+    assert!(
+        matches!(result, Err(AgentLoopExecutorError::Cancelled)),
+        "nudge cancellation must propagate, got {result:?}"
+    );
+}
+
+#[tokio::test]
 async fn exit_stage_aborted_exits_with_requested_failure_kind() {
     let host = MockHost::new(Vec::new());
     let family = crate::families::default();
