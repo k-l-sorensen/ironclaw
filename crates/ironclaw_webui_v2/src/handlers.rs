@@ -158,8 +158,12 @@ pub struct TimelineQuery {
 /// message_id, attachment_id)` triple addresses the attachment; the caller's
 /// authority comes from the authenticated session, and the facade derives the
 /// scope and resolves the storage path server-side. The response sets the
-/// authoritative `Content-Type` from the stored ref plus `nosniff` and a short
-/// private cache so the browser can reuse the bytes without re-fetching.
+/// authoritative `Content-Type` from the stored ref plus `nosniff`, forces
+/// `Content-Disposition: attachment` so a direct navigation can never render
+/// the bytes inline, and a short private cache so the browser can reuse the
+/// bytes without re-fetching. The SPA reads bytes via `fetch` and renders
+/// previews through `data:`/`blob:` URLs, so the attachment disposition is
+/// purely defensive — it does not affect in-app preview.
 pub async fn get_attachment(
     State(state): State<WebUiV2State>,
     Extension(caller): Extension<WebUiAuthenticatedCaller>,
@@ -190,6 +194,14 @@ pub async fn get_attachment(
     headers.insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, max-age=300"),
+    );
+    // Defense-in-depth: force download semantics so a direct navigation to this
+    // endpoint can never execute a mis-classified payload inline. The SPA fetches
+    // bytes via JS and previews them through data:/blob: URLs, so this does not
+    // affect in-app rendering.
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        HeaderValue::from_static("attachment"),
     );
     Ok((StatusCode::OK, headers, attachment.bytes).into_response())
 }

@@ -3118,24 +3118,6 @@ impl RebornServices {
         })
     }
 
-    /// Fallback timeline fetch for automation-trigger threads.
-    ///
-    /// Automation-trigger threads are created under the trigger creator's
-    /// scope, not the caller's session scope. The normal user-scoped
-    /// `list_thread_history` therefore always misses them. This fallback is
-    /// only reached when the user-scoped lookup returned `UnknownThread` or
-    /// `ThreadScopeMismatch`.
-    ///
-    /// Authorization: the thread_id must appear in at least one `recent_run`
-    /// for an automation returned by `list_automations` for this caller. That
-    /// is the same authorization check the Automations list endpoint applies,
-    /// so no new trust boundary is introduced. Authorization is revalidated on
-    /// every call — no caching.
-    ///
-    /// On authorization success, the history is loaded with the trigger-owned
-    /// scope. On authorization failure (thread not in any of the caller's
-    /// automation runs), the `original_not_found_error` is returned so the
-    /// response is indistinguishable from a genuinely absent thread.
     /// Resolve a caller-visible thread's history together with the thread scope
     /// it actually lives under.
     ///
@@ -3143,8 +3125,9 @@ impl RebornServices {
     /// it applies the automation-trigger fallback: trigger-fired threads are
     /// stored under the creator's scope, not the WebUI caller's session scope,
     /// so the user-scoped lookup always misses them. If the thread belongs to
-    /// one of the caller's automations (`list_automations` applies the same
-    /// authorization), the history is re-fetched under the trigger-owned scope.
+    /// one of the caller's automations (`resolve_run_thread_scope` performs the
+    /// caller-scoped authorization lookup), the history is re-fetched under the
+    /// trigger-owned scope.
     /// Both `UnknownThread` and `ThreadScopeMismatch` are eligible for the
     /// fallback; backend/serialization errors propagate as-is.
     ///

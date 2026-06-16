@@ -1456,8 +1456,8 @@ where
     }
 }
 
-/// Host-managed text-only model gateway. Implementations own provider selection,
-/// profile policy, retry/circuit behavior, and sanitization.
+/// Host-managed model gateway. Implementations own provider selection,
+/// profile policy, retry/circuit behavior, multimodal shaping, and sanitization.
 #[async_trait]
 pub trait HostManagedModelGateway: Send + Sync {
     async fn stream_model(

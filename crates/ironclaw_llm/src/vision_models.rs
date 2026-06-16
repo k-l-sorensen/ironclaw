@@ -43,9 +43,18 @@ pub fn is_vision_model(model: &str) -> bool {
 ///
 /// Priority: Claude > GPT-4 > Gemini > others.
 pub fn suggest_vision_model(models: &[String]) -> Option<&str> {
+    // Tier-first slugs are load-bearing here for the same reason as
+    // `VISION_PATTERNS`: `claude-4` is not a substring of `claude-opus-4-8`,
+    // so without the `claude-{opus,sonnet,haiku,fable}-` prefixes a current-gen
+    // Claude model would lose priority to GPT-4. Opus > Sonnet > Haiku ordering
+    // preserves the "best Claude first" intent.
     let priorities: &[&str] = &[
         "claude-3",
         "claude-4",
+        "claude-opus-",
+        "claude-sonnet-",
+        "claude-haiku-",
+        "claude-fable-",
         "gpt-4o",
         "gpt-4-turbo",
         "gpt-4-vision",
