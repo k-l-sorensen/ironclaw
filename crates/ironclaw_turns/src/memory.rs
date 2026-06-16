@@ -137,6 +137,7 @@ struct RunRecord {
     subagent_depth: u32,
     spawn_tree_root_run_id: Option<TurnRunId>,
     product_context: Option<crate::ProductTurnContext>,
+    auth_resume_disposition: Option<crate::AuthResumeDisposition>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -625,6 +626,7 @@ impl TurnStateStore for InMemoryTurnStateStore {
             subagent_depth: 0,
             spawn_tree_root_run_id: None,
             product_context: request.product_context,
+            auth_resume_disposition: None,
         };
         inner.turns.insert(turn_id, turn_record);
         inner.active_locks.insert(
@@ -1059,6 +1061,7 @@ impl TurnSpawnTreeStateStore for InMemoryTurnStateStore {
             subagent_depth,
             spawn_tree_root_run_id: Some(root_run_id),
             product_context: parent_product_context,
+            auth_resume_disposition: None,
         };
         inner.turns.insert(turn_id, turn_record);
         inner.active_locks.insert(
@@ -1499,6 +1502,7 @@ impl Inner {
                     subagent_depth: run.subagent_depth,
                     spawn_tree_root_run_id: run.spawn_tree_root_run_id,
                     product_context: run.product_context,
+                    auth_resume_disposition: run.auth_resume_disposition,
                 },
             );
         }
@@ -2022,6 +2026,7 @@ impl Inner {
             }
             let now = Utc::now();
             record.status = TurnStatus::Queued;
+            record.auth_resume_disposition = request.auth_resume_disposition.clone();
             record.gate_ref = None;
             record.credential_requirements = Vec::new();
             record.source_binding_ref = request.source_binding_ref.clone();
@@ -2924,6 +2929,7 @@ impl RunRecord {
             subagent_depth: self.subagent_depth,
             spawn_tree_root_run_id: self.spawn_tree_root_run_id,
             product_context: self.product_context.clone(),
+            auth_resume_disposition: self.auth_resume_disposition.clone(),
         }
     }
 
@@ -2947,6 +2953,7 @@ impl RunRecord {
             failure: self.failure.clone(),
             event_cursor: self.event_cursor,
             product_context: self.product_context.clone(),
+            auth_resume_disposition: self.auth_resume_disposition.clone(),
         }
     }
 }

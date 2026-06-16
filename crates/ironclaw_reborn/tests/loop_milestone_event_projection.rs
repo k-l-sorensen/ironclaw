@@ -802,6 +802,7 @@ impl HostFixture {
             failure: None,
             event_cursor: EventCursor(1),
             product_context: None,
+            auth_resume_disposition: None,
         };
         let claimed = ClaimedTurnRun {
             state,
