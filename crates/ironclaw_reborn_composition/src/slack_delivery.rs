@@ -326,9 +326,18 @@ impl SlackFinalReplyDeliveryObserver {
             else {
                 return Ok(());
             };
-            let next_blocked_marker = blocked_actionable_marker(&actionable_state);
+            let mut next_blocked_marker = blocked_actionable_marker(&actionable_state);
             let event_kind = notification.event_kind;
             let gate_ref_for_routing = notification.gate_ref_for_routing.clone();
+            // A non-OAuth `BlockedAuth` gate is converted into a cancel + terminal
+            // `FinalReplyReady` notice by the notification builder. Once that notice
+            // is delivered the run is no longer waiting, so the pre-cancel blocked
+            // marker must not keep the delivery loop polling.
+            if matches!(actionable_state.status, TurnStatus::BlockedAuth)
+                && event_kind == RunNotificationEventKind::FinalReplyReady
+            {
+                next_blocked_marker = None;
+            }
             let posted_messages = self
                 .deliver_run_notification(
                     &envelope,
@@ -2049,9 +2058,20 @@ async fn deliver_triggered_run(
             }
         };
 
-        let next_blocked_marker = blocked_actionable_marker(&state);
+        let mut next_blocked_marker = blocked_actionable_marker(&state);
         let event_kind = notification.event_kind;
         let gate_ref_for_routing = notification.gate_ref_for_routing.clone();
+        // A non-OAuth `BlockedAuth` gate is converted into a cancel + terminal
+        // `FinalReplyReady` notice by `triggered_notification_for_state`. Once that
+        // notice is delivered the run is no longer waiting, so the pre-cancel
+        // blocked marker must not drive another poll cycle — otherwise the loop
+        // re-polls the cancelled run and records the outcome as `Skipped` (or a
+        // timeout) instead of `Delivered`.
+        if matches!(state.status, TurnStatus::BlockedAuth)
+            && event_kind == RunNotificationEventKind::FinalReplyReady
+        {
+            next_blocked_marker = None;
+        }
 
         // Build the delivery request and deliver.
         let delivery_result = deliver_triggered_notification(
@@ -5497,47 +5517,29 @@ mod tests {
         let binding_ref =
             test_slack_binding_ref(install, scope.agent_id.as_ref().expect("agent").as_str());
 
-        // First poll → BlockedAuth with gate_ref; second poll → Completed.
+        // First poll → BlockedAuth (non-OAuth) with gate_ref. The non-OAuth
+        // branch cancels the run and posts a terminal "auth unavailable" notice,
+        // so the second poll is the cancelled (terminal) state — never Completed.
+        // Regression: the pre-cancel blocked marker must not re-drive the loop,
+        // which would record the outcome as Skipped instead of Delivered.
         let coordinator = Arc::new(ScriptedTurnCoordinator::with_states(vec![
             scripted_state(TurnStatus::BlockedAuth, Some(gate_ref_str)),
-            scripted_state(TurnStatus::Completed, None),
+            scripted_state(TurnStatus::Cancelled, None),
         ]));
         let thread_service = Arc::new(InMemorySessionThreadService::default());
-        seed_finalized_assistant_message(
-            &thread_service,
-            &scope,
-            run_id,
-            "Run complete after auth.",
-        )
-        .await;
 
         let outbound = Arc::new(InMemoryOutboundStateStore::default());
         seed_personal_preference(&outbound, &scope, binding_ref).await;
 
         let egress = Arc::new(FakeProtocolHttpEgress::new(vec!["slack.com".to_string()]));
         egress.allow_credential_handle("slack_bot_token");
-        // Auth-prompt delivery response.
+        // The single "auth unavailable" notice post — the run is cancelled, so no
+        // further delivery happens.
         egress.program_response(
             "slack.com",
             Ok(EgressResponse::new(
                 200,
                 slack_post_ok_json("D456", "9999.1111"),
-            )),
-        );
-        // Final-reply response (after Completed).
-        egress.program_response(
-            "slack.com",
-            Ok(EgressResponse::new(
-                200,
-                slack_post_ok_json("D456", "9999.2222"),
-            )),
-        );
-        // Auth message is deleted after final; need a delete response.
-        egress.program_response(
-            "slack.com",
-            Ok(EgressResponse::new(
-                200,
-                serde_json::json!({"ok": true}).to_string().into_bytes(),
             )),
         );
 
@@ -5568,7 +5570,15 @@ mod tests {
         driver
             .on_trigger_submitted(fire, run_id, scope.clone())
             .await;
-        wait_for_delivery_record(&delivery_store, run_id).await;
+        let record = wait_for_delivery_record(&delivery_store, run_id).await;
+        // The auth-unavailable notice WAS delivered, so the outcome must be
+        // Delivered — not Skipped/timeout from re-polling the cancelled run on a
+        // stale pre-cancel blocked marker. This is the regression guard.
+        assert_eq!(
+            record.outcome,
+            TriggeredRunDeliveryOutcomeKind::Delivered,
+            "non-OAuth auth denial delivered a notice; outcome must be Delivered, not Skipped"
+        );
 
         let creator = ironclaw_host_api::UserId::new("creator-user").expect("user id");
         // Non-OAuth auth (no `authorization_url`) is DENIED over Slack: the run is
