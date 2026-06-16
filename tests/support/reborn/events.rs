@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use ironclaw_turns::{
     TurnEventProjectionCursor, TurnEventProjectionRequest, TurnEventProjectionService,
     TurnEventProjectionSnapshot,
@@ -12,6 +14,7 @@ pub async fn turn_event_snapshot(
     Ok(TurnEventProjectionService::new(harness.turn_store())
         .snapshot(TurnEventProjectionRequest {
             scope: submitted.scope.clone(),
+            owner_user_id: owner_user_id(submitted),
             after: None,
             limit: 100,
         })
@@ -27,8 +30,17 @@ pub async fn turn_event_updates(
     Ok(TurnEventProjectionService::new(harness.turn_store())
         .updates(TurnEventProjectionRequest {
             scope: submitted.scope.clone(),
+            owner_user_id: owner_user_id(submitted),
             after,
             limit,
         })
         .await?)
+}
+
+fn owner_user_id(submitted: &SubmittedTurn) -> Option<ironclaw_host_api::UserId> {
+    submitted
+        .scope
+        .explicit_owner_user_id()
+        .cloned()
+        .or_else(|| Some(submitted.actor.user_id.clone()))
 }

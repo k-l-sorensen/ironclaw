@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use ironclaw_threads::{MessageKind, MessageStatus, ThreadMessageRecord};
 use ironclaw_turns::{TurnEventKind, TurnLifecycleEvent, TurnStatus};
 
