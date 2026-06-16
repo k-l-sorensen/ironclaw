@@ -392,6 +392,7 @@ impl RebornLocalServiceLifecycle {
                     Err(response) => return response,
                 };
                 let path = path.to_string_lossy().to_string();
+                // silent-ok: launchctl reports failure when the agent is already loaded.
                 let _ = self.runner.run("launchctl", &["load", "-w", &path]);
                 self.run_checked(
                     action,
