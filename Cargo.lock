@@ -4569,6 +4569,7 @@ dependencies = [
  "ironclaw_event_projections",
  "ironclaw_events",
  "ironclaw_extensions",
+ "ironclaw_extractors",
  "ironclaw_filesystem",
  "ironclaw_first_party_extensions",
  "ironclaw_host_api",
