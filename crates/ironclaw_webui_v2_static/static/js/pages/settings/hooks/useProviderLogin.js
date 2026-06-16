@@ -1,11 +1,16 @@
 import { useQueryClient } from "@tanstack/react-query";
+import { appScopedPath } from "../../../lib/app-path.js";
+import { gatewayOrigin, isDesktopRuntime, openExternalUrl, tauriInvoke } from "../../../lib/api.js";
 import { React } from "../../../lib/html.js";
 import { useT } from "../../../lib/i18n.js";
 import {
   completeNearaiWalletLogin,
   fetchLlmProviders,
+  restartDesktopSidecar,
+  setActiveLlm,
   startCodexLogin,
   startNearaiLogin,
+  testLlmProviderConnection,
 } from "../lib/settings-api.js";
 
 const WALLET_LOGIN_TIMEOUT_MS = 300_000;
@@ -34,6 +39,21 @@ export function isLocalDevOrigin() {
     /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host) ||
     host.endsWith(".localhost")
   );
+}
+
+// Desktop-only (additive): the login origin/URL helpers the packaged app uses.
+// On web they resolve to the same `window.location.origin` / app-scoped path
+// the hosted UI already uses, so importing them is inert there.
+export function providerLoginOrigin() {
+  if (isDesktopRuntime()) {
+    const origin = gatewayOrigin();
+    if (origin) return origin;
+  }
+  return window.location.origin;
+}
+
+export function walletLoginUrl(channelName) {
+  return appScopedPath(`/wallet/connect?channel=${encodeURIComponent(channelName)}`);
 }
 
 function walletLoginChannelName() {
@@ -86,6 +106,13 @@ const NEARAI_POLL_DEADLINE_MS = 300_000;
 const CODEX_POLL_DEADLINE_MS = 900_000;
 const POLL_INTERVAL_MS = 2000;
 
+// Desktop self-heal: when there is no popup handle to watch (the desktop
+// loopback / external-browser flow), the backend is expected to activate the
+// provider after the callback lands — but if it only stored the session, verify
+// the credential actually works (test-connection) and flip the selection
+// ourselves. Runs every few ticks; a real network call against the provider.
+const ACTIVATE_PROBE_EVERY_TICKS = 3;
+
 // Poll the LLM snapshot until `providerId` becomes the active provider, the
 // login popup is closed, or the deadline passes. When a `popup` handle is
 // given, a closed window short-circuits the wait so the UI recovers the instant
@@ -97,8 +124,10 @@ async function pollUntilActive(providerId, deadlineMs, popup) {
   // successful sign-in, so keep confirming activation for a short grace window
   // after a close before concluding the user actually cancelled.
   let graceChecksAfterClose = 2;
+  let tick = 0;
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+    tick += 1;
     const snapshot = await fetchLlmProviders().catch(() => null);
     if (snapshot?.active?.provider_id === providerId) {
       return "active";
@@ -108,6 +137,26 @@ async function pollUntilActive(providerId, deadlineMs, popup) {
         return "closed";
       }
       graceChecksAfterClose -= 1;
+    }
+    // Desktop self-heal only runs when there is no popup to watch (loopback /
+    // external-browser flow). The web popup flows reach "active"/"closed"
+    // through the branches above, so this never fires for them.
+    if (popup || tick % ACTIVATE_PROBE_EVERY_TICKS !== 0) continue;
+    const provider = snapshot?.providers?.find((entry) => entry?.id === providerId);
+    if (!provider) continue;
+    const probe = await testLlmProviderConnection({
+      provider_id: providerId,
+      adapter: provider.adapter || providerId,
+      model: provider.active_model || provider.default_model || "auto",
+    }).catch(() => null);
+    if (!probe?.ok) continue;
+    await setActiveLlm({
+      provider_id: providerId,
+      model: provider.active_model || provider.default_model || "auto",
+    }).catch(() => {});
+    const confirmed = await fetchLlmProviders().catch(() => null);
+    if (confirmed?.active?.provider_id === providerId) {
+      return "active";
     }
   }
   return "timeout";
@@ -151,6 +200,35 @@ export function useProviderLogin({ onSuccess } = {}) {
   const startNearai = React.useCallback(
     async (provider) => {
       resetLoginFeedback();
+      // Desktop: connect in the user's own browser session (where they're
+      // already signed in). The Rust command opens
+      // cloud-api.near.ai/v1/auth/<provider> with a loopback callback, captures
+      // the token, mints a long-lived sk- API key, and vaults it in the
+      // keychain — then restart the sidecar so it respawns with the key in its
+      // env (never an upsert; a user nearai provider def breaks gateway
+      // list-models). No popup handle: `pollUntilActive` runs its self-heal
+      // probe. Gated behind `isDesktopRuntime()`, so web takes the popup +
+      // local-dev-guard + hosted-SSO path below.
+      if (isDesktopRuntime()) {
+        setNearaiBusy(true);
+        try {
+          await tauriInvoke("nearai_connect_loopback", { provider });
+          await restartDesktopSidecar();
+          const outcome = await pollUntilActive("nearai", NEARAI_POLL_DEADLINE_MS, null);
+          if (outcome === "active") {
+            await finishActive();
+            return;
+          }
+          setNearaiError(t("onboarding.nearaiTimeout"));
+        } catch (err) {
+          const message = String(err?.message || err || "");
+          setNearaiError(message || t("onboarding.nearaiFailed"));
+        } finally {
+          setNearaiBusy(false);
+        }
+        return;
+      }
+
       if (isLocalDevOrigin()) {
         setNearaiError(t("onboarding.nearaiLocalSso"));
         return;
@@ -174,7 +252,7 @@ export function useProviderLogin({ onSuccess } = {}) {
       try {
         const { auth_url: authUrl } = await startNearaiLogin({
           provider,
-          origin: window.location.origin,
+          origin: providerLoginOrigin(),
         });
         popup.location.href = authUrl;
         const outcome = await pollUntilActive("nearai", NEARAI_POLL_DEADLINE_MS, popup);
@@ -218,11 +296,7 @@ export function useProviderLogin({ onSuccess } = {}) {
       // `window.open` return null) so `awaitWalletSignature` can detect the
       // user closing the popup instead of waiting out the full timeout. The
       // popup is a same-origin route we control, so the handle is safe.
-      const popup = window.open(
-        `/v2/wallet/connect?channel=${encodeURIComponent(channelName)}`,
-        "_blank",
-        "width=460,height=640"
-      );
+      const popup = window.open(walletLoginUrl(channelName), "_blank", "width=460,height=640");
       // A popup blocker makes window.open return null; fail fast instead of
       // waiting out the full signature timeout on a window that never opened.
       if (!popup) {

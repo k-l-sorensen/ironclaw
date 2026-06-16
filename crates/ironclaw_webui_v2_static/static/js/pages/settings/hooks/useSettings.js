@@ -17,6 +17,13 @@ export function useSettings() {
   });
 
   const settings = query.data?.settings || {};
+  // No v2 settings-write endpoint exists yet: `fetchSettingsExport` may resolve
+  // with `{ todo: true }`. `status:'todo'` lets the consuming write tabs (agent,
+  // networking, inference) gate their controls behind a real backend instead of
+  // implying a capability the gateway cannot prove ("No fake readiness"). The
+  // save path itself stays guarded by `throwIfApiFailed`, so a `{ success: false }`
+  // write never flashes a fake "Saved" indicator.
+  const status = query.data?.todo ? 'todo' : 'ready';
 
   const [savedKeys, setSavedKeys] = React.useState({});
   const [needsRestart, setNeedsRestart] = React.useState(false);
@@ -72,6 +79,7 @@ export function useSettings() {
   return {
     settings,
     query,
+    status,
     save,
     savedKeys,
     needsRestart,

@@ -1,11 +1,8 @@
 import { registerPack } from "../lib/i18n.js";
 
 registerPack("uk", {
-  // Language metadata
   "language.name": "Українська",
   "language.switch": "Мову змінено",
-
-  // Common
   "common.unknown": "Невідомо",
   "common.cancel": "Скасувати",
   "common.delete": "Видалити",
@@ -15,8 +12,6 @@ registerPack("uk", {
   "common.saving": "Зберегти...",
   "common.done": "Готово",
   "common.send": "Надіслати",
-
-  // Navigation
   "nav.chat": "Чат",
   "nav.close": "Закрити",
   "nav.workspace": "Робочий простір",
@@ -32,22 +27,14 @@ registerPack("uk", {
   "nav.docs": "Документація",
   "nav.sectionWork": "Робота",
   "nav.sectionSystem": "Система",
-
-  // Theme
   "theme.switchToLight": "Перемкнути на світлу тему",
   "theme.switchToDark": "Перемкнути на темну тему",
   "theme.light": "Світла тема",
   "theme.dark": "Темна тема",
-
-  // Header
   "header.signOut": "Вийти",
-
-  // Status
   "status.online": "онлайн",
   "status.offline": "офлайн",
   "status.checking": "перевірка",
-
-  // Login page
   "login.tagline": "Gateway v2",
   "login.hero": "Керування локальним агентом без втрати операторського сліду.",
   "login.heroSub": "Доступ за токеном прив’язує консоль браузера до того ж runtime шлюзу, затверджень, інструментів і стану тредів.",
@@ -62,8 +49,6 @@ registerPack("uk", {
   "login.connect": "Підключитися",
   "login.oauthDivider": "або продовжити",
   "login.oauthProvider": "Продовжити з {provider}",
-
-  // Chat — empty state
   "chat.heroTitle": "Привіт, з чим потрібна допомога?",
   "chat.heroDesc": "Почніть з цілі, питання про репозиторій, запиту на ревʼю або файлів, які потребують роботи.",
   "chat.emptyTitle": "Почніть із конкретного операторського завдання.",
@@ -74,8 +59,6 @@ registerPack("uk", {
   "chat.suggestion2Desc": "Знайти ризики коректності, заблоковані погодження та подальші дії.",
   "chat.suggestion3": "Чернетка перевірки готовності розширень",
   "chat.suggestion3Desc": "Перевірити налаштування, автентифікацію, спарювання та доступні можливості.",
-
-  // Chat — input
   "chat.placeholder": "Напишіть IronClaw…",
   "chat.heroPlaceholder": "Запитайте IronClaw про що завгодно.",
   "chat.followUpPlaceholder": "Попросіть подальші зміни",
@@ -101,8 +84,6 @@ registerPack("uk", {
   "shortcuts.newline": "Новий рядок",
   "shortcuts.help": "Показати цю довідку",
   "shortcuts.close": "Закрити",
-
-  // Chat — thread sidebar
   "chat.conversations": "Розмови",
   "chat.threads": "{count} тредів",
   "chat.newThread": "Нова",
@@ -110,15 +91,11 @@ registerPack("uk", {
   "chat.selectConversation": "Оберіть розмову",
   "chat.noConversations": "Поки що немає розмов. Почніть тред із підказок композитора.",
   "chat.turns": "{count} ходів",
-
-  // Chat — connection
   "connection.connected": "Підключено",
   "connection.reconnecting": "Перепідключення…",
   "connection.disconnected": "Відключено",
   "connection.connecting": "Підключення…",
   "connection.paused": "Призупинено, поки вкладка прихована",
-
-  // Chat — approval
   "approval.title": "Потрібне затвердження",
   "approval.approve": "Затвердити",
   "approval.deny": "Відхилити",
@@ -126,7 +103,6 @@ registerPack("uk", {
   "approval.approveAndAlways": "Затверджувати та завжди дозволяти",
   "approval.alwaysAllowToolLabel": "Завжди дозволяти {tool} без запиту",
   "approval.thisTool": "цей інструмент",
-  // Chat — tool activity
   "tool.tabDetails": "Деталі",
   "tool.tabParameters": "Параметри",
   "tool.tabResult": "Результат",
@@ -166,19 +142,13 @@ registerPack("uk", {
   "authGate.unsupportedChallenge": "Відкрийте налаштування, щоб завершити цей крок автентифікації.",
   "authGate.submitFailed": "Не вдалося зберегти маркер.",
   "authGate.resolveFailedAfterTokenSaved": "Токен збережено. Не вдалося відновити заблокований запуск; повторіть спробу відновити його.",
-
-  // Error
   "error.gatewayConnection": "Не вдалося підключитися до шлюзу",
   "error.saveFailed": "Не вдалося зберегти: {message}",
   "error.loadFailed": "Не вдалося завантажити {what}: {message}",
-
-  // Extensions tabs
   "extensions.installed": "Встановлені",
   "extensions.channels": "Канали",
   "extensions.mcp": "MCP-сервери",
   "extensions.registry": "Реєстр",
-
-  // Settings tabs
   "settings.inference": "Інференс",
   "settings.agent": "Агент",
   "settings.channels": "Канали",
@@ -188,7 +158,6 @@ registerPack("uk", {
   "settings.traceCommons": "Trace Commons",
   "settings.users": "Користувачі",
   "settings.language": "Мова",
-  // Settings — Trace Commons credits (read-only)
   "traceCommons.title": "Кредити Trace Commons",
   "traceCommons.description": "Кредит, зароблений за надані відредаговані трейси, у межах вашого облікового запису.",
   "traceCommons.emptyState": "Не зареєстровано — попросіть свого агента пройти реєстрацію за запрошенням Trace Commons.",
@@ -216,9 +185,6 @@ registerPack("uk", {
   "traceCommons.never": "ніколи",
   "traceCommons.recentExplanations": "Останні пояснення кредитів",
   "traceCommons.note": "Локальний перегляд станом на останню синхронізацію — офіційний реєстр кредитів знаходиться на сервері. Остаточний кредит може змінитися після перевірки конфіденційності, повторного відтворення/оцінювання, перевірок дублікатів і подальшого оцінювання корисності.",
-
-
-  // Settings — toolbar
   "settings.back": "Назад",
   "settings.searchPlaceholder": "Пошук налаштувань...",
   "settings.clearSearch": "Очистити пошук",
@@ -231,22 +197,16 @@ registerPack("uk", {
   "settings.importSuccess": "Налаштування імпортовано",
   "settings.importInvalid": "Вибраний файл має містити об’єкт налаштувань",
   "settings.importFailed": "Помилка імпорту: {message}",
-
-  // Settings — restart banner
   "settings.restartRequired": "Деякі зміни потребують перезапуску, щоб набрати чинності.",
   "settings.restartNow": "Перезапустити зараз",
   "settings.restartStarting": "Перезапустити...",
   "settings.restartUnavailable": "Перезапуск через вебінтерфейс ще недоступний. Перезапустіть процес шлюзу вручну, щоб застосувати незавершені зміни.",
-
-  // Restart dialog
   "restart.title": "Перезапустити IronClaw",
   "restart.description": "Перезапустити процес gateway для застосування незавершених змін.",
   "restart.warning": "Запущені завдання можуть бути перервані під час перезапуску gateway.",
   "restart.cancel": "Скасувати",
   "restart.confirm": "Підтвердити перезапуск",
   "restart.progressTitle": "Перезапуск IronClaw",
-
-  // TEE attestation
   "tee.title": "Атестація TEE",
   "tee.verified": "Доступна перевірена атестація часу виконання",
   "tee.imageDigest": "Дайджест зображення",
@@ -257,8 +217,6 @@ registerPack("uk", {
   "tee.loadFailed": "Не вдалося завантажити звіт про атестацію",
   "tee.copyReport": "Копіювати звіт",
   "tee.copied": "Скопійовано",
-
-  // Settings — LLM providers
   "llm.active": "Активний",
   "llm.addProvider": "Додати постачальника",
   "llm.adapter": "Адаптер",
@@ -323,7 +281,6 @@ registerPack("uk", {
   "llm.testConnection": "Переві��ити підключення",
   "llm.testing": "Тестування...",
   "llm.use": "Use",
-  // Settings — LLM providers (progressive disclosure)
   "llm.groupActive": "Активно",
   "llm.groupReady": "Готово до використання",
   "llm.groupSetup": "Потрібне налаштування",
@@ -332,8 +289,6 @@ registerPack("uk", {
   "llm.missingApiKey": "Відсутній ключ API",
   "llm.missingBaseUrl": "Відсутня базова URL-адреса",
   "llm.addApiKey": "Додати ключ API",
-
-  // Settings — inference groups
   "settings.group.embeddings": "Ембедінги",
   "settings.group.sampling": "Семплінг",
   "settings.field.embeddingsEnabled": "Увімкнути ембедінги",
@@ -344,8 +299,6 @@ registerPack("uk", {
   "settings.field.embeddingsModelDesc": "Ідентифікатор моделі ембедінгів",
   "settings.field.temperature": "Температура",
   "settings.field.temperatureDesc": "Температура семплінгу за замовчуванням (0.0–2.0)",
-
-  // Settings — agent groups
   "settings.group.core": "Основне",
   "settings.group.heartbeat": "Heartbeat",
   "settings.group.sandbox": "Пісочниця",
@@ -417,8 +370,6 @@ registerPack("uk", {
   "settings.field.skillsMaxContextTokensDesc": "Бюджет токенів для інʼєктованих скіл-промптів",
   "settings.field.fusionStrategy": "Стратегія злиття",
   "settings.field.fusionStrategyDesc": "Метод об’єднання результатів гібридного пошуку",
-
-  // Settings — networking
   "settings.group.gateway": "Шлюз",
   "settings.group.tunnel": "Тунель",
   "settings.field.gatewayHost": "Хост",
@@ -429,8 +380,6 @@ registerPack("uk", {
   "settings.field.tunnelProviderDesc": "Публічний тунель-сервіс",
   "settings.field.tunnelPublicUrl": "Публічний URL",
   "settings.field.tunnelPublicUrlDesc": "Статичний endpoint тунелю",
-
-  // Settings — channels tab
   "channels.builtIn": "Вбудовані канали",
   "channels.messaging": "Канали повідомлень",
   "channels.availableChannels": "Доступні канали",
@@ -467,8 +416,6 @@ registerPack("uk", {
   "channels.slackAccessSaving": "Збереження...",
   "channels.slackAccessSuccess": "Канали Slack збережено.",
   "channels.slackAccessError": "Помилка оновлення каналу Slack.",
-
-  // Settings — tools tab
   "tools.permissions": "Дозволи інструментів",
   "tools.alwaysAllow": "Завжди дозволяти",
   "tools.askEachTime": "Питати щоразу",
@@ -479,8 +426,6 @@ registerPack("uk", {
   "tools.filterPlaceholder": "Фільтрувати інструменти…",
   "tools.noMatch": "Немає інструментів, що відповідають фільтру.",
   "tools.failedLoad": "Не вдалося завантажити інструменти: {message}",
-
-  // Settings — skills tab
   "skills.installed": "Встановлені скіли",
   "skills.noInstalled": "Немає встановлених скілів",
   "skills.noInstalledDesc": "Скіли додають агенту доменні інструкції. Встановіть їх із реєстру ClawHub або покладіть файли SKILL.md у робочий простір.",
@@ -508,8 +453,6 @@ registerPack("uk", {
   "skills.removed": "Видалено навик \"{name}\"",
   "skills.activatesOn": "Активується вкл",
   "skills.imported": "імпортовано",
-
-  // Settings — users tab
   "users.title": "Користувачі ({count})",
   "users.addUser": "Додати користувача",
   "users.newUser": "Новий користувач",
@@ -525,8 +468,6 @@ registerPack("uk", {
   "users.adminRequiredDesc": "Керування користувачами доступне лише обліковим записам із правами адміністратора.",
   "users.failedLoad": "Не вдалося завантажити користувачів: {message}",
   "users.noUsers": "Немає зареєстрованих користувачів.",
-
-  // Workspace page
   "workspace.title": "Робочий простір",
   "workspace.subtitle": "Постійна памʼять",
   "workspace.refresh": "Оновити",
@@ -547,8 +488,6 @@ registerPack("uk", {
   "workspace.unableOpenDirectory": "Не вдалося відкрити директорію",
   "workspace.unableSaveFile": "Не вдалося зберегти файл",
   "workspace.savedPath": "Збережено {path}",
-
-  // Jobs page
   "jobs.allJobs": "Усі завдання",
   "jobs.refresh": "Оновити",
   "jobs.refreshing": "Оновлення…",
@@ -556,8 +495,6 @@ registerPack("uk", {
   "jobs.unavailableDesc": "Цього завдання більше не існує або воно поза вашими правами доступу.",
   "jobs.returnToJobs": "Повернутися до завдань",
   "jobs.dismiss": "Закрити",
-
-  // Jobs — list
   "jobs.list.explorer": "Оглядач",
   "jobs.list.queueTitle": "Черга завдань",
   "jobs.list.queueDesc": "Пошук за назвою або ID, перехід до запуску та зупинка активної роботи без виходу зі сторінки.",
@@ -580,14 +517,10 @@ registerPack("uk", {
   "jobs.list.started": "запущено {value}",
   "jobs.action.cancel": "Скасувати",
   "jobs.action.open": "Відкрити",
-
-  // Jobs — detail
   "jobs.detail.backToAll": "Назад до всіх завдань",
   "jobs.detail.tabs.overview": "Огляд",
   "jobs.detail.tabs.activity": "Активність",
   "jobs.detail.tabs.files": "Файли",
-
-  // Missions page
   "missions.allMissions": "Усі місії",
   "missions.refresh": "Оновити",
   "missions.refreshing": "Оновлення…",
@@ -632,8 +565,6 @@ registerPack("uk", {
   "missions.summary.spawnedThreads": "Створені треди",
   "missions.summary.completedFailed": "{completed} завершено / {failed} з помилкою",
   "missions.summary.acrossProjects": "По всіх робочих просторах проєктів",
-
-  // Automations page
   "automations.eyebrow": "Запланована робота",
   "automations.title": "Автоматизація",
   "automations.description": "Лише запланована автоматизація.",
@@ -644,8 +575,7 @@ registerPack("uk", {
   "automations.refresh": "Оновити автоматизації",
   "automations.error.loadFailed": "Неможливо завантажити автоматизації",
   "automations.schedulerOff.title": "Планування вимкнено",
-  "automations.schedulerOff.description":
-    "Ці автоматизації збережено, але вони не запускатимуться, доки не ввімкнено планувальник.",
+  "automations.schedulerOff.description": "Ці автоматизації збережено, але вони не запускатимуться, доки не ввімкнено планувальник.",
   "automations.schedule.custom": "Власний розклад",
   "automations.schedule.everyMinute": "Щохвилини",
   "automations.schedule.everyMinutes": "Кожні {count} хв",
@@ -698,8 +628,7 @@ registerPack("uk", {
   "automations.delivery.save": "Зберегти",
   "automations.delivery.clear": "Очистити",
   "automations.delivery.saved": "Збережено",
-  "automations.delivery.saveFailed":
-    "Не вдалося зберегти ціль доставки. Спробуйте ще раз.",
+  "automations.delivery.saveFailed": "Не вдалося зберегти ціль доставки. Спробуйте ще раз.",
   "automations.delivery.footnote": "На запити підтвердження, надіслані у ваш DM, відповідають, відповівши {command} у Slack.",
   "automations.delivery.pill.ready": "Готово",
   "automations.delivery.pill.unavailable": "Недоступно",
@@ -724,30 +653,20 @@ registerPack("uk", {
   "automations.table.nextRun": "Наступний запуск",
   "automations.table.lastRun": "Останній запуск",
   "automations.table.status": "Статус",
-
-  // Routines page
   "routines.explorer": "Завдання",
   "routines.title": "Рутини",
   "routines.description": "Шукайте збережені рутини, переглядайте їхній розклад або тригер і запускайте чи призупиняйте їх, не виходячи з v2.",
-
-  // Extensions page
   "ext.installed": "Встановлено",
   "ext.channels": "Канали",
   "ext.mcp": "MCP",
   "ext.registry": "Реєстр",
-
-  // Extensions — registry
   "ext.registry.searchPlaceholder": "Пошук розширень…",
   "ext.registry.emptyTitle": "Реєстр порожній",
   "ext.registry.emptyDesc": "Усі доступні розширення вже встановлені або реєстр не налаштований.",
   "ext.registry.availableTitle": "Доступні розширення",
   "ext.registry.noMatch": "Немає розширень, що відповідають фільтру.",
-
-  // Chat — history
   "chat.history.loading": "Завантаження...",
   "chat.history.loadOlder": "Завантажити старіші повідомлення",
-
-  // Projects page
   "projects.allProjects": "Усі проєкти",
   "projects.returnToProjects": "Повернутися до проєктів",
   "projects.unavailable": "Проєкт недоступний",
@@ -781,20 +700,14 @@ registerPack("uk", {
   "projects.card.failures24h": "{count} за 24 год",
   "projects.card.spendToday": "{value} витрачено сьогодні",
   "projects.explorer": "Оглядач",
-
-  // Language settings
   "lang.title": "Мова",
   "lang.description": "Оберіть мову інтерфейсу.",
   "lang.current": "Поточна мова",
-
-  // Settings — inference summary card
   "inference.provider": "Провайдер LLM",
   "inference.backend": "Сервер",
   "inference.model": "Модель",
   "inference.active": "активно",
   "inference.none": "—",
-
-  // Extensions — pairing
   "pairing.title": "Парування",
   "pairing.instructions": "Введіть код із каналу, щоб завершити створення пари.",
   "pairing.placeholder": "Введіть код парування…",
@@ -808,13 +721,9 @@ registerPack("uk", {
   "pairing.connect": "Підключитися",
   "pairing.slackSuccess": "Обліковий запис Slack підключено.",
   "pairing.slackError": "Недійсний або прострочений код сполучення Slack.",
-
-  // Admin — tabs
   "admin.tab.dashboard": "Панель",
   "admin.tab.users": "Користувачі",
   "admin.tab.usage": "Використання",
-
-  // Admin — dashboard
   "admin.dashboard.systemOverview": "Огляд системи",
   "admin.dashboard.uptime": "Час роботи: {value}",
   "admin.dashboard.totalUsers": "Усього користувачів",
@@ -834,8 +743,6 @@ registerPack("uk", {
   "admin.dashboard.status": "Статус",
   "admin.dashboard.jobs": "Завдання",
   "admin.dashboard.lastActive": "Остання активність",
-
-  // Admin — users list
   "admin.users.user": "користувач",
   "admin.users.userFallback": "користувача",
   "admin.users.title": "Користувачі ({count} / {total})",
@@ -874,8 +781,6 @@ registerPack("uk", {
   "admin.users.delete": "Видалити",
   "admin.users.deleteUserTitle": "Видалити користувача",
   "admin.users.deleteUserDesc": "Ви впевнені, що хочете видалити «{name}»? Цю дію неможливо скасувати.",
-
-  // Admin — user detail
   "admin.user.profile": "Профіль",
   "admin.user.summary": "Підсумок",
   "admin.user.id": "ID",
@@ -892,8 +797,6 @@ registerPack("uk", {
   "admin.user.saveRole": "Зберегти роль",
   "admin.user.usage30Days": "Використання (останні 30 днів)",
   "admin.user.noUsage": "Немає даних використання.",
-
-  // Admin — usage tab
   "admin.usage.overview": "Огляд використання",
   "admin.usage.noData": "Немає даних використання для цього періоду.",
   "admin.usage.totalCalls": "Усього викликів",
@@ -908,8 +811,6 @@ registerPack("uk", {
   "admin.usage.input": "Вхід",
   "admin.usage.output": "Вихід",
   "admin.usage.cost": "Вартість",
-
-  // Logs page
   "logs.levelAll": "Усі рівні",
   "logs.level.trace": "TRACE",
   "logs.level.debug": "DEBUG",
@@ -1040,5 +941,15 @@ registerPack("uk", {
   "skills.source.user": "користувач",
   "skills.source.workspace": "робоча область",
   "skills.updateFailed": "Не вдалося оновити.",
-  "skills.updated": "Навичку \"{name}\" оновлено"
+  "skills.updated": "Навичку \"{name}\" оновлено",
+
+  // Desktop feature keys (genuinely translated, merged in)
+  "chat.heroMorning": "Що IronClaw має взяти на себе далі?",
+  "chat.heroAfternoon": "Що IronClaw має взяти на себе далі?",
+  "chat.heroEvening": "Що IronClaw має взяти на себе далі?",
+  "chat.fileDownloadFailed": "Не вдалося завантажити цей файл",
+  "chat.removeImage": "Видалити зображення",
+  "chat.removeAttachment": "Видалити вкладення",
+  "settings.notWritable": "Редагування на цьому шлюзі поки недоступне",
+  "settings.notWritableDesc": "Цей шлюз поки не може зберігати зміни цих налаштувань, тому елементи керування приховано, а не показано як редаговані. Вони повернуться, щойно шлюз зможе їх зберігати."
 });

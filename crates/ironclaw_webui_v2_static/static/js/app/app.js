@@ -5,6 +5,7 @@ import { defaultRoute } from "./routes.js";
 import { GatewayLayout } from "../layout/gateway-layout.js";
 import { LoginPage as LoginView } from "../pages/login/login-page.js";
 import { ChatPage } from "../pages/chat/chat-page.js";
+import { WorkPage } from "../pages/work/work-page.js";
 import { OnboardingPage } from "../pages/onboarding/onboarding-page.js";
 import { WorkspacePage } from "../pages/workspace/workspace-page.js";
 import { ProjectsPage } from "../pages/projects/projects-page.js";
@@ -16,6 +17,14 @@ import { ExtensionsPage } from "../pages/extensions/extensions-page.js";
 import { SettingsPage } from "../pages/settings/settings-page.js";
 import { AdminPage } from "../pages/admin/admin-page.js";
 import { LogsPage } from "../pages/logs/logs-page.js";
+import { isDesktopRuntime } from "../lib/api.js";
+import { appBasePath, appScopedPath } from "../lib/app-path.js";
+
+// Where RequireAuth sends an unauthenticated visitor. The desktop shell has no
+// hosted login surface, so it routes to the top-level `/welcome` onboarding;
+// the hosted web SPA routes to `/login`. Resolved once at module load from the
+// runtime so the route table is stable for a given build.
+const unauthenticatedRoute = isDesktopRuntime() ? "/welcome" : "/login";
 
 function AuthLoading() {
   return html`
@@ -32,7 +41,7 @@ function LoginPage({ auth }) {
   const from = fromLocation
     ? `${fromLocation.pathname || defaultRoute}${fromLocation.search || ""}${fromLocation.hash || ""}`
     : defaultRoute;
-  const redirectAfter = `/v2${from === "/" ? "" : from}`;
+  const redirectAfter = appScopedPath(from === "/" ? "/" : from);
 
   const handleSubmit = React.useCallback(
     (token) => {
@@ -66,7 +75,7 @@ function RequireAuth({ auth, children }) {
   }
 
   if (!auth.isAuthenticated) {
-    return html`<${Navigate} to="/login" replace state=${{ from: location }} />`;
+    return html`<${Navigate} to=${unauthenticatedRoute} replace state=${{ from: location }} />`;
   }
 
   return children;
@@ -95,10 +104,12 @@ function AdminRoute({ auth }) {
 
 export function App() {
   const auth = useAuthSession();
+  const basePath = appBasePath();
 
   return html`
-    <${BrowserRouter} basename="/v2">
+    <${BrowserRouter} basename=${basePath || undefined}>
       <${Routes}>
+        <${Route} path="/welcome" element=${html`<${OnboardingPage} />`} />
         <${Route} path="/login" element=${html`<${LoginPage} auth=${auth} />`} />
         <${Route} path="/" element=${html`<${AuthenticatedLayout} auth=${auth} />`}>
           <${Route} index element=${html`<${Navigate} to=${defaultRoute} replace />`} />
@@ -106,6 +117,7 @@ export function App() {
           <${Route} path="welcome" element=${html`<${OnboardingPage} />`} />
           <${Route} path="chat" element=${html`<${ChatPage} />`} />
           <${Route} path="chat/:threadId" element=${html`<${ChatPage} />`} />
+          <${Route} path="work" element=${html`<${WorkPage} />`} />
           <${Route} path="workspace" element=${html`<${WorkspacePage} />`} />
           <${Route} path="workspace/*" element=${html`<${WorkspacePage} />`} />
           <${Route} path="projects" element=${html`<${ProjectsPage} />`} />

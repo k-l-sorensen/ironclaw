@@ -43,11 +43,11 @@ test('sidebar wires pagination into SidebarThreads, which renders a Load-older a
   assert.match(sidebar, /onLoadMore=\$\{threadsState\.loadMoreThreads\}/);
 
   const list = await readFile(path.join(dir, 'sidebar-threads.js'), 'utf8');
-  // A "Load older conversations" row exists, gated on hasMore.
-  assert.match(list, /Load older conversations/);
+  // A "Load older conversations" row exists (localized), gated on hasMore.
+  assert.match(list, /t\("chat\.loadOlder"\)/);
   // Search-miss auto-load pages through older threads while a search finds none.
   assert.match(list, /onLoadMore\(\)/);
-  assert.match(list, /Searching older conversations/);
+  assert.match(list, /t\("chat\.searchingOlder"\)/);
 });
 
 test('SidebarThreads renders loading + error branches, not a false empty state', async () => {
@@ -57,16 +57,16 @@ test('SidebarThreads renders loading + error branches, not a false empty state',
   assert.match(src, /isLoading = false/);
   assert.match(src, /isError = false/);
 
-  // A loading skeleton and an error+Retry path exist.
+  // A loading skeleton and an error+Retry path exist (copy is localized via useT).
   assert.match(src, /v2-skeleton/);
-  assert.match(src, /Could not load conversations/);
+  assert.match(src, /t\("chat\.loadFailed"\)/);
   assert.match(src, /onClick=\$\{\(\) => onRetry\(\)\}/);
 
-  // "No conversations yet" must be the fallback of the three-way branch — the
+  // The empty state must be the fallback of the three-way branch — the
   // skeleton and error copy both precede it in source order.
   const skeletonIdx = src.indexOf('v2-skeleton');
-  const errorIdx = src.indexOf('Could not load conversations');
-  const emptyIdx = src.indexOf('No conversations yet');
+  const errorIdx = src.indexOf('t("chat.loadFailed")');
+  const emptyIdx = src.indexOf('t("chat.noConversations")');
   assert.ok(
     skeletonIdx > -1 && errorIdx > -1 && emptyIdx > skeletonIdx && emptyIdx > errorIdx,
     'the loading + error branches must precede the empty-state copy'

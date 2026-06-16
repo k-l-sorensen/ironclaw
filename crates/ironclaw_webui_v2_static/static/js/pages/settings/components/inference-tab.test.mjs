@@ -74,6 +74,10 @@ function renderInferenceTab({ searchQuery = '' } = {}) {
     Card: 'Card',
     GoogleOauthCard: 'GoogleOauthCard',
     INFERENCE_FIELDS: [],
+    // This suite exercises the desktop InferenceTab branch (NEAR AI Cloud setup
+    // copy, GoogleOauthCard, readiness). Web behavior is covered by the
+    // provider-management/llm-providers suites.
+    isDesktopRuntime: () => true,
     ProviderLoginStatus: 'ProviderLoginStatus',
     ProviderManagement,
     useProviderLogin: () => ({

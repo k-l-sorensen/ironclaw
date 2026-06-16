@@ -1,11 +1,8 @@
 import { registerPack } from "../lib/i18n.js";
 
 registerPack("ar", {
-  // Language metadata
   "language.name": "العربية",
   "language.switch": "تم تغيير اللغة",
-
-  // Common
   "common.unknown": "غير معروف",
   "common.cancel": "إلغاء",
   "common.delete": "حذف",
@@ -15,8 +12,6 @@ registerPack("ar", {
   "common.saving": "حفظ...",
   "common.done": "تم",
   "common.send": "إرسال",
-
-  // Navigation
   "nav.chat": "الدردشة",
   "nav.close": "إغلاق",
   "nav.workspace": "مساحة العمل",
@@ -32,22 +27,14 @@ registerPack("ar", {
   "nav.docs": "الوثائق",
   "nav.sectionWork": "العمل",
   "nav.sectionSystem": "النظام",
-
-  // Theme
   "theme.switchToLight": "التبديل إلى السمة الفاتحة",
   "theme.switchToDark": "التبديل إلى السمة الداكنة",
   "theme.light": "سمة فاتحة",
   "theme.dark": "سمة داكنة",
-
-  // Header
   "header.signOut": "تسجيل الخروج",
-
-  // Status
   "status.online": "متصل",
   "status.offline": "غير متصل",
   "status.checking": "جارٍ التحقق",
-
-  // Login page
   "login.tagline": "Gateway v2",
   "login.hero": "تحكم بالوكيل المحلي دون فقدان أثر المُشغِّل.",
   "login.heroSub": "يُبقي الوصول عبر الرمز (Token) وحدة تحكم المتصفح مرتبطة بنفس تشغيل البوابة والموافقات والأدوات وحالة الخيط.",
@@ -62,8 +49,6 @@ registerPack("ar", {
   "login.connect": "اتصال",
   "login.oauthDivider": "أو المتابعة مع",
   "login.oauthProvider": "المتابعة مع {provider}",
-
-  // Chat — empty state
   "chat.heroTitle": "مرحبًا، بماذا تحتاج إلى المساعدة؟",
   "chat.heroDesc": "ابدأ بهدف، أو سؤال عن المستودع، أو طلب مراجعة، أو ملفات تحتاج إلى عمل.",
   "chat.emptyTitle": "ابدأ بمهمة تشغيل واضحة.",
@@ -74,8 +59,6 @@ registerPack("ar", {
   "chat.suggestion2Desc": "ابحث عن مخاطر الصحة والموافقات المحظورة والمتابعات.",
   "chat.suggestion3": "صياغة فحص جاهزية الملحقات",
   "chat.suggestion3Desc": "تحقق من الإعداد والمصادقة والإقران والقدرات المتاحة.",
-
-  // Chat — input
   "chat.placeholder": "راسل IronClaw...",
   "chat.heroPlaceholder": "اسأل IronClaw أي شيء.",
   "chat.followUpPlaceholder": "اطلب تغييرات متابعة",
@@ -101,8 +84,6 @@ registerPack("ar", {
   "shortcuts.newline": "سطر جديد",
   "shortcuts.help": "أظهر هذه المساعدة",
   "shortcuts.close": "إغلاق",
-
-  // Chat — thread sidebar
   "chat.conversations": "المحادثات",
   "chat.threads": "{count} خيوط",
   "chat.newThread": "جديد",
@@ -110,15 +91,11 @@ registerPack("ar", {
   "chat.selectConversation": "اختر محادثة",
   "chat.noConversations": "لا توجد محادثات بعد. ابدأ خيطًا من اقتراحات المُحرِّر.",
   "chat.turns": "{count} أدوار",
-
-  // Chat — connection
   "connection.connected": "متصل",
   "connection.reconnecting": "إعادة اتصال...",
   "connection.disconnected": "منقطع",
   "connection.connecting": "جارٍ الاتصال...",
   "connection.paused": "متوقف مؤقتًا أثناء إخفاء علامة التبويب",
-
-  // Chat — approval
   "approval.title": "مطلوب موافقة",
   "approval.approve": "موافقة",
   "approval.deny": "رفض",
@@ -126,7 +103,6 @@ registerPack("ar", {
   "approval.approveAndAlways": "موافقة والسماح دائمًا",
   "approval.alwaysAllowToolLabel": "السماح دائمًا بـ {tool} دون طلب",
   "approval.thisTool": "هذه الأداة",
-  // Chat — tool activity
   "tool.tabDetails": "التفاصيل",
   "tool.tabParameters": "المعلمات",
   "tool.tabResult": "النتيجة",
@@ -166,19 +142,13 @@ registerPack("ar", {
   "authGate.unsupportedChallenge": "افتح الإعدادات لإكمال خطوة المصادقة هذه.",
   "authGate.submitFailed": "لا يمكن حفظ الرمز المميز.",
   "authGate.resolveFailedAfterTokenSaved": "تم حفظ الرمز المميز. لا يمكن استئناف التشغيل المحظور؛ أعد محاولة استئنافه.",
-
-  // Error
   "error.gatewayConnection": "تعذر الاتصال بالبوابة",
   "error.saveFailed": "فشل الحفظ: {message}",
   "error.loadFailed": "فشل تحميل {what}: {message}",
-
-  // Extensions tabs
   "extensions.installed": "مثبتة",
   "extensions.channels": "القنوات",
   "extensions.mcp": "خوادم MCP",
   "extensions.registry": "السجل",
-
-  // Settings tabs
   "settings.inference": "الاستدلال",
   "settings.agent": "الوكيل",
   "settings.channels": "القنوات",
@@ -188,7 +158,6 @@ registerPack("ar", {
   "settings.traceCommons": "Trace Commons",
   "settings.users": "المستخدمون",
   "settings.language": "اللغة",
-  // Settings — Trace Commons credits (read-only)
   "traceCommons.title": "أرصدة Trace Commons",
   "traceCommons.description": "رصيد مكتسب مقابل الآثار المنقحة المساهم بها، مقصور على حسابك.",
   "traceCommons.emptyState": "غير مسجل — اطلب من وكيلك التسجيل باستخدام دعوة Trace Commons.",
@@ -216,9 +185,6 @@ registerPack("ar", {
   "traceCommons.never": "أبدًا",
   "traceCommons.recentExplanations": "تفسيرات الرصيد الأخيرة",
   "traceCommons.note": "عرض محلي حتى آخر مزامنة — سجل الأرصدة المعتمد موجود على الخادم. قد يتغير الرصيد النهائي بعد مراجعة الخصوصية وإعادة التشغيل/التقييم وفحوصات التكرار وتقييم الفائدة اللاحق.",
-
-
-  // Settings — toolbar
   "settings.back": "العودة",
   "settings.searchPlaceholder": "إعدادات البحث...",
   "settings.clearSearch": "مسح البحث",
@@ -231,22 +197,16 @@ registerPack("ar", {
   "settings.importSuccess": "تم استيراد الإعدادات",
   "settings.importInvalid": "يجب أن يحتوي الملف المحدد على كائن إعدادات",
   "settings.importFailed": "فشل الاستيراد: {message}",
-
-  // Settings — restart banner
   "settings.restartRequired": "بعض التغييرات تتطلب إعادة تشغيل لتطبيقها.",
   "settings.restartNow": "أعد التشغيل الآن",
   "settings.restartStarting": "إعادة التشغيل...",
   "settings.restartUnavailable": "إعادة التشغيل من واجهة الويب غير متاحة بعد. أعد تشغيل عملية البوابة يدويًا لتطبيق التغييرات المعلّقة.",
-
-  // Restart dialog
   "restart.title": "أعد تشغيل IronClaw",
   "restart.description": "أعد تشغيل عملية gateway لتطبيق التغييرات المعلقة.",
   "restart.warning": "قد يتم مقاطعة تشغيل المهام أثناء إعادة تشغيل gateway.",
   "restart.cancel": "إلغاء",
   "restart.confirm": "تأكيد إعادة التشغيل",
   "restart.progressTitle": "إعادة تشغيل IronClaw",
-
-  // TEE attestation
   "tee.title": "شهادة TEE",
   "tee.verified": "تتوفر شهادة وقت التشغيل التي تم التحقق منها",
   "tee.imageDigest": "ملخص الصورة",
@@ -257,8 +217,6 @@ registerPack("ar", {
   "tee.loadFailed": "تعذر تحميل تقرير المصادقة",
   "tee.copyReport": "نسخ التقرير",
   "tee.copied": "منسوخ",
-
-  // Settings — LLM providers
   "llm.active": "نشط",
   "llm.addProvider": "أضف موفرًا",
   "llm.adapter": "محول",
@@ -323,7 +281,6 @@ registerPack("ar", {
   "llm.testConnection": "اختبار الاتصال",
   "llm.testing": "جارٍ الاختبار...",
   "llm.use": "استخدم",
-  // Settings — LLM providers (progressive disclosure)
   "llm.groupActive": "نشط",
   "llm.groupReady": "جاهز للاستخدام",
   "llm.groupSetup": "يحتاج إلى إعداد",
@@ -332,8 +289,6 @@ registerPack("ar", {
   "llm.missingApiKey": "مفتاح واجهة برمجة التطبيقات مفقود",
   "llm.missingBaseUrl": "عنوان URL الأساسي مفقود",
   "llm.addApiKey": "أضف مفتاح واجهة برمجة التطبيقات",
-
-  // Settings — inference groups
   "settings.group.embeddings": "التضمينات",
   "settings.group.sampling": "أخذ العينات",
   "settings.field.embeddingsEnabled": "تمكين التضمينات",
@@ -344,8 +299,6 @@ registerPack("ar", {
   "settings.field.embeddingsModelDesc": "معرّف نموذج التضمينات",
   "settings.field.temperature": "الحرارة",
   "settings.field.temperatureDesc": "حرارة أخذ العينات الافتراضية (0.0–2.0)",
-
-  // Settings — agent groups
   "settings.group.core": "الأساسيات",
   "settings.group.heartbeat": "النبض",
   "settings.group.sandbox": "الصندوق الرملي",
@@ -417,8 +370,6 @@ registerPack("ar", {
   "settings.field.skillsMaxContextTokensDesc": "ميزانية الرموز لتوجيهات المهارات المحقونة",
   "settings.field.fusionStrategy": "استراتيجية الدمج",
   "settings.field.fusionStrategyDesc": "طريقة دمج نتائج البحث الهجين",
-
-  // Settings — networking
   "settings.group.gateway": "البوابة",
   "settings.group.tunnel": "النفق",
   "settings.field.gatewayHost": "المضيف",
@@ -429,8 +380,6 @@ registerPack("ar", {
   "settings.field.tunnelProviderDesc": "خدمة نفق عامة",
   "settings.field.tunnelPublicUrl": "الرابط العام",
   "settings.field.tunnelPublicUrlDesc": "نقطة نهاية ثابتة للنفق",
-
-  // Settings — channels tab
   "channels.builtIn": "قنوات مدمجة",
   "channels.messaging": "قنوات المراسلة",
   "channels.availableChannels": "القنوات المتاحة",
@@ -467,8 +416,6 @@ registerPack("ar", {
   "channels.slackAccessSaving": "جاري الحفظ...",
   "channels.slackAccessSuccess": "تم حفظ قنوات Slack.",
   "channels.slackAccessError": "فشل تحديث قناة Slack.",
-
-  // Settings — tools tab
   "tools.permissions": "أذونات الأدوات",
   "tools.alwaysAllow": "السماح دائمًا",
   "tools.askEachTime": "السؤال كل مرة",
@@ -479,8 +426,6 @@ registerPack("ar", {
   "tools.filterPlaceholder": "تصفية الأدوات…",
   "tools.noMatch": "لا توجد أدوات تطابق التصفية.",
   "tools.failedLoad": "فشل تحميل الأدوات: {message}",
-
-  // Settings — skills tab
   "skills.installed": "المهارات المثبتة",
   "skills.noInstalled": "لا توجد مهارات مثبتة",
   "skills.noInstalledDesc": "توسّع المهارات الوكيل بتعليمات متخصصة. ثبّتها من سجل ClawHub أو ضع ملفات SKILL.md داخل مساحة العمل.",
@@ -508,8 +453,6 @@ registerPack("ar", {
   "skills.removed": "تمت إزالة المهارة \"{name}\"",
   "skills.activatesOn": "يتم تفعيلها عند",
   "skills.imported": "المستوردة",
-
-  // Settings — users tab
   "users.title": "المستخدمون ({count})",
   "users.addUser": "إضافة مستخدم",
   "users.newUser": "مستخدم جديد",
@@ -525,8 +468,6 @@ registerPack("ar", {
   "users.adminRequiredDesc": "إدارة المستخدمين متاحة فقط للحسابات ذات صلاحيات الإدارة.",
   "users.failedLoad": "فشل تحميل المستخدمين: {message}",
   "users.noUsers": "لا يوجد مستخدمون مسجّلون.",
-
-  // Workspace page
   "workspace.title": "مساحة العمل",
   "workspace.subtitle": "ذاكرة دائمة",
   "workspace.refresh": "تحديث",
@@ -547,8 +488,6 @@ registerPack("ar", {
   "workspace.unableOpenDirectory": "تعذر فتح المجلد",
   "workspace.unableSaveFile": "تعذر حفظ الملف",
   "workspace.savedPath": "تم حفظ {path}",
-
-  // Jobs page
   "jobs.allJobs": "كل المهام",
   "jobs.refresh": "تحديث",
   "jobs.refreshing": "جارٍ التحديث",
@@ -556,8 +495,6 @@ registerPack("ar", {
   "jobs.unavailableDesc": "هذه المهمة لم تعد موجودة أو خارج نطاق وصولك.",
   "jobs.returnToJobs": "العودة إلى المهام",
   "jobs.dismiss": "إغلاق",
-
-  // Jobs — list
   "jobs.list.explorer": "المستكشف",
   "jobs.list.queueTitle": "قائمة المهام",
   "jobs.list.queueDesc": "ابحث بالعنوان أو المعرّف، ادخل إلى التنفيذ، وأوقف العمل النشط دون مغادرة الصفحة.",
@@ -580,14 +517,10 @@ registerPack("ar", {
   "jobs.list.started": "بدأ {value}",
   "jobs.action.cancel": "إلغاء",
   "jobs.action.open": "فتح",
-
-  // Jobs — detail
   "jobs.detail.backToAll": "العودة إلى كل المهام",
   "jobs.detail.tabs.overview": "نظرة عامة",
   "jobs.detail.tabs.activity": "النشاط",
   "jobs.detail.tabs.files": "الملفات",
-
-  // Missions page
   "missions.allMissions": "كل المهام الدورية",
   "missions.refresh": "تحديث",
   "missions.refreshing": "جارٍ التحديث",
@@ -632,8 +565,6 @@ registerPack("ar", {
   "missions.summary.spawnedThreads": "الخيوط المُنشأة",
   "missions.summary.completedFailed": "{completed} اكتملت / {failed} فشلت",
   "missions.summary.acrossProjects": "عبر كل مساحات المشاريع",
-
-  // Automations page
   "automations.eyebrow": "العمل المجدول",
   "automations.title": "الأتمتة",
   "automations.description": "الأتمتة المجدولة فقط.",
@@ -644,8 +575,7 @@ registerPack("ar", {
   "automations.refresh": "تحديث عمليات الأتمتة",
   "automations.error.loadFailed": "غير قادر على تحميل عمليات الأتمتة",
   "automations.schedulerOff.title": "تم إيقاف الجدولة",
-  "automations.schedulerOff.description":
-    "هذه الأتمتة محفوظة لكنها لن تعمل حتى يتم تفعيل المجدول.",
+  "automations.schedulerOff.description": "هذه الأتمتة محفوظة لكنها لن تعمل حتى يتم تفعيل المجدول.",
   "automations.schedule.custom": "جدول مخصص",
   "automations.schedule.everyMinute": "كل دقيقة",
   "automations.schedule.everyMinutes": "كل {count} دقيقة",
@@ -698,8 +628,7 @@ registerPack("ar", {
   "automations.delivery.save": "حفظ",
   "automations.delivery.clear": "مسح",
   "automations.delivery.saved": "تم الحفظ",
-  "automations.delivery.saveFailed":
-    "تعذّر حفظ وجهة التسليم. يرجى المحاولة مرة أخرى.",
+  "automations.delivery.saveFailed": "تعذّر حفظ وجهة التسليم. يرجى المحاولة مرة أخرى.",
   "automations.delivery.footnote": "تتم الإجابة على طلبات الموافقة المُرسَلة إلى رسالتك المباشرة بالرد بـ {command} في Slack.",
   "automations.delivery.pill.ready": "جاهز",
   "automations.delivery.pill.unavailable": "غير متاح",
@@ -724,30 +653,20 @@ registerPack("ar", {
   "automations.table.nextRun": "التشغيل التالي",
   "automations.table.lastRun": "التشغيل الأخير",
   "automations.table.status": "الحالة",
-
-  // Routines page
   "routines.explorer": "المهام",
   "routines.title": "الروتينات",
   "routines.description": "ابحث في الروتينات المحفوظة، وافحص جدولها أو المشغل، وشغلها أو أوقفها مؤقتًا دون مغادرة v2.",
-
-  // Extensions page
   "ext.installed": "مثبت",
   "ext.channels": "القنوات",
   "ext.mcp": "MCP",
   "ext.registry": "السجل",
-
-  // Extensions — registry
   "ext.registry.searchPlaceholder": "ابحث عن الإضافات…",
   "ext.registry.emptyTitle": "السجل فارغ",
   "ext.registry.emptyDesc": "كل الإضافات المتاحة مثبّتة بالفعل، أو لا يوجد سجل مُكوَّن.",
   "ext.registry.availableTitle": "الإضافات المتاحة",
   "ext.registry.noMatch": "لا توجد إضافات تطابق عامل التصفية.",
-
-  // Chat — history
   "chat.history.loading": "جارٍ التحميل...",
   "chat.history.loadOlder": "تحميل الرسائل الأقدم",
-
-  // Projects page
   "projects.allProjects": "كل المشاريع",
   "projects.returnToProjects": "العودة إلى المشاريع",
   "projects.unavailable": "المشروع غير متاح",
@@ -781,20 +700,14 @@ registerPack("ar", {
   "projects.card.failures24h": "{count} خلال 24 ساعة",
   "projects.card.spendToday": "الإنفاق اليوم {value}",
   "projects.explorer": "المستكشف",
-
-  // Language settings
   "lang.title": "اللغة",
   "lang.description": "اختر لغة عرض الواجهة.",
   "lang.current": "اللغة الحالية",
-
-  // Settings — inference summary card
   "inference.provider": "مزود LLM",
   "inference.backend": "الخلفية",
   "inference.model": "النموذج",
   "inference.active": "نشط",
   "inference.none": "—",
-
-  // Extensions — pairing
   "pairing.title": "الاقتران",
   "pairing.instructions": "أدخل الرمز من القناة لإنهاء الاقتران.",
   "pairing.placeholder": "أدخل رمز الاقتران…",
@@ -808,13 +721,9 @@ registerPack("ar", {
   "pairing.connect": "اتصال",
   "pairing.slackSuccess": "حساب Slack متصل.",
   "pairing.slackError": "رمز الاقتران Slack غير صالح أو منتهي الصلاحية.",
-
-  // Admin — tabs
   "admin.tab.dashboard": "لوحة التحكم",
   "admin.tab.users": "المستخدمون",
   "admin.tab.usage": "الاستخدام",
-
-  // Admin — dashboard
   "admin.dashboard.systemOverview": "نظرة عامة على النظام",
   "admin.dashboard.uptime": "مدة التشغيل: {value}",
   "admin.dashboard.totalUsers": "إجمالي المستخدمين",
@@ -834,8 +743,6 @@ registerPack("ar", {
   "admin.dashboard.status": "الحالة",
   "admin.dashboard.jobs": "المهام",
   "admin.dashboard.lastActive": "آخر نشاط",
-
-  // Admin — users list
   "admin.users.user": "مستخدم",
   "admin.users.userFallback": "مستخدم",
   "admin.users.title": "المستخدمون ({count} / {total})",
@@ -874,8 +781,6 @@ registerPack("ar", {
   "admin.users.delete": "حذف",
   "admin.users.deleteUserTitle": "حذف مستخدم",
   "admin.users.deleteUserDesc": "هل أنت متأكد أنك تريد حذف \"{name}\"؟ لا يمكن التراجع عن هذا الإجراء.",
-
-  // Admin — user detail
   "admin.user.profile": "الملف الشخصي",
   "admin.user.summary": "الملخص",
   "admin.user.id": "المعرّف",
@@ -892,8 +797,6 @@ registerPack("ar", {
   "admin.user.saveRole": "حفظ الدور",
   "admin.user.usage30Days": "الاستخدام (آخر 30 يومًا)",
   "admin.user.noUsage": "لا توجد بيانات استخدام.",
-
-  // Admin — usage tab
   "admin.usage.overview": "نظرة عامة على الاستخدام",
   "admin.usage.noData": "لا توجد بيانات استخدام لهذه الفترة.",
   "admin.usage.totalCalls": "إجمالي الاستدعاءات",
@@ -908,8 +811,6 @@ registerPack("ar", {
   "admin.usage.input": "الإدخال",
   "admin.usage.output": "الإخراج",
   "admin.usage.cost": "التكلفة",
-
-  // Logs page
   "logs.levelAll": "كل المستويات",
   "logs.level.trace": "TRACE",
   "logs.level.debug": "DEBUG",
@@ -1040,5 +941,15 @@ registerPack("ar", {
   "skills.source.user": "المستخدم",
   "skills.source.workspace": "مساحة العمل",
   "skills.updateFailed": "فشل التحديث.",
-  "skills.updated": "تم تحديث المهارة \"{name}\""
+  "skills.updated": "تم تحديث المهارة \"{name}\"",
+
+  // Desktop feature keys (genuinely translated, merged in)
+  "chat.heroMorning": "ما الذي تريد أن يتولاه IronClaw تاليًا؟",
+  "chat.heroAfternoon": "ما الذي تريد أن يتولاه IronClaw تاليًا؟",
+  "chat.heroEvening": "ما الذي تريد أن يتولاه IronClaw تاليًا؟",
+  "chat.fileDownloadFailed": "تعذر تنزيل هذا الملف",
+  "chat.removeImage": "إزالة الصورة",
+  "chat.removeAttachment": "إزالة المرفق",
+  "settings.notWritable": "التعديل غير متاح بعد على هذه البوابة",
+  "settings.notWritableDesc": "لا يمكن لهذه البوابة بعد حفظ التغييرات على هذه الإعدادات، لذا تُخفى عناصر التحكم بدلاً من عرضها قابلة للتعديل. ستعود بمجرد أن تتمكن البوابة من حفظها."
 });

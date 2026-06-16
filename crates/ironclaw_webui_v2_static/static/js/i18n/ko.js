@@ -1,11 +1,8 @@
 import { registerPack } from "../lib/i18n.js";
 
 registerPack("ko", {
-  // Language metadata
   "language.name": "한국어",
   "language.switch": "언어가 변경되었습니다",
-
-  // Common
   "common.unknown": "알 수 없음",
   "common.cancel": "취소",
   "common.delete": "삭제",
@@ -15,8 +12,6 @@ registerPack("ko", {
   "common.saving": "저장 중...",
   "common.done": "완료",
   "common.send": "보내기",
-
-  // Navigation
   "nav.chat": "채팅",
   "nav.close": "닫기",
   "nav.workspace": "워크스페이스",
@@ -32,22 +27,14 @@ registerPack("ko", {
   "nav.docs": "문서",
   "nav.sectionWork": "업무",
   "nav.sectionSystem": "시스템",
-
-  // Theme
   "theme.switchToLight": "라이트 테마로 전환",
   "theme.switchToDark": "다크 테마로 전환",
   "theme.light": "라이트 테마",
   "theme.dark": "다크 테마",
-
-  // Header
   "header.signOut": "로그아웃",
-
-  // Status
   "status.online": "온라인",
   "status.offline": "오프라인",
   "status.checking": "확인 중",
-
-  // Login page
   "login.tagline": "Gateway v2",
   "login.hero": "운영 추적을 유지하며 로컬 에이전트를 제어합니다.",
   "login.heroSub": "토큰 접근은 브라우저 콘솔을 동일한 게이트웨이 런타임, 승인, 도구 및 스레드 상태에 연결합니다.",
@@ -62,8 +49,6 @@ registerPack("ko", {
   "login.connect": "연결",
   "login.oauthDivider": "또는 계속",
   "login.oauthProvider": "{provider} 계속",
-
-  // Chat — empty state
   "chat.heroTitle": "안녕하세요, 무엇을 도와드릴까요?",
   "chat.heroDesc": "목표, 저장소 질문, 리뷰 요청 또는 작업이 필요한 파일로 시작하세요.",
   "chat.emptyTitle": "구체적인 운영 작업으로 시작하세요.",
@@ -74,8 +59,6 @@ registerPack("ko", {
   "chat.suggestion2Desc": "정확성 위험, 막힌 승인, 후속 조치를 확인합니다.",
   "chat.suggestion3": "확장 준비 상태 점검 초안 작성",
   "chat.suggestion3Desc": "설정, 인증, 페어링, 사용 가능한 기능을 확인합니다.",
-
-  // Chat — input
   "chat.placeholder": "IronClaw에 메시지 보내기...",
   "chat.heroPlaceholder": "IronClaw에 무엇이든 물어보세요.",
   "chat.followUpPlaceholder": "후속 변경 요청",
@@ -101,8 +84,6 @@ registerPack("ko", {
   "shortcuts.newline": "새 줄",
   "shortcuts.help": "이 도움말 보기",
   "shortcuts.close": "닫기",
-
-  // Chat — thread sidebar
   "chat.conversations": "대화",
   "chat.threads": "{count}개 스레드",
   "chat.newThread": "새로 만들기",
@@ -110,15 +91,11 @@ registerPack("ko", {
   "chat.selectConversation": "대화 선택",
   "chat.noConversations": "아직 대화가 없습니다. 작성기 제안에서 스레드를 시작하세요.",
   "chat.turns": "{count}개 턴",
-
-  // Chat — connection
   "connection.connected": "연결됨",
   "connection.reconnecting": "재연결 중...",
   "connection.disconnected": "연결 끊김",
   "connection.connecting": "연결 중...",
   "connection.paused": "탭이 숨겨진 동안 일시 중지됨",
-
-  // Chat — approval
   "approval.title": "승인 필요",
   "approval.approve": "승인",
   "approval.deny": "거부",
@@ -126,7 +103,6 @@ registerPack("ko", {
   "approval.approveAndAlways": "승인 및 항상 허용",
   "approval.alwaysAllowToolLabel": "묻지 않고 항상 {tool} 허용",
   "approval.thisTool": "이 도구",
-  // Chat — tool activity
   "tool.tabDetails": "세부 정보",
   "tool.tabParameters": "매개 변수",
   "tool.tabResult": "결과",
@@ -166,19 +142,13 @@ registerPack("ko", {
   "authGate.unsupportedChallenge": "이 인증 단계를 완료하려면 설정을 엽니다.",
   "authGate.submitFailed": "토큰을 저장할 수 없습니다.",
   "authGate.resolveFailedAfterTokenSaved": "토큰이 저장되었습니다. 차단된 실행을 재개할 수 없습니다. 다시 시작해 보세요.",
-
-  // Error
   "error.gatewayConnection": "게이트웨이에 연결할 수 없습니다",
   "error.saveFailed": "저장 실패: {message}",
   "error.loadFailed": "{what} 로드 실패: {message}",
-
-  // Extensions tabs
   "extensions.installed": "설치됨",
   "extensions.channels": "채널",
   "extensions.mcp": "MCP 서버",
   "extensions.registry": "레지스트리",
-
-  // Settings tabs
   "settings.inference": "추론",
   "settings.agent": "에이전트",
   "settings.channels": "채널",
@@ -188,7 +158,6 @@ registerPack("ko", {
   "settings.traceCommons": "Trace Commons",
   "settings.users": "사용자",
   "settings.language": "언어",
-  // Settings — Trace Commons credits (read-only)
   "traceCommons.title": "Trace Commons 크레딧",
   "traceCommons.description": "기여한 편집된 트레이스로 획득한 크레딧이며, 내 계정 범위로 표시됩니다.",
   "traceCommons.emptyState": "미등록 — 에이전트에게 Trace Commons 초대로 온보딩을 요청하세요.",
@@ -216,9 +185,6 @@ registerPack("ko", {
   "traceCommons.never": "없음",
   "traceCommons.recentExplanations": "최근 크레딧 내역",
   "traceCommons.note": "마지막 동기화 기준 로컬 보기입니다 — 공식 크레딧 원장은 서버에 있습니다. 최종 크레딧은 개인정보 검토, 리플레이/평가, 중복 검사 및 후속 유용성 평가 후 변경될 수 있습니다.",
-
-
-  // Settings — toolbar
   "settings.back": "뒤로",
   "settings.searchPlaceholder": "설정 검색...",
   "settings.clearSearch": "검색 지우기",
@@ -231,22 +197,16 @@ registerPack("ko", {
   "settings.importSuccess": "가져온 설정",
   "settings.importInvalid": "선택한 파일에 설정 개체가 포함되어야 함",
   "settings.importFailed": "가져오기 실패: {message}",
-
-  // Settings — restart banner
   "settings.restartRequired": "일부 변경사항은 재시작이 필요합니다.",
   "settings.restartNow": "지금 다시 시작",
   "settings.restartStarting": "다시 시작 중...",
   "settings.restartUnavailable": "웹 UI에서의 다시 시작은 아직 지원되지 않습니다. 대기 중인 변경 사항을 적용하려면 게이트웨이 프로세스를 수동으로 다시 시작하세요.",
-
-  // Restart dialog
   "restart.title": "IronClaw 다시 시작",
   "restart.description": "gateway 프로세스 다시 시작 보류 중인 변경 사항을 적용합니다.",
   "restart.warning": "gateway이 다시 시작되는 동안 실행 중인 작업이 중단될 수 있습니다.",
   "restart.cancel": "취소",
   "restart.confirm": "다시 시작 확인",
   "restart.progressTitle": "IronClaw 다시 시작",
-
-  // TEE attestation
   "tee.title": "TEE 증명",
   "tee.verified": "확인된 런타임 증명 사용 가능",
   "tee.imageDigest": "이미지 다이제스트",
@@ -257,8 +217,6 @@ registerPack("ko", {
   "tee.loadFailed": "증명 보고서를 로드할 수 없음",
   "tee.copyReport": "보고서 복사",
   "tee.copied": "복사됨",
-
-  // Settings — LLM providers
   "llm.active": "활성",
   "llm.addProvider": "공급자 추가",
   "llm.adapter": "어댑터",
@@ -323,7 +281,6 @@ registerPack("ko", {
   "llm.testConnection": "연결 테스트",
   "llm.testing": "테스트 중...",
   "llm.use": "Use",
-  // Settings — LLM providers (progressive disclosure)
   "llm.groupActive": "활성",
   "llm.groupReady": "사용 준비됨",
   "llm.groupSetup": "설정 필요",
@@ -332,8 +289,6 @@ registerPack("ko", {
   "llm.missingApiKey": "API 키 누락",
   "llm.missingBaseUrl": "기본 URL 누락",
   "llm.addApiKey": "API 키 추가",
-
-  // Settings — inference groups
   "settings.group.embeddings": "임베딩",
   "settings.group.sampling": "샘플링",
   "settings.field.embeddingsEnabled": "임베딩 활성화",
@@ -344,8 +299,6 @@ registerPack("ko", {
   "settings.field.embeddingsModelDesc": "임베딩 모델 식별자",
   "settings.field.temperature": "온도",
   "settings.field.temperatureDesc": "기본 샘플링 온도 (0.0–2.0)",
-
-  // Settings — agent groups
   "settings.group.core": "핵심",
   "settings.group.heartbeat": "하트비트",
   "settings.group.sandbox": "샌드박스",
@@ -417,8 +370,6 @@ registerPack("ko", {
   "settings.field.skillsMaxContextTokensDesc": "주입 스킬 프롬프트의 토큰 예산",
   "settings.field.fusionStrategy": "융합 전략",
   "settings.field.fusionStrategyDesc": "하이브리드 검색 결과 병합 방법",
-
-  // Settings — networking
   "settings.group.gateway": "게이트웨이",
   "settings.group.tunnel": "터널",
   "settings.field.gatewayHost": "호스트",
@@ -429,8 +380,6 @@ registerPack("ko", {
   "settings.field.tunnelProviderDesc": "공개 터널 서비스",
   "settings.field.tunnelPublicUrl": "공개 URL",
   "settings.field.tunnelPublicUrlDesc": "정적 터널 엔드포인트",
-
-  // Settings — channels tab
   "channels.builtIn": "내장 채널",
   "channels.messaging": "메시징 채널",
   "channels.availableChannels": "사용 가능한 채널",
@@ -467,8 +416,6 @@ registerPack("ko", {
   "channels.slackAccessSaving": "저장...",
   "channels.slackAccessSuccess": "Slack 채널이 저장되었습니다.",
   "channels.slackAccessError": "Slack 채널 업데이트에 실패했습니다.",
-
-  // Settings — tools tab
   "tools.permissions": "도구 권한",
   "tools.alwaysAllow": "항상 허용",
   "tools.askEachTime": "매번 확인",
@@ -479,8 +426,6 @@ registerPack("ko", {
   "tools.filterPlaceholder": "도구 필터링…",
   "tools.noMatch": "필터와 일치하는 도구가 없습니다.",
   "tools.failedLoad": "도구 로드 실패: {message}",
-
-  // Settings — skills tab
   "skills.installed": "설치된 스킬",
   "skills.noInstalled": "설치된 스킬 없음",
   "skills.noInstalledDesc": "스킬은 에이전트에 도메인별 지침을 추가합니다. ClawHub 레지스트리에서 설치하거나 워크스페이스에 SKILL.md 파일을 배치하세요.",
@@ -508,8 +453,6 @@ registerPack("ko", {
   "skills.removed": "제거된 스킬 \"{name}\"",
   "skills.activatesOn": "활성화",
   "skills.imported": "가져온",
-
-  // Settings — users tab
   "users.title": "사용자 ({count})",
   "users.addUser": "사용자 추가",
   "users.newUser": "새 사용자",
@@ -525,8 +468,6 @@ registerPack("ko", {
   "users.adminRequiredDesc": "사용자 관리는 관리자 권한이 있는 계정에서만 사용할 수 있습니다.",
   "users.failedLoad": "사용자 로드 실패: {message}",
   "users.noUsers": "등록된 사용자가 없습니다.",
-
-  // Workspace page
   "workspace.title": "워크스페이스",
   "workspace.subtitle": "영구 메모리",
   "workspace.refresh": "새로고침",
@@ -547,8 +488,6 @@ registerPack("ko", {
   "workspace.unableOpenDirectory": "디렉터리를 열 수 없습니다",
   "workspace.unableSaveFile": "파일을 저장할 수 없습니다",
   "workspace.savedPath": "{path} 저장됨",
-
-  // Jobs page
   "jobs.allJobs": "모든 작업",
   "jobs.refresh": "새로고침",
   "jobs.refreshing": "새로고침 중",
@@ -556,8 +495,6 @@ registerPack("ko", {
   "jobs.unavailableDesc": "이 작업은 더 이상 존재하지 않거나 접근 범위를 벗어났습니다.",
   "jobs.returnToJobs": "작업 목록으로 돌아가기",
   "jobs.dismiss": "닫기",
-
-  // Jobs — list
   "jobs.list.explorer": "탐색기",
   "jobs.list.queueTitle": "작업 큐",
   "jobs.list.queueDesc": "제목 또는 ID로 검색하고 실행으로 이동해, 페이지를 떠나지 않고도 활성 작업을 중지할 수 있습니다.",
@@ -580,14 +517,10 @@ registerPack("ko", {
   "jobs.list.started": "시작 {value}",
   "jobs.action.cancel": "취소",
   "jobs.action.open": "열기",
-
-  // Jobs — detail
   "jobs.detail.backToAll": "모든 작업으로 돌아가기",
   "jobs.detail.tabs.overview": "개요",
   "jobs.detail.tabs.activity": "활동",
   "jobs.detail.tabs.files": "파일",
-
-  // Missions page
   "missions.allMissions": "모든 미션",
   "missions.refresh": "새로고침",
   "missions.refreshing": "새로고침 중",
@@ -632,8 +565,6 @@ registerPack("ko", {
   "missions.summary.spawnedThreads": "생성 스레드",
   "missions.summary.completedFailed": "{completed} 완료 / {failed} 실패",
   "missions.summary.acrossProjects": "모든 프로젝트 워크스페이스 기준",
-
-  // Automations page
   "automations.eyebrow": "예정된 작업",
   "automations.title": "자동화",
   "automations.description": "예약된 자동화만 해당됩니다.",
@@ -644,8 +575,7 @@ registerPack("ko", {
   "automations.refresh": "자동화 새로 고침",
   "automations.error.loadFailed": "자동화를 로드할 수 없음",
   "automations.schedulerOff.title": "예약 실행이 꺼져 있습니다",
-  "automations.schedulerOff.description":
-    "이 자동화는 저장되었지만 스케줄러를 켜기 전에는 실행되지 않습니다.",
+  "automations.schedulerOff.description": "이 자동화는 저장되었지만 스케줄러를 켜기 전에는 실행되지 않습니다.",
   "automations.schedule.custom": "사용자 지정 일정",
   "automations.schedule.everyMinute": "매분",
   "automations.schedule.everyMinutes": "{count}분마다",
@@ -698,8 +628,7 @@ registerPack("ko", {
   "automations.delivery.save": "저장",
   "automations.delivery.clear": "지우기",
   "automations.delivery.saved": "저장됨",
-  "automations.delivery.saveFailed":
-    "전달 대상을 저장하지 못했습니다. 다시 시도해 주세요.",
+  "automations.delivery.saveFailed": "전달 대상을 저장하지 못했습니다. 다시 시도해 주세요.",
   "automations.delivery.footnote": "DM으로 전송된 승인 요청은 Slack에서 {command}(으)로 답장하여 처리합니다.",
   "automations.delivery.pill.ready": "준비됨",
   "automations.delivery.pill.unavailable": "사용 불가",
@@ -724,30 +653,20 @@ registerPack("ko", {
   "automations.table.nextRun": "다음 실행",
   "automations.table.lastRun": "마지막 실행",
   "automations.table.status": "상태",
-
-  // Routines page
   "routines.explorer": "작업",
   "routines.title": "루틴",
   "routines.description": "저장된 루틴을 검색하고 일정 또는 트리거를 확인한 뒤 v2를 떠나지 않고 실행하거나 일시 중지합니다.",
-
-  // Extensions page
   "ext.installed": "설치됨",
   "ext.channels": "채널",
   "ext.mcp": "MCP",
   "ext.registry": "레지스트리",
-
-  // Extensions — registry
   "ext.registry.searchPlaceholder": "확장 검색…",
   "ext.registry.emptyTitle": "레지스트리가 비어 있습니다",
   "ext.registry.emptyDesc": "사용 가능한 확장이 이미 모두 설치되어 있거나, 레지스트리가 구성되어 있지 않습니다.",
   "ext.registry.availableTitle": "사용 가능한 확장",
   "ext.registry.noMatch": "필터와 일치하는 확장이 없습니다.",
-
-  // Chat — history
   "chat.history.loading": "로딩 중...",
   "chat.history.loadOlder": "이전 메시지 불러오기",
-
-  // Projects page
   "projects.allProjects": "모든 프로젝트",
   "projects.returnToProjects": "프로젝트로 돌아가기",
   "projects.unavailable": "프로젝트를 사용할 수 없습니다",
@@ -781,20 +700,14 @@ registerPack("ko", {
   "projects.card.failures24h": "24시간 내 {count}",
   "projects.card.spendToday": "오늘 지출 {value}",
   "projects.explorer": "탐색기",
-
-  // Language settings
   "lang.title": "언어",
   "lang.description": "인터페이스 표시 언어를 선택합니다.",
   "lang.current": "현재 언어",
-
-  // Settings — inference summary card
   "inference.provider": "LLM 제공자",
   "inference.backend": "백엔드",
   "inference.model": "모델",
   "inference.active": "활성",
   "inference.none": "—",
-
-  // Extensions — pairing
   "pairing.title": "페어링",
   "pairing.instructions": "해당 채널의 코드를 입력하면 페어링이 완료됩니다.",
   "pairing.placeholder": "페어링 코드를 입력…",
@@ -808,13 +721,9 @@ registerPack("ko", {
   "pairing.connect": "연결",
   "pairing.slackSuccess": "Slack 계정이 연결되었습니다.",
   "pairing.slackError": "유효하지 않거나 만료된 Slack 페어링 코드입니다.",
-
-  // Admin — tabs
   "admin.tab.dashboard": "대시보드",
   "admin.tab.users": "사용자",
   "admin.tab.usage": "사용량",
-
-  // Admin — dashboard
   "admin.dashboard.systemOverview": "시스템 개요",
   "admin.dashboard.uptime": "업타임: {value}",
   "admin.dashboard.totalUsers": "전체 사용자",
@@ -834,8 +743,6 @@ registerPack("ko", {
   "admin.dashboard.status": "상태",
   "admin.dashboard.jobs": "작업",
   "admin.dashboard.lastActive": "마지막 활동",
-
-  // Admin — users list
   "admin.users.user": "사용자",
   "admin.users.userFallback": "사용자",
   "admin.users.title": "사용자 ({count} / {total})",
@@ -874,8 +781,6 @@ registerPack("ko", {
   "admin.users.delete": "삭제",
   "admin.users.deleteUserTitle": "사용자 삭제",
   "admin.users.deleteUserDesc": "\"{name}\" 사용자를 삭제할까요? 이 작업은 되돌릴 수 없습니다.",
-
-  // Admin — user detail
   "admin.user.profile": "프로필",
   "admin.user.summary": "요약",
   "admin.user.id": "ID",
@@ -892,8 +797,6 @@ registerPack("ko", {
   "admin.user.saveRole": "역할 저장",
   "admin.user.usage30Days": "사용량(최근 30일)",
   "admin.user.noUsage": "사용량 데이터 없음.",
-
-  // Admin — usage tab
   "admin.usage.overview": "사용량 개요",
   "admin.usage.noData": "이 기간에 대한 사용량 데이터가 없습니다.",
   "admin.usage.totalCalls": "총 호출",
@@ -908,8 +811,6 @@ registerPack("ko", {
   "admin.usage.input": "입력",
   "admin.usage.output": "출력",
   "admin.usage.cost": "비용",
-
-  // Logs page
   "logs.levelAll": "모든 수준",
   "logs.level.trace": "TRACE",
   "logs.level.debug": "DEBUG",
@@ -1040,5 +941,15 @@ registerPack("ko", {
   "skills.source.user": "사용자",
   "skills.source.workspace": "워크스페이스",
   "skills.updateFailed": "업데이트 실패.",
-  "skills.updated": "스킬 \"{name}\" 업데이트됨"
+  "skills.updated": "스킬 \"{name}\" 업데이트됨",
+
+  // Desktop feature keys (genuinely translated, merged in)
+  "chat.heroMorning": "다음으로 IronClaw가 무엇을 처리할까요?",
+  "chat.heroAfternoon": "다음으로 IronClaw가 무엇을 처리할까요?",
+  "chat.heroEvening": "다음으로 IronClaw가 무엇을 처리할까요?",
+  "chat.fileDownloadFailed": "파일을 다운로드하지 못했습니다",
+  "chat.removeImage": "이미지 제거",
+  "chat.removeAttachment": "첨부 파일 제거",
+  "settings.notWritable": "이 게이트웨이에서는 아직 편집할 수 없습니다",
+  "settings.notWritableDesc": "이 게이트웨이는 아직 이 설정의 변경 사항을 저장할 수 없으므로, 컨트롤을 편집 가능한 것으로 표시하지 않고 숨깁니다. 게이트웨이가 저장할 수 있게 되면 다시 표시됩니다."
 });

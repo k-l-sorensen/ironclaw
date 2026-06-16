@@ -2,16 +2,100 @@ import { Button } from "../../../design-system/button.js";
 import { Badge } from "../../../design-system/badge.js";
 import { Card } from "../../../design-system/card.js";
 import { Icon } from "../../../design-system/icons.js";
+import { Select } from "../../../design-system/input.js";
 import { React, html } from "../../../lib/html.js";
+import { isDesktopRuntime } from "../../../lib/api.js";
 import { useT } from "../../../lib/i18n.js";
 import {
   adapterLabel,
   isProviderConfigured,
+  modelDisplayName,
   providerAcceptsApiKey,
   providerDisplayModel,
   providerEffectiveBaseUrl,
   providerMissingReason,
 } from "../lib/llm-providers.js";
+
+// Desktop-only (additive): active model switcher backed by the gateway's live
+// model list, applied through the same set-active route the chat popover uses.
+// Only the desktop ProviderManagement renders it (behind `isDesktopRuntime()`);
+// it is exported here so it sits beside the card it complements.
+export function ActiveModelPicker({ provider, currentModel, onListModels, onApplyModel, t }) {
+  const [models, setModels] = React.useState(null);
+  const [choice, setChoice] = React.useState(currentModel || "");
+  const [busy, setBusy] = React.useState(false);
+  const [failed, setFailed] = React.useState(false);
+
+  React.useEffect(() => {
+    if (models !== null || typeof onListModels !== "function") return undefined;
+    let cancelled = false;
+    (async () => {
+      try {
+        const result = await onListModels({
+          provider_id: provider.id,
+          adapter: provider.adapter || provider.id,
+        });
+        if (cancelled) return;
+        setModels(result?.ok && Array.isArray(result.models) ? result.models : []);
+        setFailed(!result?.ok);
+      } catch (_) {
+        if (!cancelled) {
+          setModels([]);
+          setFailed(true);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [models, onListModels, provider]);
+
+  if (models === null) {
+    return html`<div className="text-xs text-[var(--v2-text-faint)]">${t("common.loading")}</div>`;
+  }
+  if (models.length === 0) {
+    return failed
+      ? html`<div className="text-xs text-[var(--v2-warning-text)]">
+          ${t("chat.modelPopoverError")}
+        </div>`
+      : null;
+  }
+
+  const apply = async () => {
+    if (!choice || busy || typeof onApplyModel !== "function") return;
+    setBusy(true);
+    try {
+      await onApplyModel(provider, choice);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return html`
+    <div className="flex flex-wrap items-center gap-2">
+      <${Select}
+        aria-label=${t("llm.model")}
+        value=${models.includes(choice) ? choice : ""}
+        onChange=${(event) => setChoice(event.target.value)}
+        wrapperClassName="min-w-[min(18rem,100%)] flex-1 sm:min-w-[18rem]"
+        className="h-11 text-xs md:h-9"
+      >
+        <option value="" disabled>${t("llm.pickModel")}</option>
+        ${models.map(
+          (entry) => html`<option key=${entry} value=${entry}>${modelDisplayName(entry)}</option>`
+        )}
+      <//>
+      <${Button}
+        type="button"
+        variant="primary"
+        disabled=${busy || !choice || choice === currentModel}
+        onClick=${apply}
+      >
+        ${busy ? t("llm.applying") : t("llm.applyModel")}
+      <//>
+    </div>
+  `;
+}
 
 export function ProviderCard({
   provider,
@@ -28,14 +112,25 @@ export function ProviderCard({
   loginBusy,
 }) {
   const t = useT();
+  const desktop = isDesktopRuntime();
   const isActive = provider.id === activeProviderId;
+  // Desktop relabels the NEAR provider to "NEAR AI Cloud"; web shows the raw
+  // provider name/id (behavior equals today's mono).
+  const displayName =
+    desktop && provider.id === "nearai" ? "NEAR AI Cloud" : provider.name || provider.id;
   const configured = isProviderConfigured(provider, builtinOverrides);
   const baseUrl = providerEffectiveBaseUrl(provider, builtinOverrides);
   const model = providerDisplayModel(provider, builtinOverrides, activeProviderId, selectedModel);
+  // Desktop derives a readable model label; web shows the raw id.
+  const rawModel = model || provider.default_model || "";
+  const modelLabel = desktop ? modelDisplayName(rawModel) : rawModel;
   const missing = providerMissingReason(provider, builtinOverrides);
   const acceptsApiKey = providerAcceptsApiKey(provider);
+  // `gateway` is only produced for the desktop synthetic-offline fallback.
   const missingLabel =
-    missing === "api_key"
+    missing === "gateway"
+      ? t("llm.gatewayUnavailable")
+      : missing === "api_key"
       ? t("llm.missingApiKey")
       : missing === "base_url"
       ? t("llm.missingBaseUrl")
@@ -53,14 +148,20 @@ export function ProviderCard({
         ${missingLabel}
       </span>`
     : html`<span className="hidden truncate font-mono text-[11px] text-[var(--v2-text-faint)] sm:inline">
-        ${adapterLabel(provider.adapter)} · ${model || provider.default_model || t("llm.none")}
+        ${adapterLabel(provider.adapter)} · ${modelLabel || t("llm.none")}
       </span>`;
 
+  // On web the Codex provider keeps its dedicated device-code sign-in; the
+  // desktop app surfaces only NEAR AI Cloud, so its filtered list never reaches
+  // an `openai_codex` card.
   const isLoginProvider = provider.id === "nearai" || provider.id === "openai_codex";
   const hasApiKey = provider.api_key_set === true || provider.has_api_key === true;
+  // Desktop labels the NEAR key action "useNearApiKey"; web uses "addApiKey"
+  // (behavior equals today's mono).
+  const nearApiKeyLabel = desktop ? t("llm.useNearApiKey") : t("llm.addApiKey");
   const configureLabel = provider.builtin
     ? provider.id === "nearai" && acceptsApiKey && !hasApiKey
-      ? t("llm.addApiKey")
+      ? nearApiKeyLabel
       : t("llm.configure")
     : t("common.edit");
   const apiKeyAction =
@@ -124,7 +225,11 @@ export function ProviderCard({
           disabled=${isBusy}
           onClick=${() => onConfigure(provider)}
         >
-          ${missing === "api_key" ? t("llm.addApiKey") : t("llm.configure")}
+          ${missing === "gateway"
+            ? t("common.retry")
+            : missing === "api_key"
+            ? (provider.id === "nearai" ? nearApiKeyLabel : t("llm.addApiKey"))
+            : t("llm.configure")}
         <//>
       `
     : null;
@@ -149,7 +254,7 @@ export function ProviderCard({
           : "",
       ].join(" ")}
     >
-      <div className="flex w-full items-stretch hover:bg-[var(--v2-surface-soft)]">
+      <div className="flex w-full flex-col hover:bg-[var(--v2-surface-soft)] sm:flex-row sm:items-stretch">
         <button
           type="button"
           aria-expanded=${expanded ? "true" : "false"}
@@ -170,7 +275,7 @@ export function ProviderCard({
           />
           <span className="flex min-w-0 flex-1 flex-wrap items-center gap-2">
             <span className="min-w-0 truncate text-sm font-semibold text-[var(--v2-text-strong)]">
-              ${provider.name || provider.id}
+              ${displayName}
             </span>
             <span className="font-mono text-[11px] text-[var(--v2-text-faint)]">${provider.id}</span>
             ${isActive && html`<${Badge} tone="positive" label=${t("llm.active")} size="sm" />`}
@@ -179,7 +284,7 @@ export function ProviderCard({
           </span>
           <span className="hidden min-w-0 max-w-[280px] truncate sm:block">${inlineMeta}</span>
         </button>
-        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 py-3 pr-4 sm:pr-5">
+        <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 border-t border-[var(--v2-panel-border)] px-4 py-3 sm:border-t-0 sm:pl-0 sm:pr-5">
           ${primaryAction}
           <button
             type="button"
@@ -187,7 +292,7 @@ export function ProviderCard({
             data-testid="llm-provider-chevron"
             aria-label=${expanded ? t("llm.collapseDetails") : t("llm.expandDetails")}
             className=${[
-              "grid h-7 w-7 place-items-center rounded-md text-[var(--v2-text-faint)] transition-transform hover:bg-[var(--v2-surface-muted)] hover:text-[var(--v2-text-strong)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--v2-accent)]",
+              "grid h-11 w-11 place-items-center rounded-md text-[var(--v2-text-faint)] transition-transform hover:bg-[var(--v2-surface-muted)] hover:text-[var(--v2-text-strong)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--v2-accent)] md:h-7 md:w-7",
               expanded ? "rotate-180" : "",
             ].join(" ")}
           >
@@ -210,7 +315,7 @@ export function ProviderCard({
             </div>
             <div>
               <div className="font-mono uppercase text-[10px] text-[var(--v2-text-faint)]">${t("llm.model")}</div>
-              <div className="mt-1 truncate font-mono">${model || t("llm.none")}</div>
+              <div className="mt-1 truncate font-mono">${modelLabel || t("llm.none")}</div>
             </div>
           </div>
 

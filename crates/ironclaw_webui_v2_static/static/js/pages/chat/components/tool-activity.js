@@ -2,19 +2,21 @@ import { Icon } from "../../../design-system/icons.js";
 import { React, html } from "../../../lib/html.js";
 import { useT } from "../../../lib/i18n.js";
 
-/* Status dot colour by tool status. Running shows the breathing dot (a no-op
-   under the static motion policy, matching the Badge component's approach). */
+/* Status dot colour by tool status. Running uses the shared semantic motion
+   class, which only animates under prefers-reduced-motion: no-preference (see
+   .v2-breathing-dot in app.css) — this keeps the calm-motion policy satisfied. */
 const DOT_STYLE = {
-  running: "bg-[var(--v2-accent)] animate-[v2-breathe_1.6s_ease-in-out_infinite]",
+  running: "bg-[var(--v2-accent)] v2-breathing-dot",
   success: "bg-[var(--v2-positive-text)]",
   error: "bg-[var(--v2-danger-text)]",
 };
 
 const STATUS_WORD = { success: "ok", error: "err", running: "run" };
 
-/* Runs longer than this collapse into a single summary line. Runs of this
-   length or shorter render each call as its own row. */
-export const TOOL_RUN_COLLAPSE_AFTER = 2;
+/* Tool chatter should never become the product. Every run collapses into a
+   human summary by default; failures expand themselves so the reason stays
+   visible. (Runs of this length or shorter render each call as its own row.) */
+export const TOOL_RUN_COLLAPSE_AFTER = 0;
 
 export function ToolActivity({ activity }) {
   if (activity.toolCalls && activity.toolCalls.length > 0) {

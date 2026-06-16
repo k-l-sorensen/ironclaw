@@ -15,7 +15,7 @@ export function ProviderLoginStatus({ login }) {
       ${t("onboarding.nearaiWaiting")}
     </div>`}
     ${nearaiError &&
-    html`<div className="text-center text-xs text-red-300">${nearaiError}</div>`}
+    html`<div className="text-center text-xs text-[var(--v2-danger-text)]">${nearaiError}</div>`}
 
     ${codexCode &&
     html`<div
@@ -41,6 +41,6 @@ export function ProviderLoginStatus({ login }) {
       ${t("onboarding.codexWaiting")}
     </div>`}
     ${codexError &&
-    html`<div className="text-center text-xs text-red-300">${codexError}</div>`}
+    html`<div className="text-center text-xs text-[var(--v2-danger-text)]">${codexError}</div>`}
   `;
 }

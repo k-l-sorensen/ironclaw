@@ -57,7 +57,20 @@ function componentProps(node, component) {
   const props = {};
   const start = node.values.indexOf(component);
   for (let index = start + 1; index < node.values.length; index += 1) {
-    const name = node.strings[index]?.match(/([A-Za-z][A-Za-z0-9]*)=\s*$/)?.[1];
+    const templateBeforeValue = node.strings[index] || "";
+    const name = templateBeforeValue.match(/([A-Za-z][A-Za-z0-9]*)=\s*$/)?.[1];
+    // Stop once we leave this component's opening tag (a self-close, close
+    // marker, or the start of a child element): later interpolations belong to
+    // siblings/children, not this component's props.
+    if (
+      !name &&
+      index > start + 1 &&
+      (templateBeforeValue.includes("/>") ||
+        templateBeforeValue.includes("<//>") ||
+        /<\s*$/.test(templateBeforeValue))
+    ) {
+      break;
+    }
     if (name) props[name] = node.values[index];
   }
   return props;
@@ -139,6 +152,8 @@ function useProviderManagementActionsStub({ providers, activeProviderId }) {
   return () => ({
     allProviderIds: providers.map((provider) => provider.id),
     closeDialog: () => {},
+    confirmRequest: null,
+    dismissConfirm: () => {},
     dialogProvider: null,
     filteredProviders: providers,
     handleDelete: () => {},
@@ -153,24 +168,54 @@ function useProviderManagementActionsStub({ providers, activeProviderId }) {
       error: null,
       isBusy: false,
       isLoading: false,
+      listModels: async () => ({ ok: true, models: ["llama", "auto"] }),
       selectedModel: "llama",
     },
   });
 }
 
-function renderProviderManagement({ providers, activeProviderId = "nearai", searchQuery = "" }) {
+// `desktop` toggles the merged ProviderManagement between its web (full
+// provider list, custom-provider creation, Codex) and desktop (NEAR AI Cloud
+// only, ActiveModelPanel, no addProvider) branches via the `isDesktopRuntime`
+// stub. The merged source references the desktop-only imports unconditionally
+// at module scope (they are stripped by sourceForTest), so the context provides
+// stubs for them on both paths.
+function renderProviderManagement({
+  providers,
+  activeProviderId = "nearai",
+  searchQuery = "",
+  desktop = false,
+}) {
   const ProviderCard = "ProviderCard";
   const context = {
     Button: "Button",
     Card: "Card",
     Icon: "Icon",
+    ActiveModelPicker: "ActiveModelPicker",
+    ConfirmDialog: "ConfirmDialog",
     ProviderCard,
     ProviderDialog: "ProviderDialog",
     ProviderLoginStatus: "ProviderLoginStatus",
     SettingsSearchEmpty: "SettingsSearchEmpty",
+    isDesktopRuntime: () => desktop,
+    filterDesktopVisibleLlmProviders: (list) =>
+      Array.isArray(list) ? list.filter((provider) => provider.id === "nearai") : [],
     globalThis: {},
     groupProvidersByStatus,
     html,
+    modelDisplayName: (model) =>
+      String(model || "")
+        .replace(/^z-ai\//, "")
+        .replace("glm-4.5", "GLM 4.5")
+        .replace(/anthropic\/claude[^ ]*/i, "NEAR premium reasoning"),
+    React: {
+      useCallback: (fn) => fn,
+      useEffect: () => {},
+      useState: (v) => [v, () => {}],
+      useRef: (v) => ({ current: v }),
+    },
+    setActiveLlm: async () => {},
+    useQueryClient: () => ({ invalidateQueries: async () => {} }),
     useProviderManagementActions: useProviderManagementActionsStub({
       providers,
       activeProviderId,
@@ -186,10 +231,11 @@ function renderProviderManagement({ providers, activeProviderId = "nearai", sear
   };
 
   vm.runInNewContext(
-    sourceForTest("./provider-management.js", ["ProviderManagement"]),
+    sourceForTest("./provider-management.js", ["ProviderManagement", "ActiveModelPanel"]),
     context
   );
-  const rendered = context.globalThis.__testExports.ProviderManagement({
+  const { ProviderManagement, ActiveModelPanel } = context.globalThis.__testExports;
+  const rendered = ProviderManagement({
     settings: {},
     gatewayStatus: {},
     searchQuery,
@@ -197,7 +243,10 @@ function renderProviderManagement({ providers, activeProviderId = "nearai", sear
   const cardProps = findComponentNodes(rendered, ProviderCard).map((node) =>
     componentProps(node, ProviderCard)
   );
-  return { rendered, cardProps };
+  const panelProps = findComponentNodes(rendered, ActiveModelPanel).map((node) =>
+    componentProps(node, ActiveModelPanel)
+  );
+  return { rendered, cardProps, ActiveModelPanel, panelProps };
 }
 
 function evalIsLocalDevOrigin({ hostname }) {
@@ -267,18 +316,25 @@ function createReactMenuStateStub(state) {
   };
 }
 
-function createProviderCardHarness() {
+function createProviderCardHarness({ desktop = false } = {}) {
   const state = {};
   const context = {
     Badge: "Badge",
     Button: "Button",
     Card: "Card",
     Icon: "Icon",
+    Select: "Select",
+    isDesktopRuntime: () => desktop,
     React: createReactStateStub(state),
     adapterLabel: (adapter) => adapter,
     globalThis: {},
     html,
     isProviderConfigured: (provider) => provider.configured !== false,
+    modelDisplayName: (model) =>
+      String(model || "")
+        .replace(/^z-ai\//, "")
+        .replace("glm-4.5", "GLM 4.5")
+        .replace(/anthropic\/claude[^ ]*/i, "NEAR premium reasoning"),
     providerAcceptsApiKey: (provider) => provider.accepts_api_key !== false,
     providerDisplayModel: (provider) => provider.default_model || "model",
     providerEffectiveBaseUrl: (provider) => provider.base_url || "https://example.com/v1",
@@ -643,7 +699,12 @@ test("isLocalDevOrigin detects loopback origins so NEAR AI SSO fails fast there"
 // Caller"): isLocalDevOrigin gates the NEAR AI login HTTP call, not just a
 // helper return value. setTimeout fires synchronously so the remote-origin
 // control path's poll resolves immediately.
-function runProviderLogin({ hostname, activeProviderId = null, popupClosed = false }) {
+function runProviderLogin({
+  hostname,
+  activeProviderId = null,
+  popupClosed = false,
+  desktop = false,
+}) {
   const stateLog = [];
   const httpCalls = [];
   // Capture every window.open URL and the popup handles so tests can assert the
@@ -674,6 +735,33 @@ function runProviderLogin({ hostname, activeProviderId = null, popupClosed = fal
     },
     useT: () => (key) => key,
     useQueryClient: () => ({ invalidateQueries: async () => {} }),
+    // Desktop-runtime branch dependencies (additive). Web tests pass
+    // `desktop:false`, so these are never hit; they exist so the merged source
+    // resolves its module-scope imports under the VM.
+    isDesktopRuntime: () => desktop,
+    gatewayOrigin: () => (desktop ? "http://127.0.0.1:3100" : ""),
+    openExternalUrl: async (url) => {
+      httpCalls.push("openExternalUrl");
+      openedUrls.push(url);
+      return true;
+    },
+    tauriInvoke: async (command) => {
+      httpCalls.push(`tauri:${command}`);
+      return {};
+    },
+    appScopedPath: (path) => path,
+    restartDesktopSidecar: async () => {
+      httpCalls.push("restartDesktopSidecar");
+      return {};
+    },
+    setActiveLlm: async () => {
+      httpCalls.push("setActiveLlm");
+      return {};
+    },
+    testLlmProviderConnection: async () => {
+      httpCalls.push("testLlmProviderConnection");
+      return { ok: true };
+    },
     startNearaiLogin: async () => {
       httpCalls.push("startNearaiLogin");
       return { auth_url: "http://auth.example" };
@@ -684,6 +772,7 @@ function runProviderLogin({ hostname, activeProviderId = null, popupClosed = fal
     },
     fetchLlmProviders: async () => ({
       active: activeProviderId ? { provider_id: activeProviderId } : null,
+      providers: [{ id: "nearai", adapter: "nearai", default_model: "auto" }],
     }),
     startCodexLogin: async () => ({ user_code: "c", verification_uri: "http://v" }),
     window: {
@@ -825,5 +914,151 @@ test("starting a new sign-in clears a prior provider's stale error", async () =>
     run.nearaiErrors().at(-1),
     "",
     "starting a different sign-in clears the prior provider's error"
+  );
+});
+
+// =====================================================================
+// Desktop runtime (isDesktopRuntime() === true): NEAR AI Cloud only.
+// =====================================================================
+
+test("[desktop] ProviderManagement collapses active NEAR into the model panel", () => {
+  const { rendered, cardProps, panelProps } = renderProviderManagement({
+    desktop: true,
+    providers: [
+      builtinProvider("nearai", { adapter: "nearai" }),
+      builtinProvider("openai"),
+      builtinProvider("anthropic", { adapter: "anthropic", has_api_key: false }),
+    ],
+  });
+
+  assert.deepEqual(groupLabels(rendered), []);
+  assert.deepEqual(deepValuesAfter(rendered, "data-provider-status="), []);
+  assert.deepEqual(cardProps, []);
+  assert.equal(panelProps.length, 1);
+  assert.equal(panelProps[0].provider.id, "nearai");
+  assert.equal(panelProps[0].currentModel, "llama");
+  assert.ok(
+    !collectScalars(rendered).includes("llm.addProvider"),
+    "normal desktop provider management must not expose custom provider creation"
+  );
+  const bodyText = collectScalars(rendered).join("\n") + collectTemplateText(rendered);
+  assert.doesNotMatch(bodyText, /openai|anthropic|OpenRouter|Claude/i);
+});
+
+test("[desktop] ProviderManagement exposes active NEAR model selection before provider rows", () => {
+  const { ActiveModelPanel, panelProps } = renderProviderManagement({
+    desktop: true,
+    providers: [
+      builtinProvider("nearai", {
+        adapter: "nearai",
+        name: "NEAR AI Cloud",
+        default_model: "auto",
+        has_api_key: true,
+      }),
+      builtinProvider("openai"),
+    ],
+  });
+
+  assert.equal(panelProps.length, 1);
+  assert.equal(panelProps[0].provider.id, "nearai");
+  assert.equal(panelProps[0].currentModel, "llama");
+
+  const renderedPanel = ActiveModelPanel({ ...panelProps[0], t: (key) => key });
+  const pickerNodes = findComponentNodes(renderedPanel, "ActiveModelPicker");
+
+  assert.equal(pickerNodes.length, 1);
+  assert.ok(collectTemplateText(renderedPanel).includes('data-testid="active-model-panel"'));
+  assert.ok(collectTemplateText(renderedPanel).includes("Current model"));
+  assert.equal(componentProps(pickerNodes[0], "ActiveModelPicker").provider.id, "nearai");
+  assert.equal(componentProps(pickerNodes[0], "ActiveModelPicker").currentModel, "llama");
+});
+
+test("[desktop] ProviderManagement search does not reveal hidden providers", () => {
+  const { rendered, cardProps } = renderProviderManagement({
+    desktop: true,
+    providers: [builtinProvider("openai")],
+    searchQuery: "open",
+  });
+
+  assert.deepEqual(groupLabels(rendered), []);
+  assert.deepEqual(cardProps, []);
+  assert.ok(findComponentNodes(rendered, "SettingsSearchEmpty").length > 0);
+});
+
+test("[desktop] ProviderManagement keeps synthetic offline NEAR fallback out of ready bucket", () => {
+  const { rendered, cardProps } = renderProviderManagement({
+    desktop: true,
+    activeProviderId: "",
+    providers: [
+      builtinProvider("nearai", {
+        adapter: "nearai",
+        api_key_required: false,
+        has_api_key: false,
+        synthetic_unavailable: true,
+      }),
+    ],
+  });
+
+  assert.deepEqual(groupLabels(rendered), ["llm.groupSetup"]);
+  assert.deepEqual(deepValuesAfter(rendered, "data-provider-status="), ["setup"]);
+  assert.deepEqual(
+    cardProps.map((props) => props.provider.id),
+    ["nearai"]
+  );
+});
+
+test("[desktop] ProviderManagement status copy uses v2 status tokens", () => {
+  const source = readFileSync(new URL("./provider-management.js", import.meta.url), "utf8");
+  assert.match(source, /--v2-danger-text/);
+  assert.match(source, /--v2-positive-text/);
+});
+
+test("[desktop] ProviderCard labels the NEAR key action useNearApiKey", () => {
+  const harness = createProviderCardHarness({ desktop: true });
+  const rendered = harness.render({
+    activeProviderId: "openai",
+    provider: builtinProvider("nearai", { adapter: "nearai", has_api_key: false }),
+  });
+  const labels = collectScalars(rendered);
+  assert.ok(labels.includes("llm.useNearApiKey"));
+  assert.ok(!labels.includes("llm.addApiKey"));
+});
+
+test("[desktop] ProviderCard renders cleaned model labels while preserving provider values", () => {
+  const harness = createProviderCardHarness({ desktop: true });
+  harness.state.expanded = true;
+
+  const rendered = harness.render({
+    provider: builtinProvider("nearai", {
+      adapter: "nearai",
+      default_model: "anthropic/claude-sonnet-4.5",
+      has_api_key: true,
+    }),
+  });
+  const bodyText = collectScalars(rendered).join("\n") + collectTemplateText(rendered);
+
+  assert.match(bodyText, /NEAR premium reasoning/);
+  assert.doesNotMatch(bodyText, /anthropic\/claude|Claude/i);
+});
+
+test("[desktop] startNearai connects via loopback and never opens a hosted-SSO popup", async () => {
+  // Desktop NEAR connect goes through the Rust loopback command + sidecar
+  // restart, never the browser-popup hosted-SSO path. The local-dev-origin
+  // guard must not block it (it is not a frontend_callback redirect).
+  const run = runProviderLogin({
+    hostname: "localhost",
+    desktop: true,
+    activeProviderId: "nearai",
+  });
+  await run.hook.startNearai("github");
+  assert.ok(
+    run.httpCalls.includes("tauri:nearai_connect_loopback"),
+    "invokes the loopback connect command"
+  );
+  assert.ok(run.httpCalls.includes("restartDesktopSidecar"), "restarts the sidecar");
+  assert.ok(!run.httpCalls.includes("open"), "never opens a browser popup on desktop");
+  assert.ok(
+    !run.nearaiErrors().includes("onboarding.nearaiLocalSso"),
+    "the local-dev guard does not block the desktop loopback flow"
   );
 });

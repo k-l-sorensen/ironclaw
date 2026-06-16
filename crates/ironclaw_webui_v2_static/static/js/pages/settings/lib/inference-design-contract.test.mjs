@@ -45,7 +45,9 @@ test('inference tab gates stub field cards behind a writable settings backend', 
   const source = await readFile(inferenceTabPath, 'utf8');
 
   // The gate variable and its use to suppress the INFERENCE_FIELDS sections.
-  assert.match(source, /const settingsWritable = settingsStatus !== 'todo';/);
+  // Quote style is allowed to vary (mono uses double quotes; the desktop fork
+  // used single) — the gate semantics are what matter.
+  assert.match(source, /const settingsWritable = settingsStatus !== ['"]todo['"];/);
   assert.match(
     source,
     /const sections = settingsWritable\s*\?\s*filterSettingsSections\(INFERENCE_FIELDS[\s\S]*?:\s*\[\];/

@@ -1,11 +1,8 @@
 import { registerPack } from "../lib/i18n.js";
 
 registerPack("hi", {
-  // Language metadata
   "language.name": "हिन्दी",
   "language.switch": "भाषा बदल दी गई",
-
-  // Common
   "common.unknown": "अज्ञात",
   "common.cancel": "रद्द करें",
   "common.delete": "हटाएं",
@@ -15,8 +12,6 @@ registerPack("hi", {
   "common.saving": "सहेजा जा रहा है...",
   "common.done": "पूर्ण",
   "common.send": "भेजें",
-
-  // Navigation
   "nav.chat": "चैट",
   "nav.close": "बंद करें",
   "nav.workspace": "वर्कस्पेस",
@@ -32,22 +27,14 @@ registerPack("hi", {
   "nav.docs": "दस्तावेज़",
   "nav.sectionWork": "कार्य",
   "nav.sectionSystem": "सिस्टम",
-
-  // Theme
   "theme.switchToLight": "लाइट थीम पर स्विच करें",
   "theme.switchToDark": "डार्क थीम पर स्विच करें",
   "theme.light": "लाइट थीम",
   "theme.dark": "डार्क थीम",
-
-  // Header
   "header.signOut": "साइन आउट",
-
-  // Status
   "status.online": "ऑनलाइन",
   "status.offline": "ऑफलाइन",
   "status.checking": "जांच हो रही है",
-
-  // Login page
   "login.tagline": "Gateway v2",
   "login.hero": "ऑपरेटर ट्रेल खोए बिना लोकल एजेंट कंट्रोल।",
   "login.heroSub": "टोकन एक्सेस ब्राउज़र कंसोल को उसी गेटवे runtime, approvals, tools और thread state से जोड़ता है।",
@@ -62,8 +49,6 @@ registerPack("hi", {
   "login.connect": "कनेक्ट",
   "login.oauthDivider": "या जारी रखें",
   "login.oauthProvider": "{provider} के साथ जारी रखें",
-
-  // Chat — empty state
   "chat.heroTitle": "नमस्ते, आपको किसमें मदद चाहिए?",
   "chat.heroDesc": "किसी लक्ष्य, रेपो प्रश्न, समीक्षा अनुरोध या काम की जरूरत वाली फाइलों से शुरू करें.",
   "chat.emptyTitle": "एक ठोस ऑपरेटर कार्य से शुरू करें।",
@@ -74,8 +59,6 @@ registerPack("hi", {
   "chat.suggestion2Desc": "सहीपन के जोखिम, रुकी हुई स्वीकृतियां और फॉलो-अप देखें.",
   "chat.suggestion3": "एक्सटेंशन readiness check ड्राफ्ट करें",
   "chat.suggestion3Desc": "सेटअप, ऑथ, पेयरिंग और उपलब्ध क्षमताओं की पुष्टि करें.",
-
-  // Chat — input
   "chat.placeholder": "IronClaw को संदेश...",
   "chat.heroPlaceholder": "IronClaw से कुछ भी पूछें.",
   "chat.followUpPlaceholder": "फॉलो-अप बदलाव मांगें",
@@ -101,8 +84,6 @@ registerPack("hi", {
   "shortcuts.newline": "नई लाइन",
   "shortcuts.help": "यह सहायता दिखाएं",
   "shortcuts.close": "बंद करें",
-
-  // Chat — thread sidebar
   "chat.conversations": "वार्तालाप",
   "chat.threads": "{count} थ्रेड्स",
   "chat.newThread": "नया",
@@ -110,15 +91,11 @@ registerPack("hi", {
   "chat.selectConversation": "वार्तालाप चुनें",
   "chat.noConversations": "अभी कोई वार्तालाप नहीं। composer सुझावों से थ्रेड शुरू करें।",
   "chat.turns": "{count} टर्न",
-
-  // Chat — connection
   "connection.connected": "कनेक्टेड",
   "connection.reconnecting": "रीकनेक्ट हो रहा है...",
   "connection.disconnected": "डिस्कनेक्टेड",
   "connection.connecting": "कनेक्ट हो रहा है...",
   "connection.paused": "टैब छिपा होने पर रोका गया",
-
-  // Chat — approval
   "approval.title": "अनुमोदन आवश्यक",
   "approval.approve": "अनुमोदित करें",
   "approval.deny": "अस्वीकार करें",
@@ -126,7 +103,6 @@ registerPack("hi", {
   "approval.approveAndAlways": "स्वीकृत करें और हमेशा अनुमति दें",
   "approval.alwaysAllowToolLabel": "बिना पूछे हमेशा {tool} की अनुमति दें",
   "approval.thisTool": "यह टूल",
-  // Chat — tool activity
   "tool.tabDetails": "विवरण",
   "tool.tabParameters": "पैरामीटर्स",
   "tool.tabResult": "परिणाम",
@@ -166,19 +142,13 @@ registerPack("hi", {
   "authGate.unsupportedChallenge": "इस प्रमाणीकरण चरण को पूरा करने के लिए सेटिंग्स खोलें।",
   "authGate.submitFailed": "टोकन सहेजा न��ीं जा सका.",
   "authGate.resolveFailedAfterTokenSaved": "टोकन सहेजा गया। अवरुद्ध रन को फिर से शुरू नहीं किया जा सका; इसे फिर से शुरू करने का पुनः प्रयास करें.",
-
-  // Error
   "error.gatewayConnection": "गेटवे से कनेक्ट नहीं हो पाया",
   "error.saveFailed": "सेव विफल: {message}",
   "error.loadFailed": "{what} लोड नहीं हो पाया: {message}",
-
-  // Extensions tabs
   "extensions.installed": "इंस्टॉल किए गए",
   "extensions.channels": "चैनल",
   "extensions.mcp": "MCP सर्वर",
   "extensions.registry": "रजिस्ट्री",
-
-  // Settings tabs
   "settings.inference": "अनुमान",
   "settings.agent": "एजेंट",
   "settings.channels": "चैनल",
@@ -188,7 +158,6 @@ registerPack("hi", {
   "settings.traceCommons": "Trace Commons",
   "settings.users": "उपयोगकर्ता",
   "settings.language": "भाषा",
-  // Settings — Trace Commons credits (read-only)
   "traceCommons.title": "Trace Commons क्रेडिट",
   "traceCommons.description": "योगदान किए गए संपादित ट्रेस के लिए अर्जित क्रेडिट, आपके खाते तक सीमित।",
   "traceCommons.emptyState": "नामांकित नहीं — अपने एजेंट से Trace Commons आमंत्रण के साथ नामांकन करने को कहें।",
@@ -216,9 +185,6 @@ registerPack("hi", {
   "traceCommons.never": "कभी नहीं",
   "traceCommons.recentExplanations": "हाल की क्रेडिट व्याख्याएँ",
   "traceCommons.note": "अंतिम सिंक के समय का स्थानीय दृश्य — आधिकारिक क्रेडिट बहीखाता सर्वर-साइड है। गोपनीयता समीक्षा, रीप्ले/मूल्यांकन, डुप्लिकेट जाँच और बाद की उपयोगिता स्कोरिंग के बाद अंतिम क्रेडिट बदल सकता है।",
-
-
-  // Settings — toolbar
   "settings.back": "वापस",
   "settings.searchPlaceholder": "खोज सेटिंग्स...",
   "settings.clearSearch": "स्पष्ट खोज",
@@ -231,22 +197,16 @@ registerPack("hi", {
   "settings.importSuccess": "आयातित सेटिंग्स",
   "settings.importInvalid": "चयनित फ़ाइल में एक सेटिंग ऑब्जेक्ट होना चाहिए",
   "settings.importFailed": "आयात विफल: {message}",
-
-  // Settings — restart banner
   "settings.restartRequired": "कुछ बदलाव लागू होने के लिए रीस्टार्ट की ज़रूरत है।",
   "settings.restartNow": "अभी पुनरारंभ करें",
   "settings.restartStarting": "पुनरारंभ हो रहा है...",
   "settings.restartUnavailable": "वेब UI से पुनरारंभ अभी उपलब्ध नहीं है। लंबित परिवर्तनों को लागू करने के लिए गेटवे प्रक्रिया को मैन्युअल रूप से पुनरारंभ करें।",
-
-  // Restart dialog
   "restart.title": "IronClaw पुनरारंभ करें",
   "restart.description": "लंबित परिवर्तनों को लागू करने के लिए gateway प्रक्रिया को पुनरारंभ करें।",
   "restart.warning": "gateway के पुनरारंभ होने पर चल रहे कार्य बाधित हो सकते हैं।",
   "restart.cancel": "रद्द करें",
   "restart.confirm": "पुनरारंभ की पुष्टि करें",
   "restart.progressTitle": "IronClaw को पुनरारंभ करना",
-
-  // TEE attestation
   "tee.title": "टी सत्यापन",
   "tee.verified": "सत्यापित रनटाइम सत्यापन उ���लब्ध",
   "tee.imageDigest": "छवि डाइजेस्ट",
@@ -257,8 +217,6 @@ registerPack("hi", {
   "tee.loadFailed": "सत्यापन रिपोर्ट लोड नहीं हो सकी",
   "tee.copyReport": "रिपोर्ट कॉपी करें",
   "tee.copied": "कॉपी किया गया",
-
-  // Settings — LLM providers
   "llm.active": "सक्रिय",
   "llm.addProvider": "प्रदाता जोड़ें",
   "llm.adapter": "एडाप्टर",
@@ -323,7 +281,6 @@ registerPack("hi", {
   "llm.testConnection": "परीक्षण कनेक्शन",
   "llm.testing": "परीक्षण...",
   "llm.use": "Use",
-  // Settings — LLM providers (progressive disclosure)
   "llm.groupActive": "सक्रिय",
   "llm.groupReady": "उपयोग के लिए तैयार",
   "llm.groupSetup": "सेटअप की आवश्यकता",
@@ -332,8 +289,6 @@ registerPack("hi", {
   "llm.missingApiKey": "गुम एपीआई कुंजी",
   "llm.missingBaseUrl": "गुम आधार यूआरएल",
   "llm.addApiKey": "एपीआई कुंजी जोड़ें",
-
-  // Settings — inference groups
   "settings.group.embeddings": "एंबेडिंग्स",
   "settings.group.sampling": "सैंपलिंग",
   "settings.field.embeddingsEnabled": "Embeddings सक्षम करें",
@@ -344,8 +299,6 @@ registerPack("hi", {
   "settings.field.embeddingsModelDesc": "Embedding मॉडल identifier",
   "settings.field.temperature": "तापमान",
   "settings.field.temperatureDesc": "डिफ़ॉल्ट sampling temperature (0.0–2.0)",
-
-  // Settings — agent groups
   "settings.group.core": "कोर",
   "settings.group.heartbeat": "दिल की धड़कन",
   "settings.group.sandbox": "सैंडबॉक्स",
@@ -417,8 +370,6 @@ registerPack("hi", {
   "settings.field.skillsMaxContextTokensDesc": "Injected skill prompts के लिए token budget",
   "settings.field.fusionStrategy": "फ्यूजन रणनीति",
   "settings.field.fusionStrategyDesc": "Hybrid search result merge method",
-
-  // Settings — networking
   "settings.group.gateway": "Gateway",
   "settings.group.tunnel": "सुरंग",
   "settings.field.gatewayHost": "होस्ट",
@@ -429,8 +380,6 @@ registerPack("hi", {
   "settings.field.tunnelProviderDesc": "सार्वजनिक सुरंग सेवा",
   "settings.field.tunnelPublicUrl": "सार्वजनिक URL",
   "settings.field.tunnelPublicUrlDesc": "स्थिर सुरंग समापन बिंदु",
-
-  // Settings — channels tab
   "channels.builtIn": "अंतर्निहित चैनल",
   "channels.messaging": "संदेश चैनल",
   "channels.availableChannels": "उपलब्ध चैनल",
@@ -467,8 +416,6 @@ registerPack("hi", {
   "channels.slackAccessSaving": "सहेजा जा रहा है...",
   "channels.slackAccessSuccess": "Slack चैनल सहेजे गए।",
   "channels.slackAccessError": "Slack चैनल अद्यतन विफल रहा।",
-
-  // Settings — tools tab
   "tools.permissions": "टूल अनुमतियाँ",
   "tools.alwaysAllow": "हमेशा अनुमति दें",
   "tools.askEachTime": "हर बार पूछें",
@@ -479,8 +426,6 @@ registerPack("hi", {
   "tools.filterPlaceholder": "फ़िल्टर उपकरण...",
   "tools.noMatch": "कोई भी उपकरण फ़िल्टर से मेल नहीं खाता।",
   "tools.failedLoad": "टूल लोड करने में विफल: {message}",
-
-  // Settings — skills tab
   "skills.installed": "स्थापित कौशल",
   "skills.noInstalled": "कोई कौशल स्थापित नहीं",
   "skills.noInstalledDesc": "Skills एजेंट को domain-specific instructions के साथ extend करती हैं। इन्हें ClawHub registry से install करें या workspace में SKILL.md फाइलें रखें।",
@@ -508,8 +453,6 @@ registerPack("hi", {
   "skills.removed": "हटाया गया कौशल \"{name}\"",
   "skills.activatesOn": "सक्रिय होता है",
   "skills.imported": "आयातित",
-
-  // Settings — users tab
   "users.title": "उपयोगकर्ता ({count})",
   "users.addUser": "उपयोगकर्ता जोड़ें",
   "users.newUser": "नया उपयोगकर्ता",
@@ -525,8 +468,6 @@ registerPack("hi", {
   "users.adminRequiredDesc": "User management केवल admin privileges वाले accounts के लिए उपलब्ध है।",
   "users.failedLoad": "उपयोगकर्ताओं को लोड करने में विफल: {message}",
   "users.noUsers": "कोई उपयोगकर्ता पंजीकृत नहीं है।",
-
-  // Workspace page
   "workspace.title": "Workspace",
   "workspace.subtitle": "स्थायी स्मृति",
   "workspace.refresh": "ताज़ा करें",
@@ -547,8 +488,6 @@ registerPack("hi", {
   "workspace.unableOpenDirectory": "निर्देशिका खोलने में असमर्थ",
   "workspace.unableSaveFile": "फ़ाइल सहेजने में असमर्थ",
   "workspace.savedPath": "सहेजा गया {path}",
-
-  // Jobs page
   "jobs.allJobs": "सभी नौकरियां",
   "jobs.refresh": "ताज़ा करें",
   "jobs.refreshing": "ताज़ा करना",
@@ -556,8 +495,6 @@ registerPack("hi", {
   "jobs.unavailableDesc": "यह job अब मौजूद नहीं है या आपकी access scope के बाहर है।",
   "jobs.returnToJobs": "नौकरियों पर लौटें",
   "jobs.dismiss": "खारिज करें",
-
-  // Jobs — list
   "jobs.list.explorer": "एक्सप्लोरर",
   "jobs.list.queueTitle": "जॉब कतार",
   "jobs.list.queueDesc": "शीर्षक या ID से खोजें, रन में जाएँ, और पेज छोड़े बिना सक्रिय काम रोकें।",
@@ -580,14 +517,10 @@ registerPack("hi", {
   "jobs.list.started": "शुरू हुआ {value}",
   "jobs.action.cancel": "रद्द करें",
   "jobs.action.open": "खोलें",
-
-  // Jobs — detail
   "jobs.detail.backToAll": "सभी जॉब पर वापस",
   "jobs.detail.tabs.overview": "ओवरव्यू",
   "jobs.detail.tabs.activity": "एक्टिविटी",
   "jobs.detail.tabs.files": "फ़ाइलें",
-
-  // Missions page
   "missions.allMissions": "सभी मिशन",
   "missions.refresh": "ताज़ा करें",
   "missions.refreshing": "ताज़ा करना",
@@ -632,8 +565,6 @@ registerPack("hi", {
   "missions.summary.spawnedThreads": "उत्पन्न धागे",
   "missions.summary.completedFailed": "{completed} पूर्ण / {failed} विफल",
   "missions.summary.acrossProjects": "प्रत्येक परियोजना में workspace",
-
-  // Automations page
   "automations.eyebrow": "निर्धारित कार्य",
   "automations.title": "स्वचालन",
   "automations.description": "केवल अनुसूचित स्वचालन।",
@@ -644,8 +575,7 @@ registerPack("hi", {
   "automations.refresh": "ऑटोमेशन ताज़ा करें",
   "automations.error.loadFailed": "ऑटोमेशन लोड करने में असमर्थ",
   "automations.schedulerOff.title": "शेड्यूलिंग बंद है",
-  "automations.schedulerOff.description":
-    "ये ऑटोमेशन सहेजे गए हैं लेकिन शेड्यूलर सक्षम होने तक नहीं चलेंगे।",
+  "automations.schedulerOff.description": "ये ऑटोमेशन सहेजे गए हैं लेकिन शेड्यूलर सक्षम होने तक नहीं चलेंगे।",
   "automations.schedule.custom": "कस्टम शेड्यूल",
   "automations.schedule.everyMinute": "हर मिनट",
   "automations.schedule.everyMinutes": "हर {count} मिनट",
@@ -698,8 +628,7 @@ registerPack("hi", {
   "automations.delivery.save": "सहेजें",
   "automations.delivery.clear": "साफ़ करें",
   "automations.delivery.saved": "सहेजा गया",
-  "automations.delivery.saveFailed":
-    "डिलीवरी लक्ष्य सहेजा नहीं जा सका। कृपया पुनः प्रयास करें।",
+  "automations.delivery.saveFailed": "डिलीवरी लक्ष्य सहेजा नहीं जा सका। कृपया पुनः प्रयास करें।",
   "automations.delivery.footnote": "आपके DM पर भेजे गए अनुमोदन अनुरोधों का उत्तर Slack में {command} का उत्तर देकर दिया जाता है।",
   "automations.delivery.pill.ready": "तैयार",
   "automations.delivery.pill.unavailable": "अनुपलब्ध",
@@ -724,30 +653,20 @@ registerPack("hi", {
   "automations.table.nextRun": "अगला रन",
   "automations.table.lastRun": "अंतिम रन",
   "automations.table.status": "स्थिति",
-
-  // Routines page
   "routines.explorer": "कार्य",
   "routines.title": "रूटीन",
   "routines.description": "सहेजे गए रूटीन खोजें, उनका शेड्यूल या ट्रिगर देखें, और v2 छोड़े बिना उन्हें चलाएं या रोकें.",
-
-  // Extensions page
   "ext.installed": "इंस्टॉल",
   "ext.channels": "चैनल",
   "ext.mcp": "MCP",
   "ext.registry": "रजिस्ट्री",
-
-  // Extensions — registry
   "ext.registry.searchPlaceholder": "एक्सटेंशन खोजें…",
   "ext.registry.emptyTitle": "रजिस्ट्री खाली है",
   "ext.registry.emptyDesc": "सभी उपलब्ध एक्सटेंशन पहले से इंस्टॉल हैं, या कोई रजिस्ट्री कॉन्फ़िगर नहीं है।",
   "ext.registry.availableTitle": "उपलब्ध एक्सटेंशन",
   "ext.registry.noMatch": "फ़िल्टर से मेल खाने वाला कोई एक्सटेंशन नहीं।",
-
-  // Chat — history
   "chat.history.loading": "लोड हो रहा है...",
   "chat.history.loadOlder": "पुराने संदेश लोड करें",
-
-  // Projects page
   "projects.allProjects": "सभी प्रोजेक्ट",
   "projects.returnToProjects": "प्रोजेक्ट पर वापस",
   "projects.unavailable": "प्रोजेक्ट उपलब्ध नहीं",
@@ -781,20 +700,14 @@ registerPack("hi", {
   "projects.card.failures24h": "24h में {count}",
   "projects.card.spendToday": "आज खर्च {value}",
   "projects.explorer": "एक्सप्लोरर",
-
-  // Language settings
   "lang.title": "भाषा",
   "lang.description": "इंटरफ़ेस के लिए display language चुनें।",
   "lang.current": "वर्तमान भाषा",
-
-  // Settings — inference summary card
   "inference.provider": "एलएलएम प्रदाता",
   "inference.backend": "बैकएंड",
   "inference.model": "मॉडल",
   "inference.active": "सक्रिय",
   "inference.none": "—",
-
-  // Extensions — pairing
   "pairing.title": "पेयरिंग",
   "pairing.instructions": "पेयरिंग समाप्त करने के लिए चैनल से कोड दर्ज करें।",
   "pairing.placeholder": "पेयरिंग कोड दर्ज करें…",
@@ -808,13 +721,9 @@ registerPack("hi", {
   "pairing.connect": "कनेक्ट",
   "pairing.slackSuccess": "Slack खाता कनेक्ट किया गया।",
   "pairing.slackError": "अमान्य या समाप्त हो चुका Slack युग्मन कोड।",
-
-  // Admin — tabs
   "admin.tab.dashboard": "डैशबोर्ड",
   "admin.tab.users": "उपयोगकर्ता",
   "admin.tab.usage": "उपयोग",
-
-  // Admin — dashboard
   "admin.dashboard.systemOverview": "सिस्टम अवलोकन",
   "admin.dashboard.uptime": "अपटाइम: {value}",
   "admin.dashboard.totalUsers": "कुल उपयोगकर्ता",
@@ -834,8 +743,6 @@ registerPack("hi", {
   "admin.dashboard.status": "स्थिति",
   "admin.dashboard.jobs": "नौकरियाँ",
   "admin.dashboard.lastActive": "अंतिम सक्रिय",
-
-  // Admin — users list
   "admin.users.user": "उपयोगकर्ता",
   "admin.users.userFallback": "उपयोगकर्ता",
   "admin.users.title": "उपयोगकर्ता ({count} / {total})",
@@ -874,8 +781,6 @@ registerPack("hi", {
   "admin.users.delete": "हटाएं",
   "admin.users.deleteUserTitle": "उपयोगकर्ता हटाएं",
   "admin.users.deleteUserDesc": "क्या आप वाकई \"{name}\" हटाना चाहते हैं? इस एक्शन को वापस नहीं किया जा सकता।",
-
-  // Admin — user detail
   "admin.user.profile": "प्रोफ़ाइल",
   "admin.user.summary": "सारांश",
   "admin.user.id": "ID",
@@ -892,8 +797,6 @@ registerPack("hi", {
   "admin.user.saveRole": "भूमिका सहेजें",
   "admin.user.usage30Days": "उपयोग (पिछले 30 दिन)",
   "admin.user.noUsage": "कोई उपयोग डेटा नहीं।",
-
-  // Admin — usage tab
   "admin.usage.overview": "उपयोग अवलोकन",
   "admin.usage.noData": "इस अवधि के लिए कोई उपयोग डेटा नहीं।",
   "admin.usage.totalCalls": "कुल कॉल",
@@ -908,8 +811,6 @@ registerPack("hi", {
   "admin.usage.input": "इनपुट",
   "admin.usage.output": "आउटपुट",
   "admin.usage.cost": "लागत",
-
-  // Logs page
   "logs.levelAll": "सभी स्तर",
   "logs.level.trace": "TRACE",
   "logs.level.debug": "DEBUG",
@@ -1040,5 +941,15 @@ registerPack("hi", {
   "skills.source.user": "उपयोगकर्ता",
   "skills.source.workspace": "वर्कस्पेस",
   "skills.updateFailed": "अपडेट विफल।",
-  "skills.updated": "स्किल \"{name}\" अपडेट की गई"
+  "skills.updated": "स्किल \"{name}\" अपडेट की गई",
+
+  // Desktop feature keys (genuinely translated, merged in)
+  "chat.heroMorning": "IronClaw आगे किस काम को संभाले?",
+  "chat.heroAfternoon": "IronClaw आगे किस काम को संभाले?",
+  "chat.heroEvening": "IronClaw आगे किस काम को संभाले?",
+  "chat.fileDownloadFailed": "वह फ़ाइल डाउनलोड नहीं हो सकी",
+  "chat.removeImage": "इमेज हटाएँ",
+  "chat.removeAttachment": "अटैचमेंट हटाएँ",
+  "settings.notWritable": "इस गेटवे पर अभी संपादन उपलब्ध नहीं है",
+  "settings.notWritableDesc": "यह गेटवे अभी इन सेटिंग्स में बदलाव सहेज नहीं सकता, इसलिए नियंत्रण संपादन योग्य दिखाने के बजाय छिपा दिए गए हैं। जब गेटवे इन्हें सहेज पाएगा, तब ये फिर दिखेंगे।"
 });

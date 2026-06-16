@@ -1,3 +1,5 @@
+import { isDesktopRuntime } from "../../../lib/api.js";
+
 export const SETTINGS_TABS = [
   { id: "inference", labelKey: "settings.inference", icon: "spark" },
   { id: "agent", labelKey: "settings.agent", icon: "bolt" },
@@ -5,17 +7,41 @@ export const SETTINGS_TABS = [
   { id: "networking", labelKey: "settings.networking", icon: "pulse" },
   { id: "tools", labelKey: "settings.tools", icon: "tool" },
   { id: "skills", labelKey: "settings.skills", icon: "file" },
+  // The Trace Commons tab is a web feature (real `/traces/*` endpoints). The
+  // desktop fork dropped it; mono keeps it. On desktop the tab is hidden at the
+  // `isDesktopRuntime()` gate so its presence here is web-only by effect.
   { id: "traces", labelKey: "settings.traceCommons", icon: "layers" },
   { id: "users", labelKey: "settings.users", icon: "lock" },
   { id: "language", labelKey: "settings.language", icon: "globe" },
 ];
+
+// Embeddings provider field. On web, the full provider choice (openai + nearai)
+// stays — behavior equals today's mono. On desktop, narrow it to NEAR AI Cloud
+// only (single fixed option, relabelled), gated behind `isDesktopRuntime()`.
+const EMBEDDINGS_PROVIDER_FIELD = isDesktopRuntime()
+  ? {
+      key: "embeddings.provider",
+      labelKey: "settings.field.embeddingsProvider",
+      descKey: "settings.field.embeddingsProviderDesc",
+      type: "select",
+      options: ["nearai"],
+      optionLabels: { nearai: "NEAR AI Cloud" },
+      allowDefault: false,
+    }
+  : {
+      key: "embeddings.provider",
+      labelKey: "settings.field.embeddingsProvider",
+      descKey: "settings.field.embeddingsProviderDesc",
+      type: "select",
+      options: ["openai", "nearai"],
+    };
 
 export const INFERENCE_FIELDS = [
   {
     groupKey: "settings.group.embeddings",
     fields: [
       { key: "embeddings.enabled", labelKey: "settings.field.embeddingsEnabled", descKey: "settings.field.embeddingsEnabledDesc", type: "boolean" },
-      { key: "embeddings.provider", labelKey: "settings.field.embeddingsProvider", descKey: "settings.field.embeddingsProviderDesc", type: "select", options: ["openai", "nearai"] },
+      EMBEDDINGS_PROVIDER_FIELD,
       { key: "embeddings.model", labelKey: "settings.field.embeddingsModel", descKey: "settings.field.embeddingsModelDesc", type: "text" },
     ],
   },

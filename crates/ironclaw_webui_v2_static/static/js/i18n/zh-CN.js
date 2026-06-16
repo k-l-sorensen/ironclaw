@@ -1,11 +1,8 @@
 import { registerPack } from "../lib/i18n.js";
 
 registerPack("zh-CN", {
-  // Language metadata
   "language.name": "简体中文",
   "language.switch": "语言已更改",
-
-  // Common
   "common.unknown": "未知",
   "common.cancel": "取消",
   "common.delete": "删除",
@@ -15,8 +12,6 @@ registerPack("zh-CN", {
   "common.saving": "保存中...",
   "common.done": "完成",
   "common.send": "发送",
-
-  // Navigation
   "nav.chat": "对话",
   "nav.close": "关闭",
   "nav.workspace": "工作区",
@@ -32,22 +27,14 @@ registerPack("zh-CN", {
   "nav.docs": "文档",
   "nav.sectionWork": "工作",
   "nav.sectionSystem": "系统",
-
-  // Theme
   "theme.switchToLight": "切换到浅色主题",
   "theme.switchToDark": "切换到深色主题",
   "theme.light": "浅色主题",
   "theme.dark": "深色主题",
-
-  // Header
   "header.signOut": "退出登录",
-
-  // Status
   "status.online": "在线",
   "status.offline": "离线",
   "status.checking": "检查中",
-
-  // Login page
   "login.tagline": "Gateway v2",
   "login.hero": "本地代理控制，不丢失操作轨迹。",
   "login.heroSub": "令牌访问将浏览器控制台绑定到同一网关运行时、审批、工具和线程状态。",
@@ -62,8 +49,6 @@ registerPack("zh-CN", {
   "login.connect": "连接",
   "login.oauthDivider": "或继续使用",
   "login.oauthProvider": "通过 {provider} 继续",
-
-  // Chat — empty state
   "chat.heroTitle": "你好，需要我帮你做什么？",
   "chat.heroDesc": "可以从一个目标、仓库问题、审查请求，或需要处理的文件开始。",
   "chat.emptyTitle": "从一个具体的操作任务开始。",
@@ -74,8 +59,6 @@ registerPack("zh-CN", {
   "chat.suggestion2Desc": "查找正确性风险、被阻塞的审批和后续事项。",
   "chat.suggestion3": "草拟扩展就绪检查",
   "chat.suggestion3Desc": "验证设置、认证、配对和可用能力。",
-
-  // Chat — input
   "chat.placeholder": "给 IronClaw 发消息...",
   "chat.heroPlaceholder": "向 IronClaw 提问。",
   "chat.followUpPlaceholder": "请求后续修改",
@@ -101,8 +84,6 @@ registerPack("zh-CN", {
   "shortcuts.newline": "换行",
   "shortcuts.help": "显示此帮助",
   "shortcuts.close": "关闭",
-
-  // Chat — thread sidebar
   "chat.conversations": "对话",
   "chat.threads": "{count} 个线程",
   "chat.newThread": "新建",
@@ -110,15 +91,11 @@ registerPack("zh-CN", {
   "chat.selectConversation": "选择对话",
   "chat.noConversations": "暂无对话。从编辑器建议开始一个线程。",
   "chat.turns": "{count} 轮",
-
-  // Chat — connection
   "connection.connected": "已连接",
   "connection.reconnecting": "重连中...",
   "connection.disconnected": "已断开",
   "connection.connecting": "连接中...",
   "connection.paused": "在标签页隐藏时已暂停",
-
-  // Chat — approval
   "approval.title": "需要审批",
   "approval.approve": "批准",
   "approval.deny": "拒绝",
@@ -126,7 +103,6 @@ registerPack("zh-CN", {
   "approval.approveAndAlways": "批准并始终允许",
   "approval.alwaysAllowToolLabel": "始终允许 {tool} （不再询问）",
   "approval.thisTool": "此工具",
-  // Chat — tool activity
   "tool.tabDetails": "详情",
   "tool.tabParameters": "参数",
   "tool.tabResult": "结果",
@@ -166,19 +142,13 @@ registerPack("zh-CN", {
   "authGate.unsupportedChallenge": "请打开设置完成此身份验证步骤。",
   "authGate.submitFailed": "无法保存令牌。",
   "authGate.resolveFailedAfterTokenSaved": "令牌已保存。无法恢复被拦截的运行；请重试以恢复。",
-
-  // Error
   "error.gatewayConnection": "无法连接到网关",
   "error.saveFailed": "保存失败：{message}",
   "error.loadFailed": "加载 {what} 失败：{message}",
-
-  // Extensions tabs
   "extensions.installed": "已安装",
   "extensions.channels": "渠道",
   "extensions.mcp": "MCP 服务器",
   "extensions.registry": "注册表",
-
-  // Settings tabs
   "settings.inference": "推理",
   "settings.agent": "代理",
   "settings.channels": "频道",
@@ -188,7 +158,6 @@ registerPack("zh-CN", {
   "settings.traceCommons": "Trace Commons",
   "settings.users": "用户",
   "settings.language": "语言",
-  // Settings — Trace Commons credits (read-only)
   "traceCommons.title": "Trace Commons 积分",
   "traceCommons.description": "通过贡献已脱敏的跟踪记录获得的积分，仅限您的账户。",
   "traceCommons.emptyState": "未注册 — 请让您的智能体使用 Trace Commons 邀请完成注册。",
@@ -216,9 +185,6 @@ registerPack("zh-CN", {
   "traceCommons.never": "从未",
   "traceCommons.recentExplanations": "最近的积分说明",
   "traceCommons.note": "截至最近同步的本地视图 — 权威积分账本在服务器端。最终积分可能在隐私审核、重放/评估、去重检查和后续效用评分后发生变化。",
-
-
-  // Settings — toolbar
   "settings.back": "返回",
   "settings.searchPlaceholder": "搜索设置...",
   "settings.clearSearch": "清除搜索",
@@ -231,22 +197,16 @@ registerPack("zh-CN", {
   "settings.importSuccess": "设置已导入",
   "settings.importInvalid": "所选文件必须包含设置对象",
   "settings.importFailed": "导入失败：{message}",
-
-  // Settings — restart banner
   "settings.restartRequired": "某些更改需要重启才能生效。",
   "settings.restartNow": "立即重启",
   "settings.restartStarting": "正在重启...",
   "settings.restartUnavailable": "暂不支持从网页界面重启。请手动重启网关进程以应用待生效的更改。",
-
-  // Restart dialog
   "restart.title": "重启 IronClaw",
   "restart.description": "重启网关进程以应用待处理的更改。",
   "restart.warning": "网关重启时正在运行的任务可能会中断。",
   "restart.cancel": "取消",
   "restart.confirm": "确认重启",
   "restart.progressTitle": "正在重启 IronClaw",
-
-  // TEE attestation
   "tee.title": "TEE 证明",
   "tee.verified": "已获得验证的运行环境证明",
   "tee.imageDigest": "镜像摘要",
@@ -257,8 +217,6 @@ registerPack("zh-CN", {
   "tee.loadFailed": "无法加载证明报告",
   "tee.copyReport": "复制报告",
   "tee.copied": "已复制",
-
-  // Settings — LLM providers
   "llm.active": "当前活动",
   "llm.addProvider": "添加提供商",
   "llm.adapter": "适配器",
@@ -323,7 +281,6 @@ registerPack("zh-CN", {
   "llm.testConnection": "测试连接",
   "llm.testing": "测试中...",
   "llm.use": "使用",
-  // Settings — LLM providers (progressive disclosure)
   "llm.groupActive": "当前活动",
   "llm.groupReady": "准备就绪",
   "llm.groupSetup": "需要设置",
@@ -332,8 +289,6 @@ registerPack("zh-CN", {
   "llm.missingApiKey": "缺少 API 密钥",
   "llm.missingBaseUrl": "缺少基础 URL",
   "llm.addApiKey": "添加 API 密钥",
-
-  // Settings — inference groups
   "settings.group.embeddings": "向量嵌入",
   "settings.group.sampling": "采样",
   "settings.field.embeddingsEnabled": "启用嵌入",
@@ -344,8 +299,6 @@ registerPack("zh-CN", {
   "settings.field.embeddingsModelDesc": "嵌入模型标识",
   "settings.field.temperature": "温度",
   "settings.field.temperatureDesc": "默认采样温度 (0.0–2.0)",
-
-  // Settings — agent groups
   "settings.group.core": "核心",
   "settings.group.heartbeat": "心跳",
   "settings.group.sandbox": "沙箱",
@@ -417,8 +370,6 @@ registerPack("zh-CN", {
   "settings.field.skillsMaxContextTokensDesc": "注入技能提示的令牌预算",
   "settings.field.fusionStrategy": "融合策略",
   "settings.field.fusionStrategyDesc": "混合搜索的结果合并方法",
-
-  // Settings — networking
   "settings.group.gateway": "网关",
   "settings.group.tunnel": "隧道",
   "settings.field.gatewayHost": "主机",
@@ -429,8 +380,6 @@ registerPack("zh-CN", {
   "settings.field.tunnelProviderDesc": "公共隧道服务",
   "settings.field.tunnelPublicUrl": "公共 URL",
   "settings.field.tunnelPublicUrlDesc": "静态隧道端点",
-
-  // Settings — channels tab
   "channels.builtIn": "内置频道",
   "channels.messaging": "消息频道",
   "channels.availableChannels": "可用频道",
@@ -467,8 +416,6 @@ registerPack("zh-CN", {
   "channels.slackAccessSaving": "保存中...",
   "channels.slackAccessSuccess": "Slack 频道配置已保存。",
   "channels.slackAccessError": "保存 Slack 频道配置失败。",
-
-  // Settings — tools tab
   "tools.permissions": "工具权限",
   "tools.alwaysAllow": "始终允许",
   "tools.askEachTime": "每次询问",
@@ -479,8 +426,6 @@ registerPack("zh-CN", {
   "tools.filterPlaceholder": "筛选工具…",
   "tools.noMatch": "没有匹配的工具。",
   "tools.failedLoad": "加载工具失败：{message}",
-
-  // Settings — skills tab
   "skills.installed": "已安装技能",
   "skills.noInstalled": "未安装技能",
   "skills.noInstalledDesc": "技能为代理提供特定领域的指令。从 ClawHub 注册表安装或在工作区放置 SKILL.md 文件。",
@@ -508,8 +453,6 @@ registerPack("zh-CN", {
   "skills.removed": "已对名称 \"{name}\" 进行了解绑移除。",
   "skills.activatesOn": "技能被激活在于时机：",
   "skills.imported": "已被导入",
-
-  // Settings — users tab
   "users.title": "用户 ({count})",
   "users.addUser": "添加用户",
   "users.newUser": "新用户",
@@ -525,8 +468,6 @@ registerPack("zh-CN", {
   "users.adminRequiredDesc": "用户管理仅对具有管理员权限的帐户可用。",
   "users.failedLoad": "加载用户失败：{message}",
   "users.noUsers": "暂无注册用户。",
-
-  // Workspace page
   "workspace.title": "工作区",
   "workspace.subtitle": "持久记忆",
   "workspace.refresh": "刷新",
@@ -547,8 +488,6 @@ registerPack("zh-CN", {
   "workspace.unableOpenDirectory": "无法打开目录",
   "workspace.unableSaveFile": "无法保存文件",
   "workspace.savedPath": "已保存 {path}",
-
-  // Jobs page
   "jobs.allJobs": "所有任务",
   "jobs.refresh": "刷新",
   "jobs.refreshing": "刷新中",
@@ -556,8 +495,6 @@ registerPack("zh-CN", {
   "jobs.unavailableDesc": "此任务不再存在或超出您的访问范围。",
   "jobs.returnToJobs": "返回任务列表",
   "jobs.dismiss": "关闭",
-
-  // Jobs — list
   "jobs.list.explorer": "浏览",
   "jobs.list.queueTitle": "任务队列",
   "jobs.list.queueDesc": "按标题或 ID 搜索，进入一次运行，并在不离开页面的情况下停止正在进行的工作。",
@@ -580,14 +517,10 @@ registerPack("zh-CN", {
   "jobs.list.started": "开始于 {value}",
   "jobs.action.cancel": "取消",
   "jobs.action.open": "打开",
-
-  // Jobs — detail
   "jobs.detail.backToAll": "返回所有任务",
   "jobs.detail.tabs.overview": "概览",
   "jobs.detail.tabs.activity": "活动",
   "jobs.detail.tabs.files": "文件",
-
-  // Missions page
   "missions.allMissions": "所有目标",
   "missions.refresh": "刷新",
   "missions.refreshing": "刷新中",
@@ -632,8 +565,6 @@ registerPack("zh-CN", {
   "missions.summary.spawnedThreads": "生成线程",
   "missions.summary.completedFailed": "{completed} 已完成 / {failed} 失败",
   "missions.summary.acrossProjects": "覆盖所有项目工作区",
-
-  // Automations page
   "automations.eyebrow": "自动化计划工作",
   "automations.title": "自动化清单选项",
   "automations.description": "当前页面主要用于浏览并展示系统的自动化以及对应的计划调度。",
@@ -644,8 +575,7 @@ registerPack("zh-CN", {
   "automations.refresh": "更新最新自动化",
   "automations.error.loadFailed": "提取系统自动化计划列表不成功！",
   "automations.schedulerOff.title": "调度已关闭",
-  "automations.schedulerOff.description":
-    "这些自动化已保存，但在启用调度器之前不会运行。",
+  "automations.schedulerOff.description": "这些自动化已保存，但在启用调度器之前不会运行。",
   "automations.schedule.custom": "自定义计划",
   "automations.schedule.everyMinute": "每分钟",
   "automations.schedule.everyMinutes": "每 {count} 分钟",
@@ -698,8 +628,7 @@ registerPack("zh-CN", {
   "automations.delivery.save": "保存",
   "automations.delivery.clear": "清除",
   "automations.delivery.saved": "已保存",
-  "automations.delivery.saveFailed":
-    "无法保存投递目标，请重试。",
+  "automations.delivery.saveFailed": "无法保存投递目标，请重试。",
   "automations.delivery.footnote": "发送到你私信的审批请求，可在 Slack 中回复 {command} 来处理。",
   "automations.delivery.pill.ready": "就绪",
   "automations.delivery.pill.unavailable": "不可用",
@@ -724,30 +653,20 @@ registerPack("zh-CN", {
   "automations.table.nextRun": "近期下一个执行的节点时间",
   "automations.table.lastRun": "前一次最临近过去运作周期时间",
   "automations.table.status": "当前整体状态情况",
-
-  // Routines page
   "routines.explorer": "任务",
   "routines.title": "例程",
   "routines.description": "搜索已保存的例程，检查其计划或触发器，并在不离开 v2 的情况下运行或暂停。",
-
-  // Extensions page
   "ext.installed": "已安装",
   "ext.channels": "频道",
   "ext.mcp": "MCP",
   "ext.registry": "注册表",
-
-  // Extensions — registry
   "ext.registry.searchPlaceholder": "搜索扩展…",
   "ext.registry.emptyTitle": "注册表为空",
   "ext.registry.emptyDesc": "所有可用扩展已安装，或未配置注册表。",
   "ext.registry.availableTitle": "可用扩展",
   "ext.registry.noMatch": "没有扩展符合筛选条件。",
-
-  // Chat — history
   "chat.history.loading": "加载中...",
   "chat.history.loadOlder": "加载更早的消息",
-
-  // Projects page
   "projects.allProjects": "所有项目",
   "projects.returnToProjects": "返回项目",
   "projects.unavailable": "项目不可用",
@@ -781,20 +700,14 @@ registerPack("zh-CN", {
   "projects.card.failures24h": "24 小时内 {count}",
   "projects.card.spendToday": "今日花费 {value}",
   "projects.explorer": "浏览",
-
-  // Language settings
   "lang.title": "语言",
   "lang.description": "选择界面显示语言。",
   "lang.current": "当前语言",
-
-  // Settings — inference summary card
   "inference.provider": "LLM 提供商",
   "inference.backend": "后端",
   "inference.model": "模型",
   "inference.active": "活跃",
   "inference.none": "—",
-
-  // Extensions — pairing
   "pairing.title": "配对",
   "pairing.instructions": "输入频道上提供出的专属配对代码数字来进行连接并且完善验证完成设置了。",
   "pairing.placeholder": "输入配对码…",
@@ -808,13 +721,9 @@ registerPack("zh-CN", {
   "pairing.connect": "点击通过去连接验证并校验这种配对工作",
   "pairing.slackSuccess": "针对所提供需要的 Slack 系统帐户，应用已被设置关联成功地进行接入且链接上系统上了！",
   "pairing.slackError": "被输进入过的此类 Slack 服务程序对应代码由于是不存在其生效期的或者存在任何拼写的其它异常的不可行的错误原因，所以已出现无法响应验证了。您得需要核实后可重试一遍此处的绑定方法！",
-
-  // Admin — tabs
   "admin.tab.dashboard": "仪表盘",
   "admin.tab.users": "用户",
   "admin.tab.usage": "用量",
-
-  // Admin — dashboard
   "admin.dashboard.systemOverview": "系统概览",
   "admin.dashboard.uptime": "运行时间：{value}",
   "admin.dashboard.totalUsers": "用户总数",
@@ -834,8 +743,6 @@ registerPack("zh-CN", {
   "admin.dashboard.status": "状态",
   "admin.dashboard.jobs": "任务",
   "admin.dashboard.lastActive": "最后活跃",
-
-  // Admin — users list
   "admin.users.user": "用户",
   "admin.users.userFallback": "用户",
   "admin.users.title": "用户（{count} / {total}）",
@@ -874,8 +781,6 @@ registerPack("zh-CN", {
   "admin.users.delete": "删除",
   "admin.users.deleteUserTitle": "删除用户",
   "admin.users.deleteUserDesc": "确定要删除“{name}”吗？此操作无法撤销。",
-
-  // Admin — user detail
   "admin.user.profile": "资料",
   "admin.user.summary": "摘要",
   "admin.user.id": "ID",
@@ -892,8 +797,6 @@ registerPack("zh-CN", {
   "admin.user.saveRole": "保存角色",
   "admin.user.usage30Days": "用量（最近 30 天）",
   "admin.user.noUsage": "暂无用量数据。",
-
-  // Admin — usage tab
   "admin.usage.overview": "用量概览",
   "admin.usage.noData": "该周期暂无用量数据。",
   "admin.usage.totalCalls": "调用总数",
@@ -908,8 +811,6 @@ registerPack("zh-CN", {
   "admin.usage.input": "输入",
   "admin.usage.output": "输出",
   "admin.usage.cost": "成本",
-
-  // Logs page
   "logs.levelAll": "所有级别",
   "logs.level.trace": "TRACE",
   "logs.level.debug": "DEBUG",
@@ -1040,5 +941,15 @@ registerPack("zh-CN", {
   "skills.source.user": "用户",
   "skills.source.workspace": "工作区",
   "skills.updateFailed": "更新失败。",
-  "skills.updated": "已更新技能“{name}”"
+  "skills.updated": "已更新技能“{name}”",
+
+  // Desktop feature keys (genuinely translated, merged in)
+  "chat.heroMorning": "接下来想让 IronClaw 帮你处理什么？",
+  "chat.heroAfternoon": "接下来想让 IronClaw 帮你处理什么？",
+  "chat.heroEvening": "接下来想让 IronClaw 帮你处理什么？",
+  "chat.fileDownloadFailed": "无法下载该文件",
+  "chat.removeImage": "移除图片",
+  "chat.removeAttachment": "移除附件",
+  "settings.notWritable": "此网关暂不支持编辑",
+  "settings.notWritableDesc": "此网关暂时无法保存对这些设置的更改，因此控件被隐藏，而不是显示为可编辑。待网关能够持久保存后，它们将重新出现。"
 });

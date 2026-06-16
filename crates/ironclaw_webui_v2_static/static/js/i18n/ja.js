@@ -1,11 +1,8 @@
 import { registerPack } from "../lib/i18n.js";
 
 registerPack("ja", {
-  // Language metadata
   "language.name": "日本語",
   "language.switch": "言語を変更しました",
-
-  // Common
   "common.unknown": "不明",
   "common.cancel": "キャンセル",
   "common.delete": "削除",
@@ -15,8 +12,6 @@ registerPack("ja", {
   "common.saving": "保存中...",
   "common.done": "完了",
   "common.send": "送信",
-
-  // Navigation
   "nav.chat": "チャット",
   "nav.close": "閉じる",
   "nav.workspace": "ワークスペース",
@@ -32,22 +27,14 @@ registerPack("ja", {
   "nav.docs": "ドキュメント",
   "nav.sectionWork": "作業",
   "nav.sectionSystem": "システム",
-
-  // Theme
   "theme.switchToLight": "ライトテーマに切り替え",
   "theme.switchToDark": "ダークテーマに切り替え",
   "theme.light": "ライトテーマ",
   "theme.dark": "ダークテーマ",
-
-  // Header
   "header.signOut": "サインアウト",
-
-  // Status
   "status.online": "オンライン",
   "status.offline": "オフライン",
   "status.checking": "確認中",
-
-  // Login page
   "login.tagline": "Gateway v2",
   "login.hero": "オペレーターの痕跡を失わずにローカルエージェントを制御。",
   "login.heroSub": "トークンアクセスにより、ブラウザコンソールは同じゲートウェイランタイム、承認、ツール、スレッド状態に紐づきます。",
@@ -62,8 +49,6 @@ registerPack("ja", {
   "login.connect": "接続",
   "login.oauthDivider": "または続行",
   "login.oauthProvider": "{provider} で続行",
-
-  // Chat — empty state
   "chat.heroTitle": "こんにちは。何を手伝いましょうか?",
   "chat.heroDesc": "目標、リポジトリの質問、レビュー依頼、作業が必要なファイルから始められます。",
   "chat.emptyTitle": "具体的なオペレータータスクから始めましょう。",
@@ -74,8 +59,6 @@ registerPack("ja", {
   "chat.suggestion2Desc": "正確性のリスク、ブロックされた承認、フォローアップを探します。",
   "chat.suggestion3": "拡張の準備状況チェックを下書きする",
   "chat.suggestion3Desc": "セットアップ、認証、ペアリング、利用可能な機能を確認します。",
-
-  // Chat — input
   "chat.placeholder": "IronClaw にメッセージ…",
   "chat.heroPlaceholder": "IronClaw に何でも聞いてください。",
   "chat.followUpPlaceholder": "フォローアップ変更を依頼",
@@ -101,8 +84,6 @@ registerPack("ja", {
   "shortcuts.newline": "改行",
   "shortcuts.help": "このヘルプを表示",
   "shortcuts.close": "閉じる",
-
-  // Chat — thread sidebar
   "chat.conversations": "会話",
   "chat.threads": "{count} スレッド",
   "chat.newThread": "新規",
@@ -110,15 +91,11 @@ registerPack("ja", {
   "chat.selectConversation": "会話を選択",
   "chat.noConversations": "まだ会話がありません。コンポーザーの提案からスレッドを開始してください。",
   "chat.turns": "{count} ターン",
-
-  // Chat — connection
   "connection.connected": "接続済み",
   "connection.reconnecting": "再接続中…",
   "connection.disconnected": "切断",
   "connection.connecting": "接続中…",
   "connection.paused": "タブが非表示の間一時停止",
-
-  // Chat — approval
   "approval.title": "承認が必要です",
   "approval.approve": "承認",
   "approval.deny": "拒否",
@@ -126,7 +103,6 @@ registerPack("ja", {
   "approval.approveAndAlways": "承認して常に許可",
   "approval.alwaysAllowToolLabel": "確認せずに {tool} を常に許可",
   "approval.thisTool": "このツール",
-  // Chat — tool activity
   "tool.tabDetails": "詳細",
   "tool.tabParameters": "パラメーター",
   "tool.tabResult": "結果",
@@ -166,19 +142,13 @@ registerPack("ja", {
   "authGate.unsupportedChallenge": "設定を開いてこの認証手順を完了します。",
   "authGate.submitFailed": "トークンを保存できませんでした。",
   "authGate.resolveFailedAfterTokenSaved": "トークンが保存されました。ブロックされた実行を再開できませんでした。再開してみてください。",
-
-  // Error
   "error.gatewayConnection": "ゲートウェイに接続できません",
   "error.saveFailed": "保存に失敗しました: {message}",
   "error.loadFailed": "{what} の読み込みに失敗しました: {message}",
-
-  // Extensions tabs
   "extensions.installed": "インストール済み",
   "extensions.channels": "チャネル",
   "extensions.mcp": "MCP サーバー",
   "extensions.registry": "レジストリ",
-
-  // Settings tabs
   "settings.inference": "推論",
   "settings.agent": "エージェント",
   "settings.channels": "チャネル",
@@ -188,7 +158,6 @@ registerPack("ja", {
   "settings.traceCommons": "Trace Commons",
   "settings.users": "ユーザー",
   "settings.language": "言語",
-  // Settings — Trace Commons credits (read-only)
   "traceCommons.title": "Trace Commons クレジット",
   "traceCommons.description": "提供した編集済みトレースで獲得したクレジット。アカウント単位で表示されます。",
   "traceCommons.emptyState": "未登録 — エージェントに Trace Commons の招待でオンボーディングを依頼してください。",
@@ -216,9 +185,6 @@ registerPack("ja", {
   "traceCommons.never": "なし",
   "traceCommons.recentExplanations": "最近のクレジット明細",
   "traceCommons.note": "最終同期時点のローカル表示です — 正式なクレジット台帳はサーバー側にあります。確定クレジットはプライバシー審査、リプレイ/評価、重複チェック、後段の有用性スコアリングの後に変わる可能性があります。",
-
-
-  // Settings — toolbar
   "settings.back": "戻る",
   "settings.searchPlaceholder": "検索設定...",
   "settings.clearSearch": "検索をクリア",
@@ -231,22 +197,16 @@ registerPack("ja", {
   "settings.importSuccess": "インポートされた設定",
   "settings.importInvalid": "選択したファイルには設定オブジェクトが含まれている必要があります",
   "settings.importFailed": "インポートに失敗しました: {message}",
-
-  // Settings — restart banner
   "settings.restartRequired": "一部の変更は反映に再起動が必要です。",
   "settings.restartNow": "今すぐ再起動します",
   "settings.restartStarting": "再起動中...",
   "settings.restartUnavailable": "ウェブ UI からの再起動はまだ利用できません。保留中の変更を適用するには、ゲートウェイプロセスを手動で再起動してください。",
-
-  // Restart dialog
   "restart.title": "IronClaw を再起動",
   "restart.description": "gateway プロセスを再起動します保留中の変更を適用します。",
   "restart.warning": "gateway の再起動中に、実行中のタスクが中断される場合があります。",
   "restart.cancel": "キャンセル",
   "restart.confirm": "再起動の確認",
   "restart.progressTitle": "IronClaw の再起動",
-
-  // TEE attestation
   "tee.title": "TEE 認証",
   "tee.verified": "検証済みのランタイム認証が利用可能",
   "tee.imageDigest": "イメージ ダイジェスト",
@@ -257,8 +217,6 @@ registerPack("ja", {
   "tee.loadFailed": "認証レポートをロードできませんでした",
   "tee.copyReport": "レポートのコピー",
   "tee.copied": "コピーされました",
-
-  // Settings — LLM providers
   "llm.active": "アクティブ",
   "llm.addProvider": "プロバイダーの追加",
   "llm.adapter": "アダプタ",
@@ -323,7 +281,6 @@ registerPack("ja", {
   "llm.testConnection": "テスト接続",
   "llm.testing": "テスト中...",
   "llm.use": "Use",
-  // Settings — LLM providers (progressive disclosure)
   "llm.groupActive": "アクティブ",
   "llm.groupReady": "使用準備完了",
   "llm.groupSetup": "セットアップが必要",
@@ -332,8 +289,6 @@ registerPack("ja", {
   "llm.missingApiKey": "API キーがありません",
   "llm.missingBaseUrl": "ベース URL がありません",
   "llm.addApiKey": "API キーを追加",
-
-  // Settings — inference groups
   "settings.group.embeddings": "埋め込み",
   "settings.group.sampling": "サンプリング",
   "settings.field.embeddingsEnabled": "埋め込みを有効化",
@@ -344,8 +299,6 @@ registerPack("ja", {
   "settings.field.embeddingsModelDesc": "埋め込みモデル識別子",
   "settings.field.temperature": "温度",
   "settings.field.temperatureDesc": "デフォルトのサンプリング温度 (0.0–2.0)",
-
-  // Settings — agent groups
   "settings.group.core": "コア",
   "settings.group.heartbeat": "ハートビート",
   "settings.group.sandbox": "サンドボックス",
@@ -417,8 +370,6 @@ registerPack("ja", {
   "settings.field.skillsMaxContextTokensDesc": "注入スキルプロンプトのトークン予算",
   "settings.field.fusionStrategy": "フュージョン戦略",
   "settings.field.fusionStrategyDesc": "ハイブリッド検索の結果マージ方法",
-
-  // Settings — networking
   "settings.group.gateway": "ゲートウェイ",
   "settings.group.tunnel": "トンネル",
   "settings.field.gatewayHost": "ホスト",
@@ -429,8 +380,6 @@ registerPack("ja", {
   "settings.field.tunnelProviderDesc": "公開トンネルサービス",
   "settings.field.tunnelPublicUrl": "公開 URL",
   "settings.field.tunnelPublicUrlDesc": "静的トンネルエンドポイント",
-
-  // Settings — channels tab
   "channels.builtIn": "組み込みチャネル",
   "channels.messaging": "メッセージングチャネル",
   "channels.availableChannels": "利用可能なチャネル",
@@ -467,8 +416,6 @@ registerPack("ja", {
   "channels.slackAccessSaving": "保存...",
   "channels.slackAccessSuccess": "Slack チャンネルが保存されました。",
   "channels.slackAccessError": "Slack チャネルの更新に失敗しました。",
-
-  // Settings — tools tab
   "tools.permissions": "ツール権限",
   "tools.alwaysAllow": "常に許可",
   "tools.askEachTime": "毎回確認",
@@ -479,8 +426,6 @@ registerPack("ja", {
   "tools.filterPlaceholder": "ツールをフィルタ…",
   "tools.noMatch": "フィルタに一致するツールがありません。",
   "tools.failedLoad": "ツールの読み込みに失敗しました: {message}",
-
-  // Settings — skills tab
   "skills.installed": "インストール済みスキル",
   "skills.noInstalled": "スキルがありません",
   "skills.noInstalledDesc": "スキルはエージェントにドメイン固有の指示を追加します。ClawHub レジストリからインストールするか、ワークスペースに SKILL.md を配置してください。",
@@ -508,8 +453,6 @@ registerPack("ja", {
   "skills.removed": "スキル「{name}」を削除",
   "skills.activatesOn": "にアクティブ化します",
   "skills.imported": "輸入された",
-
-  // Settings — users tab
   "users.title": "ユーザー ({count})",
   "users.addUser": "ユーザー追加",
   "users.newUser": "新規ユーザー",
@@ -525,8 +468,6 @@ registerPack("ja", {
   "users.adminRequiredDesc": "ユーザー管理は管理者権限のあるアカウントのみ利用できます。",
   "users.failedLoad": "ユーザーの読み込みに失敗しました: {message}",
   "users.noUsers": "登録ユーザーがいません。",
-
-  // Workspace page
   "workspace.title": "ワークスペース",
   "workspace.subtitle": "永続メモリ",
   "workspace.refresh": "更新",
@@ -547,8 +488,6 @@ registerPack("ja", {
   "workspace.unableOpenDirectory": "ディレクトリを開けません",
   "workspace.unableSaveFile": "ファイルを保存できません",
   "workspace.savedPath": "保存しました: {path}",
-
-  // Jobs page
   "jobs.allJobs": "すべてのジョブ",
   "jobs.refresh": "更新",
   "jobs.refreshing": "更新中",
@@ -556,8 +495,6 @@ registerPack("ja", {
   "jobs.unavailableDesc": "このジョブは存在しないか、アクセス範囲外です。",
   "jobs.returnToJobs": "ジョブ一覧へ戻る",
   "jobs.dismiss": "閉じる",
-
-  // Jobs — list
   "jobs.list.explorer": "エクスプローラー",
   "jobs.list.queueTitle": "ジョブキュー",
   "jobs.list.queueDesc": "タイトルまたはIDで検索し、実行に入って、ページを離れずにアクティブな作業を停止できます。",
@@ -580,14 +517,10 @@ registerPack("ja", {
   "jobs.list.started": "開始 {value}",
   "jobs.action.cancel": "キャンセル",
   "jobs.action.open": "開く",
-
-  // Jobs — detail
   "jobs.detail.backToAll": "すべてのジョブに戻る",
   "jobs.detail.tabs.overview": "概要",
   "jobs.detail.tabs.activity": "アクティビティ",
   "jobs.detail.tabs.files": "ファイル",
-
-  // Missions page
   "missions.allMissions": "すべてのミッション",
   "missions.refresh": "更新",
   "missions.refreshing": "更新中",
@@ -632,8 +565,6 @@ registerPack("ja", {
   "missions.summary.spawnedThreads": "生成スレッド",
   "missions.summary.completedFailed": "完了 {completed} / 失敗 {failed}",
   "missions.summary.acrossProjects": "すべてのプロジェクトワークスペース",
-
-  // Automations page
   "automations.eyebrow": "予定された作業",
   "automations.title": "自動化",
   "automations.description": "スケジュールされた自動化のみ。",
@@ -644,8 +575,7 @@ registerPack("ja", {
   "automations.refresh": "自動化の更新",
   "automations.error.loadFailed": "自動化をロードできません",
   "automations.schedulerOff.title": "スケジュールは無効です",
-  "automations.schedulerOff.description":
-    "これらのオートメーションは保存されていますが、スケジューラーを有効にするまで実行されません。",
+  "automations.schedulerOff.description": "これらのオートメーションは保存されていますが、スケジューラーを有効にするまで実行されません。",
   "automations.schedule.custom": "カスタムスケジュール",
   "automations.schedule.everyMinute": "毎分",
   "automations.schedule.everyMinutes": "{count}分ごと",
@@ -698,8 +628,7 @@ registerPack("ja", {
   "automations.delivery.save": "保存",
   "automations.delivery.clear": "クリア",
   "automations.delivery.saved": "保存しました",
-  "automations.delivery.saveFailed":
-    "配信先を保存できませんでした。もう一度お試しください。",
+  "automations.delivery.saveFailed": "配信先を保存できませんでした。もう一度お試しください。",
   "automations.delivery.footnote": "DM に送信された承認リクエストは、Slack で {command} と返信して回答します。",
   "automations.delivery.pill.ready": "準備完了",
   "automations.delivery.pill.unavailable": "利用不可",
@@ -724,30 +653,20 @@ registerPack("ja", {
   "automations.table.nextRun": "次の実行",
   "automations.table.lastRun": "前回の実行",
   "automations.table.status": "ステータス",
-
-  // Routines page
   "routines.explorer": "タスク",
   "routines.title": "ルーチン",
   "routines.description": "保存済みルーチンを検索し、スケジュールやトリガーを確認して、v2 を離れずに実行または一時停止できます。",
-
-  // Extensions page
   "ext.installed": "インストール済み",
   "ext.channels": "チャネル",
   "ext.mcp": "MCP",
   "ext.registry": "レジストリ",
-
-  // Extensions — registry
   "ext.registry.searchPlaceholder": "拡張機能を検索…",
   "ext.registry.emptyTitle": "レジストリは空です",
   "ext.registry.emptyDesc": "利用可能な拡張機能はすべてインストール済みか、レジストリが設定されていません。",
   "ext.registry.availableTitle": "利用可能な拡張機能",
   "ext.registry.noMatch": "フィルターに一致する拡張機能はありません。",
-
-  // Chat — history
   "chat.history.loading": "読み込み中...",
   "chat.history.loadOlder": "過去のメッセージを読み込む",
-
-  // Projects page
   "projects.allProjects": "すべてのプロジェクト",
   "projects.returnToProjects": "プロジェクトに戻る",
   "projects.unavailable": "プロジェクトは利用できません",
@@ -781,20 +700,14 @@ registerPack("ja", {
   "projects.card.failures24h": "24時間で {count}",
   "projects.card.spendToday": "今日の支出 {value}",
   "projects.explorer": "エクスプローラー",
-
-  // Language settings
   "lang.title": "言語",
   "lang.description": "表示言語を選択します。",
   "lang.current": "現在の言語",
-
-  // Settings — inference summary card
   "inference.provider": "LLM プロバイダー",
   "inference.backend": "バックエンド",
   "inference.model": "モデル",
   "inference.active": "アクティブ",
   "inference.none": "—",
-
-  // Extensions — pairing
   "pairing.title": "ペアリング",
   "pairing.instructions": "チャンネルからのコードを入力してペアリングを完了します。",
   "pairing.placeholder": "ペアリングコードを入力…",
@@ -808,13 +721,9 @@ registerPack("ja", {
   "pairing.connect": "接続",
   "pairing.slackSuccess": "Slack アカウントが接続されました。",
   "pairing.slackError": "Slack ペアリング コードが無効または期限切れです。",
-
-  // Admin — tabs
   "admin.tab.dashboard": "ダッシュボード",
   "admin.tab.users": "ユーザー",
   "admin.tab.usage": "使用量",
-
-  // Admin — dashboard
   "admin.dashboard.systemOverview": "システム概要",
   "admin.dashboard.uptime": "稼働時間: {value}",
   "admin.dashboard.totalUsers": "総ユーザー数",
@@ -834,8 +743,6 @@ registerPack("ja", {
   "admin.dashboard.status": "状態",
   "admin.dashboard.jobs": "ジョブ",
   "admin.dashboard.lastActive": "最終アクティブ",
-
-  // Admin — users list
   "admin.users.user": "ユーザー",
   "admin.users.userFallback": "ユーザー",
   "admin.users.title": "ユーザー ({count} / {total})",
@@ -874,8 +781,6 @@ registerPack("ja", {
   "admin.users.delete": "削除",
   "admin.users.deleteUserTitle": "ユーザーを削除",
   "admin.users.deleteUserDesc": "「{name}」を削除しますか？この操作は取り消せません。",
-
-  // Admin — user detail
   "admin.user.profile": "プロフィール",
   "admin.user.summary": "サマリー",
   "admin.user.id": "ID",
@@ -892,8 +797,6 @@ registerPack("ja", {
   "admin.user.saveRole": "ロールを保存",
   "admin.user.usage30Days": "使用量（過去30日）",
   "admin.user.noUsage": "使用量データがありません。",
-
-  // Admin — usage tab
   "admin.usage.overview": "使用量概要",
   "admin.usage.noData": "この期間の使用量データがありません。",
   "admin.usage.totalCalls": "総呼び出し数",
@@ -908,8 +811,6 @@ registerPack("ja", {
   "admin.usage.input": "入力",
   "admin.usage.output": "出力",
   "admin.usage.cost": "コスト",
-
-  // Logs page
   "logs.levelAll": "すべてのレベル",
   "logs.level.trace": "TRACE",
   "logs.level.debug": "DEBUG",
@@ -1040,5 +941,15 @@ registerPack("ja", {
   "skills.source.user": "ユーザー",
   "skills.source.workspace": "ワークスペース",
   "skills.updateFailed": "更新に失敗しました。",
-  "skills.updated": "スキル \"{name}\" を更新しました"
+  "skills.updated": "スキル \"{name}\" を更新しました",
+
+  // Desktop feature keys (genuinely translated, merged in)
+  "chat.heroMorning": "次に IronClaw に何を任せますか?",
+  "chat.heroAfternoon": "次に IronClaw に何を任せますか?",
+  "chat.heroEvening": "次に IronClaw に何を任せますか?",
+  "chat.fileDownloadFailed": "そのファイルをダウンロードできませんでした",
+  "chat.removeImage": "画像を削除",
+  "chat.removeAttachment": "添付を削除",
+  "settings.notWritable": "このゲートウェイではまだ編集できません",
+  "settings.notWritableDesc": "このゲートウェイはまだこれらの設定の変更を保存できないため、コントロールは編集可能として表示するのではなく非表示にしています。ゲートウェイが保存できるようになると再び表示されます。"
 });

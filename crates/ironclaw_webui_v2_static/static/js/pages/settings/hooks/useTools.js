@@ -1,7 +1,6 @@
 import { React } from "../../../lib/html.js";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { fetchTools, updateToolPermission } from "../lib/settings-api.js";
-import { throwIfApiFailed } from "../lib/api-result.js";
 
 export function useTools() {
   const queryClient = useQueryClient();
@@ -11,15 +10,25 @@ export function useTools() {
   });
 
   const tools = query.data?.tools || [];
+  // No v2 tools endpoint exists yet: `fetchTools` returns `{ todo: true }` and
+  // `updateToolPermission` is a `{ success: false }` stub. `status:'todo'` lets
+  // the tab gate the permission controls behind a real backend so a select never
+  // implies a saved change that never reached the gateway ("No fake readiness").
+  const status = query.data?.todo ? 'todo' : 'ready';
 
   const [savedTools, setSavedTools] = React.useState({});
 
   const mutation = useMutation({
-    // Treat `success: false` as a failed save so the UI never shows a fake
-    // "Saved" indicator for a permission change that didn't persist.
-    mutationFn: async ({ name, state }) =>
-      throwIfApiFailed(await updateToolPermission(name, state), "Save failed"),
-    onSuccess: (_data, { name, state }) => {
+    mutationFn: ({ name, state }) => updateToolPermission(name, state),
+    onSuccess: (data, { name, state }) => {
+      // The stub resolves without persisting. Only reflect the change and flash
+      // "saved" when the gateway actually confirms the write — otherwise the row
+      // and the saved indicator would assert a permission change that never
+      // happened.
+      if (data?.success === false || data?.todo) {
+        return;
+      }
+
       queryClient.setQueryData(["settings-tools"], (old) => {
         if (!old) return old;
         return {
@@ -37,5 +46,5 @@ export function useTools() {
     [mutation]
   );
 
-  return { tools, query, setPermission, savedTools, error: mutation.error };
+  return { tools, query, status, setPermission, savedTools, error: mutation.error };
 }

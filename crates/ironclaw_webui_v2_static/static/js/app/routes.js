@@ -8,10 +8,14 @@ export const defaultRoute = "/chat";
 // the page's `lib/*-api.js` calls real endpoints.
 export const primaryRoutes = [
   { id: "chat", path: "/chat", labelKey: "nav.chat" },
+  { id: "work", path: "/work", labelKey: "nav.work", hidden: false },
   { id: "workspace", path: "/workspace", labelKey: "nav.workspace", hidden: true },
   { id: "projects", path: "/projects", labelKey: "nav.projects", hidden: true },
   { id: "jobs", path: "/jobs", labelKey: "nav.jobs", hidden: true },
   { id: "routines", path: "/routines", labelKey: "nav.routines", hidden: true },
+  // Scheduled work the agent already created is a real, gateway-backed
+  // read-only viewer (listAutomations) — labelled "Scheduled" and promoted
+  // into primary nav. routines stays hidden — its API is still a TODO stub.
   { id: "automations", path: "/automations", labelKey: "nav.automations" },
   { id: "missions", path: "/missions", labelKey: "nav.missions", hidden: true },
   { id: "extensions", path: "/extensions", labelKey: "nav.extensions" },
@@ -22,7 +26,7 @@ export const primaryRoutes = [
 export const routeSectionDefs = [
   {
     labelKey: "nav.sectionWork",
-    ids: ["chat", "workspace", "projects", "jobs", "routines", "automations", "missions"],
+    ids: ["chat", "work", "automations", "workspace", "projects", "jobs", "routines", "missions"],
   },
   {
     labelKey: "nav.sectionSystem",

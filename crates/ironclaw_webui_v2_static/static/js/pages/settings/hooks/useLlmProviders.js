@@ -1,4 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { isDesktopRuntime } from "../../../lib/api.js";
 import {
   deleteLlmProvider,
   fetchLlmProviders,
@@ -8,6 +9,7 @@ import {
   upsertLlmProvider,
 } from "../lib/settings-api.js";
 import {
+  filterDesktopVisibleLlmProviders,
   isProviderConfigured,
   providerDefaultModel,
   providerMissingReason,
@@ -26,17 +28,55 @@ import {
 // the identity constant across renders.
 const EMPTY_BUILTIN_OVERRIDES = Object.freeze({});
 
+// Desktop-only: a synthetic NEAR AI Cloud entry shown while the local sidecar
+// gateway is unreachable, so the setup panel still offers a sign-in path
+// instead of an empty list. `synthetic_unavailable` keeps it out of the ready
+// bucket (see `isProviderConfigured`). Web never builds this — the real
+// snapshot or an honest error is shown instead.
+function fallbackNearaiSnapshot() {
+  return {
+    providers: [
+      {
+        id: "nearai",
+        name: "NEAR AI Cloud",
+        description: "Model access through NEAR AI Cloud.",
+        adapter: "nearai",
+        default_model: "auto",
+        builtin: true,
+        synthetic_unavailable: true,
+        api_key_required: false,
+        accepts_api_key: true,
+        base_url_required: false,
+        api_key_set: false,
+      },
+    ],
+    active: null,
+  };
+}
+
 export function useLlmProviders({ settings: _settings, gatewayStatus, enabled = true }) {
+  const desktop = isDesktopRuntime();
   const queryClient = useQueryClient();
   const providersQuery = useQuery({
     queryKey: ["llm-providers"],
     queryFn: fetchLlmProviders,
     enabled,
     staleTime: 60_000,
+    // Desktop only: ride out local sidecar boot (HTTP bind can lag the WebView
+    // by a few seconds): connection-refused fails in milliseconds and the
+    // onboarding gate must not see a settled error for a booting backend. Web
+    // keeps react-query's default retry behavior.
+    ...(desktop ? { retry: 1, retryDelay: 600 } : {}),
   });
 
+  // Desktop: fall back to the synthetic NEAR entry when the snapshot is missing
+  // (gateway still booting / unreachable) so the setup panel never goes blank.
+  // Web: an empty snapshot stays empty — we never invent a provider.
+  const fallbackSnapshot = desktop
+    ? fallbackNearaiSnapshot()
+    : { providers: [], active: null };
   const snapshot = enabled
-    ? providersQuery.data || { providers: [], active: null }
+    ? providersQuery.data || fallbackSnapshot
     : { providers: [], active: null };
   // If the providers query failed (e.g. 404 when the route is gated under
   // multi-user / SSO auth, or a transient 5xx / offline), we can't conclude
@@ -44,30 +84,19 @@ export function useLlmProviders({ settings: _settings, gatewayStatus, enabled = 
   // callers must not treat the failure as a reason to onboard.
   const isError = enabled && providersQuery.isError;
   const builtinOverrides = EMPTY_BUILTIN_OVERRIDES;
-  // Map the wire view onto the field names the components/helpers expect.
-  const allProviders = (snapshot.providers || []).map((provider) => ({
-    ...provider,
-    name: provider.description,
-    has_api_key: provider.api_key_set === true,
-  }));
-  // Whether the backend has a usable active provider. Prefer the persisted
-  // operator snapshot, but also honor runtime/env-configured LLMs surfaced by
-  // gateway status so first-run onboarding does not mask an already-live model.
-  const hasActiveProvider = Boolean(snapshot.active?.provider_id || gatewayStatus?.llm_backend);
-  // The honest active selection: null when nothing is configured. The grouping,
-  // sort, and per-card "active" badge must key off this — otherwise a clean
-  // install renders NEAR AI under the "ACTIVE" section even though no provider
-  // is selected (#4857). The `nearai` fallback below is for downstream *default*
-  // selection only and must never leak into active-state display.
-  const activeProviderId = hasActiveProvider
-    ? snapshot.active?.provider_id || gatewayStatus?.llm_backend
-    : null;
+
+  const providerSnapshot = deriveProviderSnapshot(snapshot, { gatewayStatus, desktop });
+  const {
+    allProviders,
+    activeProviderId,
+    selectedModel,
+    builtinProviders,
+    customProviders,
+    hasActiveProvider,
+  } = providerSnapshot;
   // Default provider id used when the user activates/saves without a prior
   // selection. Intentionally falls back to `nearai`; never used for grouping.
   const defaultProviderId = activeProviderId || "nearai";
-  const selectedModel = snapshot.active?.model || gatewayStatus?.llm_model || "";
-  const builtinProviders = allProviders.filter((provider) => provider.builtin);
-  const customProviders = allProviders.filter((provider) => !provider.builtin);
   const providers = [...allProviders].sort((a, b) => {
     if (a.id === activeProviderId) return -1;
     if (b.id === activeProviderId) return 1;
@@ -138,7 +167,11 @@ export function useLlmProviders({ settings: _settings, gatewayStatus, enabled = 
     selectedModel,
     hasActiveProvider,
     isError,
-    isLoading: providersQuery.isLoading,
+    // Desktop keeps showing any rows it already has while a refetch is in
+    // flight (synthetic fallback never collapses to a spinner); web reports the
+    // raw query loading state.
+    isLoading: desktop ? providersQuery.isLoading && !providers.length : providersQuery.isLoading,
+    isChecking: providersQuery.isLoading,
     error: providersQuery.error,
     setActiveProvider: (provider) => setActiveMutation.mutateAsync(provider),
     saveCustomProvider: (payload) => saveProviderMutation.mutateAsync(payload),
@@ -146,9 +179,69 @@ export function useLlmProviders({ settings: _settings, gatewayStatus, enabled = 
     deleteCustomProvider: (provider) => deleteCustomMutation.mutateAsync(provider),
     testConnection: testLlmProviderConnection,
     listModels: listLlmProviderModels,
+    refresh,
     isBusy:
       setActiveMutation.isPending ||
       saveProviderMutation.isPending ||
       deleteCustomMutation.isPending,
+  };
+}
+
+// Map the wire snapshot onto the field names the components/helpers expect and
+// resolve the active selection. `options.desktop` switches the two behaviors
+// the desktop fork diverged on:
+//   - provider visibility: desktop narrows to NEAR AI Cloud only; web keeps the
+//     full list.
+//   - active resolution: web honors a runtime/env LLM surfaced by gateway
+//     status (`llm_backend`) so an operator-configured model is not masked at
+//     first run; desktop trusts only the persisted snapshot's `active`, hiding
+//     stale/non-NEAR active snapshots until an advanced-provider mode exists.
+export function deriveProviderSnapshot(snapshot = {}, options = {}) {
+  const { gatewayStatus, desktop = false } = options;
+  const builtinOverrides = {};
+  const rawProviders = (Array.isArray(snapshot.providers) ? snapshot.providers : []).map(
+    (provider) => ({
+      ...provider,
+      name: provider.name || provider.description || provider.id,
+      has_api_key: provider.api_key_set === true,
+    })
+  );
+  const allProviders = desktop ? filterDesktopVisibleLlmProviders(rawProviders) : rawProviders;
+
+  if (desktop) {
+    const rawActiveProviderId = snapshot.active?.provider_id || "";
+    const activeProvider = allProviders.find((provider) => provider.id === rawActiveProviderId);
+    const hasActiveProvider = Boolean(activeProvider);
+    const activeProviderId = hasActiveProvider ? rawActiveProviderId : "";
+    const selectedModel = hasActiveProvider ? snapshot.active?.model || "" : "";
+    return {
+      allProviders,
+      builtinProviders: allProviders.filter((provider) => provider.builtin),
+      customProviders: allProviders.filter((provider) => !provider.builtin),
+      builtinOverrides,
+      hasActiveProvider,
+      activeProviderId,
+      selectedModel,
+    };
+  }
+
+  // Web: honor the persisted operator snapshot, but also honor runtime/env
+  // LLMs surfaced by gateway status so first-run onboarding does not mask an
+  // already-live model. The honest active selection is null when nothing is
+  // configured — grouping, sort, and the per-card "active" badge key off this
+  // so a clean install does not promote any provider into "ACTIVE" (#4857).
+  const hasActiveProvider = Boolean(snapshot.active?.provider_id || gatewayStatus?.llm_backend);
+  const activeProviderId = hasActiveProvider
+    ? snapshot.active?.provider_id || gatewayStatus?.llm_backend
+    : null;
+  const selectedModel = snapshot.active?.model || gatewayStatus?.llm_model || "";
+  return {
+    allProviders,
+    builtinProviders: allProviders.filter((provider) => provider.builtin),
+    customProviders: allProviders.filter((provider) => !provider.builtin),
+    builtinOverrides,
+    hasActiveProvider,
+    activeProviderId,
+    selectedModel,
   };
 }

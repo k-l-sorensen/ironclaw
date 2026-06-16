@@ -5,10 +5,11 @@ import vm from "node:vm";
 
 function loadGates() {
   const source = readFileSync(new URL("./gates.js", import.meta.url), "utf8")
-    .replace("export function gateFromEvent", "function gateFromEvent");
+    .replace("export function gateFromEvent", "function gateFromEvent")
+    .replace("export function gateFromProjection", "function gateFromProjection");
   const context = { globalThis: {} };
   vm.runInNewContext(
-    `${source}\nglobalThis.__testExports = { gateFromEvent };`,
+    `${source}\nglobalThis.__testExports = { gateFromEvent, gateFromProjection };`,
     context,
   );
   return context.globalThis.__testExports;
@@ -140,4 +141,33 @@ test("gateFromEvent preserves legacy auth prompts as manual token prompts", () =
     }).challengeKind,
     "manual_token",
   );
+});
+
+test("gateFromProjection builds a minimal mono-shaped gate from a projection item", () => {
+  const { gateFromProjection } = loadGates();
+
+  assert.deepEqual(
+    plain(
+      gateFromProjection("run-2", {
+        gate_ref: "gate:approval",
+        headline: "Approval required",
+        allow_always: true,
+      }),
+    ),
+    {
+      kind: "gate",
+      runId: "run-2",
+      gateRef: "gate:approval",
+      headline: "Approval required",
+      body: "",
+      allowAlways: true,
+    },
+  );
+});
+
+test("gateFromProjection returns null without an active run id", () => {
+  const { gateFromProjection } = loadGates();
+
+  assert.equal(gateFromProjection(null, { gate_ref: "gate:approval" }), null);
+  assert.equal(gateFromProjection("run-2", null), null);
 });

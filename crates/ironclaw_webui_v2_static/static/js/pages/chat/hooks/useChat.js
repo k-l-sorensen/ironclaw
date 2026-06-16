@@ -1,6 +1,7 @@
 import {
   cancelRun as cancelRunRequest,
   createThread as createThreadRequest,
+  isDesktopRuntime,
   resolveGate as resolveGateRequest,
   sendMessage,
   submitManualToken,
@@ -19,8 +20,16 @@ import {
   removePending,
 } from "../lib/pending-messages.js";
 import { toRenderAttachment, toWireAttachment } from "../lib/attachments.js";
+import { buildDurableAttachmentBlock } from "../lib/history-messages.js";
 import { useHistory } from "./useHistory.js";
 import { useSSE } from "./useSSE.js";
+
+// Desktop-only runtime probe. `isDesktopRuntime` is imported from api.js for
+// the real module; the unit harness strips imports, so guard the reference so
+// it resolves to `false` (web path) when the symbol is absent under test.
+function inDesktopRuntime() {
+  return typeof isDesktopRuntime === "function" && isDesktopRuntime();
+}
 
 const AUTH_TOKEN_FLOW_TIMEOUT_MS = 30000;
 const AUTH_GATE_CREDENTIAL_STORED_ERROR =
@@ -282,6 +291,36 @@ export function useChat(threadId) {
       const wireAttachments = stagedAttachments.map(toWireAttachment);
       const renderAttachments = stagedAttachments.map(toRenderAttachment);
 
+      // SEND-contract branch by runtime. Web is canonical and unchanged: the
+      // user's text rides in `content`, attachments ride first-class in the
+      // `WebUiInboundAttachment` wire field. The bundled desktop sidecar drops
+      // the first-class field from its timeline echo AND never feeds attachment
+      // bytes to the model, so the DESKTOP-ONLY path inlines extracted text
+      // into `content` as a durable manifest block and ships no bytes on the
+      // wire. Gated behind the desktop runtime so the web contract is intact.
+      const desktopRuntime = inDesktopRuntime();
+      let contentForSend = content;
+      let sendAttachments = wireAttachments;
+      if (desktopRuntime && stagedAttachments.length > 0) {
+        const durableSourceAttachments = stagedAttachments.map((att) => ({
+          name: att.filename,
+          mime_type: att.mimeType,
+          data_base64: att.dataBase64,
+          size: att.sizeBytes,
+        }));
+        const durableBlock =
+          typeof buildDurableAttachmentBlock === "function"
+            ? buildDurableAttachmentBlock(durableSourceAttachments, {
+                contentBytes: new TextEncoder().encode(content).length,
+              })
+            : "";
+        if (durableBlock) contentForSend = `${content}${durableBlock}`;
+        // The model reads the document only through the inlined durable text
+        // block; the gateway cannot land attachment bytes under the desktop
+        // composition, so drop bytes from the wire (keep nothing first-class).
+        sendAttachments = [];
+      }
+
       // Channel-connect slash commands ("/connect telegram") never carry
       // attachments; skip that detection when files are staged so an
       // upload is never misread as a command and dropped.
@@ -335,8 +374,8 @@ export function useChat(threadId) {
       try {
         const response = await sendMessage({
           threadId: sendThreadId,
-          content,
-          attachments: wireAttachments,
+          content: contentForSend,
+          attachments: sendAttachments,
         });
         // Refresh the sidebar only while the cached entry is missing
         // or title-less. Once the first-message title has appeared,

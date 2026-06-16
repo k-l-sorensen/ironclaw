@@ -19,7 +19,7 @@ export function SettingsPage() {
   const { gatewayStatus, gatewayStatusQuery, isAdmin = false } = useOutletContext();
   const defaultTab = isAdmin ? "inference" : "language";
   const tab = requestedTab || defaultTab;
-  const { settings, query, save, savedKeys, needsRestart, saveError } = useSettings();
+  const { settings, query, status, save, savedKeys, needsRestart, saveError } = useSettings();
   const [searchQuery, setSearchQuery] = React.useState("");
 
   React.useEffect(() => {
@@ -32,6 +32,7 @@ export function SettingsPage() {
     inference: html`<${InferenceTab}
       settings=${settings}
       gatewayStatus=${gatewayStatus}
+      settingsStatus=${status}
       onSave=${save}
       savedKeys=${savedKeys}
       isLoading=${isLoading}
@@ -39,6 +40,7 @@ export function SettingsPage() {
     />`,
     agent: html`<${AgentTab}
       settings=${settings}
+      settingsStatus=${status}
       onSave=${save}
       savedKeys=${savedKeys}
       isLoading=${isLoading}
@@ -47,6 +49,7 @@ export function SettingsPage() {
     channels: html`<${ChannelsTab} searchQuery=${searchQuery} />`,
     networking: html`<${NetworkingTab}
       settings=${settings}
+      settingsStatus=${status}
       onSave=${save}
       savedKeys=${savedKeys}
       isLoading=${isLoading}
@@ -86,7 +89,7 @@ export function SettingsPage() {
             ${saveError &&
             html`
               <div
-                className="rounded-xl border border-red-400/30 bg-red-500/10 px-4 py-3 text-sm text-red-200"
+                className="rounded-xl border border-[color-mix(in_srgb,var(--v2-danger-text)_36%,var(--v2-panel-border))] bg-[var(--v2-danger-soft)] px-4 py-3 text-sm text-[var(--v2-danger-text)]"
               >
                 ${t("error.saveFailed", { message: saveError.message })}
               </div>

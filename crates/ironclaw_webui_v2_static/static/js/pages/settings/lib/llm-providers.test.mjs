@@ -3,7 +3,10 @@ import test from "node:test";
 
 import {
   API_KEY_UNCHANGED,
+  filterDesktopVisibleLlmProviders,
   groupProvidersByStatus,
+  isDesktopVisibleLlmProvider,
+  modelDisplayName,
   nextModelAfterFetch,
   providerAcceptsApiKey,
   providerStatus,
@@ -71,6 +74,24 @@ test("providerStatus returns 'setup' when an API key is missing", () => {
 
 test("providerStatus returns 'setup' when a required base URL is missing", () => {
   assert.equal(providerStatus(builtinNeedsBaseUrl("openai"), {}, "nearai"), "setup");
+});
+
+test("providerStatus returns 'setup' for synthetic unavailable fallback providers", () => {
+  // Desktop-only: the synthetic offline-NEAR fallback must never be classified
+  // ready, regardless of its declared key/base-url requirements.
+  assert.equal(
+    providerStatus(
+      builtinReady("nearai", {
+        adapter: "nearai",
+        api_key_required: false,
+        has_api_key: false,
+        synthetic_unavailable: true,
+      }),
+      {},
+      ""
+    ),
+    "setup"
+  );
 });
 
 test("providerAcceptsApiKey supports dual-auth NEAR providers", () => {
@@ -187,4 +208,45 @@ test("nextModelAfterFetch keeps the current model when it is in the fetched list
 test("nextModelAfterFetch keeps the current model when no models were fetched", () => {
   assert.equal(nextModelAfterFetch("", []), null);
   assert.equal(nextModelAfterFetch("x", null), null);
+});
+
+// --- Desktop-only helpers (additive; gated behind isDesktopRuntime() at call
+// sites). The catalog itself is never trimmed — these only narrow a list. ---
+
+test("filterDesktopVisibleLlmProviders keeps only NEAR AI Cloud for normal desktop UI", () => {
+  const providers = [
+    builtinReady("nearai", { adapter: "nearai" }),
+    builtinReady("openrouter"),
+    builtinReady("anthropic"),
+  ];
+
+  assert.deepEqual(
+    filterDesktopVisibleLlmProviders(providers).map((provider) => provider.id),
+    ["nearai"]
+  );
+});
+
+test("isDesktopVisibleLlmProvider accepts provider objects and ids", () => {
+  assert.equal(isDesktopVisibleLlmProvider({ id: "nearai" }), true);
+  assert.equal(isDesktopVisibleLlmProvider("nearai"), true);
+  assert.equal(isDesktopVisibleLlmProvider({ id: "openai" }), false);
+  assert.equal(isDesktopVisibleLlmProvider(null), false);
+});
+
+test("modelDisplayName keeps NEAR model choices readable without provider plumbing", () => {
+  assert.equal(modelDisplayName("auto"), "Auto");
+  assert.equal(modelDisplayName("z-ai/glm-4.5"), "GLM 4.5");
+  assert.equal(modelDisplayName("gpt-oss-120b"), "GPT OSS 120B");
+  assert.equal(modelDisplayName("qwen/qwen3.5"), "Qwen3.5");
+});
+
+test("modelDisplayName renders the real NEAR AI Cloud catalog id, not a generic tier", () => {
+  assert.equal(modelDisplayName("anthropic/claude-haiku-4-5"), "Claude Haiku 4.5");
+  assert.equal(modelDisplayName("anthropic/claude-opus-4-7"), "Claude Opus 4.7");
+  assert.equal(modelDisplayName("anthropic/claude-sonnet-4.5"), "Claude Sonnet 4.5");
+  assert.equal(modelDisplayName("deepseek-ai/DeepSeek-V4-Flash"), "DeepSeek V4 Flash");
+  assert.equal(modelDisplayName("google/gemini-2.5-pro"), "Gemini 2.5 Pro");
+  assert.equal(modelDisplayName("moonshotai/kimi-k2.6"), "Kimi K2.6");
+  assert.equal(modelDisplayName("openai/gpt-5.5"), "GPT 5.5");
+  assert.equal(modelDisplayName("zai-org/GLM-5.1-FP8"), "GLM 5.1 FP8");
 });

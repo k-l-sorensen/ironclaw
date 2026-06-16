@@ -68,6 +68,26 @@ export function gateFromEvent(eventType, prompt) {
 
   return null;
 }
+
+// Build a pending gate from a `ProductProjectionItem::Gate` rather than a
+// typed `gate` event. The projection item carries `gate_ref` (+ optional
+// `headline` / `allow_always`) but never a `run_id`, so the caller supplies
+// the active run id it correlated from the surrounding projection batch. The
+// shape mirrors `gateFromEvent`'s minimal gate branch (mono field names) so
+// downstream consumers — approval-card, chat.js `approve()` — see one gate
+// contract regardless of whether it arrived as an event or a projection item.
+export function gateFromProjection(activeRunId, gate) {
+  if (!activeRunId || !gate) return null;
+  return {
+    kind: "gate",
+    runId: activeRunId,
+    gateRef: gate.gate_ref,
+    headline: gate.headline,
+    body: "",
+    allowAlways: gate.allow_always === true,
+  };
+}
+
 function approvalDetailsFromContext(context) {
   const details = [];
   if (context.action?.label) {

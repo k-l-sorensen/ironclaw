@@ -1,5 +1,6 @@
 import { React, html } from "../../../lib/html.js";
 import { Card } from "../../../design-system/card.js";
+import { ConfirmDialog } from "../../../design-system/confirm-dialog.js";
 import { useT } from "../../../lib/i18n.js";
 import { useSkills } from "../hooks/useSkills.js";
 import { matchesSearch } from "../lib/settings-search.js";
@@ -12,6 +13,7 @@ export function SkillsTab({ searchQuery = "" }) {
   const {
     skills,
     query,
+    status,
     fetchSkillContent,
     installSkill,
     removeSkill,
@@ -22,52 +24,72 @@ export function SkillsTab({ searchQuery = "" }) {
   } = useSkills();
   const [actionError, setActionError] = React.useState("");
   const [actionResult, setActionResult] = React.useState("");
+  const [confirmRemove, setConfirmRemove] = React.useState(null);
 
-  const handleRemove = React.useCallback(async (name) => {
-    if (!window.confirm(t("skills.confirmDelete", { name }))) return;
-    setActionError("");
-    setActionResult("");
-    try {
-      const response = await removeSkill(name);
-      if (!response?.success) {
-        setActionError(response?.message || t("skills.removeFailed"));
-        return;
+  // No v2 skills endpoint exists yet (useSkills status:'todo'): an import here
+  // resolves against a stub that never persists. Rendering the install form would
+  // imply a capability the gateway cannot prove, so gate it behind a real backend
+  // and keep the dignified installed/empty states ("No fake readiness").
+  const installPanel =
+    status !== 'todo'
+      ? html`<${SkillInstallPanel} onInstall=${installSkill} isInstalling=${isInstalling} />`
+      : null;
+
+  const handleRemove = React.useCallback(
+    (name) => {
+      setConfirmRemove({
+        message: t("skills.confirmRemove", { name }),
+        title: t("skills.removeTitle"),
+        confirmLabel: t("skills.removeConfirm"),
+        tone: "danger",
+        onConfirm: async () => {
+          setActionError("");
+          setActionResult("");
+          const response = await removeSkill(name);
+          if (!response?.success) {
+            // Throw so the dialog stays open and shows the reason inline.
+            throw new Error(response?.message || t("skills.removeFailed"));
+          }
+          setActionResult(response.message || t("skills.removed", { name }));
+        },
+      });
+    },
+    [removeSkill, t]
+  );
+
+  const handleUpdate = React.useCallback(
+    async (name, content) => {
+      if (!content.trim()) {
+        setActionError(t("skills.contentRequired"));
+        setActionResult("");
+        return { success: false, message: t("skills.contentRequired") };
       }
-      setActionResult(response.message || t("skills.removed", { name }));
-    } catch (err) {
-      setActionError(err.message || t("skills.removeFailed"));
-    }
-  }, [removeSkill, t]);
-
-  const handleUpdate = React.useCallback(async (name, content) => {
-    if (!content.trim()) {
-      setActionError(t("skills.contentRequired"));
+      setActionError("");
       setActionResult("");
-      return { success: false, message: t("skills.contentRequired") };
-    }
-    setActionError("");
-    setActionResult("");
-    try {
-      const response = await updateSkill({ name, content });
-      if (!response?.success) {
-        setActionError(response?.message || t("skills.updateFailed"));
+      try {
+        const response = await updateSkill({ name, content });
+        if (!response?.success) {
+          setActionError(response?.message || t("skills.updateFailed"));
+          return response;
+        }
+        setActionResult(response.message || t("skills.updated", { name }));
         return response;
+      } catch (err) {
+        const message = err.message || t("skills.updateFailed");
+        setActionError(message);
+        return { success: false, message };
       }
-      setActionResult(response.message || t("skills.updated", { name }));
-      return response;
-    } catch (err) {
-      const message = err.message || t("skills.updateFailed");
-      setActionError(message);
-      return { success: false, message };
-    }
-  }, [t, updateSkill]);
+    },
+    [t, updateSkill]
+  );
 
   let body;
   if (query.isLoading) {
     body = html`
       <${Card} padding="md">
           <div className="mb-4 h-3 w-24 animate-pulse rounded bg-[var(--v2-surface-muted)]" />
-          ${[1, 2, 3].map((i) => html`
+          ${[1, 2, 3].map(
+            (i) => html`
             <div key=${i} className="flex items-center justify-between border-t border-[var(--v2-panel-border)] py-4 first:border-0">
               <div>
                 <div className="h-4 w-32 animate-pulse rounded bg-[var(--v2-surface-muted)]" />
@@ -75,7 +97,8 @@ export function SkillsTab({ searchQuery = "" }) {
               </div>
               <div className="h-6 w-20 animate-pulse rounded-full bg-[var(--v2-surface-muted)]" />
             </div>
-          `)}
+          `
+          )}
         <//>
     `;
   } else if (query.error) {
@@ -102,9 +125,9 @@ export function SkillsTab({ searchQuery = "" }) {
     if (skills.length === 0) {
       body = html`
         <${Card} padding="lg">
-          <h3 className="text-lg font-semibold text-[var(--v2-text-strong)]">${t("skills.noInstalled")}</h3>
+          <h3 className="text-lg font-semibold text-[var(--v2-text-strong)]">${t('skills.noInstalled')}</h3>
           <p className="mt-2 max-w-md text-sm leading-6 text-[var(--v2-text-muted)]">
-            ${t("skills.noInstalledDesc")}
+            ${t('skills.noInstalledDesc')}
           </p>
         <//>
       `;
@@ -134,9 +157,10 @@ export function SkillsTab({ searchQuery = "" }) {
 
   return html`
     <div className="space-y-4">
-      <${SkillInstallPanel} onInstall=${installSkill} isInstalling=${isInstalling} />
+      ${installPanel}
       <${SkillActionResult} error=${actionError} result=${actionResult} />
       ${body}
+      <${ConfirmDialog} request=${confirmRemove} onClose=${() => setConfirmRemove(null)} />
     </div>
   `;
 }
@@ -145,7 +169,7 @@ function SkillGroup({ title, skills, onEdit, onRemove, onUpdate, isRemoving, isU
   if (skills.length === 0) return null;
   return html`
     <${Card} padding="md">
-      <h3 className="mb-4 font-mono text-[11px] uppercase tracking-[0.14em] text-[var(--v2-accent-text)]">
+      <h3 className="mb-4 text-xs font-semibold uppercase tracking-[0.08em] text-[var(--v2-accent-text)]">
         ${title}
       </h3>
       ${skills.map(
@@ -192,8 +216,8 @@ function SkillActionResult({ error, result }) {
   return html`
     <div
       className=${error
-        ? "rounded-xl border border-red-400/30 bg-red-500/10 px-4 py-3 text-sm text-red-200"
-        : "rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-200"}
+        ? "rounded-xl border border-[color-mix(in_srgb,var(--v2-danger-text)_36%,var(--v2-panel-border))] bg-[var(--v2-danger-soft)] px-4 py-3 text-sm text-[var(--v2-danger-text)]"
+        : "rounded-xl border border-[color-mix(in_srgb,var(--v2-positive-text)_36%,var(--v2-panel-border))] bg-[var(--v2-positive-soft)] px-4 py-3 text-sm text-[var(--v2-positive-text)]"}
     >
       ${error || result}
     </div>

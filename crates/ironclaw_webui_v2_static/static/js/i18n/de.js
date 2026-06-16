@@ -1,11 +1,8 @@
 import { registerPack } from "../lib/i18n.js";
 
 registerPack("de", {
-  // Language metadata
   "language.name": "Deutsch",
   "language.switch": "Sprache geändert",
-
-  // Common
   "common.unknown": "Unbekannt",
   "common.cancel": "Abbrechen",
   "common.delete": "Löschen",
@@ -15,8 +12,6 @@ registerPack("de", {
   "common.saving": "Speichern...",
   "common.done": "Fertig",
   "common.send": "Senden",
-
-  // Navigation
   "nav.chat": "Chat",
   "nav.close": "Schließen",
   "nav.workspace": "Arbeitsbereich",
@@ -32,22 +27,14 @@ registerPack("de", {
   "nav.docs": "Dokumentation",
   "nav.sectionWork": "Arbeit",
   "nav.sectionSystem": "System",
-
-  // Theme
   "theme.switchToLight": "Zum hellen Theme wechseln",
   "theme.switchToDark": "Zum dunklen Theme wechseln",
   "theme.light": "Helles Theme",
   "theme.dark": "Dunkles Theme",
-
-  // Header
   "header.signOut": "Abmelden",
-
-  // Status
   "status.online": "online",
   "status.offline": "offline",
   "status.checking": "prüfen",
-
-  // Login page
   "login.tagline": "Gateway v2",
   "login.hero": "Lokale Agentensteuerung ohne den Operator‑Trail zu verlieren.",
   "login.heroSub": "Tokenzugriff bindet die Browser‑Konsole an dieselbe Gateway‑Runtime, Freigaben, Tools und Thread‑Zustand.",
@@ -62,8 +49,6 @@ registerPack("de", {
   "login.connect": "Verbinden",
   "login.oauthDivider": "oder weiter mit",
   "login.oauthProvider": "Weiter mit {provider}",
-
-  // Chat — empty state
   "chat.heroTitle": "Hallo, wobei brauchst du Hilfe?",
   "chat.heroDesc": "Beginne mit einem Ziel, einer Repo-Frage, einer Review-Anfrage oder Dateien, die bearbeitet werden muessen.",
   "chat.emptyTitle": "Starte mit einer konkreten Operator‑Aufgabe.",
@@ -74,8 +59,6 @@ registerPack("de", {
   "chat.suggestion2Desc": "Nach Korrektheitsrisiken, blockierten Freigaben und Follow-ups suchen.",
   "chat.suggestion3": "Extension‑Readiness‑Check entwerfen",
   "chat.suggestion3Desc": "Setup, Authentifizierung, Pairing und verfuegbare Funktionen pruefen.",
-
-  // Chat — input
   "chat.placeholder": "Nachricht an IronClaw…",
   "chat.heroPlaceholder": "Frag IronClaw etwas.",
   "chat.followUpPlaceholder": "Folgeaenderungen anfordern",
@@ -101,8 +84,6 @@ registerPack("de", {
   "shortcuts.newline": "Neue Zeile",
   "shortcuts.help": "Diese Hilfe anzeigen",
   "shortcuts.close": "Schließen",
-
-  // Chat — thread sidebar
   "chat.conversations": "Unterhaltungen",
   "chat.threads": "{count} Threads",
   "chat.newThread": "Neu",
@@ -110,15 +91,11 @@ registerPack("de", {
   "chat.selectConversation": "Unterhaltung auswählen",
   "chat.noConversations": "Noch keine Unterhaltungen. Starte einen Thread über die Composer‑Vorschläge.",
   "chat.turns": "{count} Turns",
-
-  // Chat — connection
   "connection.connected": "Verbunden",
   "connection.reconnecting": "Verbindung wird wiederhergestellt…",
   "connection.disconnected": "Getrennt",
   "connection.connecting": "Verbinden…",
   "connection.paused": "Angehalten, während Tab ausgeblendet ist",
-
-  // Chat — approval
   "approval.title": "Freigabe erforderlich",
   "approval.approve": "Freigeben",
   "approval.deny": "Ablehnen",
@@ -126,7 +103,6 @@ registerPack("de", {
   "approval.approveAndAlways": "Genehmigen und immer zulassen",
   "approval.alwaysAllowToolLabel": "{tool} immer ohne Nachfrage zulassen",
   "approval.thisTool": "dieses Tool",
-  // Chat — tool activity
   "tool.tabDetails": "Details",
   "tool.tabParameters": "Parameter",
   "tool.tabResult": "Ergebnis",
@@ -166,19 +142,13 @@ registerPack("de", {
   "authGate.unsupportedChallenge": "Einstellungen öffnen, um diesen Authentifizierungsschritt abzuschließen.",
   "authGate.submitFailed": "Das Token konnte nicht gespeichert werden.",
   "authGate.resolveFailedAfterTokenSaved": "Token gespeichert. Der blockierte Lauf konnte nicht fortgesetzt werden; Versuchen Sie es erneut, um es fortzusetzen.",
-
-  // Error
   "error.gatewayConnection": "Verbindung zum Gateway fehlgeschlagen",
   "error.saveFailed": "Speichern fehlgeschlagen: {message}",
   "error.loadFailed": "{what} konnte nicht geladen werden: {message}",
-
-  // Extensions tabs
   "extensions.installed": "Installiert",
   "extensions.channels": "Kanaele",
   "extensions.mcp": "MCP-Server",
   "extensions.registry": "Registrierung",
-
-  // Settings tabs
   "settings.inference": "Inferenz",
   "settings.agent": "Agent",
   "settings.channels": "Kanäle",
@@ -188,7 +158,6 @@ registerPack("de", {
   "settings.traceCommons": "Trace Commons",
   "settings.users": "Benutzer",
   "settings.language": "Sprache",
-  // Settings — Trace Commons credits (read-only)
   "traceCommons.title": "Trace-Commons-Guthaben",
   "traceCommons.description": "Guthaben für beigetragene redigierte Traces, beschränkt auf Ihr Konto.",
   "traceCommons.emptyState": "Nicht angemeldet — bitten Sie Ihren Agenten, sich mit einer Trace-Commons-Einladung anzumelden.",
@@ -216,9 +185,6 @@ registerPack("de", {
   "traceCommons.never": "nie",
   "traceCommons.recentExplanations": "Aktuelle Guthaben-Erläuterungen",
   "traceCommons.note": "Lokale Ansicht zum Zeitpunkt der letzten Synchronisierung — das maßgebliche Guthaben-Hauptbuch liegt serverseitig. Das endgültige Guthaben kann sich nach Datenschutzprüfung, Replay/Eval, Duplikatprüfungen und nachgelagerter Nützlichkeitsbewertung ändern.",
-
-
-  // Settings — toolbar
   "settings.back": "Zurück",
   "settings.searchPlaceholder": "Sucheinstellungen...",
   "settings.clearSearch": "Suche löschen",
@@ -231,22 +197,16 @@ registerPack("de", {
   "settings.importSuccess": "Einstellungen importiert",
   "settings.importInvalid": "Ausgewählte Datei muss ein Einstellungsobjekt enthalten",
   "settings.importFailed": "Import fehlgeschlagen: {message}",
-
-  // Settings — restart banner
   "settings.restartRequired": "Einige Änderungen erfordern einen Neustart, um wirksam zu werden.",
   "settings.restartNow": "Jetzt neu starten",
   "settings.restartStarting": "Wird neu gestartet...",
   "settings.restartUnavailable": "Ein Neustart über die Weboberfläche ist noch nicht verfügbar. Starten Sie den Gateway-Prozess manuell neu, um ausstehende Änderungen anzuwenden.",
-
-  // Restart dialog
   "restart.title": "IronClaw neu starten",
   "restart.description": "Starten Sie den gateway-Prozess neu, um ausstehende Änderungen zu übernehmen.",
   "restart.warning": "Laufende Aufgaben können unterbrochen werden, während der gateway neu startet.",
   "restart.cancel": "Abbrechen",
   "restart.confirm": "Neustart bestätigen",
   "restart.progressTitle": "Neustart von IronClaw",
-
-  // TEE attestation
   "tee.title": "TEE-Nachweis",
   "tee.verified": "Verifizierter Laufzeitnachweis verfügbar",
   "tee.imageDigest": "Image Digest",
@@ -257,8 +217,6 @@ registerPack("de", {
   "tee.loadFailed": "Nachweisbericht konnte nicht geladen werden",
   "tee.copyReport": "Bericht kopieren",
   "tee.copied": "Kopiert",
-
-  // Settings — LLM providers
   "llm.active": "Aktiv",
   "llm.addProvider": "Anbieter hinzufügen",
   "llm.adapter": "Adapter",
@@ -323,7 +281,6 @@ registerPack("de", {
   "llm.testConnection": "Verbindung testen",
   "llm.testing": "Testen...",
   "llm.use": "Use",
-  // Settings — LLM providers (progressive disclosure)
   "llm.groupActive": "Aktiv",
   "llm.groupReady": "Einsatzbereit",
   "llm.groupSetup": "Muss eingerichtet werden",
@@ -332,8 +289,6 @@ registerPack("de", {
   "llm.missingApiKey": "Fehlender API-Schlüssel",
   "llm.missingBaseUrl": "Fehlende Basis-URL",
   "llm.addApiKey": "API-Schlüssel hinzufügen",
-
-  // Settings — inference groups
   "settings.group.embeddings": "Einbettungen",
   "settings.group.sampling": "Sampling",
   "settings.field.embeddingsEnabled": "Embeddings aktivieren",
@@ -344,8 +299,6 @@ registerPack("de", {
   "settings.field.embeddingsModelDesc": "Embedding‑Modell‑Identifier",
   "settings.field.temperature": "Temperatur",
   "settings.field.temperatureDesc": "Standard‑Sampling‑Temperatur (0.0–2.0)",
-
-  // Settings — agent groups
   "settings.group.core": "Kern",
   "settings.group.heartbeat": "Heartbeat",
   "settings.group.sandbox": "Sandbox",
@@ -417,8 +370,6 @@ registerPack("de", {
   "settings.field.skillsMaxContextTokensDesc": "Token‑Budget für injected Skill‑Prompts",
   "settings.field.fusionStrategy": "Fusion‑Strategie",
   "settings.field.fusionStrategyDesc": "Methode zum Mergen hybrider Suchergebnisse",
-
-  // Settings — networking
   "settings.group.gateway": "Gateway",
   "settings.group.tunnel": "Tunnel",
   "settings.field.gatewayHost": "Host",
@@ -429,8 +380,6 @@ registerPack("de", {
   "settings.field.tunnelProviderDesc": "Public‑Tunnel‑Service",
   "settings.field.tunnelPublicUrl": "Öffentliche URL",
   "settings.field.tunnelPublicUrlDesc": "Statischer Tunnel‑Endpoint",
-
-  // Settings — channels tab
   "channels.builtIn": "Built‑in Channels",
   "channels.messaging": "Messaging‑Channels",
   "channels.availableChannels": "Verfügbare Channels",
@@ -467,8 +416,6 @@ registerPack("de", {
   "channels.slackAccessSaving": "Speichern...",
   "channels.slackAccessSuccess": "Slack Kanäle gespeichert.",
   "channels.slackAccessError": "Slack-Kanalaktualisierung fehlgeschlagen.",
-
-  // Settings — tools tab
   "tools.permissions": "Tool‑Berechtigungen",
   "tools.alwaysAllow": "Immer erlauben",
   "tools.askEachTime": "Jedes Mal fragen",
@@ -479,8 +426,6 @@ registerPack("de", {
   "tools.filterPlaceholder": "Tools filtern…",
   "tools.noMatch": "Keine Tools passen zum Filter.",
   "tools.failedLoad": "Tools konnten nicht geladen werden: {message}",
-
-  // Settings — skills tab
   "skills.installed": "Installierte Skills",
   "skills.noInstalled": "Keine Skills installiert",
   "skills.noInstalledDesc": "Skills erweitern den Agenten mit domänenspezifischen Anweisungen. Installiere sie aus dem ClawHub‑Registry oder lege SKILL.md‑Dateien in deinen Workspace.",
@@ -508,8 +453,6 @@ registerPack("de", {
   "skills.removed": "Skill „{name}“ entfernt",
   "skills.activatesOn": "Aktiviert am",
   "skills.imported": "importiert",
-
-  // Settings — users tab
   "users.title": "Benutzer ({count})",
   "users.addUser": "Benutzer hinzufügen",
   "users.newUser": "Neuer Benutzer",
@@ -525,8 +468,6 @@ registerPack("de", {
   "users.adminRequiredDesc": "Benutzerverwaltung ist nur für Konten mit Admin‑Rechten verfügbar.",
   "users.failedLoad": "Benutzer konnten nicht geladen werden: {message}",
   "users.noUsers": "Keine Benutzer registriert.",
-
-  // Workspace page
   "workspace.title": "Arbeitsbereich",
   "workspace.subtitle": "Persistente Memory",
   "workspace.refresh": "Aktualisieren",
@@ -547,8 +488,6 @@ registerPack("de", {
   "workspace.unableOpenDirectory": "Verzeichnis konnte nicht geöffnet werden",
   "workspace.unableSaveFile": "Datei konnte nicht gespeichert werden",
   "workspace.savedPath": "{path} gespeichert",
-
-  // Jobs page
   "jobs.allJobs": "Alle Jobs",
   "jobs.refresh": "Aktualisieren",
   "jobs.refreshing": "Aktualisieren…",
@@ -556,8 +495,6 @@ registerPack("de", {
   "jobs.unavailableDesc": "Dieser Job existiert nicht mehr oder liegt außerhalb deines Zugriffs.",
   "jobs.returnToJobs": "Zurück zu Jobs",
   "jobs.dismiss": "Schließen",
-
-  // Jobs — list
   "jobs.list.explorer": "Explorer",
   "jobs.list.queueTitle": "Job-Warteschlange",
   "jobs.list.queueDesc": "Suche nach Titel oder ID, öffne einen Run und stoppe aktive Arbeit, ohne die Seite zu verlassen.",
@@ -580,14 +517,10 @@ registerPack("de", {
   "jobs.list.started": "gestartet {value}",
   "jobs.action.cancel": "Abbrechen",
   "jobs.action.open": "Öffnen",
-
-  // Jobs — detail
   "jobs.detail.backToAll": "Zurück zu allen Jobs",
   "jobs.detail.tabs.overview": "Übersicht",
   "jobs.detail.tabs.activity": "Aktivität",
   "jobs.detail.tabs.files": "Dateien",
-
-  // Missions page
   "missions.allMissions": "Alle Missionen",
   "missions.refresh": "Aktualisieren",
   "missions.refreshing": "Aktualisieren…",
@@ -632,8 +565,6 @@ registerPack("de", {
   "missions.summary.spawnedThreads": "Erzeugte Threads",
   "missions.summary.completedFailed": "{completed} abgeschlossen / {failed} fehlgeschlagen",
   "missions.summary.acrossProjects": "Über alle Projekt‑Workspaces",
-
-  // Automations page
   "automations.eyebrow": "Geplante Arbeit",
   "automations.title": "Automatisierungen",
   "automations.description": "Nur geplante Automatisierungen.",
@@ -644,8 +575,7 @@ registerPack("de", {
   "automations.refresh": "Automatisierungen aktualisieren",
   "automations.error.loadFailed": "Automatisierungen können nicht geladen werden",
   "automations.schedulerOff.title": "Planung ist deaktiviert",
-  "automations.schedulerOff.description":
-    "Diese Automatisierungen sind gespeichert, werden aber erst ausgeführt, wenn die Planung aktiviert ist.",
+  "automations.schedulerOff.description": "Diese Automatisierungen sind gespeichert, werden aber erst ausgeführt, wenn die Planung aktiviert ist.",
   "automations.schedule.custom": "Benutzerdefinierter Zeitplan",
   "automations.schedule.everyMinute": "Jede Minute",
   "automations.schedule.everyMinutes": "Alle {count} Minuten",
@@ -698,8 +628,7 @@ registerPack("de", {
   "automations.delivery.save": "Speichern",
   "automations.delivery.clear": "Löschen",
   "automations.delivery.saved": "Gespeichert",
-  "automations.delivery.saveFailed":
-    "Zustellungsziel konnte nicht gespeichert werden. Bitte versuche es erneut.",
+  "automations.delivery.saveFailed": "Zustellungsziel konnte nicht gespeichert werden. Bitte versuche es erneut.",
   "automations.delivery.footnote": "Freigabeanfragen an deine DM werden durch Antworten mit {command} in Slack beantwortet.",
   "automations.delivery.pill.ready": "Bereit",
   "automations.delivery.pill.unavailable": "Nicht verfügbar",
@@ -724,30 +653,20 @@ registerPack("de", {
   "automations.table.nextRun": "Nächster Lauf",
   "automations.table.lastRun": "Letzter Lauf",
   "automations.table.status": "Status",
-
-  // Routines page
   "routines.explorer": "Aufgaben",
   "routines.title": "Routinen",
   "routines.description": "Gespeicherte Routinen suchen, Zeitplan oder Ausloeser pruefen und sie ausfuehren oder pausieren, ohne v2 zu verlassen.",
-
-  // Extensions page
   "ext.installed": "Installiert",
   "ext.channels": "Kanäle",
   "ext.mcp": "MCP",
   "ext.registry": "Registrierung",
-
-  // Extensions — registry
   "ext.registry.searchPlaceholder": "Extensions suchen…",
   "ext.registry.emptyTitle": "Registry ist leer",
   "ext.registry.emptyDesc": "Alle verfügbaren Extensions sind bereits installiert oder es ist keine Registry konfiguriert.",
   "ext.registry.availableTitle": "Verfügbare Extensions",
   "ext.registry.noMatch": "Keine Extensions passen zum Filter.",
-
-  // Chat — history
   "chat.history.loading": "Laden...",
   "chat.history.loadOlder": "Ältere Nachrichten laden",
-
-  // Projects page
   "projects.allProjects": "Alle Projekte",
   "projects.returnToProjects": "Zurück zu Projekten",
   "projects.unavailable": "Projekt nicht verfügbar",
@@ -781,20 +700,14 @@ registerPack("de", {
   "projects.card.failures24h": "{count} in 24 Stunden",
   "projects.card.spendToday": "{value} heute ausgegeben",
   "projects.explorer": "Explorer",
-
-  // Language settings
   "lang.title": "Sprache",
   "lang.description": "Wähle die Anzeigesprache der Oberfläche.",
   "lang.current": "Aktuelle Sprache",
-
-  // Settings — inference summary card
   "inference.provider": "LLM‑Provider",
   "inference.backend": "Backend",
   "inference.model": "Modell",
   "inference.active": "aktiv",
   "inference.none": "—",
-
-  // Extensions — pairing
   "pairing.title": "Kopplung",
   "pairing.instructions": "Geben Sie den Code vom Kanal ein, um die Kopplung abzuschließen.",
   "pairing.placeholder": "Pairing‑Code eingeben…",
@@ -808,13 +721,9 @@ registerPack("de", {
   "pairing.connect": "Verbinden",
   "pairing.slackSuccess": "Slack-Konto verbunden.",
   "pairing.slackError": "Ungültiger oder abgelaufener Slack-Kopplungscode.",
-
-  // Admin — tabs
   "admin.tab.dashboard": "Dashboard",
   "admin.tab.users": "Benutzer",
   "admin.tab.usage": "Nutzung",
-
-  // Admin — dashboard
   "admin.dashboard.systemOverview": "Systemübersicht",
   "admin.dashboard.uptime": "Betriebszeit: {value}",
   "admin.dashboard.totalUsers": "Benutzer gesamt",
@@ -834,8 +743,6 @@ registerPack("de", {
   "admin.dashboard.status": "Status",
   "admin.dashboard.jobs": "Jobs",
   "admin.dashboard.lastActive": "Zuletzt aktiv",
-
-  // Admin — users list
   "admin.users.user": "Benutzer",
   "admin.users.userFallback": "Benutzer",
   "admin.users.title": "Benutzer ({count} / {total})",
@@ -874,8 +781,6 @@ registerPack("de", {
   "admin.users.delete": "Löschen",
   "admin.users.deleteUserTitle": "Benutzer löschen",
   "admin.users.deleteUserDesc": "Möchtest du „{name}“ wirklich löschen? Diese Aktion kann nicht rückgängig gemacht werden.",
-
-  // Admin — user detail
   "admin.user.profile": "Profil",
   "admin.user.summary": "Zusammenfassung",
   "admin.user.id": "ID",
@@ -892,8 +797,6 @@ registerPack("de", {
   "admin.user.saveRole": "Rolle speichern",
   "admin.user.usage30Days": "Nutzung (letzte 30 Tage)",
   "admin.user.noUsage": "Keine Nutzungsdaten.",
-
-  // Admin — usage tab
   "admin.usage.overview": "Nutzungsübersicht",
   "admin.usage.noData": "Keine Nutzungsdaten für diesen Zeitraum.",
   "admin.usage.totalCalls": "Calls gesamt",
@@ -908,8 +811,6 @@ registerPack("de", {
   "admin.usage.input": "Eingabe",
   "admin.usage.output": "Ausgabe",
   "admin.usage.cost": "Kosten",
-
-  // Logs page
   "logs.levelAll": "Alle Stufen",
   "logs.level.trace": "TRACE",
   "logs.level.debug": "DEBUG",
@@ -1040,5 +941,15 @@ registerPack("de", {
   "skills.source.user": "Benutzer",
   "skills.source.workspace": "Workspace",
   "skills.updateFailed": "Aktualisierung fehlgeschlagen.",
-  "skills.updated": "Skill \"{name}\" aktualisiert"
+  "skills.updated": "Skill \"{name}\" aktualisiert",
+
+  // Desktop feature keys (genuinely translated, merged in)
+  "chat.heroMorning": "Worum soll sich IronClaw als Nächstes kümmern?",
+  "chat.heroAfternoon": "Worum soll sich IronClaw als Nächstes kümmern?",
+  "chat.heroEvening": "Worum soll sich IronClaw als Nächstes kümmern?",
+  "chat.fileDownloadFailed": "Diese Datei konnte nicht heruntergeladen werden",
+  "chat.removeImage": "Bild entfernen",
+  "chat.removeAttachment": "Anhang entfernen",
+  "settings.notWritable": "Bearbeiten auf diesem Gateway noch nicht verfügbar",
+  "settings.notWritableDesc": "Dieses Gateway kann Änderungen an diesen Einstellungen noch nicht speichern, daher werden die Bedienelemente ausgeblendet, statt als bearbeitbar angezeigt zu werden. Sie kehren zurück, sobald das Gateway sie dauerhaft speichern kann."
 });

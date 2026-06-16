@@ -1,7 +1,10 @@
 import { React } from "../../../lib/html.js";
 import { fetchTimeline } from "../../../lib/api.js";
 import { authScope } from "../../../lib/auth-scope.js";
-import { messagesFromTimeline } from "../lib/history-messages.js";
+import {
+  messagesFromTimeline,
+  pendingMessagesAfterTimeline,
+} from "../lib/history-messages.js";
 
 const PAGE_SIZE = 50;
 
@@ -106,8 +109,16 @@ export function useHistory(threadId, options = {}) {
         const nextCursor = data.next_cursor || null;
 
         // RebornTimelineResponse.next_cursor === null means we reached
-        // the start of the thread.
-        if (!cursor) setPendingMessages?.([]);
+        // the start of the thread. Keep only the pending rows the timeline
+        // hasn't confirmed yet rather than blanket-clearing: Reborn can
+        // accept a turn, then fail at model auth before projecting the user
+        // record, and a second in-flight turn may not have projected at all.
+        // `pendingMessagesAfterTimeline` drops exactly the id-confirmed rows.
+        if (!cursor) {
+          setPendingMessages?.(
+            pendingMessagesAfterTimeline(data.messages || [], pendingMessages),
+          );
+        }
 
         // A full (non-paginated) load can be cached without the previous
         // state, so refresh the cache even if the user has since switched

@@ -1,5 +1,6 @@
 import { React, html } from "../lib/html.js";
 import { Icon } from "../design-system/icons.js";
+import { ConfirmDialog } from "../design-system/confirm-dialog.js";
 import { useT } from "../lib/i18n.js";
 import { getPinnedIds, subscribePins, togglePin } from "../lib/pin-store.js";
 
@@ -55,17 +56,23 @@ function ThreadItem({ thread, isActive, isPinned, presentation, onSelect, onDele
   const activityIso = threadActivityIso(thread);
   const timeLabel = formatThreadActivityLabel(activityIso);
   const timeTitle = formatThreadActivityTooltip(activityIso);
+  const [confirmDelete, setConfirmDelete] = React.useState(null);
 
   const handleDelete = React.useCallback(
     (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (!window.confirm("Delete this chat?")) return;
-      Promise.resolve(onDelete?.(thread.id)).catch((err) => {
-        window.alert(err?.message || "Unable to delete chat");
+      // Failure surfaces inline in the dialog (no native window.alert): the
+      // onConfirm promise rejecting keeps the dialog open with the error.
+      setConfirmDelete({
+        message: t("chat.deleteThreadConfirm"),
+        title: t("common.deleteChat"),
+        confirmLabel: t("common.delete"),
+        tone: "danger",
+        onConfirm: () => Promise.resolve(onDelete?.(thread.id)),
       });
     },
-    [onDelete, thread.id]
+    [onDelete, thread.id, t]
   );
 
   const handleTogglePin = React.useCallback(
@@ -146,6 +153,7 @@ function ThreadItem({ thread, isActive, isPinned, presentation, onSelect, onDele
       >
         <${Icon} name="trash" className="h-3.5 w-3.5" strokeWidth=${2} />
       </button>`}
+      <${ConfirmDialog} request=${confirmDelete} onClose=${() => setConfirmDelete(null)} />
     </div>
   `;
 }
@@ -174,7 +182,18 @@ function ThreadGroup({ label, items, activeThreadId, states, pinnedIds, onSelect
   `;
 }
 
-export function SidebarThreads({ threads, activeThreadId, onSelect, onDelete }) {
+export function SidebarThreads({
+  threads,
+  activeThreadId,
+  isLoading = false,
+  isError = false,
+  onRetry,
+  hasMore = false,
+  isLoadingMore = false,
+  onLoadMore,
+  onSelect,
+  onDelete,
+}) {
   const [collapsed, setCollapsed] = React.useState(false);
   const [query, setQuery] = React.useState("");
   const states = useThreadStates();
@@ -218,11 +237,21 @@ export function SidebarThreads({ threads, activeThreadId, onSelect, onDelete }) 
     };
   }, [threads, query, pinnedIds]);
 
+  // Search-miss auto-load: while a search has no loaded matches but older pages
+  // exist, page through them so a thread on page 3 is still findable. Bounded —
+  // stops once hasMore is false; one fetch at a time.
+  const isSearching = query.trim().length > 0;
+  React.useEffect(() => {
+    if (isSearching && totalMatches === 0 && hasMore && !isLoadingMore && onLoadMore) {
+      onLoadMore();
+    }
+  }, [isSearching, totalMatches, hasMore, isLoadingMore, onLoadMore]);
+
   return html`
     <div className="flex min-h-0 flex-1 flex-col px-2">
       <button
         onClick=${() => setCollapsed((v) => !v)}
-        className="flex w-full items-center gap-1 rounded-[6px] px-2 py-1.5 hover:bg-[var(--v2-surface-muted)]"
+        className="flex min-h-[44px] w-full items-center gap-1 rounded-[6px] px-2 py-1.5 hover:bg-[var(--v2-surface-muted)]"
       >
         <span
           className="flex-1 text-left text-[11px] font-semibold uppercase tracking-wider text-[var(--v2-text-faint)]"
@@ -251,21 +280,59 @@ export function SidebarThreads({ threads, activeThreadId, onSelect, onDelete }) 
             value=${query}
             onInput=${(event) => setQuery(event.currentTarget.value)}
             placeholder=${t("common.searchChats")}
-            className="h-8 w-full rounded-[8px] border border-[var(--v2-panel-border)] bg-[var(--v2-input-bg)] pl-8 pr-2 text-[12px] text-[var(--v2-text-strong)] outline-none placeholder:text-[var(--v2-text-faint)] focus:border-[var(--v2-accent)]"
+            className="h-8 min-h-[44px] w-full rounded-[8px] border border-[var(--v2-panel-border)] bg-[var(--v2-input-bg)] pl-8 pr-2 text-[12px] text-[var(--v2-text-strong)] outline-none placeholder:text-[var(--v2-text-faint)] focus:border-[var(--v2-accent)]"
           />
         </div>`}
         <div
           className="mt-1 flex flex-col gap-2 overflow-y-auto [scrollbar-width:thin]"
         >
           ${threads.length === 0 &&
-          html`<div className="px-3 py-2 text-[12px] text-[var(--v2-text-faint)]">
-            ${t("chat.noConversations")}
-          </div>`}
+          (isLoading
+            ? html`<div
+                role="status"
+                aria-live="polite"
+                className="flex flex-col gap-1.5 px-1 py-2"
+              >
+                <span className="sr-only">${t("chat.loadingConversations")}</span>
+                ${[1, 2, 3, 4].map(
+                  (i) =>
+                    html`<div
+                      key=${i}
+                      aria-hidden="true"
+                      className="v2-skeleton h-8 w-full rounded-[8px]"
+                    />`
+                )}
+              </div>`
+            : isError
+            ? html`<div role="alert" className="px-3 py-2">
+                <p className="text-[12px] text-[var(--v2-danger-text)]">
+                  ${t("chat.loadFailed")}
+                </p>
+                ${onRetry &&
+                html`<button
+                  type="button"
+                  onClick=${() => onRetry()}
+                  className="mt-1.5 inline-flex min-h-[44px] items-center gap-1 rounded-[6px] px-2 py-1 text-[12px] font-medium text-[var(--v2-accent-text)] hover:bg-[var(--v2-surface-muted)]"
+                >
+                  <${Icon} name="retry" className="h-3.5 w-3.5" /> ${t("common.retry")}
+                </button>`}
+              </div>`
+            : html`<div className="px-3 py-2 text-[12px] text-[var(--v2-text-faint)]">
+                ${t("chat.noConversations")}
+              </div>`)}
           ${threads.length > 0 &&
           totalMatches === 0 &&
-          html`<div className="px-3 py-2 text-[12px] text-[var(--v2-text-faint)]">
-            ${t("common.noChatsMatch").replace("{query}", query)}
-          </div>`}
+          (hasMore || isLoadingMore
+            ? html`<div
+                role="status"
+                aria-live="polite"
+                className="flex items-center gap-2 px-3 py-2 text-[12px] text-[var(--v2-text-faint)]"
+              >
+                <${Icon} name="search" className="h-3.5 w-3.5" /> ${t("chat.searchingOlder")}
+              </div>`
+            : html`<div className="px-3 py-2 text-[12px] text-[var(--v2-text-faint)]">
+                ${t("common.noChatsMatch").replace("{query}", query)}
+              </div>`)}
 
           <${ThreadGroup}
             label=${t("common.pinned")}
@@ -285,6 +352,16 @@ export function SidebarThreads({ threads, activeThreadId, onSelect, onDelete }) 
             onSelect=${onSelect}
             onDelete=${onDelete}
           />
+          ${hasMore &&
+          !(isSearching && totalMatches === 0) &&
+          html`<button
+            type="button"
+            onClick=${() => onLoadMore?.()}
+            disabled=${isLoadingMore}
+            className="mt-1 inline-flex min-h-[44px] w-full items-center justify-center gap-1.5 rounded-[8px] border border-[var(--v2-panel-border)] px-3 text-[12px] font-medium text-[var(--v2-text-muted)] hover:bg-[var(--v2-surface-muted)] hover:text-[var(--v2-text-strong)] disabled:opacity-60"
+          >
+            ${isLoadingMore ? t("common.loading") : t("chat.loadOlder")}
+          </button>`}
         </div>
       `}
     </div>

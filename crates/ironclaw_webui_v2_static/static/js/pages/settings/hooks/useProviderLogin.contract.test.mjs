@@ -15,12 +15,13 @@ const dir = path.dirname(fileURLToPath(import.meta.url));
 test('wallet login popup opens without noopener/noreferrer so close-detection works', async () => {
   const source = await readFile(path.join(dir, 'useProviderLogin.js'), 'utf8');
 
-  // The wallet popup open uses a plain size feature string, no opener-nulling flags.
+  // The wallet popup open uses a plain size feature string, no opener-nulling
+  // flags. Quote style may vary (mono double / desktop single).
   assert.match(
     source,
-    /window\.open\(\s*walletLoginUrl\(channelName\),\s*'_blank',\s*'width=460,height=640'\s*\)/
+    /window\.open\(\s*walletLoginUrl\(channelName\),\s*['"]_blank['"],\s*['"]width=460,height=640['"]\s*\)/
   );
-  assert.doesNotMatch(source, /'noopener,noreferrer,width/);
+  assert.doesNotMatch(source, /['"]noopener,noreferrer,width/);
 
   // The cancel path still relies on the popup handle being real.
   assert.match(source, /if \(popup && popup\.closed\)/);

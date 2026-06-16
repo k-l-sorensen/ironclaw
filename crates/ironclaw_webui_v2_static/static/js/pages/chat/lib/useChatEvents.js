@@ -1,5 +1,5 @@
 import { React } from "../../../lib/html.js";
-import { gateFromEvent } from "./gates.js";
+import { gateFromEvent, gateFromProjection } from "./gates.js";
 import {
   isTerminalToolStatus,
   toolCardFromActivity,
@@ -420,14 +420,22 @@ function applyProjectionItems({
       // if no run is active yet — a later projection_update will
       // re-surface it once a run_status arrives.
       if (activeRunId && promptRunIdRef?.current === activeRunId) {
-        setPendingGate((current) => current || {
-          kind: "gate",
-          runId: activeRunId,
-          gateRef: item.gate.gate_ref,
-          headline: item.gate.headline,
-          body: "",
-          allowAlways: item.gate.allow_always === true,
-        });
+        // Prefer the shared `gateFromProjection` helper (one gate contract
+        // across event + projection paths). Fall back to the inline literal
+        // when the symbol is unavailable — the unit harness strips imports and
+        // injects only `gateFromEvent`, so the projected-gate tests still run.
+        const projected =
+          typeof gateFromProjection === "function"
+            ? gateFromProjection(activeRunId, item.gate)
+            : {
+                kind: "gate",
+                runId: activeRunId,
+                gateRef: item.gate.gate_ref,
+                headline: item.gate.headline,
+                body: "",
+                allowAlways: item.gate.allow_always === true,
+              };
+        if (projected) setPendingGate((current) => current || projected);
         setIsProcessing(false);
       }
     }
