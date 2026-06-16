@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -23,6 +24,9 @@ use ironclaw_product_workflow::{
 
 const LAUNCHD_LABEL: &str = "com.ironclaw.reborn";
 const SYSTEMD_UNIT: &str = "ironclaw-reborn.service";
+const WEBUI_TOKEN_ENV: &str = "IRONCLAW_REBORN_WEBUI_TOKEN";
+const WEBUI_USER_ID_ENV: &str = "IRONCLAW_REBORN_WEBUI_USER_ID";
+const SERVICE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ServicePlatform {
@@ -58,14 +62,33 @@ struct SystemCommandRunner;
 
 impl ServiceCommandRunner for SystemCommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, String> {
-        let output = Command::new(program)
+        let mut child = Command::new(program)
             .args(args)
-            .output()
+            .stdout(std::process::Stdio::piped())
+            .spawn()
             .map_err(|error| format!("service manager command could not be started: {error}"))?;
-        Ok(CommandOutput {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        })
+        let started = Instant::now();
+        loop {
+            match child.try_wait().map_err(|error| {
+                format!("service manager command status could not be read: {error}")
+            })? {
+                Some(_) => {
+                    let output = child.wait_with_output().map_err(|error| {
+                        format!("service manager command output could not be read: {error}")
+                    })?;
+                    return Ok(CommandOutput {
+                        success: output.status.success(),
+                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    });
+                }
+                None if started.elapsed() >= SERVICE_COMMAND_TIMEOUT => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("service manager command timed out".to_string());
+                }
+                None => std::thread::sleep(Duration::from_millis(25)),
+            }
+        }
     }
 }
 
@@ -106,14 +129,22 @@ pub(crate) struct RebornLocalServiceLifecycle {
     platform: ServicePlatform,
     home_dir: Option<PathBuf>,
     executable: Result<PathBuf, String>,
+    webui_boot_env: Result<WebuiBootEnv, String>,
     operator_identity: Option<OperatorIdentity>,
     runner: Arc<dyn ServiceCommandRunner>,
+    operation_permits: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OperatorIdentity {
     tenant_id: TenantId,
     user_id: UserId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WebuiBootEnv {
+    token: String,
+    user_id: String,
 }
 
 impl std::fmt::Debug for RebornLocalServiceLifecycle {
@@ -123,6 +154,7 @@ impl std::fmt::Debug for RebornLocalServiceLifecycle {
             .field("platform", &self.platform)
             .field("home_dir", &self.home_dir.is_some())
             .field("executable", &"<redacted>")
+            .field("webui_boot_env", &self.webui_boot_env.is_ok())
             .field("operator_identity", &self.operator_identity.is_some())
             .finish_non_exhaustive()
     }
@@ -135,8 +167,10 @@ impl RebornLocalServiceLifecycle {
             home_dir: std::env::var_os("HOME").map(PathBuf::from),
             executable: std::env::current_exe()
                 .map_err(|error| format!("current executable path could not be resolved: {error}")),
+            webui_boot_env: webui_boot_env_from_env(),
             operator_identity: None,
             runner: Arc::new(SystemCommandRunner),
+            operation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -146,11 +180,13 @@ impl RebornLocalServiceLifecycle {
             home_dir: std::env::var_os("HOME").map(PathBuf::from),
             executable: std::env::current_exe()
                 .map_err(|error| format!("current executable path could not be resolved: {error}")),
+            webui_boot_env: webui_boot_env_from_env(),
             operator_identity: Some(OperatorIdentity {
                 tenant_id: operator_tenant_id,
                 user_id: operator_user_id,
             }),
             runner: Arc::new(SystemCommandRunner),
+            operation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -165,8 +201,13 @@ impl RebornLocalServiceLifecycle {
             platform,
             home_dir,
             executable: Ok(executable),
+            webui_boot_env: Ok(WebuiBootEnv {
+                token: "test-webui-token".to_string(),
+                user_id: "user-test".to_string(),
+            }),
             operator_identity: Some(test_operator_identity()),
             runner,
+            operation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
@@ -181,14 +222,25 @@ impl RebornLocalServiceLifecycle {
             platform,
             home_dir,
             executable: Err(executable_error),
+            webui_boot_env: Ok(WebuiBootEnv {
+                token: "test-webui-token".to_string(),
+                user_id: "user-test".to_string(),
+            }),
             operator_identity: Some(test_operator_identity()),
             runner,
+            operation_permits: Arc::new(tokio::sync::Semaphore::new(1)),
         }
     }
 
     #[cfg(test)]
     fn with_operator_identity(mut self, tenant_id: TenantId, user_id: UserId) -> Self {
         self.operator_identity = Some(OperatorIdentity { tenant_id, user_id });
+        self
+    }
+
+    #[cfg(test)]
+    fn with_webui_boot_env_error(mut self, error: &str) -> Self {
+        self.webui_boot_env = Err(error.to_string());
         self
     }
 
@@ -235,6 +287,15 @@ impl RebornLocalServiceLifecycle {
         action: RebornServiceLifecycleAction,
     ) -> Result<&PathBuf, RebornServiceLifecycleResponse> {
         self.executable
+            .as_ref()
+            .map_err(|message| Self::failed_response(action, message))
+    }
+
+    fn webui_boot_env_for_action(
+        &self,
+        action: RebornServiceLifecycleAction,
+    ) -> Result<&WebuiBootEnv, RebornServiceLifecycleResponse> {
+        self.webui_boot_env
             .as_ref()
             .map_err(|message| Self::failed_response(action, message))
     }
@@ -360,9 +421,20 @@ impl RebornLocalServiceLifecycle {
                     Err(response) => return response,
                 };
                 let path = path.to_string_lossy().to_string();
-                // silent-ok: best-effort stop+unload, idempotent on already-stopped service.
-                let _ = self.runner.run("launchctl", &["stop", LAUNCHD_LABEL]);
-                let _ = self.runner.run("launchctl", &["unload", "-w", &path]);
+                if !self
+                    .runner
+                    .run("launchctl", &["stop", LAUNCHD_LABEL])
+                    .is_ok_and(|output| output.success)
+                {
+                    return Self::failed_response(action, "local service manager command failed");
+                }
+                if !self
+                    .runner
+                    .run("launchctl", &["unload", "-w", &path])
+                    .is_ok_and(|output| output.success)
+                {
+                    return Self::failed_response(action, "local service manager command failed");
+                }
                 RebornServiceLifecycleResponse {
                     action,
                     state: RebornServiceLifecycleState::Stopped,
@@ -467,7 +539,10 @@ impl RebornLocalServiceLifecycle {
         action: RebornServiceLifecycleAction,
     ) -> Result<String, RebornServiceLifecycleResponse> {
         let executable = self.executable_path_for_action(action)?;
+        let boot_env = self.webui_boot_env_for_action(action)?;
         let exe = systemd_escape(executable.to_string_lossy().as_ref());
+        let token = systemd_escape(&boot_env.token);
+        let user_id = systemd_escape(&boot_env.user_id);
         Ok(format!(
             "[Unit]\n\
              Description=IronClaw Reborn WebUI service\n\
@@ -475,6 +550,8 @@ impl RebornLocalServiceLifecycle {
              \n\
              [Service]\n\
              Type=simple\n\
+             Environment=\"{WEBUI_TOKEN_ENV}={token}\"\n\
+             Environment=\"{WEBUI_USER_ID_ENV}={user_id}\"\n\
              ExecStart=\"{exe}\" serve\n\
              Restart=always\n\
              RestartSec=3\n\
@@ -489,7 +566,10 @@ impl RebornLocalServiceLifecycle {
         action: RebornServiceLifecycleAction,
     ) -> Result<String, RebornServiceLifecycleResponse> {
         let executable = self.executable_path_for_action(action)?;
+        let boot_env = self.webui_boot_env_for_action(action)?;
         let exe = xml_escape(executable.to_string_lossy().as_ref());
+        let token = xml_escape(&boot_env.token);
+        let user_id = xml_escape(&boot_env.user_id);
         Ok(format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -502,6 +582,13 @@ impl RebornLocalServiceLifecycle {
     <string>{exe}</string>
     <string>serve</string>
   </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>{WEBUI_TOKEN_ENV}</key>
+    <string>{token}</string>
+    <key>{WEBUI_USER_ID_ENV}</key>
+    <string>{user_id}</string>
+  </dict>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -546,13 +633,22 @@ impl OperatorServiceLifecycleService for RebornLocalServiceLifecycle {
         request: RebornServiceLifecycleRequest,
     ) -> Result<RebornServiceLifecycleResponse, RebornServicesError> {
         self.ensure_authorized_operator(&caller)?;
+        let permit = self
+            .operation_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|error| RebornServicesError::internal_from(error.to_string()))?;
         let service = self.clone();
         let action = request.action;
-        tokio::task::spawn_blocking(move || match action {
-            RebornServiceLifecycleAction::Install => service.install(),
-            RebornServiceLifecycleAction::Start => service.start(),
-            RebornServiceLifecycleAction::Stop => service.stop(),
-            RebornServiceLifecycleAction::Status => service.status(),
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            match action {
+                RebornServiceLifecycleAction::Install => service.install(),
+                RebornServiceLifecycleAction::Start => service.start(),
+                RebornServiceLifecycleAction::Stop => service.stop(),
+                RebornServiceLifecycleAction::Status => service.status(),
+            }
         })
         .await
         .map_err(|error| {
@@ -592,6 +688,25 @@ fn xml_escape(raw: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+fn webui_boot_env_from_env() -> Result<WebuiBootEnv, String> {
+    let token = required_env(WEBUI_TOKEN_ENV)?;
+    let user_id = required_env(WEBUI_USER_ID_ENV)?;
+    Ok(WebuiBootEnv { token, user_id })
+}
+
+fn required_env(name: &str) -> Result<String, String> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        Ok(_) => Err(format!(
+            "{name} is empty and cannot be persisted into the local service"
+        )),
+        Err(std::env::VarError::NotPresent) => Err(format!(
+            "{name} must be set before installing the local service"
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!("{name} must be valid UTF-8")),
+    }
 }
 
 #[cfg(test)]
@@ -726,6 +841,8 @@ mod tests {
         #[cfg(unix)]
         assert_service_file_owner_only(&unit_path);
         assert!(unit.contains("ExecStart=\"/usr/local/bin/ironclaw-reborn\" serve"));
+        assert!(unit.contains("Environment=\"IRONCLAW_REBORN_WEBUI_TOKEN=test-webui-token\""));
+        assert!(unit.contains("Environment=\"IRONCLAW_REBORN_WEBUI_USER_ID=user-test\""));
         assert_eq!(
             runner.calls(),
             vec![
@@ -770,6 +887,35 @@ mod tests {
         let unit_path = temp.path().join(".config/systemd/user").join(SYSTEMD_UNIT);
         let unit = std::fs::read_to_string(unit_path).expect("unit file");
         assert!(unit.contains("ExecStart=\"/usr/local/bin/iron%%claw-$$reborn\" serve"));
+    }
+
+    #[tokio::test]
+    async fn linux_install_fails_when_webui_boot_env_is_unavailable() {
+        let temp = TempDir::new().expect("tempdir");
+        let runner = Arc::new(RecordingRunner::new("inactive"));
+        let service = linux_service(&temp, runner.clone())
+            .with_webui_boot_env_error("IRONCLAW_REBORN_WEBUI_TOKEN must be set");
+
+        let response = service
+            .control_service(
+                test_caller(),
+                RebornServiceLifecycleRequest {
+                    action: RebornServiceLifecycleAction::Install,
+                },
+            )
+            .await
+            .expect("install response");
+
+        assert_eq!(response.state, RebornServiceLifecycleState::Failed);
+        assert!(response.message.contains("IRONCLAW_REBORN_WEBUI_TOKEN"));
+        assert!(runner.calls().is_empty());
+        assert!(
+            !temp
+                .path()
+                .join(".config/systemd/user")
+                .join(SYSTEMD_UNIT)
+                .exists()
+        );
     }
 
     #[cfg(unix)]
@@ -940,6 +1086,37 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn macos_install_persists_webui_boot_environment() {
+        let temp = TempDir::new().expect("tempdir");
+        let runner = Arc::new(RecordingRunner::new(""));
+        let service = macos_service(&temp, runner);
+
+        let response = service
+            .control_service(
+                test_caller(),
+                RebornServiceLifecycleRequest {
+                    action: RebornServiceLifecycleAction::Install,
+                },
+            )
+            .await
+            .expect("install response");
+
+        assert_eq!(response.state, RebornServiceLifecycleState::Installed);
+        let plist_path = temp
+            .path()
+            .join("Library")
+            .join("LaunchAgents")
+            .join(format!("{LAUNCHD_LABEL}.plist"));
+        let plist = std::fs::read_to_string(&plist_path).expect("plist file");
+        #[cfg(unix)]
+        assert_service_file_owner_only(&plist_path);
+        assert!(plist.contains("<key>IRONCLAW_REBORN_WEBUI_TOKEN</key>"));
+        assert!(plist.contains("<string>test-webui-token</string>"));
+        assert!(plist.contains("<key>IRONCLAW_REBORN_WEBUI_USER_ID</key>"));
+        assert!(plist.contains("<string>user-test</string>"));
     }
 
     #[tokio::test]
