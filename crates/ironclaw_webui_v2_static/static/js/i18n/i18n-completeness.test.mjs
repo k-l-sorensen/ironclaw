@@ -137,6 +137,8 @@ const BASELINE_MISSING_KEYS = Object.freeze([
   'onboarding.providerNearaiDescDesktop',
   'onboarding.resumingSession',
   'onboarding.signInGithub',
+  'onboarding.staticPreviewUnavailable',
+  'onboarding.staticPreviewUnavailableCopy',
   'skills.removeConfirm',
   'skills.removeTitle',
   'tool.riskDelete',
@@ -160,7 +162,7 @@ test('every advertised language has a registered pack', () => {
 
 test('i18n baseline is sorted, unique, and references real English keys', () => {
   const englishKeys = Object.keys(packs.en || {}).sort();
-  assert.equal(englishKeys.length, 1077);
+  assert.equal(englishKeys.length, 1079);
   assert.deepEqual(BASELINE_MISSING_KEYS, sortedUnique(BASELINE_MISSING_KEYS));
 
   const unknownBaselineKeys = BASELINE_MISSING_KEYS.filter((key) => !packs.en?.[key]);

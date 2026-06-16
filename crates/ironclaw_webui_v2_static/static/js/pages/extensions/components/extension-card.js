@@ -9,7 +9,11 @@ import {
   STATE_LABELS,
   isChannelExtensionKind,
 } from "../lib/extensions-schema.js";
-import { primaryExtensionAction } from "../lib/extension-actions.js";
+import {
+  connectorFamily,
+  connectorKey,
+  primaryExtensionAction,
+} from "../lib/extension-actions.js";
 
 /* Card layout (Option B): self-contained bordered card. Capabilities collapse
    behind a count disclosure; secondary actions (Configure / Setup / Remove)
@@ -316,5 +320,198 @@ export function RegistryCard({ entry, onInstall, isBusy, statusLabel }) {
 
       ${kwOpen && html`<${ChipGrid} items=${keywords} />`}
     </div>
+  `;
+}
+
+// Brand favicon tile for a connector/app. Maps a registry entry or curated
+// CORE_CONNECTIONS source to a stable icon kind (data-connector-icon) the
+// product surface and smoke tests key on. The glyphs are inline SVG so they
+// render without external assets in the WKWebView; builtin/abstract kinds fall
+// back to design-system icons.
+const APP_ICON =
+  "grid h-9 w-9 shrink-0 place-items-center overflow-hidden rounded-[10px] border " +
+  "border-[var(--v2-panel-border)] bg-[var(--v2-surface)] shadow-[var(--v2-shadow-sm)]";
+
+export function connectorIconKind(source) {
+  const key = connectorKey(source);
+  const family = connectorFamily(source);
+
+  if (key === "gmail") return "gmail";
+  if (key === "google-calendar" || key === "google_calendar") return "google-calendar";
+  if (key === "google-drive" || key === "gdrive" || key === "drive") return "google-drive";
+  if (key === "google-sheets" || key === "gsheets" || key === "sheets") return "google-sheets";
+  if (key.includes("github")) return "github";
+  if (key.includes("telegram")) return "telegram";
+  if (key.includes("web") || key.includes("http") || key.includes("hacker-news")) return "web";
+  if (key.includes("routine") || key.includes("trigger")) return "routine";
+  if (family === "notion") return "notion";
+  if (family === "slack") return "slack";
+  if (family === "workspace") return "workspace";
+  if (family === "google") return "google";
+  if (source?.kind === "wasm_channel") return "channel";
+  if (source?.kind === "mcp_server") return "knowledge";
+  return "tool";
+}
+
+function GoogleBarsIcon({ letter }) {
+  return html`
+    <svg viewBox="0 0 36 36" className="h-full w-full" aria-hidden="true">
+      <rect width="36" height="36" rx="9" fill="#fff" />
+      <path d="M6 9h24v5H6z" fill="#4285f4" />
+      <path d="M6 14h24v5H6z" fill="#34a853" />
+      <path d="M6 19h24v5H6z" fill="#fbbc04" />
+      <path d="M6 24h24v3H6z" fill="#ea4335" />
+      <text
+        x="18"
+        y="22"
+        textAnchor="middle"
+        fontSize="13"
+        fontWeight="700"
+        fontFamily="Inter, ui-sans-serif, system-ui"
+        fill="#1f2937"
+      >
+        ${letter}
+      </text>
+    </svg>
+  `;
+}
+
+function connectorGlyph(kind) {
+  switch (kind) {
+    case "gmail":
+      return html`
+        <svg viewBox="0 0 36 36" className="h-full w-full" aria-hidden="true">
+          <rect width="36" height="36" rx="9" fill="#fff" />
+          <path
+            d="M7 11.5v14h5.2V16.2L18 20.8l5.8-4.6v9.3H29v-14h-5.2L18 16.1l-5.8-4.6H7Z"
+            fill="#ea4335"
+          />
+          <path d="M7 11.5 18 20.8l11-9.3v3.8L18 24.6 7 15.3v-3.8Z" fill="#fbbc04" />
+          <path d="M7 15.3v10.2h5.2v-5.8L7 15.3Z" fill="#4285f4" />
+          <path d="M29 15.3v10.2h-5.2v-5.8L29 15.3Z" fill="#34a853" />
+        </svg>
+      `;
+    case "google-calendar":
+      return html`
+        <svg viewBox="0 0 36 36" className="h-full w-full" aria-hidden="true">
+          <rect width="36" height="36" rx="9" fill="#fff" />
+          <path d="M9 8h18a2 2 0 0 1 2 2v4H7v-4a2 2 0 0 1 2-2Z" fill="#4285f4" />
+          <path d="M7 14h22v12a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V14Z" fill="#fff" />
+          <path
+            d="M9 8h18a2 2 0 0 1 2 2v16a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2V10a2 2 0 0 1 2-2Z"
+            fill="none"
+            stroke="#dadce0"
+          />
+          <text
+            x="18"
+            y="24"
+            textAnchor="middle"
+            fontSize="12"
+            fontWeight="700"
+            fontFamily="Inter, ui-sans-serif, system-ui"
+            fill="#1a73e8"
+          >
+            31
+          </text>
+        </svg>
+      `;
+    case "notion":
+      return html`
+        <svg viewBox="0 0 36 36" className="h-full w-full" aria-hidden="true">
+          <rect
+            x="5"
+            y="5"
+            width="26"
+            height="26"
+            rx="5"
+            fill="#fff"
+            stroke="#111827"
+            strokeWidth="1.5"
+          />
+          <text
+            x="18"
+            y="23.5"
+            textAnchor="middle"
+            fontSize="17"
+            fontWeight="800"
+            fontFamily="Georgia, serif"
+            fill="#111827"
+          >
+            N
+          </text>
+        </svg>
+      `;
+    case "slack":
+      return html`
+        <svg viewBox="0 0 36 36" className="h-full w-full" aria-hidden="true">
+          <rect width="36" height="36" rx="9" fill="#fff" />
+          <rect x="10" y="15" width="6" height="16" rx="3" fill="#36c5f0" />
+          <rect x="5" y="20" width="16" height="6" rx="3" fill="#36c5f0" />
+          <rect x="20" y="5" width="6" height="16" rx="3" fill="#2eb67d" />
+          <rect x="15" y="10" width="16" height="6" rx="3" fill="#2eb67d" />
+          <rect x="20" y="15" width="6" height="16" rx="3" fill="#ecb22e" />
+          <rect x="15" y="20" width="16" height="6" rx="3" fill="#ecb22e" />
+          <rect x="10" y="5" width="6" height="16" rx="3" fill="#e01e5a" />
+          <rect x="5" y="10" width="16" height="6" rx="3" fill="#e01e5a" />
+        </svg>
+      `;
+    case "google-drive":
+      return html`
+        <svg viewBox="0 0 36 36" className="h-full w-full" aria-hidden="true">
+          <rect width="36" height="36" rx="9" fill="#fff" />
+          <path d="M14.5 7h7l8.5 14.7h-7L14.5 7Z" fill="#0f9d58" />
+          <path d="M6 21.7 14.5 7l3.5 6.1-5 8.6H6Z" fill="#f4b400" />
+          <path d="M13 21.7h17L26.5 28h-17L13 21.7Z" fill="#4285f4" />
+        </svg>
+      `;
+    case "google-sheets":
+      return html`<${GoogleBarsIcon} letter="S" />`;
+    case "github":
+      return html`
+        <svg viewBox="0 0 36 36" className="h-full w-full" aria-hidden="true">
+          <rect width="36" height="36" rx="9" fill="#111827" />
+          <circle cx="18" cy="18" r="9" fill="#fff" />
+          <path
+            d="M14.2 26.5c.6-1.4.4-2.4 0-3.1-2.9.2-4.1-1.2-4.6-2.4-.3-.7-.7-1.1-1.3-1.6-.4-.3-.1-.6.5-.5 1.1.2 1.8 1.2 2.2 1.8.9 1.5 2.5 1.3 3.3 1 .1-.7.5-1.3 1-1.6-2.6-.3-5.2-1.3-5.2-5.4 0-1.2.4-2.2 1.1-3-.1-.3-.5-1.5.1-3 0 0 .9-.3 3 1.1.9-.2 1.8-.4 2.7-.4s1.9.1 2.7.4c2.1-1.4 3-1.1 3-1.1.6 1.5.2 2.7.1 3 .7.8 1.1 1.8 1.1 3 0 4.1-2.6 5.1-5.2 5.4.7.6 1.2 1.6 1.2 3.2v3.1"
+            fill="#111827"
+          />
+        </svg>
+      `;
+    case "telegram":
+      return html`
+        <svg viewBox="0 0 36 36" className="h-full w-full" aria-hidden="true">
+          <rect width="36" height="36" rx="9" fill="#27a7e7" />
+          <path
+            d="M27.8 9.4 23 27.1c-.3 1.2-1.2 1.5-2.3.9l-6.4-4.7-3.1 3c-.3.3-.6.6-1.2.6l.4-6.6L22.5 11c.5-.5-.1-.7-.8-.3L7.1 19.9c-1.1.3-1.9-.1-2.1-.8-.2-.6.5-1.1 1.4-1.4l19.5-7.5c.9-.3 1.7.2 1.9 1.2Z"
+            fill="#fff"
+          />
+        </svg>
+      `;
+    case "workspace":
+      return html`<${Icon} name="folder" className="h-5 w-5 text-[var(--v2-text-muted)]" />`;
+    case "web":
+      return html`<${Icon} name="search" className="h-5 w-5 text-[var(--v2-accent-text)]" />`;
+    case "routine":
+      return html`<${Icon} name="clock" className="h-5 w-5 text-[var(--v2-warning-text)]" />`;
+    case "channel":
+      return html`<${Icon} name="send" className="h-5 w-5 text-[var(--v2-text-muted)]" />`;
+    case "knowledge":
+      return html`<${Icon} name="layers" className="h-5 w-5 text-[var(--v2-text-muted)]" />`;
+    default:
+      return html`<${Icon} name="plug" className="h-5 w-5 text-[var(--v2-text-muted)]" />`;
+  }
+}
+
+export function ConnectorAppIcon({ source, className = "" }) {
+  const kind = connectorIconKind(source);
+  return html`
+    <span
+      aria-hidden="true"
+      data-testid="connector-app-icon"
+      data-connector-icon=${kind}
+      className=${[APP_ICON, className].filter(Boolean).join(" ")}
+    >
+      ${connectorGlyph(kind)}
+    </span>
   `;
 }

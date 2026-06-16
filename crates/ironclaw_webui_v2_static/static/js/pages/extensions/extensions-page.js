@@ -97,6 +97,7 @@ export function ExtensionsPage() {
     />`,
     registry: html`<${RegistryTab}
       catalogEntries=${catalogEntries}
+      loadError=${loadError}
       onInstall=${install}
       onActivate=${activate}
       onConfigure=${handleConfigure}

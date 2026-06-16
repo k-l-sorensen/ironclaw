@@ -10,7 +10,7 @@ import { Icon } from "../../design-system/icons.js";
 import { ProviderDialog } from "../settings/components/provider-dialog.js";
 import { ProviderLoginStatus } from "../settings/components/provider-login-status.js";
 import { useProviderManagementActions } from "../settings/hooks/useProviderManagementActions.js";
-import { useProviderLogin } from "../settings/hooks/useProviderLogin.js";
+import { isLocalDevOrigin, useProviderLogin } from "../settings/hooks/useProviderLogin.js";
 import { isProviderConfigured } from "../settings/lib/llm-providers.js";
 import { setActiveLlm, testLlmProviderConnection } from "../settings/lib/settings-api.js";
 import { ProviderLogo } from "./provider-logos.js";
@@ -263,12 +263,21 @@ function NearAiSetupMenu({ provider, isBusy, login, t, onSetUp }) {
 }
 
 export function OnboardingPage() {
-  // Onboarding (operator first-run setup) is admin-only. The top-level
-  // /welcome route has no parent Outlet, so read the context defensively.
-  const { isAdmin = false, isChecking = false } = useOutletContext() || {};
-  if (isChecking) return null;
-  if (!isAdmin) {
-    return html`<${Navigate} to="/chat" replace />`;
+  // First-run setup is admin-only ONLY when reached as the nested /welcome under
+  // the authenticated layout — that route supplies an outlet context carrying the
+  // caller's admin status, and a signed-in non-admin bounces to chat. The
+  // top-level /welcome is the unauthenticated first-run entry (desktop's
+  // unauthenticatedRoute) and the browser static preview: no outlet context, no
+  // session yet, so the admin gate does not apply and the onboarding renders
+  // directly. Gating it there would redirect every first-run visitor straight
+  // back out before they could sign in.
+  const outlet = useOutletContext();
+  if (outlet) {
+    const { isAdmin = false, isChecking = false } = outlet;
+    if (isChecking) return null;
+    if (!isAdmin) {
+      return html`<${Navigate} to="/chat" replace />`;
+    }
   }
   return html`<${OperatorOnboardingPage} />`;
 }
@@ -323,6 +332,11 @@ function OperatorOnboardingPage() {
   const showFallbackAccess = providerAccessBlocked;
   const primaryAuthVariant = providerAccessBlocked ? "secondary" : "primary";
   const desktopRuntime = isDesktopRuntime();
+  // A browser-served static preview (npm run dev:webui-static, or any loopback
+  // origin without the Tauri shim) can never start the local sidecar, so its
+  // gateway-unavailable copy must say that plainly instead of implying a desktop
+  // restart will fix it. Design law: no fake readiness.
+  const staticPreview = !desktopRuntime && isLocalDevOrigin();
   const accessStatusTitle = providerSnapshotPending
     ? desktopRuntime
       ? t("onboarding.gatewayCheckingDesktop")
@@ -330,14 +344,18 @@ function OperatorOnboardingPage() {
     : providerSnapshotUnavailable
       ? desktopRuntime
         ? t("onboarding.gatewayUnavailableDesktop")
-        : t("onboarding.gatewayUnavailableWeb")
+        : staticPreview
+          ? t("onboarding.staticPreviewUnavailable")
+          : t("onboarding.gatewayUnavailableWeb")
       : t("onboarding.gatewayReady");
   const gatewayPendingCopy = desktopRuntime
     ? t("onboarding.gatewayPendingCopyDesktop")
     : t("onboarding.gatewayPendingCopyWeb");
   const gatewayUnavailableCopy = desktopRuntime
     ? t("onboarding.gatewayUnavailableCopyDesktop")
-    : t("onboarding.gatewayUnavailableCopyWeb");
+    : staticPreview
+      ? t("onboarding.staticPreviewUnavailableCopy")
+      : t("onboarding.gatewayUnavailableCopyWeb");
   const gatewayFollowupCopy = desktopRuntime
     ? t("onboarding.gatewayFollowupCopyDesktop")
     : t("onboarding.gatewayFollowupCopyWeb");
@@ -501,9 +519,12 @@ function OperatorOnboardingPage() {
                           </span>
                         </span>
                       </div>
-                      <p className="text-sm leading-6 text-[var(--v2-text-muted)]">
-                        ${gatewayFollowupCopy}
-                      </p>
+                      ${providerSnapshotPending &&
+                      html`
+                        <p className="text-sm leading-6 text-[var(--v2-text-muted)]">
+                          ${gatewayFollowupCopy}
+                        </p>
+                      `}
                       <div className="grid grid-cols-2 gap-2">
                         <${Button}
                           type="button"

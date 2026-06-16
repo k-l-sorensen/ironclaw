@@ -627,6 +627,7 @@ function WebComposer({
 function DesktopComposer({
   disabled,
   text,
+  onTextChange,
   initialText,
   resetKey,
   context,
@@ -714,8 +715,14 @@ function DesktopComposer({
         ? "bg-[var(--v2-danger-text)]"
         : "bg-[var(--v2-warning-text)]";
 
+  // Apply a handed-off draft (workflow recipe, project creation prompt) to the
+  // shell-owned text state, then move the caret to the end. The shell renders
+  // the desktop textarea as a controlled value=${text}, so without writing
+  // through onTextChange the draft would never appear (web applies it inside
+  // WebComposer instead). Keyed on resetKey so each navigation re-applies.
   React.useEffect(() => {
     if (!initialText) return;
+    onTextChange(initialText);
     window.requestAnimationFrame(() => {
       if (textareaRef.current) {
         textareaRef.current.focus();
