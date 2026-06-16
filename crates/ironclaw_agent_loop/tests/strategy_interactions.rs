@@ -59,7 +59,7 @@ async fn terminate_hint_after_batch_stops_without_extra_model_call() {
 }
 
 #[tokio::test]
-async fn denied_call_skips_and_repetition_net_catches_stuck_denials() {
+async fn denied_call_repetition_does_not_trip_coarse_failure_escape() {
     let (host, _) = MockAgentLoopDriverHost::builder()
         .script(ScenarioScript::same_failure_repeated(
             "demo.echo",
@@ -76,11 +76,15 @@ async fn denied_call_skips_and_repetition_net_catches_stuck_denials() {
 
     match exit {
         LoopExit::Failed(failed) => {
-            assert_eq!(failed.reason_kind, LoopFailureKind::NoProgressDetected);
+            assert_eq!(failed.reason_kind, LoopFailureKind::ModelError);
         }
-        other => panic!("expected no-progress failure, got {other:?}"),
+        other => panic!("expected model exhaustion failure after continuing, got {other:?}"),
     }
-    assert_eq!(host.model_call_count(), 3);
+    assert!(host.finalized_assistant_messages().is_empty());
+    assert!(
+        host.model_call_count() > 3,
+        "policy-denied failure kind alone must not stop the run at the old threshold"
+    );
 }
 
 #[tokio::test]

@@ -51,6 +51,65 @@ mod filesystem_store;
 
 pub use filesystem_store::{FilesystemDurableAuditLog, FilesystemDurableEventLog};
 
+#[cfg(feature = "postgres")]
+pub const DEFAULT_POSTGRES_POOL_MAX_SIZE: usize = 16;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PostgresPoolTlsOptions {
+    pub ssl_mode_override: Option<RebornPostgresSslMode>,
+    pub allow_remote_cleartext: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebornPostgresSslMode {
+    Disable,
+    Prefer,
+    Require,
+}
+
+impl std::str::FromStr for RebornPostgresSslMode {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.to_ascii_lowercase().as_str() {
+            "disable" => Ok(Self::Disable),
+            "allow" | "prefer" => Ok(Self::Prefer),
+            "require" | "verify-ca" | "verify-full" => Ok(Self::Require),
+            _ => Err(format!(
+                "invalid Postgres ssl mode '{value}', expected 'disable', 'allow', 'prefer', 'require', 'verify-ca', or 'verify-full'"
+            )),
+        }
+    }
+}
+
+/// Open a PostgreSQL pool using the same TLS policy as the production event
+/// store backend.
+#[cfg(feature = "postgres")]
+pub fn open_postgres_pool(
+    url: SecretString,
+) -> Result<deadpool_postgres::Pool, RebornEventStoreError> {
+    postgres_backed::build_pool(url, DEFAULT_POSTGRES_POOL_MAX_SIZE, Default::default())
+}
+
+/// Open a PostgreSQL pool with an explicit maximum connection count.
+#[cfg(feature = "postgres")]
+pub fn open_postgres_pool_with_max_size(
+    url: SecretString,
+    max_size: usize,
+) -> Result<deadpool_postgres::Pool, RebornEventStoreError> {
+    postgres_backed::build_pool(url, max_size, Default::default())
+}
+
+/// Open a PostgreSQL pool with explicit TLS options.
+#[cfg(feature = "postgres")]
+pub fn open_postgres_pool_with_tls_options(
+    url: SecretString,
+    max_size: usize,
+    tls_options: PostgresPoolTlsOptions,
+) -> Result<deadpool_postgres::Pool, RebornEventStoreError> {
+    postgres_backed::build_pool(url, max_size, tls_options)
+}
+
 /// Backend configuration for Reborn durable event/audit stores.
 ///
 /// The `Libsql` / `Postgres` variants open a backend-specific
@@ -75,7 +134,10 @@ pub enum RebornEventStoreConfig {
     /// [`PostgresRootFilesystem`](ironclaw_filesystem::PostgresRootFilesystem)
     /// over the provided URL and runs durable-log ops through the unified
     /// filesystem dispatch fabric.
-    Postgres { url: SecretString },
+    Postgres {
+        url: SecretString,
+        tls_options: PostgresPoolTlsOptions,
+    },
     /// libSQL backend configuration. The store opens a
     /// [`LibSqlRootFilesystem`](ironclaw_filesystem::LibSqlRootFilesystem)
     /// over the provided local path or remote URL and runs durable-log ops
@@ -115,9 +177,11 @@ pub enum RebornEventStoreError {
     )]
     ProductionLibsqlAmbiguousTarget,
     #[error(
-        "remote Reborn Postgres event store requires sslmode=require (sslmode=disable rejected)"
+        "remote Reborn Postgres event store requires sslmode=require unless remote cleartext is explicitly allowed (sslmode=disable rejected)"
     )]
     RemotePostgresClearTextDisabled,
+    #[error("Reborn Postgres pool max_size must be greater than 0")]
+    InvalidPostgresPoolMaxSize,
     #[error("{backend} Reborn event store backend is not enabled in this build")]
     BackendUnavailable { backend: &'static str },
     #[error("{backend} Reborn event store failed during {operation}")]
@@ -175,13 +239,14 @@ pub async fn build_reborn_event_stores(
                 audit: Arc::new(JsonlDurableAuditLog::from_store(store)),
             })
         }
-        RebornEventStoreConfig::Postgres { url } => {
+        RebornEventStoreConfig::Postgres { url, tls_options } => {
             #[cfg(feature = "postgres")]
             {
-                postgres_backed::build(url).await
+                postgres_backed::build(url, tls_options).await
             }
             #[cfg(not(feature = "postgres"))]
             {
+                let _ = tls_options;
                 let _ = url;
                 Err(RebornEventStoreError::BackendUnavailable {
                     backend: "postgres",
@@ -473,12 +538,16 @@ mod postgres_backed {
     use tokio_postgres::{Config, NoTls};
     use tokio_postgres_rustls::MakeRustlsConnect;
 
-    use super::{RebornEventStoreError, RebornEventStores, wrap_root_filesystem_as_event_stores};
+    use super::{
+        PostgresPoolTlsOptions, RebornEventStoreError, RebornEventStores, RebornPostgresSslMode,
+        wrap_root_filesystem_as_event_stores,
+    };
 
     pub(super) async fn build(
         url: SecretString,
+        tls_options: PostgresPoolTlsOptions,
     ) -> Result<RebornEventStores, RebornEventStoreError> {
-        let pool = build_pool(url).await?;
+        let pool = build_pool(url, super::DEFAULT_POSTGRES_POOL_MAX_SIZE, tls_options)?;
         let filesystem = Arc::new(PostgresRootFilesystem::new(pool));
         filesystem.run_migrations().await.map_err(|source| {
             RebornEventStoreError::backend("postgres", "run migrations", source)
@@ -486,17 +555,37 @@ mod postgres_backed {
         wrap_root_filesystem_as_event_stores(filesystem)
     }
 
-    async fn build_pool(url: SecretString) -> Result<Pool, RebornEventStoreError> {
+    pub(super) fn build_pool(
+        url: SecretString,
+        max_size: usize,
+        tls_options: PostgresPoolTlsOptions,
+    ) -> Result<Pool, RebornEventStoreError> {
+        if max_size == 0 {
+            return Err(RebornEventStoreError::InvalidPostgresPoolMaxSize);
+        }
         let raw_url = url.expose_secret();
         let mut pg_config: Config = raw_url.parse().map_err(|source| {
             RebornEventStoreError::backend("postgres", "parse connection string", source)
         })?;
+        if let Some(ssl_mode) = tls_options.ssl_mode_override {
+            pg_config.ssl_mode(ssl_mode.into());
+        }
         let manager_config = ManagerConfig {
             recycling_method: RecyclingMethod::Fast,
         };
         let local = is_local_postgres_config(&pg_config);
         let local_wants_tls = local && matches!(pg_config.get_ssl_mode(), SslMode::Require);
-        let manager = if local && !local_wants_tls {
+        let remote_cleartext = !local && matches!(pg_config.get_ssl_mode(), SslMode::Disable);
+        let manager = if remote_cleartext {
+            if !tls_options.allow_remote_cleartext {
+                return Err(RebornEventStoreError::RemotePostgresClearTextDisabled);
+            }
+            tracing::warn!(
+                target = "ironclaw::reborn::event_store::postgres",
+                "remote Reborn Postgres cleartext connection explicitly allowed; use only on a trusted private network"
+            );
+            Manager::from_config(pg_config, NoTls, manager_config)
+        } else if local && !local_wants_tls {
             // Local without an explicit `sslmode=require`: NoTls is acceptable
             // because the connection never leaves the host.
             Manager::from_config(pg_config, NoTls, manager_config)
@@ -514,6 +603,7 @@ mod postgres_backed {
             Manager::from_config(pg_config, tls, manager_config)
         };
         Pool::builder(manager)
+            .max_size(max_size)
             .runtime(Runtime::Tokio1)
             .build()
             .map_err(|source| RebornEventStoreError::backend("postgres", "build pool", source))
@@ -591,6 +681,16 @@ mod postgres_backed {
         }
     }
 
+    impl From<RebornPostgresSslMode> for SslMode {
+        fn from(value: RebornPostgresSslMode) -> Self {
+            match value {
+                RebornPostgresSslMode::Disable => SslMode::Disable,
+                RebornPostgresSslMode::Prefer => SslMode::Prefer,
+                RebornPostgresSslMode::Require => SslMode::Require,
+            }
+        }
+    }
+
     /// Build a rustls TLS connector for remote Postgres connections.
     ///
     /// Mirrors `src/db/tls.rs`: prefer the platform's native certificate
@@ -625,8 +725,9 @@ mod postgres_backed {
 
     #[cfg(test)]
     mod tests {
-        use super::{Config, enforce_remote_ssl_mode, is_local_postgres_config};
-        use crate::RebornEventStoreError;
+        use super::{Config, build_pool, enforce_remote_ssl_mode, is_local_postgres_config};
+        use crate::{PostgresPoolTlsOptions, RebornEventStoreError, RebornPostgresSslMode};
+        use secrecy::SecretString;
         use tokio_postgres::config::SslMode;
 
         fn parse(url: &str) -> Config {
@@ -746,6 +847,51 @@ mod postgres_backed {
         }
 
         #[test]
+        fn sslmode_aliases_parse_to_internal_modes() {
+            for value in ["allow", "prefer"] {
+                assert_eq!(
+                    value.parse::<RebornPostgresSslMode>().expect("parse"),
+                    RebornPostgresSslMode::Prefer,
+                    "{value} should map to the internal prefer mode"
+                );
+            }
+            for value in ["require", "verify-ca", "verify-full"] {
+                assert_eq!(
+                    value.parse::<RebornPostgresSslMode>().expect("parse"),
+                    RebornPostgresSslMode::Require,
+                    "{value} should map to the internal require mode"
+                );
+            }
+        }
+
+        #[test]
+        fn build_pool_rejects_remote_cleartext_without_explicit_opt_in() {
+            let err = build_pool(
+                SecretString::from("postgres://user@db.example.com/db?sslmode=disable".to_string()),
+                1,
+                PostgresPoolTlsOptions::default(),
+            )
+            .expect_err("remote cleartext must fail closed");
+            assert!(matches!(
+                err,
+                RebornEventStoreError::RemotePostgresClearTextDisabled
+            ));
+        }
+
+        #[test]
+        fn build_pool_allows_remote_cleartext_with_explicit_opt_in() {
+            build_pool(
+                SecretString::from("postgres://user@db.example.com/db?sslmode=disable".to_string()),
+                1,
+                PostgresPoolTlsOptions {
+                    ssl_mode_override: None,
+                    allow_remote_cleartext: true,
+                },
+            )
+            .expect("explicit remote cleartext opt-in should allow pool construction");
+        }
+
+        #[test]
         fn enforce_remote_ssl_mode_upgrades_prefer_to_require() {
             // Default sslmode is `prefer`, which silently downgrades when
             // the server declines TLS — for remote we force `require`.
@@ -846,14 +992,19 @@ impl DurableEventLog for JsonlDurableEventLog {
     ) -> Result<EventReplay<RuntimeEvent>, EventError> {
         let owned_filter = filter.clone();
         self.store
-            .read_after(
-                StreamKind::Runtime,
-                stream,
-                filter,
-                after,
-                limit,
-                move |event| owned_filter.matches_event(event),
-            )
+            .read_runtime_after(StreamKind::Runtime, stream, after, limit, move |event| {
+                owned_filter.matches_event(event)
+            })
+            .await
+    }
+
+    async fn head_cursor(
+        &self,
+        stream: &EventStreamKey,
+        after: EventCursor,
+    ) -> Result<EventCursor, EventError> {
+        self.store
+            .head_cursor(StreamKind::Runtime, stream, after)
             .await
     }
 }
@@ -1012,6 +1163,70 @@ impl JsonlStore {
         .map_err(|_| durable_error("jsonl event store failed to read stream"))?
     }
 
+    async fn read_runtime_after(
+        &self,
+        kind: StreamKind,
+        stream: &EventStreamKey,
+        after: Option<EventCursor>,
+        limit: usize,
+        is_match: impl Fn(&RuntimeEvent) -> bool + Send + 'static,
+    ) -> Result<EventReplay<RuntimeEvent>, EventError> {
+        if limit == 0 {
+            return Err(EventError::InvalidReplayRequest {
+                reason: "limit must be greater than zero".to_string(),
+            });
+        }
+        let after = after.unwrap_or_default();
+        let lock = self.stream_lock(kind, stream).await;
+        let _guard = lock.lock().await;
+        let path = self.stream_path(kind, stream);
+        tokio::task::spawn_blocking(move || {
+            stream_read_after_with(
+                &path,
+                after,
+                limit,
+                is_match,
+                trusted_runtime_jsonl_entry_from_str,
+            )
+        })
+        .await
+        .map_err(|_| durable_error("jsonl event store failed to read stream"))?
+    }
+
+    /// Atomic head snapshot: read the last assigned cursor directly from the
+    /// stream file's tail. `read_last_jsonl_cursor` seeks to EOF and parses
+    /// only the final line, so this is O(1) in stream length — never an
+    /// unbounded forward scan. We take the in-process stream lock (and the
+    /// shared OS lock inside the reader is unnecessary here because we only
+    /// read the already-committed last line) so a concurrent in-process append
+    /// cannot interleave a partial tail line. The observed last cursor is the
+    /// true head at the instant of the call.
+    ///
+    /// `after` is the caller's known-valid resume cursor. A head strictly below
+    /// `after` means the caller asked for a foreign / future cursor, so we
+    /// surface [`EventError::ReplayGap`] — mirroring `read_after`.
+    async fn head_cursor(
+        &self,
+        kind: StreamKind,
+        stream: &EventStreamKey,
+        after: EventCursor,
+    ) -> Result<EventCursor, EventError> {
+        let lock = self.stream_lock(kind, stream).await;
+        let _guard = lock.lock().await;
+        let path = self.stream_path(kind, stream);
+        let head = tokio::task::spawn_blocking(move || read_last_jsonl_cursor(&path))
+            .await
+            .map_err(|_| durable_error("jsonl event store failed to read stream head"))??
+            .unwrap_or(0);
+        if after.as_u64() > head {
+            return Err(EventError::ReplayGap {
+                requested: after,
+                earliest: EventCursor::new(head),
+            });
+        }
+        Ok(EventCursor::new(head))
+    }
+
     async fn stream_lock(&self, kind: StreamKind, stream: &EventStreamKey) -> Arc<Mutex<()>> {
         let key = stream_lock_key(kind, stream);
         let mut locks = self.locks.lock().await;
@@ -1064,6 +1279,13 @@ impl StreamKind {
 struct JsonlEntry<T> {
     cursor: EventCursor,
     record: T,
+}
+
+#[derive(Debug, Deserialize)]
+struct TrustedRuntimeJsonlEntry {
+    cursor: EventCursor,
+    #[serde(deserialize_with = "ironclaw_events::deserialize_trusted_runtime_event")]
+    record: RuntimeEvent,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1140,6 +1362,20 @@ where
     T: DeserializeOwned,
     F: Fn(&T) -> bool,
 {
+    stream_read_after_with(path, after, limit, is_match, parse_jsonl_entry::<T>)
+}
+
+fn stream_read_after_with<T, F, D>(
+    path: &Path,
+    after: EventCursor,
+    limit: usize,
+    is_match: F,
+    decode_entry: D,
+) -> Result<EventReplay<T>, EventError>
+where
+    F: Fn(&T) -> bool,
+    D: Fn(&str) -> Result<JsonlEntry<T>, EventError>,
+{
     use std::io::{BufRead, BufReader};
 
     let file = match std::fs::File::open(path) {
@@ -1206,11 +1442,7 @@ where
         // strictly greater than `after`.
         after_validated = true;
         last_scanned = envelope_cursor;
-        let envelope = serde_json::from_str::<JsonlEntry<T>>(&line).map_err(|error| {
-            EventError::Serialize {
-                reason: error.to_string(),
-            }
-        })?;
+        let envelope = decode_entry(&line)?;
         if !is_match(&envelope.record) {
             continue;
         }
@@ -1244,6 +1476,29 @@ where
     Ok(EventReplay {
         entries: replay_entries,
         next_cursor,
+    })
+}
+
+fn parse_jsonl_entry<T>(line: &str) -> Result<JsonlEntry<T>, EventError>
+where
+    T: DeserializeOwned,
+{
+    serde_json::from_str::<JsonlEntry<T>>(line).map_err(|error| EventError::Serialize {
+        reason: error.to_string(),
+    })
+}
+
+fn trusted_runtime_jsonl_entry_from_str(
+    line: &str,
+) -> Result<JsonlEntry<RuntimeEvent>, EventError> {
+    let envelope = serde_json::from_str::<TrustedRuntimeJsonlEntry>(line).map_err(|error| {
+        EventError::Serialize {
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(JsonlEntry {
+        cursor: envelope.cursor,
+        record: envelope.record,
     })
 }
 
@@ -1433,9 +1688,91 @@ async fn create_secure_dir_all(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use ironclaw_host_api::{AgentId, TenantId, UserId};
+    use ironclaw_host_api::{
+        AgentId, CapabilityId, InvocationId, ProjectId, ResourceScope, TenantId, UserId,
+    };
 
     use super::*;
+
+    fn jsonl_scope() -> ResourceScope {
+        ResourceScope {
+            tenant_id: TenantId::new("default").expect("tenant id"),
+            user_id: UserId::new("alice").expect("user id"),
+            agent_id: Some(AgentId::new("default").expect("agent id")),
+            project_id: Some(ProjectId::new("project-a").expect("project id")),
+            mission_id: None,
+            thread_id: None,
+            invocation_id: InvocationId::new(),
+        }
+    }
+
+    async fn jsonl_event_log(root: std::path::PathBuf) -> Arc<dyn DurableEventLog> {
+        build_reborn_event_stores(
+            RebornProfile::LocalDev,
+            RebornEventStoreConfig::Jsonl {
+                root,
+                accept_single_node_durable: false,
+            },
+        )
+        .await
+        .expect("build jsonl event store")
+        .events
+    }
+
+    #[tokio::test]
+    async fn jsonl_head_cursor_reports_latest_and_rejects_future() {
+        // The JSONL production backend's head_cursor is the replay/live
+        // boundary probe taken at subscription start. A cursor-arithmetic bug
+        // or a missed ReplayGap would silently misclassify replay vs live, so
+        // exercise the empty-stream, post-append, mid-stream, and future-cursor
+        // cases directly. Mirrors the filesystem backend contract test.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = jsonl_event_log(temp.path().join("event-store")).await;
+        let scope = jsonl_scope();
+        let stream = EventStreamKey::from_scope(&scope);
+        let capability = CapabilityId::new("demo.echo").expect("capability id");
+
+        // Empty stream: head is origin (no records yet).
+        assert_eq!(
+            log.head_cursor(&stream, EventCursor::origin())
+                .await
+                .expect("head of empty stream"),
+            EventCursor::origin()
+        );
+
+        for _ in 0..3 {
+            log.append(RuntimeEvent::dispatch_requested(
+                scope.clone(),
+                capability.clone(),
+            ))
+            .await
+            .expect("append");
+        }
+
+        // Head is the latest appended cursor.
+        assert_eq!(
+            log.head_cursor(&stream, EventCursor::origin())
+                .await
+                .expect("head after 3 appends"),
+            EventCursor::new(3)
+        );
+        // Probing from a valid mid-stream cursor still returns the true head.
+        assert_eq!(
+            log.head_cursor(&stream, EventCursor::new(2))
+                .await
+                .expect("head from mid-stream cursor"),
+            EventCursor::new(3)
+        );
+        // A cursor beyond head is a foreign/future cursor -> ReplayGap.
+        let err = log
+            .head_cursor(&stream, EventCursor::new(99))
+            .await
+            .expect_err("future cursor must be rejected");
+        assert!(
+            matches!(err, EventError::ReplayGap { .. }),
+            "expected ReplayGap, got {err:?}"
+        );
+    }
 
     #[tokio::test]
     async fn jsonl_stream_lock_registry_prunes_released_locks() {

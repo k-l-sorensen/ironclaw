@@ -8,11 +8,12 @@ use async_trait::async_trait;
 use chrono::Utc;
 use ironclaw_host_api::{AgentId, TenantId, ThreadId, UserId};
 use ironclaw_loop_support::{
-    CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
-    EmptyLoopCapabilityPort, HostIdentityContextBuildError, HostIdentityContextCandidate,
-    HostIdentityContextSource, HostInputBatch, HostInputQueue, HostInputQueueError,
-    HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
-    HostManagedModelResponse, ProductLiveCancellationProbe, RunCancellationFactory,
+    CapabilityAllowSet, CapabilityResolveError, CapabilityResultWrite,
+    CapabilitySurfaceProfileResolver, EmptyLoopCapabilityPort, HostIdentityContextBuildError,
+    HostIdentityContextCandidate, HostIdentityContextSource, HostInputBatch, HostInputQueue,
+    HostInputQueueError, HostManagedModelError, HostManagedModelGateway, HostManagedModelRequest,
+    HostManagedModelResponse, JsonSpawnSubagentInputCodec, LoopCapabilityPortFactory,
+    LoopCapabilityResultWriter, ProductLiveCancellationProbe, RunCancellationFactory,
     RunCancellationHandle,
 };
 use ironclaw_product_adapters::{
@@ -25,7 +26,6 @@ use ironclaw_product_workflow::{
     DefaultInboundTurnService, FakeConversationBindingService, InboundTurnOutcome,
     InboundTurnService, ProductWorkflowError,
 };
-use ironclaw_reborn::loop_driver_host::LoopCapabilityPortFactory;
 use ironclaw_reborn::loop_exit_applier::ThreadCheckpointLoopExitEvidencePort;
 use ironclaw_reborn::model_routes::{
     ModelRoute, ModelRoutePolicy, ModelSelectionMode, ModelSlot, StaticModelRouteResolver,
@@ -34,8 +34,10 @@ use ironclaw_reborn::planned_driver_factory::{
     PLANNED_DEFAULT_PROFILE_ID, default_planned_run_profile_resolver,
 };
 use ironclaw_reborn::runtime::{
-    DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, build_product_live_planned_runtime,
+    DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts, RuntimeTurnStateStore,
+    build_product_live_planned_runtime,
 };
+use ironclaw_reborn_composition::ProductLiveCapabilityIo;
 use ironclaw_threads::{
     InMemorySessionThreadService, MessageStatus, SessionThreadService, ThreadHistoryRequest,
     ThreadScope,
@@ -43,10 +45,10 @@ use ironclaw_threads::{
 use ironclaw_turns::{
     CancelRunRequest, CancelRunResponse, DefaultTurnCoordinator, EventCursor, GetRunStateRequest,
     IdempotencyKey, InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore,
-    InMemoryTurnStateStore, ResumeTurnRequest, ResumeTurnResponse, RunProfileId, RunProfileVersion,
-    SanitizedCancelReason, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy, TurnActor,
-    TurnCoordinator, TurnError, TurnId, TurnRunId, TurnRunState, TurnRunWake, TurnScope,
-    TurnStateStore, TurnStatus,
+    InMemoryTurnStateStore, LoopResultRef, ResumeTurnRequest, ResumeTurnResponse, RunProfileId,
+    RunProfileVersion, SanitizedCancelReason, SubmitTurnRequest, SubmitTurnResponse, ThreadBusy,
+    TurnActor, TurnCoordinator, TurnError, TurnId, TurnOriginKind, TurnRunId, TurnRunState,
+    TurnRunWake, TurnScope, TurnStateStore, TurnStatus,
     run_profile::{
         AgentLoopHostError, InMemoryLoopHostMilestoneSink, InstructionSafetyContext,
         LoopCancelReasonKind, LoopCapabilityPort, LoopInputAckToken, LoopInputCursorToken,
@@ -60,13 +62,17 @@ fn sample_user_message_envelope(event_suffix: &str) -> ProductInboundEnvelope {
     sample_user_message_envelope_with_install_and_text(event_suffix, "install_alpha", "hello world")
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CapturingTurnCoordinator {
     last_submit: Arc<Mutex<Option<SubmitTurnRequest>>>,
 }
 
 #[async_trait]
 impl TurnCoordinator for CapturingTurnCoordinator {
+    async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        Ok(TurnRunId::new())
+    }
+
     async fn submit_turn(
         &self,
         request: SubmitTurnRequest,
@@ -128,6 +134,10 @@ impl ScriptedTurnCoordinator {
 
 #[async_trait]
 impl TurnCoordinator for ScriptedTurnCoordinator {
+    async fn prepare_turn(&self, _scope: TurnScope) -> Result<TurnRunId, TurnError> {
+        Ok(TurnRunId::new())
+    }
+
     async fn submit_turn(
         &self,
         request: SubmitTurnRequest,
@@ -223,6 +233,21 @@ impl LoopCapabilityPortFactory for EmptyCapabilityFactory {
         _run_context: &LoopRunContext,
     ) -> Result<Arc<dyn LoopCapabilityPort>, AgentLoopHostError> {
         Ok(Arc::new(EmptyLoopCapabilityPort))
+    }
+}
+
+struct UnusedCapabilityResultWriter;
+
+#[async_trait]
+impl LoopCapabilityResultWriter for UnusedCapabilityResultWriter {
+    async fn write_capability_result(
+        &self,
+        _write: CapabilityResultWrite<'_>,
+    ) -> Result<(LoopResultRef, u64), AgentLoopHostError> {
+        Err(AgentLoopHostError::new(
+            ironclaw_turns::run_profile::AgentLoopHostErrorKind::InvalidInvocation,
+            "unused capability result writer",
+        ))
     }
 }
 
@@ -383,13 +408,25 @@ fn test_safety_context() -> InstructionSafetyContext {
 }
 
 fn binding_with_user(user: &str, thread: &str) -> ironclaw_product_workflow::ResolvedBinding {
+    let user_id = UserId::new(user).expect("valid user");
     ironclaw_product_workflow::ResolvedBinding {
         tenant_id: TenantId::new("tenant:install_alpha").expect("valid tenant"),
-        user_id: UserId::new(user).expect("valid user"),
+        actor_user_id: user_id.clone(),
+        subject_user_id: Some(user_id),
         thread_id: ThreadId::new(thread).expect("valid thread"),
         agent_id: Some(AgentId::new("agent:fake").expect("valid agent")),
         project_id: None,
     }
+}
+
+fn turn_scope_for_binding(binding: &ironclaw_product_workflow::ResolvedBinding) -> TurnScope {
+    TurnScope::new_with_owner(
+        binding.tenant_id.clone(),
+        binding.agent_id.clone(),
+        binding.project_id.clone(),
+        binding.thread_id.clone(),
+        binding.subject_user_id.clone(),
+    )
 }
 
 fn sample_user_message_envelope_with_text(
@@ -403,6 +440,20 @@ fn sample_user_message_envelope_with_install_and_text(
     event_suffix: &str,
     installation_id: &str,
     text: &str,
+) -> ProductInboundEnvelope {
+    sample_user_message_envelope_with_install_text_and_trigger(
+        event_suffix,
+        installation_id,
+        text,
+        ProductTriggerReason::DirectChat,
+    )
+}
+
+fn sample_user_message_envelope_with_install_text_and_trigger(
+    event_suffix: &str,
+    installation_id: &str,
+    text: &str,
+    trigger: ProductTriggerReason,
 ) -> ProductInboundEnvelope {
     let evidence = ProtocolAuthEvidence::test_verified(
         AuthRequirement::SharedSecretHeader {
@@ -423,7 +474,7 @@ fn sample_user_message_envelope_with_install_and_text(
         ExternalActorRef::new("test", "user1", Option::<String>::None).expect("valid"),
         ExternalConversationRef::new(None, "conv1", None, None).expect("valid"),
         ProductInboundPayload::UserMessage(
-            UserMessagePayload::new(text, vec![], ProductTriggerReason::DirectChat).expect("valid"),
+            UserMessagePayload::new(text, vec![], trigger).expect("valid"),
         ),
     )
     .expect("parsed");
@@ -457,7 +508,7 @@ async fn user_message_resolves_binding_persists_message_and_submits_turn() {
                 tenant_id: binding.tenant_id.clone(),
                 agent_id: binding.agent_id.clone().expect("agent id"),
                 project_id: binding.project_id.clone(),
-                owner_user_id: Some(binding.user_id.clone()),
+                owner_user_id: binding.subject_user_id.clone(),
                 mission_id: None,
             },
             thread_id: binding.thread_id.clone(),
@@ -468,6 +519,64 @@ async fn user_message_resolves_binding_persists_message_and_submits_turn() {
     assert_eq!(history.messages[0].content.as_deref(), Some("hello world"));
     assert_eq!(history.messages[0].status, MessageStatus::Submitted);
     assert!(history.messages[0].turn_run_id.is_some());
+}
+
+#[tokio::test]
+async fn shared_user_message_submits_subject_owned_turn_scope() {
+    let binding_service = FakeConversationBindingService::new();
+    let thread_service = InMemorySessionThreadService::default();
+    let coordinator = CapturingTurnCoordinator::default();
+    let service = DefaultInboundTurnService::new(
+        binding_service,
+        thread_service.clone(),
+        coordinator.clone(),
+    );
+    let envelope = sample_user_message_envelope_with_install_text_and_trigger(
+        "shared-turn-owner",
+        "install_alpha",
+        "hello shared channel",
+        ProductTriggerReason::BotMention,
+    );
+
+    let outcome = service
+        .accept_user_message(&envelope)
+        .await
+        .expect("shared route should submit");
+    let binding = match &outcome {
+        InboundTurnOutcome::Submitted { binding, .. } => binding,
+        _ => panic!("expected Submitted, got {outcome:?}"),
+    };
+
+    let submitted = coordinator
+        .last_submit
+        .lock()
+        .expect("captured submit lock")
+        .clone()
+        .expect("turn should be submitted");
+    assert_eq!(
+        submitted.scope.explicit_owner_user_id(),
+        binding.subject_user_id.as_ref()
+    );
+    assert_eq!(submitted.actor.user_id, binding.actor_user_id);
+
+    let history = thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: ThreadScope {
+                tenant_id: binding.tenant_id.clone(),
+                agent_id: binding.agent_id.clone().expect("agent id"),
+                project_id: binding.project_id.clone(),
+                owner_user_id: binding.subject_user_id.clone(),
+                mission_id: None,
+            },
+            thread_id: binding.thread_id.clone(),
+        })
+        .await
+        .expect("shared route history should use the resolved subject");
+    assert_eq!(history.messages.len(), 1);
+    assert_eq!(
+        history.messages[0].content.as_deref(),
+        Some("hello shared channel")
+    );
 }
 
 #[tokio::test]
@@ -498,12 +607,7 @@ async fn user_message_no_profile_submission_uses_planned_reborn_default() {
     };
     let state = store
         .get_run_state(GetRunStateRequest {
-            scope: ironclaw_turns::TurnScope::new(
-                binding.tenant_id,
-                binding.agent_id,
-                binding.project_id,
-                binding.thread_id,
-            ),
+            scope: turn_scope_for_binding(&binding),
             run_id: submitted_run_id,
         })
         .await
@@ -534,7 +638,7 @@ async fn user_message_no_profile_uses_product_live_runtime_and_persists_reply() 
         tenant_id: binding.tenant_id.clone(),
         agent_id: binding.agent_id.clone().expect("agent id"),
         project_id: binding.project_id.clone(),
-        owner_user_id: Some(binding.user_id.clone()),
+        owner_user_id: binding.subject_user_id.clone(),
         mission_id: None,
     };
     let model_route_resolver = Arc::new(
@@ -547,8 +651,10 @@ async fn user_message_no_profile_uses_product_live_runtime_and_persists_reply() 
         ),
     );
     let cancellation_factory = Arc::new(ReadyRunCancellationFactory::default());
+    let turn_state_for_runtime: Arc<dyn RuntimeTurnStateStore> = turn_store.clone();
     let composition = build_product_live_planned_runtime(DefaultPlannedRuntimeParts {
-        turn_state: Arc::clone(&turn_store),
+        attachment_read_port: None,
+        turn_state: turn_state_for_runtime,
         thread_service: Arc::new(thread_service.clone()),
         thread_scope: thread_scope.clone(),
         model_gateway,
@@ -557,6 +663,20 @@ async fn user_message_no_profile_uses_product_live_runtime_and_persists_reply() 
         milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
         capability_factory: Arc::new(EmptyCapabilityFactory),
         capability_surface_resolver: Arc::new(AllowAllCapabilitySurfaceResolver),
+        capability_result_writer: Arc::new(UnusedCapabilityResultWriter),
+        subagent_goal_store: Arc::new(
+            ironclaw_reborn::subagent::goal_store::InMemoryBoundedSubagentGoalStore::new(),
+        ),
+        subagent_gate_store: Arc::new(
+            ironclaw_reborn::subagent::gate_resolution::BoundedSubagentGateResolutionStore::new(),
+        ),
+        subagent_definition_resolver: Arc::new(
+            ironclaw_reborn::subagent::flavors::StaticSubagentDefinitionResolver,
+        ),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(Arc::new(
+            ProductLiveCapabilityIo::default(),
+        ))),
+        subagent_spawn_limits: ironclaw_loop_support::SubagentSpawnLimits::default(),
         loop_exit_evidence: Arc::new(
             ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
                 Arc::new(thread_service.clone()),
@@ -575,6 +695,10 @@ async fn user_message_no_profile_uses_product_live_runtime_and_persists_reply() 
         model_policy_guard: Some(Arc::new(NoOpPolicyGuard)),
         model_budget_accountant: Some(Arc::new(NoOpBudgetAccountant)),
         safety_context: Some(test_safety_context()),
+        hook_dispatcher_builder_factory: None,
+        communication_context_provider: None,
+        hook_security_audit_sink: None,
+        turn_event_sink: None,
     })
     .expect("product-live runtime should build");
 
@@ -598,12 +722,7 @@ async fn user_message_no_profile_uses_product_live_runtime_and_persists_reply() 
     else {
         panic!("expected submitted outcome");
     };
-    let turn_scope = TurnScope::new(
-        binding.tenant_id.clone(),
-        binding.agent_id.clone(),
-        binding.project_id.clone(),
-        binding.thread_id.clone(),
-    );
+    let turn_scope = turn_scope_for_binding(&binding);
     let state = match timeout(Duration::from_secs(3), async {
         loop {
             let state = turn_store
@@ -690,7 +809,7 @@ async fn user_message_no_profile_can_cancel_product_live_run_from_product_path()
         tenant_id: binding.tenant_id.clone(),
         agent_id: binding.agent_id.clone().expect("agent id"),
         project_id: binding.project_id.clone(),
-        owner_user_id: Some(binding.user_id.clone()),
+        owner_user_id: binding.subject_user_id.clone(),
         mission_id: None,
     };
     let model_route_resolver = Arc::new(
@@ -703,8 +822,10 @@ async fn user_message_no_profile_can_cancel_product_live_run_from_product_path()
         ),
     );
     let cancellation_factory = Arc::new(ReadyRunCancellationFactory::default());
+    let turn_state_for_runtime: Arc<dyn RuntimeTurnStateStore> = turn_store.clone();
     let composition = build_product_live_planned_runtime(DefaultPlannedRuntimeParts {
-        turn_state: Arc::clone(&turn_store),
+        attachment_read_port: None,
+        turn_state: turn_state_for_runtime,
         thread_service: Arc::new(thread_service.clone()),
         thread_scope: thread_scope.clone(),
         model_gateway,
@@ -713,6 +834,20 @@ async fn user_message_no_profile_can_cancel_product_live_run_from_product_path()
         milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
         capability_factory: Arc::new(EmptyCapabilityFactory),
         capability_surface_resolver: Arc::new(AllowAllCapabilitySurfaceResolver),
+        capability_result_writer: Arc::new(UnusedCapabilityResultWriter),
+        subagent_goal_store: Arc::new(
+            ironclaw_reborn::subagent::goal_store::InMemoryBoundedSubagentGoalStore::new(),
+        ),
+        subagent_gate_store: Arc::new(
+            ironclaw_reborn::subagent::gate_resolution::BoundedSubagentGateResolutionStore::new(),
+        ),
+        subagent_definition_resolver: Arc::new(
+            ironclaw_reborn::subagent::flavors::StaticSubagentDefinitionResolver,
+        ),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(Arc::new(
+            ProductLiveCapabilityIo::default(),
+        ))),
+        subagent_spawn_limits: ironclaw_loop_support::SubagentSpawnLimits::default(),
         // Product-live composition must bind the applier evidence to the
         // runtime cancellation source even if the supplied evidence is not.
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
@@ -730,6 +865,10 @@ async fn user_message_no_profile_can_cancel_product_live_run_from_product_path()
         model_policy_guard: Some(Arc::new(NoOpPolicyGuard)),
         model_budget_accountant: Some(Arc::new(NoOpBudgetAccountant)),
         safety_context: Some(test_safety_context()),
+        hook_dispatcher_builder_factory: None,
+        communication_context_provider: None,
+        hook_security_audit_sink: None,
+        turn_event_sink: None,
     })
     .expect("product-live runtime should build");
 
@@ -768,17 +907,12 @@ async fn user_message_no_profile_can_cancel_product_live_run_from_product_path()
     .await
     .expect("product live run should reach model call");
 
-    let turn_scope = TurnScope::new(
-        binding.tenant_id.clone(),
-        binding.agent_id.clone(),
-        binding.project_id.clone(),
-        binding.thread_id.clone(),
-    );
+    let turn_scope = turn_scope_for_binding(&binding);
     let cancel_response = composition
         .coordinator
         .cancel_run(CancelRunRequest {
             scope: turn_scope.clone(),
-            actor: TurnActor::new(binding.user_id.clone()),
+            actor: TurnActor::new(binding.actor_user_id.clone()),
             run_id: submitted_run_id,
             reason: SanitizedCancelReason::UserRequested,
             idempotency_key: IdempotencyKey::new("idem-product-live-cancel").expect("valid"),
@@ -859,7 +993,7 @@ async fn product_live_runtime_rejects_unretained_cancellation_factory() {
         tenant_id: binding.tenant_id.clone(),
         agent_id: binding.agent_id.clone().expect("agent id"),
         project_id: binding.project_id.clone(),
-        owner_user_id: Some(binding.user_id.clone()),
+        owner_user_id: binding.subject_user_id.clone(),
         mission_id: None,
     };
     let model_route_resolver = Arc::new(
@@ -872,9 +1006,11 @@ async fn product_live_runtime_rejects_unretained_cancellation_factory() {
         ),
     );
 
+    let turn_state_for_runtime: Arc<dyn RuntimeTurnStateStore> = turn_store.clone();
     let error = match build_product_live_planned_runtime(DefaultPlannedRuntimeParts {
-        turn_state: turn_store,
-        thread_service: Arc::new(thread_service),
+        attachment_read_port: None,
+        turn_state: turn_state_for_runtime,
+        thread_service: Arc::new(thread_service.clone()),
         thread_scope: thread_scope.clone(),
         model_gateway,
         checkpoint_state_store: Arc::new(InMemoryCheckpointStateStore::default()),
@@ -882,6 +1018,20 @@ async fn product_live_runtime_rejects_unretained_cancellation_factory() {
         milestone_sink: Arc::new(InMemoryLoopHostMilestoneSink::default()),
         capability_factory: Arc::new(EmptyCapabilityFactory),
         capability_surface_resolver: Arc::new(AllowAllCapabilitySurfaceResolver),
+        capability_result_writer: Arc::new(UnusedCapabilityResultWriter),
+        subagent_goal_store: Arc::new(
+            ironclaw_reborn::subagent::goal_store::InMemoryBoundedSubagentGoalStore::new(),
+        ),
+        subagent_gate_store: Arc::new(
+            ironclaw_reborn::subagent::gate_resolution::BoundedSubagentGateResolutionStore::new(),
+        ),
+        subagent_definition_resolver: Arc::new(
+            ironclaw_reborn::subagent::flavors::StaticSubagentDefinitionResolver,
+        ),
+        subagent_spawn_input_codec: Arc::new(JsonSpawnSubagentInputCodec::new(Arc::new(
+            ProductLiveCapabilityIo::default(),
+        ))),
+        subagent_spawn_limits: ironclaw_loop_support::SubagentSpawnLimits::default(),
         loop_exit_evidence: Arc::new(ThreadCheckpointLoopExitEvidencePort::new_with_thread_scope(
             Arc::new(InMemorySessionThreadService::default()),
             Arc::new(InMemoryTurnStateStore::default()) as Arc<dyn TurnStateStore>,
@@ -897,6 +1047,10 @@ async fn product_live_runtime_rejects_unretained_cancellation_factory() {
         model_policy_guard: Some(Arc::new(NoOpPolicyGuard)),
         model_budget_accountant: Some(Arc::new(NoOpBudgetAccountant)),
         safety_context: Some(test_safety_context()),
+        hook_dispatcher_builder_factory: None,
+        communication_context_provider: None,
+        hook_security_audit_sink: None,
+        turn_event_sink: None,
     }) {
         Ok(_) => panic!("product-live readiness must reject inert cancellation"),
         Err(error) => error,
@@ -906,7 +1060,7 @@ async fn product_live_runtime_rejects_unretained_cancellation_factory() {
 }
 
 #[tokio::test]
-async fn busy_thread_persists_second_message_as_deferred() {
+async fn busy_thread_persists_second_message_as_rejected_busy() {
     let binding_service = FakeConversationBindingService::new();
     let thread_service = InMemorySessionThreadService::default();
     let store = Arc::new(InMemoryTurnStateStore::default());
@@ -921,10 +1075,10 @@ async fn busy_thread_persists_second_message_as_deferred() {
         .accept_user_message(&second)
         .await
         .expect("second deferred");
-    assert!(matches!(outcome, InboundTurnOutcome::DeferredBusy { .. }));
+    assert!(matches!(outcome, InboundTurnOutcome::RejectedBusy { .. }));
 
     let binding = match outcome {
-        InboundTurnOutcome::DeferredBusy { binding, .. } => binding,
+        InboundTurnOutcome::RejectedBusy { binding, .. } => binding,
         _ => unreachable!(),
     };
     let history = thread_service
@@ -933,7 +1087,7 @@ async fn busy_thread_persists_second_message_as_deferred() {
                 tenant_id: binding.tenant_id.clone(),
                 agent_id: binding.agent_id.clone().expect("agent id"),
                 project_id: binding.project_id.clone(),
-                owner_user_id: Some(binding.user_id.clone()),
+                owner_user_id: binding.subject_user_id.clone(),
                 mission_id: None,
             },
             thread_id: binding.thread_id.clone(),
@@ -942,7 +1096,7 @@ async fn busy_thread_persists_second_message_as_deferred() {
         .expect("history");
     assert_eq!(history.messages.len(), 2);
     assert_eq!(history.messages[1].content.as_deref(), Some("second"));
-    assert_eq!(history.messages[1].status, MessageStatus::DeferredBusy);
+    assert_eq!(history.messages[1].status, MessageStatus::RejectedBusy);
 }
 
 #[tokio::test]
@@ -981,7 +1135,7 @@ async fn retry_validates_live_binding_before_accepted_message_replay() {
     let InboundTurnOutcome::Submitted { binding, .. } = outcome else {
         panic!("expected submitted retry")
     };
-    assert_eq!(binding.user_id.as_str(), "user:churned");
+    assert_eq!(binding.actor_user_id.as_str(), "user:churned");
     assert_eq!(binding.thread_id.as_str(), "thread:churned");
     assert_eq!(
         binding_handle.resolve_count(),
@@ -995,7 +1149,7 @@ async fn retry_validates_live_binding_before_accepted_message_replay() {
                 tenant_id: binding.tenant_id.clone(),
                 agent_id: binding.agent_id.clone().expect("agent id"),
                 project_id: binding.project_id.clone(),
-                owner_user_id: Some(binding.user_id.clone()),
+                owner_user_id: binding.subject_user_id.clone(),
                 mission_id: None,
             },
             thread_id: binding.thread_id.clone(),
@@ -1057,7 +1211,7 @@ async fn replay_lookup_is_namespaced_by_installation() {
                 tenant_id: binding.tenant_id.clone(),
                 agent_id: binding.agent_id.clone().expect("agent id"),
                 project_id: binding.project_id.clone(),
-                owner_user_id: Some(binding.user_id.clone()),
+                owner_user_id: binding.subject_user_id.clone(),
                 mission_id: None,
             },
             thread_id: binding.thread_id.clone(),
@@ -1069,48 +1223,95 @@ async fn replay_lookup_is_namespaced_by_installation() {
 }
 
 #[tokio::test]
-async fn deferred_busy_retry_resubmits_existing_message() {
+async fn legacy_deferred_busy_retry_resubmits_existing_message() {
+    // A message row whose status was force-downgraded to `DeferredBusy` (the
+    // legacy status written by the now-retired `mark_message_deferred_busy`
+    // writer) must be RESUBMITTED when replayed — `from_replay_parts` maps
+    // `DeferredBusy → NeedsSubmission`.  This is distinct from `RejectedBusy`
+    // replay, which is terminal and never resubmits (covered by the dedicated
+    // `rejected_busy_replay_is_re_rejected_not_resubmitted` test).
     let binding_service = FakeConversationBindingService::new();
     let thread_service = InMemorySessionThreadService::default();
     let coordinator = ScriptedTurnCoordinator::default();
-    let active_run_id = TurnRunId::new();
-    coordinator.push_result(Err(TurnError::ThreadBusy(ThreadBusy {
-        active_run_id,
-        status: TurnStatus::Running,
-        event_cursor: EventCursor::default(),
-    })));
-    let service =
-        DefaultInboundTurnService::new(binding_service, thread_service.clone(), coordinator);
+    let service = DefaultInboundTurnService::new(
+        binding_service,
+        thread_service.clone(),
+        coordinator.clone(),
+    );
 
-    let envelope = sample_user_message_envelope("busy-retry-existing");
+    // First call: submit successfully so the message row exists in the thread
+    // service with status `Submitted`.
+    let envelope = sample_user_message_envelope("deferred-busy-legacy");
     let first = service
         .accept_user_message(&envelope)
         .await
-        .expect("first busy");
-    assert!(matches!(first, InboundTurnOutcome::DeferredBusy { .. }));
-
-    let second = service
-        .accept_user_message(&envelope)
-        .await
-        .expect("retry submits existing deferred message");
-    let InboundTurnOutcome::Submitted { binding, .. } = second else {
-        panic!("expected submitted retry")
+        .expect("initial submission");
+    let binding = match first {
+        InboundTurnOutcome::Submitted { ref binding, .. } => binding.clone(),
+        _ => panic!("expected Submitted on first call, got {first:?}"),
     };
+    let thread_scope = ThreadScope {
+        tenant_id: binding.tenant_id.clone(),
+        agent_id: binding.agent_id.clone().expect("agent id"),
+        project_id: binding.project_id.clone(),
+        owner_user_id: binding.subject_user_id.clone(),
+        mission_id: None,
+    };
+    assert_eq!(
+        coordinator.submissions().len(),
+        1,
+        "coordinator must have been called once after initial submission"
+    );
+
+    // Back-door: downgrade the stored row to `DeferredBusy` to simulate a
+    // legacy row written by the now-retired `mark_message_deferred_busy`
+    // writer.  Production code no longer creates `DeferredBusy` rows, but
+    // they may exist in older deployments.
     let history = thread_service
         .list_thread_history(ThreadHistoryRequest {
-            scope: ThreadScope {
-                tenant_id: binding.tenant_id.clone(),
-                agent_id: binding.agent_id.clone().expect("agent id"),
-                project_id: binding.project_id.clone(),
-                owner_user_id: Some(binding.user_id.clone()),
-                mission_id: None,
-            },
+            scope: thread_scope.clone(),
             thread_id: binding.thread_id.clone(),
         })
         .await
-        .expect("history");
+        .expect("history after initial submit");
     assert_eq!(history.messages.len(), 1);
-    assert_eq!(history.messages[0].status, MessageStatus::Submitted);
+    let message_id = history.messages[0].message_id;
+    thread_service
+        .inject_legacy_deferred_busy_for_test(&thread_scope, &binding.thread_id, message_id)
+        .await
+        .expect("inject DeferredBusy");
+
+    // Second call with the same envelope: the replay path sees `DeferredBusy`
+    // and maps it to `NeedsSubmission`, triggering a new submission to the
+    // coordinator.
+    let second = service
+        .accept_user_message(&envelope)
+        .await
+        .expect("DeferredBusy replay resubmission");
+    assert!(
+        matches!(second, InboundTurnOutcome::Submitted { .. }),
+        "DeferredBusy replay must resubmit (NeedsSubmission path), got {second:?}"
+    );
+    assert_eq!(
+        coordinator.submissions().len(),
+        2,
+        "coordinator must be called a second time for the DeferredBusy replay resubmission"
+    );
+
+    // The message row must now reflect the new submission.
+    let history_after = thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: thread_scope,
+            thread_id: binding.thread_id.clone(),
+        })
+        .await
+        .expect("history after DeferredBusy replay");
+    assert_eq!(history_after.messages.len(), 1, "must not create a new row");
+    assert_eq!(
+        history_after.messages[0].status,
+        MessageStatus::Submitted,
+        "resubmitted message must be marked Submitted"
+    );
 }
 
 #[tokio::test]
@@ -1136,6 +1337,20 @@ async fn reply_target_binding_ref_has_single_reply_prefix() {
     assert!(reply_ref.starts_with("reply:"));
     assert!(!reply_ref.starts_with("reply:reply:"));
     assert_eq!(reply_ref.matches("reply:").count(), 1);
+    assert_eq!(
+        request.product_context.as_ref().map(|c| c.origin),
+        Some(TurnOriginKind::Inbound),
+        "inbound turn must carry Inbound origin"
+    );
+    assert_eq!(
+        request
+            .product_context
+            .as_ref()
+            .and_then(|c| c.adapter.as_ref())
+            .map(|a| a.as_str()),
+        Some("test_adapter"),
+        "inbound turn must carry adapter name from envelope"
+    );
 }
 
 #[tokio::test]
@@ -1206,4 +1421,66 @@ async fn binding_failure_surfaces_workflow_error() {
         err,
         ProductWorkflowError::BindingResolutionFailed { .. }
     ));
+}
+
+#[tokio::test]
+async fn rejected_busy_replay_is_re_rejected_not_resubmitted() {
+    let binding_service = FakeConversationBindingService::new();
+    let thread_service = InMemorySessionThreadService::default();
+    let coordinator = ScriptedTurnCoordinator::default();
+    let active_run_id = TurnRunId::new();
+    coordinator.push_result(Err(TurnError::ThreadBusy(ThreadBusy {
+        active_run_id,
+        status: TurnStatus::Running,
+        event_cursor: EventCursor::default(),
+    })));
+    let service =
+        DefaultInboundTurnService::new(binding_service, thread_service.clone(), coordinator);
+
+    let envelope = sample_user_message_envelope("rejected-busy-replay");
+    let first = service
+        .accept_user_message(&envelope)
+        .await
+        .expect("first busy");
+    assert!(
+        matches!(first, InboundTurnOutcome::RejectedBusy { .. }),
+        "first submission should be rejected busy"
+    );
+
+    let replayed = service
+        .accept_user_message(&envelope)
+        .await
+        .expect("replay of rejected busy message");
+    assert!(
+        matches!(replayed, InboundTurnOutcome::RejectedBusy { .. }),
+        "replay of a rejected busy message must return RejectedBusy, not submit a new turn"
+    );
+
+    let binding = match replayed {
+        InboundTurnOutcome::RejectedBusy { ref binding, .. } => binding.clone(),
+        _ => unreachable!(),
+    };
+    let history = thread_service
+        .list_thread_history(ThreadHistoryRequest {
+            scope: ThreadScope {
+                tenant_id: binding.tenant_id.clone(),
+                agent_id: binding.agent_id.clone().expect("agent id"),
+                project_id: binding.project_id.clone(),
+                owner_user_id: binding.subject_user_id.clone(),
+                mission_id: None,
+            },
+            thread_id: binding.thread_id.clone(),
+        })
+        .await
+        .expect("history");
+    assert_eq!(
+        history.messages.len(),
+        1,
+        "replay must not create a new submitted message row"
+    );
+    assert_eq!(
+        history.messages[0].status,
+        MessageStatus::RejectedBusy,
+        "original message must remain RejectedBusy, not Submitted"
+    );
 }

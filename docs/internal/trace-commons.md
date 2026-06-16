@@ -33,6 +33,51 @@ upload-claim issuer. Hosted corpus storage, review/admin state, DB/object
 storage, and production worker control-plane logic live in the public
 `zmanian/tracedao-server` repository.
 
+## Agent Onboarding (invite link)
+
+Onboarding no longer requires running the reborn binary with ~15 CLI flags plus
+an operator-minted workload JWT. A user can paste a single invite link
+(`https://issuer.<host>/onboard#<code>`) into IronClaw chat and the agent walks
+them through consent and registration. The flow lives in
+`crates/ironclaw_reborn_traces/src/onboarding/` and is exposed to the reborn
+engine as two first-party capabilities.
+
+Pieces:
+
+- `onboarding::invite` parses the invite link. The operator-handed invite origin
+  is the trust root: the client pins the issuer origin from the invite, rejects
+  embedded userinfo, and only allows `http` for loopback.
+- `onboarding::device_key` generates a per-`(user-scope, tenant)` Ed25519 device
+  keypair, staged under a pending path before the network call and atomically
+  promoted to a tenant path on success (so a crash/retry reuses the same key and
+  the server-side single-use invite is never double-consumed). Private keys are
+  written 0600 via the hardened `write_json_file`, never logged, and zeroized on
+  drop.
+- `onboarding::onboard()` exchanges the invite code plus the device public key
+  for tenant config at `POST /v1/onboard`, verifies the response `issuer_url`
+  origin equals the invite origin (trust anchoring) and the echoed
+  `device_key_id` matches the locally derived one, then writes a
+  `StandingTraceContributionPolicy` with `auth_mode = DeviceKey`.
+- **Device-key auth mode**: when a policy is in `DeviceKey` mode, the
+  upload-claim refresh self-signs a short-lived (60s) EdDSA workload JWT with the
+  device key instead of reading a workload-token env var, and omits the invite
+  code (the registered key is the post-invite credential). The legacy
+  `WorkloadTokenEnv` path is unchanged and remains the default; old policy files
+  deserialize as `WorkloadTokenEnv`.
+- **Engine tools**: `builtin.trace_commons.onboard` (consent-gated — refuses
+  unless `confirmed=true`, after the agent gathers the two consents per the
+  tool's own description in
+  `crates/ironclaw_host_runtime/src/first_party_tools/trace_commons.rs`) and
+  `builtin.trace_commons.status`
+  (read-only enrollment state). Both route through the standard first-party
+  dispatch pipeline. Onboarding outputs carry only the public `device_key_id`
+  hash — never key material.
+
+The server side (the `POST /v1/onboard` endpoint, device-key registry, and the
+device-key auth branch at claim issuance) lives in
+`TraceCommons/trace-commons-server` (tracked in issues #136–#141). Design spec:
+`docs/superpowers/specs/2026-06-05-trace-commons-agent-onboarding-design.md`.
+
 ## CLI MVP
 
 ```bash
@@ -49,6 +94,23 @@ ironclaw traces opt-in \
   --upload-token-audience trace-commons \
   --upload-token-tenant-id tenant-a \
   --upload-token-workload-token-env IRONCLAW_TRACE_WORKLOAD_TOKEN
+
+# Pilot deployments add an operator-issued invite code. The issuer's
+# allowlist gate refuses claim requests whose invite code is not in the
+# active allowlist snapshot — see trace-commons-server's
+# docs/operator/pilot-allowlist.md for the operator side. When the issuer
+# refuses, the client surfaces the typed label
+# (PilotAllowlistNotMatched / PilotAllowlistInviteCodeMissing /
+# PilotAllowlistStale / PilotAllowlistMalformed) so you can act on it
+# directly.
+ironclaw traces opt-in \
+  --endpoint https://trace-ingest.internal/v1/traces \
+  --upload-token-issuer-url https://issuer.near.com/v1/trace-upload-claim \
+  --upload-token-issuer-allowed-hosts issuer.near.com \
+  --upload-token-audience trace-commons \
+  --upload-token-tenant-id tenant-a \
+  --upload-token-workload-token-env IRONCLAW_TRACE_WORKLOAD_TOKEN \
+  --upload-token-invite-code INV-PILOT-001
 
 # Create a local redacted envelope from an existing recorded trace.
 ironclaw traces preview \

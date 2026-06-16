@@ -6,9 +6,8 @@
 //!
 //! ## Boundaries
 //!
-//! - Handlers consume only [`RebornServicesApi`] for all six commands
-//!   (`create_thread`, `submit_turn`, `get_timeline`, `stream_events`,
-//!   `cancel_run`, `resolve_gate`). They never reach into the dispatcher,
+//! - Handlers consume only [`RebornServicesApi`] for chat, run/gate,
+//!   extension, and automation reads. They never reach into the dispatcher,
 //!   `HostRuntime`, run-state, DB stores, or any runtime lane.
 //! - Auth and CORS are **not** enforced here. Host composition runs the
 //!   bearer-token middleware that builds a [`WebUiAuthenticatedCaller`] and
@@ -23,10 +22,11 @@
 //!
 //! `stream_events` is exposed as SSE. The current
 //! [`RebornServicesApi::stream_events`] is drain-only, so the handler
-//! drains once, emits each event as an SSE message with the projection
-//! cursor as the SSE id, then polls at a low cadence for newly-arrived
-//! events. When the facade gains a real subscription API the handler can
-//! migrate without changing the descriptor.
+//! drains once, renders each product envelope into a
+//! [`WebChatV2EventFrame`] SSE message with the projection cursor as the
+//! SSE id, then polls at a low cadence for newly-arrived events. When the
+//! facade gains a real subscription API the handler can migrate without
+//! changing the descriptor or browser-visible event schema.
 //!
 //! Beyond the route descriptor's per-caller request rate limit, the
 //! handler caps the number of *concurrent* SSE streams a single
@@ -35,6 +35,7 @@
 //! caller's slot indefinitely.
 //!
 //! [`RebornServicesApi`]: ironclaw_product_workflow::RebornServicesApi
+//! [`WebChatV2EventFrame`]: crate::WebChatV2EventFrame
 //! [`WebUiAuthenticatedCaller`]: ironclaw_product_workflow::WebUiAuthenticatedCaller
 //! [`IngressRouteDescriptor`]: ironclaw_host_api::ingress::IngressRouteDescriptor
 
@@ -49,21 +50,63 @@ mod handlers;
 #[cfg(feature = "webui-v2-beta")]
 mod router;
 #[cfg(feature = "webui-v2-beta")]
+mod schema;
+#[cfg(feature = "webui-v2-beta")]
 mod sse_capacity;
 
+#[allow(deprecated)]
+pub use descriptors::is_webui_v2_llm_config_route_id;
 #[cfg(feature = "webui-v2-beta")]
 pub use descriptors::{
-    WEBUI_V2_ROUTE_CANCEL_RUN, WEBUI_V2_ROUTE_CREATE_THREAD, WEBUI_V2_ROUTE_GET_TIMELINE,
-    WEBUI_V2_ROUTE_LIST_THREADS, WEBUI_V2_ROUTE_RESOLVE_GATE, WEBUI_V2_ROUTE_SEND_MESSAGE,
-    WEBUI_V2_ROUTE_SETUP_EXTENSION, WEBUI_V2_ROUTE_STREAM_EVENTS, WEBUI_V2_ROUTE_STREAM_EVENTS_WS,
+    WEBUI_V2_ROUTE_ACTIVATE_EXTENSION, WEBUI_V2_ROUTE_CANCEL_RUN,
+    WEBUI_V2_ROUTE_COMPLETE_NEARAI_WALLET_LOGIN, WEBUI_V2_ROUTE_CREATE_THREAD,
+    WEBUI_V2_ROUTE_DELETE_LLM_PROVIDER, WEBUI_V2_ROUTE_DELETE_THREAD,
+    WEBUI_V2_ROUTE_GET_ATTACHMENT, WEBUI_V2_ROUTE_GET_EXTENSION_SETUP,
+    WEBUI_V2_ROUTE_GET_LLM_CONFIG, WEBUI_V2_ROUTE_GET_OUTBOUND_PREFERENCES,
+    WEBUI_V2_ROUTE_GET_SESSION, WEBUI_V2_ROUTE_GET_SKILL, WEBUI_V2_ROUTE_GET_TIMELINE,
+    WEBUI_V2_ROUTE_INSTALL_EXTENSION, WEBUI_V2_ROUTE_INSTALL_SKILL,
+    WEBUI_V2_ROUTE_LIST_AUTOMATIONS, WEBUI_V2_ROUTE_LIST_CONNECTABLE_CHANNELS,
+    WEBUI_V2_ROUTE_LIST_EXTENSION_REGISTRY, WEBUI_V2_ROUTE_LIST_EXTENSIONS,
+    WEBUI_V2_ROUTE_LIST_LLM_MODELS, WEBUI_V2_ROUTE_LIST_OUTBOUND_DELIVERY_TARGETS,
+    WEBUI_V2_ROUTE_LIST_PROJECT_FILES, WEBUI_V2_ROUTE_LIST_SKILLS, WEBUI_V2_ROUTE_LIST_THREADS,
+    WEBUI_V2_ROUTE_OPERATOR_DIAGNOSTICS, WEBUI_V2_ROUTE_OPERATOR_GET_CONFIG_KEY,
+    WEBUI_V2_ROUTE_OPERATOR_GET_SETUP, WEBUI_V2_ROUTE_OPERATOR_LIST_CONFIG,
+    WEBUI_V2_ROUTE_OPERATOR_LOGS, WEBUI_V2_ROUTE_OPERATOR_RUN_SETUP,
+    WEBUI_V2_ROUTE_OPERATOR_SERVICE_LIFECYCLE, WEBUI_V2_ROUTE_OPERATOR_SET_CONFIG_KEY,
+    WEBUI_V2_ROUTE_OPERATOR_STATUS, WEBUI_V2_ROUTE_OPERATOR_VALIDATE_CONFIG,
+    WEBUI_V2_ROUTE_READ_PROJECT_FILE, WEBUI_V2_ROUTE_REMOVE_EXTENSION, WEBUI_V2_ROUTE_REMOVE_SKILL,
+    WEBUI_V2_ROUTE_RESOLVE_GATE, WEBUI_V2_ROUTE_SEARCH_SKILLS, WEBUI_V2_ROUTE_SEND_MESSAGE,
+    WEBUI_V2_ROUTE_SET_ACTIVE_LLM, WEBUI_V2_ROUTE_SET_OUTBOUND_PREFERENCES,
+    WEBUI_V2_ROUTE_SETUP_EXTENSION, WEBUI_V2_ROUTE_START_CODEX_LOGIN,
+    WEBUI_V2_ROUTE_START_NEARAI_LOGIN, WEBUI_V2_ROUTE_STAT_PROJECT_FILE,
+    WEBUI_V2_ROUTE_STREAM_EVENTS, WEBUI_V2_ROUTE_STREAM_EVENTS_WS,
+    WEBUI_V2_ROUTE_TEST_LLM_CONNECTION, WEBUI_V2_ROUTE_TRACE_CREDITS,
+    WEBUI_V2_ROUTE_TRACE_HOLD_AUTHORIZE, WEBUI_V2_ROUTE_UPDATE_SKILL,
+    WEBUI_V2_ROUTE_UPSERT_LLM_PROVIDER, is_webui_v2_operator_webui_config_route_id,
     webui_v2_routes,
 };
 #[cfg(feature = "webui-v2-beta")]
 pub use error::{WebUiV2HttpError, WebUiV2HttpErrorBody};
 #[cfg(feature = "webui-v2-beta")]
 pub use handlers::{
-    cancel_run, create_thread, get_timeline, list_threads, resolve_gate, send_message,
-    setup_extension, stream_events, stream_events_ws,
+    activate_extension, cancel_run, complete_nearai_wallet_login, create_thread,
+    delete_llm_provider, delete_thread, get_attachment, get_extension_setup, get_llm_config,
+    get_operator_config_key, get_operator_diagnostics, get_operator_setup, get_operator_status,
+    get_outbound_preferences, get_session, get_skill_content, get_timeline, install_extension,
+    install_skill, list_automations, list_connectable_channels, list_extension_registry,
+    list_extensions, list_llm_models, list_operator_config, list_outbound_delivery_targets,
+    list_skills, list_threads, query_operator_logs, remove_extension, remove_skill, resolve_gate,
+    run_operator_service_lifecycle, run_operator_setup, search_skills, send_message,
+    set_active_llm, set_operator_config_key, set_outbound_preferences, setup_extension,
+    start_codex_login, start_nearai_login, stream_events, stream_events_ws, test_llm_connection,
+    trace_credits, update_skill, upsert_llm_provider,
 };
 #[cfg(feature = "webui-v2-beta")]
-pub use router::{WebUiV2State, webui_v2_router};
+pub use router::{
+    WebUiV2Capabilities, WebUiV2RouteOptions, WebUiV2State, webui_v2_router,
+    webui_v2_router_with_options,
+};
+#[cfg(feature = "webui-v2-beta")]
+pub use schema::{WebChatV2Event, WebChatV2EventFrame};
+#[cfg(feature = "webui-v2-beta")]
+pub use sse_capacity::DEFAULT_SSE_MAX_CONCURRENT_PER_CALLER;

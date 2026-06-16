@@ -25,11 +25,12 @@ use ironclaw_turns::{
         CapabilityBatchOutcome, CapabilityInvocation, CapabilityOutcome, FinalizeAssistantMessage,
         LoadCheckpointPayloadRequest, LoadedCheckpointPayload, LoopCancelReasonKind,
         LoopCancellationPort, LoopCancellationSignal, LoopCapabilityPort, LoopCheckpointPort,
-        LoopCheckpointRequest, LoopCheckpointStateRef, LoopContextBundle, LoopContextPort,
+        LoopCheckpointRequest, LoopCheckpointStateRef, LoopCompactionError, LoopCompactionOutcome,
+        LoopCompactionPort, LoopCompactionRequest, LoopContextBundle, LoopContextPort,
         LoopContextRequest, LoopInput, LoopInputAckToken, LoopInputBatch, LoopInputCursor,
         LoopInputPort, LoopModelPort, LoopModelRequest, LoopModelResponse, LoopProgressEvent,
         LoopProgressPort, LoopPromptBundle, LoopPromptBundleRequest, LoopPromptPort,
-        LoopRunContext, LoopRunInfoPort, LoopTranscriptPort, RunProfileResolver,
+        LoopRunContext, LoopRunInfoPort, LoopSafeSummary, LoopTranscriptPort, RunProfileResolver,
         StageCheckpointPayloadRequest, UpdateAssistantDraft, VisibleCapabilityRequest,
         VisibleCapabilitySurface,
     },
@@ -65,6 +66,7 @@ fn resume_request(
         run_id: context.run_id,
         checkpoint_id,
         resolved_run_profile: context.resolved_run_profile.clone(),
+        auth_resume_disposition: None,
     }
 }
 
@@ -552,8 +554,27 @@ impl LoopProgressPort for ForbiddenResumeHost {
     }
 }
 
+#[async_trait::async_trait]
+impl LoopCompactionPort for ForbiddenResumeHost {
+    async fn compact_loop_context(
+        &self,
+        _request: LoopCompactionRequest,
+    ) -> Result<LoopCompactionOutcome, LoopCompactionError> {
+        let error = self.forbidden_call("compact_loop_context");
+        Err(LoopCompactionError::PersistenceFailed {
+            safe_summary: LoopSafeSummary::new(error.safe_summary)
+                .expect("forbidden call summary should be loop-safe"),
+        })
+    }
+}
+
+#[async_trait::async_trait]
 impl LoopCancellationPort for ForbiddenResumeHost {
     fn observe_cancellation(&self) -> Option<LoopCancellationSignal> {
         None
+    }
+
+    async fn cancellation_requested(&self) -> LoopCancellationSignal {
+        std::future::pending().await
     }
 }

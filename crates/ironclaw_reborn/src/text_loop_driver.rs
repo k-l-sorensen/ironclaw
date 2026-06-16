@@ -17,7 +17,11 @@ use ironclaw_turns::{
     },
 };
 
+use crate::model_failure_mapping::model_stage_failure_category;
+
 pub(crate) const TEXT_ONLY_DRIVER_ID: &str = "reborn:text-only-model-reply";
+/// Stage name for the model call site; matches the string used in `map_host_error` call sites.
+const STAGE_MODEL: &str = "model";
 pub(crate) const TEXT_ONLY_DRIVER_VERSION: u64 = 1;
 const DEFAULT_CONTEXT_LIMIT: usize = 16;
 
@@ -83,7 +87,7 @@ impl AgentLoopDriver for TextOnlyModelReplyDriver {
                 capability_view: None,
             })
             .await
-            .map_err(|error| map_host_error("model", error))?;
+            .map_err(|error| map_host_error(STAGE_MODEL, error))?;
 
         let reply = match model_response.output {
             ParentLoopOutput::AssistantReply(reply) => reply,
@@ -169,10 +173,19 @@ fn map_host_error(stage: &'static str, error: AgentLoopHostError) -> AgentLoopDr
     tracing::warn!(
         stage,
         kind = ?error.kind,
+        reason_kind = ?error.reason_kind,
         diagnostic_ref = ?error.diagnostic_ref,
         safe_summary = %error.safe_summary,
         "loop host port returned sanitized error"
     );
+
+    if let Some(category) =
+        model_stage_failure_category(stage == STAGE_MODEL, error.kind, error.reason_kind)
+    {
+        return AgentLoopDriverError::Failed {
+            reason_kind: category.to_string(),
+        };
+    }
 
     match error.kind {
         AgentLoopHostErrorKind::InvalidInvocation
@@ -194,8 +207,10 @@ fn map_host_error(stage: &'static str, error: AgentLoopHostError) -> AgentLoopDr
         AgentLoopHostErrorKind::BudgetExceeded
         | AgentLoopHostErrorKind::BudgetApprovalRequired
         | AgentLoopHostErrorKind::BudgetAccountingFailed
-        | AgentLoopHostErrorKind::CredentialUnavailable
         | AgentLoopHostErrorKind::PolicyDenied => AgentLoopDriverError::Failed {
+            reason_kind: loop_failure_kind_name(LoopFailureKind::ModelError).to_string(),
+        },
+        AgentLoopHostErrorKind::CredentialUnavailable => AgentLoopDriverError::Failed {
             reason_kind: loop_failure_kind_name(LoopFailureKind::ModelError).to_string(),
         },
         AgentLoopHostErrorKind::CheckpointRejected => AgentLoopDriverError::Failed {
@@ -232,6 +247,10 @@ fn loop_failure_kind_name(kind: LoopFailureKind) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::failure_categories::{
+        MODEL_CREDENTIALS_UNAVAILABLE_CATEGORY, MODEL_CREDITS_EXHAUSTED_CATEGORY,
+        MODEL_CREDITS_EXHAUSTED_REASON_KIND,
+    };
 
     #[test]
     fn host_internal_errors_map_to_sanitized_unavailable() {
@@ -250,6 +269,81 @@ mod tests {
             }
         );
         assert_driver_error_hides_raw_payloads(&mapped);
+    }
+
+    #[test]
+    fn model_credit_exhaustion_maps_to_sanitized_failure_category() {
+        let mapped = map_host_error(
+            "model",
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::CredentialUnavailable,
+                "safe summary wording is display-only",
+            )
+            .with_reason_kind(MODEL_CREDITS_EXHAUSTED_REASON_KIND),
+        );
+
+        assert_eq!(
+            mapped,
+            AgentLoopDriverError::Failed {
+                reason_kind: MODEL_CREDITS_EXHAUSTED_CATEGORY.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn model_credential_unavailable_maps_to_sanitized_failure_category() {
+        let mapped = map_host_error(
+            "model",
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::CredentialUnavailable,
+                "model credentials are unavailable",
+            ),
+        );
+
+        assert_eq!(
+            mapped,
+            AgentLoopDriverError::Failed {
+                reason_kind: MODEL_CREDENTIALS_UNAVAILABLE_CATEGORY.to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn non_model_stage_with_credit_reason_does_not_map_to_credits_category() {
+        const CREDIT_SUMMARY: &str = "model provider account is out of credits";
+        let mapped = map_host_error(
+            "prompt",
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::CredentialUnavailable,
+                CREDIT_SUMMARY,
+            )
+            .with_reason_kind(MODEL_CREDITS_EXHAUSTED_REASON_KIND),
+        );
+
+        assert_eq!(
+            mapped,
+            AgentLoopDriverError::Failed {
+                reason_kind: loop_failure_kind_name(LoopFailureKind::ModelError).to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn non_model_stage_with_credential_unavailable_maps_to_model_error() {
+        let mapped = map_host_error(
+            "prompt",
+            AgentLoopHostError::new(
+                AgentLoopHostErrorKind::CredentialUnavailable,
+                "model credentials are unavailable",
+            ),
+        );
+
+        assert_eq!(
+            mapped,
+            AgentLoopDriverError::Failed {
+                reason_kind: loop_failure_kind_name(LoopFailureKind::ModelError).to_string()
+            }
+        );
     }
 
     fn assert_driver_error_hides_raw_payloads(error: &AgentLoopDriverError) {

@@ -21,14 +21,29 @@
 //! - No v1 dependency: this crate carries no `src/` import and never
 //!   reads v1 secrets / settings / DB.
 
+mod auth;
 mod oidc;
 mod session;
+mod signed_session_login;
 
+#[cfg(any(test, feature = "dev-in-memory-session"))]
+pub use auth::EmailUserDirectory;
+pub use auth::{
+    GitHubOAuthConfig, GitHubProvider, GoogleOAuthConfig, GoogleProvider, OAuthError,
+    OAuthProvider, OAuthProviderName, OAuthProviderNameError, OAuthRouterConfig, OAuthUserProfile,
+    ProviderInitError, PublicRouteMount, UserDirectory, UserDirectoryError, webui_v2_auth_router,
+};
 pub use oidc::{
     AudienceClaim, ClaimToUserIdFn, IdTokenClaims, OidcAuthenticator, OidcAuthenticatorConfig,
     OidcAuthenticatorError,
 };
 pub use session::{SessionAuthenticator, SessionRecord, SessionStore, SessionStoreError};
+// Host-owned signed-token login surface (production-suitable, non-dev):
+// the standalone `serve` binary supplies env config and calls the
+// builder; the auth/session model lives here, not in the command crate.
+pub use signed_session_login::{
+    SignedSessionLoginConfig, SignedSessionLoginWiring, build_signed_session_login,
+};
 // `InMemorySessionStore` is gated behind `dev-in-memory-session` so a
 // production binary cannot accidentally wire a process-local store as
 // a `SessionStore` impl. Local dev and tests opt in via the feature.
@@ -106,19 +121,22 @@ pub async fn serve_webui_v2(opts: RebornWebuiServeOptions) -> Result<(), RebornW
         let _ = tx.send(bound);
     }
 
-    axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
-            // If the host drops the sender without firing, treat that
-            // as "shutdown requested" so the serve loop returns
-            // cleanly rather than running forever.
-            let _ = shutdown.await;
-            tracing::info!(
-                target = "ironclaw::reborn::webui_ingress",
-                "WebChat v2 graceful shutdown signal received",
-            );
-        })
-        .await
-        .map_err(RebornWebuiServeError::Serve)
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move {
+        // If the host drops the sender without firing, treat that
+        // as "shutdown requested" so the serve loop returns
+        // cleanly rather than running forever.
+        let _ = shutdown.await;
+        tracing::info!(
+            target = "ironclaw::reborn::webui_ingress",
+            "WebChat v2 graceful shutdown signal received",
+        );
+    })
+    .await
+    .map_err(RebornWebuiServeError::Serve)
 }
 
 /// Authenticator that compares the bearer token from the request
@@ -161,7 +179,10 @@ pub enum EnvBearerConfigError {
 
 #[async_trait]
 impl WebuiAuthenticator for EnvBearerAuthenticator {
-    async fn authenticate(&self, candidate: &str) -> Option<UserId> {
+    async fn authenticate(
+        &self,
+        candidate: &str,
+    ) -> Option<ironclaw_reborn_composition::WebuiAuthentication> {
         // Constant-time comparison so an attacker cannot use response
         // timing to learn the prefix of the configured token. Both
         // operands are coerced to `&[u8]` of the same length to make
@@ -171,10 +192,16 @@ impl WebuiAuthenticator for EnvBearerAuthenticator {
         let expected = self.token.expose_secret().as_bytes();
         let candidate = candidate.as_bytes();
         if expected.ct_eq(candidate).into() {
-            Some(self.user_id.clone())
+            Some(ironclaw_reborn_composition::WebuiAuthentication::operator(
+                self.user_id.clone(),
+            ))
         } else {
             None
         }
+    }
+
+    fn mounts_operator_webui_config_routes(&self) -> bool {
+        true
     }
 }
 
@@ -195,7 +222,16 @@ mod tests {
         )
         .expect("auth");
         let result = auth.authenticate("right-token").await;
-        assert_eq!(result.as_ref().map(|u| u.as_str()), Some("user-alpha"));
+        assert_eq!(
+            result.as_ref().map(|auth| auth.user_id.as_str()),
+            Some("user-alpha")
+        );
+        assert_eq!(
+            result
+                .as_ref()
+                .map(|auth| auth.capabilities.operator_webui_config),
+            Some(true)
+        );
     }
 
     #[tokio::test]

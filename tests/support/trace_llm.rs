@@ -723,6 +723,7 @@ impl LlmProvider for TraceLlm {
                         input_tokens,
                         output_tokens,
                         finish_reason: FinishReason::Stop,
+                        reasoning: None,
                         cache_read_input_tokens: 0,
                         cache_creation_input_tokens: 0,
                     });
@@ -777,6 +778,7 @@ impl LlmProvider for TraceLlm {
                         arguments: tc.arguments,
                         reasoning: None,
                         signature: None,
+                        arguments_parse_error: None,
                     })
                     .collect();
                 Ok(ToolCompletionResponse {

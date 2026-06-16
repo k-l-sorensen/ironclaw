@@ -13,6 +13,7 @@ use super::instruction_bundle::{
 };
 use super::milestones::LoopHostMilestoneEmitter;
 use super::milestones::LoopHostMilestoneSink;
+use super::runtime_context::LoopRuntimeContext;
 
 const DEFAULT_TEXT_ONLY_MESSAGE_LIMIT: usize = 32;
 const MAX_TEXT_ONLY_MESSAGE_LIMIT: usize = 128;
@@ -45,6 +46,7 @@ where
     current_surface_version: Option<Arc<CurrentSurfaceVersionLookup>>,
     current_surface: Option<Arc<CurrentSurfaceLookup>>,
     safety_context: Option<InstructionSafetyContext>,
+    runtime_context: Option<LoopRuntimeContext>,
     instruction_materialization_store: Option<Arc<dyn InstructionMaterializationStore>>,
 }
 
@@ -63,6 +65,7 @@ where
             current_surface_version: None,
             current_surface: None,
             safety_context: None,
+            runtime_context: None,
             instruction_materialization_store: None,
         }
     }
@@ -128,6 +131,11 @@ where
         self
     }
 
+    pub fn with_runtime_context(mut self, runtime_context: LoopRuntimeContext) -> Self {
+        self.runtime_context = Some(runtime_context);
+        self
+    }
+
     pub fn with_instruction_materialization_store(
         mut self,
         store: Arc<dyn InstructionMaterializationStore>,
@@ -144,13 +152,6 @@ where
             return Err(AgentLoopHostError::new(
                 AgentLoopHostErrorKind::PolicyDenied,
                 "prompt mode is not supported by the text-only prompt port",
-            ));
-        }
-
-        if !request.inline_messages.is_empty() {
-            return Err(AgentLoopHostError::new(
-                AgentLoopHostErrorKind::PolicyDenied,
-                "inline_messages not yet supported by this prompt builder",
             ));
         }
 
@@ -240,6 +241,12 @@ where
         request: LoopPromptBundleRequest,
     ) -> Result<LoopPromptBundle, AgentLoopHostError> {
         self.validate_request(&request)?;
+        if self.runtime_context.is_some() && self.instruction_materialization_store.is_none() {
+            return Err(AgentLoopHostError::new(
+                AgentLoopHostErrorKind::InvalidInvocation,
+                "instruction materialization store is required for this prompt bundle",
+            ));
+        }
         let context = self
             .context_port
             .load_loop_context(LoopContextRequest {
@@ -272,10 +279,21 @@ where
         } else {
             None
         };
+        let compaction_message_index = if context.compaction_message_index.is_empty() {
+            context
+                .messages
+                .iter()
+                .filter_map(|message| message.compaction.clone())
+                .collect::<Vec<_>>()
+        } else {
+            context.compaction_message_index.clone()
+        };
         let instruction_bundle = self.instruction_builder().build(InstructionBundleRequest {
             context_bundle: context,
             visible_surface,
             safety_context: self.safety_context.clone(),
+            inline_messages: request.inline_messages.clone(),
+            runtime_context: self.runtime_context.clone(),
         })?;
         if let Some(store) = self.instruction_materialization_store.as_ref() {
             store.put_materialized_messages(
@@ -292,6 +310,7 @@ where
             bundle_ref: LoopPromptBundleRef::fresh_for_run(&self.context),
             messages: instruction_bundle.messages,
             surface_version: request.surface_version.clone(),
+            compaction_message_index,
             instruction_fingerprint: Some(instruction_bundle.fingerprint),
             identity_message_count,
             instruction_snippet_count,
@@ -315,14 +334,16 @@ mod tests {
     use std::sync::Arc;
 
     use async_trait::async_trait;
+    use chrono::TimeZone;
     use ironclaw_host_api::{AgentId, ProjectId, TenantId, ThreadId};
 
     use super::*;
     use crate::{
-        RunProfileId, RunProfileVersion, TurnId, TurnRunId, TurnScope,
+        LoopMessageRef, RunProfileId, RunProfileVersion, TurnId, TurnRunId, TurnScope,
         run_profile::{
             InMemoryInstructionMaterializationStore, InMemoryLoopHostMilestoneSink,
-            LoopContextBundle, LoopContextMessage, LoopInlineMessage, LoopInlineMessageRole,
+            LoopContextBundle, LoopContextCompactionKind, LoopContextCompactionMetadata,
+            LoopContextMessage, LoopInlineMessage, LoopInlineMessageRole, LoopRuntimeContext,
             LoopSafeSummary, ResolvedRunProfile,
         },
     };
@@ -335,20 +356,22 @@ mod tests {
             &self,
             _request: LoopContextRequest,
         ) -> Result<LoopContextBundle, AgentLoopHostError> {
-            panic!("inline message guard should run before context loading")
+            Ok(LoopContextBundle::default())
         }
     }
 
     #[tokio::test]
-    async fn host_managed_prompt_port_rejects_inline_messages() {
+    async fn host_managed_prompt_port_materializes_inline_messages() {
         let context = test_context();
+        let store = Arc::new(InMemoryInstructionMaterializationStore::default());
         let port = HostManagedLoopPromptPort::new(
-            context,
+            context.clone(),
             Arc::new(PanicContextPort),
             Arc::new(InMemoryLoopHostMilestoneSink::default()),
-        );
+        )
+        .with_instruction_materialization_store(store.clone());
 
-        let error = port
+        let bundle = port
             .build_prompt_bundle(LoopPromptBundleRequest {
                 mode: PromptMode::TextOnly,
                 context_cursor: None,
@@ -362,13 +385,15 @@ mod tests {
                 }],
             })
             .await
-            .unwrap_err();
+            .unwrap();
 
-        assert_eq!(error.kind, AgentLoopHostErrorKind::PolicyDenied);
-        assert_eq!(
-            error.safe_summary,
-            "inline_messages not yet supported by this prompt builder"
-        );
+        let inline_ref = &bundle.messages[0].content_ref;
+        let materialized = store
+            .get_materialized_message(&context, inline_ref)
+            .unwrap()
+            .expect("inline message should materialize");
+        assert_eq!(materialized.role, "user");
+        assert_eq!(materialized.model_content, "safe inline nudge");
     }
 
     /// A context port that returns configurable identity and body messages.
@@ -398,6 +423,7 @@ mod tests {
             Ok(LoopContextBundle {
                 identity_messages: self.identity_messages.clone(),
                 messages: self.messages.clone(),
+                compaction_message_index: Vec::new(),
                 instruction_snippets: vec![],
                 memory_snippets: vec![],
             })
@@ -415,6 +441,7 @@ mod tests {
             message_ref: None,
             role: "system".to_string(),
             safe_summary: summary_text.to_string(),
+            compaction: None,
         };
         let store = Arc::new(InMemoryInstructionMaterializationStore::default());
         let port = HostManagedLoopPromptPort::new(
@@ -455,7 +482,7 @@ mod tests {
             .get_materialized_message(&context, &msg.content_ref)
             .unwrap()
             .expect("summary-only identity message should be materialized");
-        assert_eq!(materialized.safe_content, summary_text);
+        assert_eq!(materialized.model_content, summary_text);
     }
 
     /// A summary-only entry in the main messages list (not just identity_messages)
@@ -467,6 +494,7 @@ mod tests {
             message_ref: None,
             role: "user".to_string(),
             safe_summary: "What is the capital of France?".to_string(),
+            compaction: None,
         };
         let store = Arc::new(InMemoryInstructionMaterializationStore::default());
         let port = HostManagedLoopPromptPort::new(
@@ -505,7 +533,167 @@ mod tests {
             .get_materialized_message(&context, &bundle.messages[0].content_ref)
             .unwrap()
             .expect("summary-only body message should be materialized");
-        assert_eq!(materialized.safe_content, "What is the capital of France?");
+        assert_eq!(materialized.model_content, "What is the capital of France?");
+    }
+
+    #[tokio::test]
+    async fn host_managed_prompt_port_preserves_compaction_message_index() {
+        let context = test_context();
+        let compaction = LoopContextCompactionMetadata {
+            sequence: 7,
+            kind: LoopContextCompactionKind::User,
+            estimated_tokens: 13,
+        };
+        let message = LoopContextMessage {
+            message_ref: Some(LoopMessageRef::new("msg:compaction-source").unwrap()),
+            role: "user".to_string(),
+            safe_summary: "visible message".to_string(),
+            compaction: Some(compaction.clone()),
+        };
+        let port = HostManagedLoopPromptPort::new(
+            context,
+            Arc::new(StubContextPort::new(vec![], vec![message])),
+            Arc::new(InMemoryLoopHostMilestoneSink::default()),
+        );
+
+        let bundle = port
+            .build_prompt_bundle(LoopPromptBundleRequest {
+                mode: PromptMode::TextOnly,
+                context_cursor: None,
+                surface_version: None,
+                checkpoint_state_ref: None,
+                max_messages: Some(8),
+                capability_view: None,
+                inline_messages: vec![],
+            })
+            .await
+            .expect("bundle should preserve compaction metadata");
+
+        assert_eq!(bundle.compaction_message_index, vec![compaction]);
+    }
+
+    #[tokio::test]
+    async fn prompt_port_attaches_runtime_context() {
+        let context = test_context();
+        let store = Arc::new(InMemoryInstructionMaterializationStore::default());
+        let runtime_ctx = LoopRuntimeContext {
+            loop_started_at_utc: chrono::Utc
+                .with_ymd_and_hms(2026, 6, 11, 21, 32, 0)
+                .unwrap(),
+            user_timezone: None,
+            communication: None,
+            product_context: None,
+        };
+
+        let port_with = HostManagedLoopPromptPort::new(
+            context.clone(),
+            Arc::new(PanicContextPort),
+            Arc::new(InMemoryLoopHostMilestoneSink::default()),
+        )
+        .with_runtime_context(runtime_ctx)
+        .with_instruction_materialization_store(store.clone());
+
+        let bundle_with = port_with
+            .build_prompt_bundle(LoopPromptBundleRequest {
+                mode: PromptMode::TextOnly,
+                context_cursor: None,
+                surface_version: None,
+                checkpoint_state_ref: None,
+                max_messages: Some(8),
+                capability_view: None,
+                inline_messages: vec![],
+            })
+            .await
+            .unwrap();
+
+        let runtime_msg = store
+            .get_materialized_message(
+                &context,
+                &bundle_with
+                    .messages
+                    .iter()
+                    .find(|m| m.content_ref.as_str().starts_with("msg:runtime."))
+                    .expect("runtime message must exist in bundle with context")
+                    .content_ref,
+            )
+            .unwrap()
+            .expect("runtime message must materialize");
+        assert!(
+            runtime_msg
+                .model_content
+                .contains("Current date/time at loop start:"),
+            "model_content: {}",
+            runtime_msg.model_content
+        );
+
+        let port_without = HostManagedLoopPromptPort::new(
+            context.clone(),
+            Arc::new(PanicContextPort),
+            Arc::new(InMemoryLoopHostMilestoneSink::default()),
+        );
+
+        let bundle_without = port_without
+            .build_prompt_bundle(LoopPromptBundleRequest {
+                mode: PromptMode::TextOnly,
+                context_cursor: None,
+                surface_version: None,
+                checkpoint_state_ref: None,
+                max_messages: Some(8),
+                capability_view: None,
+                inline_messages: vec![],
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !bundle_without
+                .messages
+                .iter()
+                .any(|m| m.content_ref.as_str().starts_with("msg:runtime.")),
+            "no runtime section message should appear when runtime_context is not set"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_port_with_runtime_context_without_store_is_invalid_invocation() {
+        let context = test_context();
+        let runtime_ctx = LoopRuntimeContext {
+            loop_started_at_utc: chrono::Utc
+                .with_ymd_and_hms(2026, 6, 11, 21, 32, 0)
+                .unwrap(),
+            user_timezone: None,
+            communication: None,
+            product_context: None,
+        };
+
+        let port = HostManagedLoopPromptPort::new(
+            context,
+            Arc::new(PanicContextPort),
+            Arc::new(InMemoryLoopHostMilestoneSink::default()),
+        )
+        .with_runtime_context(runtime_ctx);
+
+        let result = port
+            .build_prompt_bundle(LoopPromptBundleRequest {
+                mode: PromptMode::TextOnly,
+                context_cursor: None,
+                surface_version: None,
+                checkpoint_state_ref: None,
+                max_messages: Some(8),
+                capability_view: None,
+                inline_messages: vec![],
+            })
+            .await;
+
+        let err = result.expect_err(
+            "building a prompt bundle with runtime_context but no materialization store must fail",
+        );
+        assert_eq!(
+            err.kind,
+            AgentLoopHostErrorKind::InvalidInvocation,
+            "expected InvalidInvocation, got {:?}",
+            err.kind
+        );
     }
 
     fn test_context() -> LoopRunContext {

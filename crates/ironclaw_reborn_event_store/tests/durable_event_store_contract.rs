@@ -219,6 +219,46 @@ async fn jsonl_runtime_log_survives_rebuild_and_preserves_filtered_cursor_semant
 }
 
 #[tokio::test]
+async fn jsonl_runtime_log_replays_host_written_privileged_runtime_kind() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let stores = build_reborn_event_stores(
+        RebornProfile::LocalDev,
+        RebornEventStoreConfig::Jsonl {
+            root: temp.path().join("event-store"),
+            accept_single_node_durable: false,
+        },
+    )
+    .await
+    .expect("jsonl stores");
+    let scope = scope_for("alice", "project-a");
+    let stream = EventStreamKey::from_scope(&scope);
+
+    stores
+        .events
+        .append(RuntimeEvent::dispatch_succeeded(
+            scope,
+            capability_id(),
+            extension_id(),
+            RuntimeKind::FirstParty,
+            7,
+        ))
+        .await
+        .expect("append host runtime event");
+
+    let replay = stores
+        .events
+        .read_after_cursor(&stream, &ReadScope::any(), None, 10)
+        .await
+        .expect("trusted runtime replay");
+
+    assert_eq!(replay.entries.len(), 1);
+    assert_eq!(
+        replay.entries[0].record.runtime,
+        Some(RuntimeKind::FirstParty)
+    );
+}
+
+#[tokio::test]
 async fn jsonl_runtime_log_rejects_zero_limit_and_foreign_future_cursor() {
     let temp = tempfile::tempdir().expect("tempdir");
     let stores = build_reborn_event_stores(
@@ -439,6 +479,7 @@ async fn postgres_replay_advances_next_cursor_past_trailing_filtered_records() {
         RebornProfile::Production,
         RebornEventStoreConfig::Postgres {
             url: SecretString::new(url.into_boxed_str()),
+            tls_options: Default::default(),
         },
     )
     .await
@@ -501,6 +542,7 @@ async fn postgres_runtime_and_audit_logs_survive_rebuild_with_filtered_cursor_se
         RebornProfile::Production,
         RebornEventStoreConfig::Postgres {
             url: SecretString::new(url.clone().into_boxed_str()),
+            tls_options: Default::default(),
         },
     )
     .await
@@ -549,6 +591,7 @@ async fn postgres_runtime_and_audit_logs_survive_rebuild_with_filtered_cursor_se
         RebornProfile::Production,
         RebornEventStoreConfig::Postgres {
             url: SecretString::new(url.into_boxed_str()),
+            tls_options: Default::default(),
         },
     )
     .await
