@@ -227,7 +227,9 @@ A trigger fire is synthetic inbound, not a parallel agent loop.
   trigger-domain crates must not own the access policy. Until that request
   is backed by the real agent/project access source of truth, a normal
   runtime must fail closed instead of enabling the trigger poller with the
-  tenant-scope placeholder.
+  tenant-scope placeholder. Single-operator `serve` deployments may satisfy
+  the contract with exact trusted host configuration when the authenticated
+  WebUI user is also the runtime owner.
 - Local-dev `run` and `serve` may satisfy that contract by seeding active
   access rows from trusted operator configuration at boot. `run` reconciles the
   configured CLI owner for its tenant/agent/no-project scope because the generic
@@ -243,6 +245,13 @@ A trigger fire is synthetic inbound, not a parallel agent loop.
   reactivated. The seeded row is exact
   `tenant_id`/`creator_user_id`/`agent_id`/`project_id` access; a missing
   project is not a wildcard.
+- Production `serve` with env-bearer WebUI auth may satisfy that contract by
+  wiring an exact secure-tenant checker over the trusted host tenant, the
+  authenticated WebUI user/runtime owner, the default agent, and the optional
+  default project. This checker is not a multi-tenant membership source of
+  truth; it intentionally authorizes only the configured single-operator scope
+  and denies any trigger persisted for another tenant, creator, agent, or
+  project.
 - The trusted inbound request is a host-owned synthetic inbound shape around the ordinary inbound fields. It carries only ingress identity and turn scope data needed to create the canonical turn, and it has no adapter-supplied requested-scope hints before binding resolution.
 - It must not encode delivery targets, notification targets, or any other outbound routing policy.
 

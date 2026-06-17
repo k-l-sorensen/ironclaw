@@ -12,9 +12,11 @@ use ironclaw_reborn_composition::build_webui_services;
 use ironclaw_reborn_composition::host_api::{AgentId, ProjectId, TenantId, UserId};
 use ironclaw_reborn_composition::{
     GoogleOAuthRouteConfig, LocalTriggerAccessReconciliation, LocalTriggerAccessRole,
-    LocalTriggerAccessSource, RebornBuildInput, RebornReadiness, RebornRuntimeIdentity,
-    RebornRuntimeInput, RebornWebuiBundle, WebuiAuthenticator, WebuiServeConfig,
-    build_reborn_runtime, open_local_trigger_access_store, webui_v2_app_with_lifecycle,
+    LocalTriggerAccessSource, RebornBuildInput, RebornCompositionProfile, RebornReadiness,
+    RebornRuntimeIdentity, RebornRuntimeInput, RebornWebuiBundle, TriggerFireAccessCheck,
+    TriggerFireAccessChecker, TriggerFireAccessDecision, TriggerFireAccessError,
+    WebuiAuthenticator, WebuiServeConfig, build_reborn_runtime, open_local_trigger_access_store,
+    webui_v2_app_with_lifecycle,
 };
 #[cfg(feature = "slack-v2-host-beta")]
 use ironclaw_reborn_composition::{
@@ -344,7 +346,7 @@ impl ServeCommand {
             .context("failed to build tokio runtime for `serve`")?;
 
         rt.block_on(async move {
-            runtime_input = with_local_trigger_fire_access_checker(
+            runtime_input = with_serve_trigger_fire_access_checker(
                 runtime_input,
                 &user_store_path,
                 &tenant_id,
@@ -687,6 +689,108 @@ async fn with_local_trigger_fire_access_checker(
     Ok(runtime_input.with_trigger_fire_access_checker(access_store))
 }
 
+async fn with_serve_trigger_fire_access_checker(
+    runtime_input: RebornRuntimeInput,
+    user_store_path: &std::path::Path,
+    tenant_id: &TenantId,
+    user_id: &UserId,
+    default_agent_id: &AgentId,
+    default_project_id: Option<&ProjectId>,
+) -> anyhow::Result<RebornRuntimeInput> {
+    if !runtime_input.trigger_poller.enabled {
+        return Ok(runtime_input);
+    }
+
+    match runtime_input
+        .services
+        .as_ref()
+        .map(|services| services.profile())
+    {
+        Some(RebornCompositionProfile::LocalDev | RebornCompositionProfile::LocalDevYolo) => {
+            with_local_trigger_fire_access_checker(
+                runtime_input,
+                user_store_path,
+                tenant_id,
+                user_id,
+                default_agent_id,
+                default_project_id,
+            )
+            .await
+        }
+        Some(RebornCompositionProfile::Production) => Ok(runtime_input
+            .with_trigger_fire_access_checker(Arc::new(
+                SecureTenantTriggerFireAccessChecker::new(
+                    tenant_id.clone(),
+                    user_id.clone(),
+                    default_agent_id.clone(),
+                    default_project_id.cloned(),
+                ),
+            ))),
+        Some(RebornCompositionProfile::MigrationDryRun | RebornCompositionProfile::Disabled)
+        | None => Ok(runtime_input),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SecureTenantTriggerFireAccessChecker {
+    tenant_id: TenantId,
+    owner_user_id: UserId,
+    default_agent_id: AgentId,
+    default_project_id: Option<ProjectId>,
+}
+
+impl SecureTenantTriggerFireAccessChecker {
+    fn new(
+        tenant_id: TenantId,
+        owner_user_id: UserId,
+        default_agent_id: AgentId,
+        default_project_id: Option<ProjectId>,
+    ) -> Self {
+        Self {
+            tenant_id,
+            owner_user_id,
+            default_agent_id,
+            default_project_id,
+        }
+    }
+
+    fn deny(reason: impl Into<String>) -> TriggerFireAccessDecision {
+        TriggerFireAccessDecision::Denied {
+            reason: reason.into(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl TriggerFireAccessChecker for SecureTenantTriggerFireAccessChecker {
+    async fn check_trigger_fire_access(
+        &self,
+        request: TriggerFireAccessCheck,
+    ) -> Result<TriggerFireAccessDecision, TriggerFireAccessError> {
+        if request.tenant_id != self.tenant_id {
+            return Ok(Self::deny(
+                "trigger tenant does not match the WebChat v2 tenant",
+            ));
+        }
+        if request.creator_user_id != self.owner_user_id {
+            return Ok(Self::deny(
+                "trigger creator does not match the authenticated WebChat v2 user",
+            ));
+        }
+        if request.agent_id.as_ref() != Some(&self.default_agent_id) {
+            return Ok(Self::deny(
+                "trigger agent does not match the WebChat v2 default agent",
+            ));
+        }
+        if request.project_id.as_ref() != self.default_project_id.as_ref() {
+            return Ok(Self::deny(
+                "trigger project does not match the WebChat v2 default project",
+            ));
+        }
+        Ok(TriggerFireAccessDecision::Allowed)
+    }
+}
+
 fn resolve_webui_default_agent(
     identity_section: Option<&IdentitySection>,
     runtime_identity: &RebornRuntimeIdentity,
@@ -830,6 +934,85 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("reborn-cli"), "message: {message}");
         assert!(message.contains("local-user"), "message: {message}");
+    }
+
+    #[tokio::test]
+    async fn secure_tenant_trigger_fire_checker_allows_exact_webui_scope() {
+        let tenant_id = TenantId::new("secure-tenant").expect("tenant");
+        let user_id = UserId::new("secure-user").expect("user");
+        let agent_id = AgentId::new("secure-agent").expect("agent");
+        let project_id = ProjectId::new("secure-project").expect("project");
+        let checker = SecureTenantTriggerFireAccessChecker::new(
+            tenant_id.clone(),
+            user_id.clone(),
+            agent_id.clone(),
+            Some(project_id.clone()),
+        );
+
+        let decision = checker
+            .check_trigger_fire_access(TriggerFireAccessCheck {
+                tenant_id,
+                creator_user_id: user_id,
+                agent_id: Some(agent_id),
+                project_id: Some(project_id),
+                trigger_id: ironclaw_reborn_composition::TriggerId::new(),
+                fire_slot: chrono::Utc::now(),
+            })
+            .await
+            .expect("check trigger fire access");
+
+        assert_eq!(decision, TriggerFireAccessDecision::Allowed);
+    }
+
+    #[tokio::test]
+    async fn secure_tenant_trigger_fire_checker_denies_scope_mismatch() {
+        let tenant_id = TenantId::new("secure-tenant").expect("tenant");
+        let user_id = UserId::new("secure-user").expect("user");
+        let agent_id = AgentId::new("secure-agent").expect("agent");
+        let project_id = ProjectId::new("secure-project").expect("project");
+        let checker = SecureTenantTriggerFireAccessChecker::new(
+            tenant_id.clone(),
+            user_id.clone(),
+            agent_id.clone(),
+            Some(project_id),
+        );
+
+        let other_user_decision = checker
+            .check_trigger_fire_access(TriggerFireAccessCheck {
+                tenant_id: tenant_id.clone(),
+                creator_user_id: UserId::new("other-user").expect("user"),
+                agent_id: Some(agent_id.clone()),
+                project_id: Some(ProjectId::new("secure-project").expect("project")),
+                trigger_id: ironclaw_reborn_composition::TriggerId::new(),
+                fire_slot: chrono::Utc::now(),
+            })
+            .await
+            .expect("check trigger fire access");
+        assert_eq!(
+            other_user_decision,
+            TriggerFireAccessDecision::Denied {
+                reason: "trigger creator does not match the authenticated WebChat v2 user"
+                    .to_string(),
+            }
+        );
+
+        let other_project_decision = checker
+            .check_trigger_fire_access(TriggerFireAccessCheck {
+                tenant_id,
+                creator_user_id: user_id,
+                agent_id: Some(agent_id),
+                project_id: Some(ProjectId::new("other-project").expect("project")),
+                trigger_id: ironclaw_reborn_composition::TriggerId::new(),
+                fire_slot: chrono::Utc::now(),
+            })
+            .await
+            .expect("check trigger fire access");
+        assert_eq!(
+            other_project_decision,
+            TriggerFireAccessDecision::Denied {
+                reason: "trigger project does not match the WebChat v2 default project".to_string(),
+            }
+        );
     }
 
     #[tokio::test]

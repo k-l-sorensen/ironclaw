@@ -30,8 +30,9 @@ use ironclaw_host_runtime::{
 use ironclaw_product_workflow::{WebUiAuthenticatedCaller, WebUiListAutomationsRequest};
 use ironclaw_reborn_composition::{
     RebornBuildInput, RebornCompositionProfile, RebornRuntimeIdentity, RebornRuntimeInput,
-    RebornRuntimeProcessBinding, build_reborn_runtime, build_webui_services,
-    builtin_first_party_trust_policy,
+    RebornRuntimeProcessBinding, TriggerFireAccessCheck, TriggerFireAccessChecker,
+    TriggerFireAccessDecision, TriggerFireAccessError, TriggerPollerSettings, build_reborn_runtime,
+    build_webui_services, builtin_first_party_trust_policy,
 };
 
 // ─── minimal sandbox transport stub ──────────────────────────────────────────
@@ -52,6 +53,19 @@ impl SandboxCommandTransport for RecordingSandboxTransport {
             sandboxed: true,
             duration: Duration::ZERO,
         })
+    }
+}
+
+#[derive(Debug)]
+struct AllowingTriggerFireAccessChecker;
+
+#[async_trait]
+impl TriggerFireAccessChecker for AllowingTriggerFireAccessChecker {
+    async fn check_trigger_fire_access(
+        &self,
+        _request: TriggerFireAccessCheck,
+    ) -> Result<TriggerFireAccessDecision, TriggerFireAccessError> {
+        Ok(TriggerFireAccessDecision::Allowed)
     }
 }
 
@@ -129,6 +143,65 @@ async fn production_runtime_webui_serves_automations_without_local_runtime() {
         result.automations.len(),
         0,
         "empty repository returns zero automations"
+    );
+
+    runtime.shutdown().await.expect("runtime shutdown");
+}
+
+/// Regression guard for hosted deployments that intentionally do not wire a
+/// shell/process backend. Production runtime trigger polling should start over
+/// durable trigger/conversation/turn stores without requiring local runtime
+/// services or a tenant sandbox process port.
+#[tokio::test]
+async fn production_runtime_starts_trigger_poller_without_process_backend() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(
+        libsql::Builder::new_local(dir.path().join("reborn.db"))
+            .build()
+            .await
+            .expect("libsql db"),
+    );
+
+    let input = RebornRuntimeInput::from_services(
+        RebornBuildInput::libsql(
+            RebornCompositionProfile::Production,
+            "runtime-trigger-prod-owner",
+            db,
+            dir.path().join("events.db").to_string_lossy(),
+            None,
+            ironclaw_secrets::SecretMaterial::from("01234567890123456789012345678901"),
+        )
+        .with_production_trust_policy(Arc::new(
+            builtin_first_party_trust_policy().expect("trust policy"),
+        ))
+        .with_runtime_policy(EffectiveRuntimePolicy {
+            deployment: DeploymentMode::HostedMultiTenant,
+            requested_profile: RuntimeProfile::SecureDefault,
+            resolved_profile: RuntimeProfile::SecureDefault,
+            filesystem_backend: FilesystemBackendKind::ScopedVirtual,
+            process_backend: ProcessBackendKind::None,
+            network_mode: NetworkMode::Deny,
+            secret_mode: SecretMode::BrokeredHandles,
+            approval_policy: ApprovalPolicy::AskAlways,
+            audit_mode: AuditMode::Standard,
+        }),
+    )
+    .with_identity(RebornRuntimeIdentity {
+        tenant_id: "runtime-trigger-prod-tenant".to_string(),
+        agent_id: "runtime-trigger-prod-agent".to_string(),
+        source_binding_id: "runtime-trigger-prod-source".to_string(),
+        reply_target_binding_id: "runtime-trigger-prod-reply".to_string(),
+    })
+    .with_trigger_poller_settings(TriggerPollerSettings::enabled())
+    .with_trigger_fire_access_checker(Arc::new(AllowingTriggerFireAccessChecker));
+
+    let runtime = build_reborn_runtime(input)
+        .await
+        .expect("production runtime builds with trigger poller");
+
+    assert!(
+        runtime.services().readiness.workers.trigger_poller,
+        "production trigger poller must start without process backend access"
     );
 
     runtime.shutdown().await.expect("runtime shutdown");

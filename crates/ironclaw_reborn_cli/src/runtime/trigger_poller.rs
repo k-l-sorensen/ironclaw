@@ -82,10 +82,11 @@ fn truncate_env_value_for_display(raw: &str) -> String {
 ///    absent here falls through to the compiled default.
 /// 3. Compiled default — `TriggerPollerSettings::default()` (all limits at the
 ///    `ironclaw_triggers` crate defaults). The `enabled` default depends on the
-///    caller/profile: local-dev `serve` enables the scheduler by default so
-///    automations actually run, while production and every other caller default
-///    to disabled. Config and env still override this (an env kill-switch wins),
-///    because this layer is applied first.
+///    caller/profile: `serve` enables the scheduler by default for profiles
+///    with runtime poller wiring (local-dev and production) so scheduled
+///    automations actually run, while every other caller defaults to disabled.
+///    Config and env still override this (an env kill-switch wins), because
+///    this layer is applied first.
 ///
 /// V1 invariant: `max_concurrent_fires_per_trigger` must be exactly 1. Passing
 /// any other value (via config or, were an env override ever added, env) returns
@@ -98,14 +99,13 @@ pub(super) fn trigger_poller_settings(
     caller: RuntimeInputCaller,
     profile: RebornProfile,
 ) -> anyhow::Result<TriggerPollerSettings> {
-    // Layer 3: compiled default. `enabled` is on by default for local-dev
-    // `serve` (so scheduled automations actually fire) and off everywhere
-    // else; production launch has no wired poller runtime yet.
+    // Layer 3: compiled default. `enabled` is on by default for runtime
+    // `serve` profiles that wire the trigger poller, and off everywhere else.
     let mut settings = TriggerPollerSettings::default();
     if caller == RuntimeInputCaller::Serve
         && matches!(
             profile,
-            RebornProfile::LocalDev | RebornProfile::LocalDevYolo
+            RebornProfile::LocalDev | RebornProfile::LocalDevYolo | RebornProfile::Production
         )
     {
         settings.enabled = true;
@@ -274,10 +274,10 @@ mod tests {
     }
 
     #[test]
-    fn trigger_poller_settings_production_serve_default_is_disabled() {
-        // Production launch does not currently wire the poller runtime. A bare
-        // production `serve` must therefore keep the poller off unless the
-        // operator explicitly opts into an unsupported config/env setting.
+    fn trigger_poller_settings_production_serve_default_is_enabled() {
+        // Production `serve` wires the poller through durable stores, so the
+        // compiled default should run scheduled automations without requiring
+        // an explicit [trigger_poller] section.
         let _lock = lock_trigger_env();
         let _enabled = EnvGuard::clear("IRONCLAW_TRIGGER_POLLER_ENABLED");
         let _interval = EnvGuard::clear("IRONCLAW_TRIGGER_POLLER_INTERVAL_SECS");
@@ -290,8 +290,8 @@ mod tests {
         .expect("production serve trigger poller settings");
 
         assert!(
-            !settings.enabled,
-            "production serve must not implicitly enable the scheduler"
+            settings.enabled,
+            "production serve must default the scheduler on"
         );
     }
 
@@ -314,9 +314,9 @@ mod tests {
 
     #[test]
     fn trigger_poller_settings_production_explicit_config_enabled_still_wins() {
-        // Keep layer precedence simple: production defaults are disabled, but an
-        // explicit operator enable remains visible so runtime composition can
-        // fail closed with the production-not-wired error.
+        // Keep layer precedence simple: explicit production config remains
+        // visible even though the compiled production serve default is already
+        // enabled.
         let _lock = lock_trigger_env();
         let _enabled = EnvGuard::clear("IRONCLAW_TRIGGER_POLLER_ENABLED");
         let _interval = EnvGuard::clear("IRONCLAW_TRIGGER_POLLER_INTERVAL_SECS");
@@ -335,7 +335,7 @@ mod tests {
 
         assert!(
             settings.enabled,
-            "explicit production config must override the disabled default"
+            "explicit production config must preserve the enabled setting"
         );
     }
 

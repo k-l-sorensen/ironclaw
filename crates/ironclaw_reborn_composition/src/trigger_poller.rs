@@ -311,20 +311,20 @@ pub(crate) trait TriggerTurnSnapshotSource: Send + Sync {
     async fn snapshot(&self) -> Result<TurnPersistenceSnapshot, TriggerError>;
 }
 
-pub(crate) struct LocalTriggerTurnSnapshotSource<S> {
+pub(crate) struct TriggerTurnStateSnapshotSource<S> {
     store: Arc<S>,
 }
 
-impl<S> LocalTriggerTurnSnapshotSource<S> {
+impl<S> TriggerTurnStateSnapshotSource<S> {
     pub(crate) fn new(store: Arc<S>) -> Self {
         Self { store }
     }
 }
 
-#[cfg(feature = "libsql")]
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 #[async_trait]
 impl<F> TriggerTurnSnapshotSource
-    for LocalTriggerTurnSnapshotSource<ironclaw_turns::FilesystemTurnStateStore<F>>
+    for TriggerTurnStateSnapshotSource<ironclaw_turns::FilesystemTurnStateStore<F>>
 where
     F: ironclaw_filesystem::RootFilesystem + Send + Sync + 'static,
 {
@@ -339,14 +339,14 @@ where
 #[cfg(not(feature = "libsql"))]
 #[async_trait]
 impl TriggerTurnSnapshotSource
-    for LocalTriggerTurnSnapshotSource<ironclaw_turns::InMemoryTurnStateStore>
+    for TriggerTurnStateSnapshotSource<ironclaw_turns::InMemoryTurnStateStore>
 {
     async fn snapshot(&self) -> Result<TurnPersistenceSnapshot, TriggerError> {
         Ok(self.store.persistence_snapshot())
     }
 }
 
-#[cfg(feature = "libsql")]
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 fn trigger_backend_error(error: impl std::fmt::Display) -> TriggerError {
     TriggerError::Backend {
         reason: error.to_string(),

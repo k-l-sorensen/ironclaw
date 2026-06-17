@@ -111,8 +111,8 @@ use crate::runtime_input::{
 use crate::trigger_poller::TenantScopedTrustedTriggerFireAuthorizer;
 use crate::trigger_poller::{
     AccessCheckerTriggerFireAuthorizer, ConversationContentRefMaterializer,
-    LocalTriggerTurnSnapshotSource, SnapshotActiveRunLookup, TRIGGER_POLLER_SHUTDOWN_TIMEOUT,
-    TriggerPollerCompositionDeps, TriggerPollerRuntimeHandle, TriggerTurnSnapshotSource,
+    SnapshotActiveRunLookup, TRIGGER_POLLER_SHUTDOWN_TIMEOUT, TriggerPollerCompositionDeps,
+    TriggerPollerRuntimeHandle, TriggerTurnSnapshotSource, TriggerTurnStateSnapshotSource,
     spawn_trigger_poller,
 };
 use crate::{
@@ -161,6 +161,7 @@ struct RuntimeStoreParts<'a> {
     broadcast_budget_event_sink: Arc<ironclaw_resources::BroadcastBudgetEventSink>,
     subagent_goal_store: Arc<dyn RuntimeSubagentGoalStore>,
     trigger_repository: Option<Arc<dyn ironclaw_triggers::TriggerRepository>>,
+    trigger_turn_snapshot_source: Arc<dyn TriggerTurnSnapshotSource>,
 }
 
 fn local_runtime_parts(
@@ -187,6 +188,9 @@ fn local_runtime_parts(
         broadcast_budget_event_sink: Arc::clone(&local_runtime.broadcast_budget_event_sink),
         subagent_goal_store,
         trigger_repository: Some(Arc::clone(&local_runtime.trigger_repository)),
+        trigger_turn_snapshot_source: Arc::new(TriggerTurnStateSnapshotSource::new(Arc::clone(
+            &local_runtime.turn_state,
+        ))),
     }
 }
 
@@ -213,6 +217,9 @@ where
             &graph.scoped_filesystem,
         ))) as Arc<dyn RuntimeSubagentGoalStore>,
         trigger_repository: Some(Arc::clone(&graph.trigger_repository)),
+        trigger_turn_snapshot_source: Arc::new(TriggerTurnStateSnapshotSource::new(Arc::clone(
+            &graph.turn_state,
+        ))),
     }
 }
 
@@ -550,6 +557,51 @@ async fn build_trigger_poller_services(
     }
 }
 
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+async fn build_production_trigger_poller_services(
+    production_runtime: Option<&crate::factory::RebornProductionRuntimeServices>,
+    turn_coordinator: Arc<dyn TurnCoordinator>,
+    thread_service: Arc<dyn SessionThreadService>,
+    authorizer_config: TriggerPollerAuthorizerConfig,
+    access_checker: Option<Arc<dyn crate::runtime_input::TriggerFireAccessChecker>>,
+    tenant_id: TenantId,
+    default_agent_id: AgentId,
+) -> Result<TriggerPollerServices, RebornRuntimeError> {
+    let production_runtime =
+        production_runtime.ok_or_else(|| RebornRuntimeError::InvalidArgument {
+            reason: "trigger poller requires production runtime services".to_string(),
+        })?;
+    let authorizer = build_trigger_fire_authorizer(authorizer_config, access_checker, tenant_id)?;
+    let conversations = production_runtime
+        .durable_trigger_conversation_services()
+        .await
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("trigger conversation services unavailable: {error}"),
+        })?;
+    #[cfg(any(test, feature = "test-support"))]
+    let pairing_service: Arc<dyn ironclaw_conversations::ConversationActorPairingService> =
+        Arc::new(conversations.clone());
+    let TriggerPollerServicesInner {
+        materializer,
+        trusted_submitter,
+    } = build_trigger_poller_services_from_conversation_services(
+        conversations.clone(),
+        conversations,
+        turn_coordinator,
+        thread_service,
+        default_agent_id,
+        authorizer,
+    );
+    Ok(TriggerPollerServices {
+        materializer,
+        trusted_submitter,
+        #[cfg(feature = "slack-v2-host-beta")]
+        post_submit_hook_slot: Arc::new(std::sync::OnceLock::new()),
+        #[cfg(any(test, feature = "test-support"))]
+        pairing_service,
+    })
+}
+
 fn trigger_poller_authorization_required_error() -> RebornRuntimeError {
     RebornRuntimeError::InvalidArgument {
         reason: "trigger poller cannot be enabled without a fire-time creator access checker"
@@ -630,10 +682,8 @@ where
 }
 
 fn build_trigger_active_run_lookup(
-    turn_state_store: Arc<LocalDevTurnStateStore>,
+    snapshot_source: Arc<dyn TriggerTurnSnapshotSource>,
 ) -> Arc<dyn ironclaw_triggers::TriggerActiveRunLookup> {
-    let snapshot_source: Arc<dyn TriggerTurnSnapshotSource> =
-        Arc::new(LocalTriggerTurnSnapshotSource::new(turn_state_store));
     Arc::new(SnapshotActiveRunLookup::new(snapshot_source))
 }
 
@@ -2238,7 +2288,8 @@ pub async fn build_reborn_runtime(
         budget_gate_store,
         broadcast_budget_event_sink,
         subagent_goal_store,
-        trigger_repository: _trigger_repository,
+        trigger_repository,
+        trigger_turn_snapshot_source,
     } = runtime_parts;
     let (skill_context_source, skill_activation_source, skill_execution_adapter) =
         match (configured_skill_context_source, local_runtime) {
@@ -2832,25 +2883,51 @@ pub async fn build_reborn_runtime(
         Arc<dyn ironclaw_conversations::ConversationActorPairingService>,
     >;
     if trigger_poller.enabled {
-        let local_runtime = local_runtime.ok_or(RebornRuntimeError::InvalidArgument {
-            reason: "trigger poller is not wired for production runtime launch".to_string(),
-        })?;
+        let trigger_repository =
+            trigger_repository.ok_or_else(|| RebornRuntimeError::InvalidArgument {
+                reason: "trigger poller requires a trigger repository".to_string(),
+            })?;
         validate_trigger_poller_authorization(
             &trigger_poller,
             trigger_fire_access_checker.as_ref(),
         )?;
-        let trigger_poller_services = build_trigger_poller_services(
-            local_runtime,
-            Arc::clone(&planned_turn_coordinator),
-            Arc::clone(&thread_service),
-            trigger_poller.authorizer,
-            trigger_fire_access_checker.clone(),
-            thread_scope.tenant_id.clone(),
-            validated_identity.agent_id.clone(),
-        )
-        .await?;
+        let trigger_poller_services = match local_runtime {
+            Some(local_runtime) => {
+                build_trigger_poller_services(
+                    local_runtime,
+                    Arc::clone(&planned_turn_coordinator),
+                    Arc::clone(&thread_service),
+                    trigger_poller.authorizer,
+                    trigger_fire_access_checker.clone(),
+                    thread_scope.tenant_id.clone(),
+                    validated_identity.agent_id.clone(),
+                )
+                .await?
+            }
+            None => {
+                #[cfg(any(feature = "libsql", feature = "postgres"))]
+                {
+                    build_production_trigger_poller_services(
+                        services.production_runtime.as_ref(),
+                        Arc::clone(&planned_turn_coordinator),
+                        Arc::clone(&thread_service),
+                        trigger_poller.authorizer,
+                        trigger_fire_access_checker.clone(),
+                        thread_scope.tenant_id.clone(),
+                        validated_identity.agent_id.clone(),
+                    )
+                    .await?
+                }
+                #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+                {
+                    return Err(RebornRuntimeError::InvalidArgument {
+                        reason: "trigger poller requires durable production storage".to_string(),
+                    });
+                }
+            }
+        };
         let active_run_lookup =
-            build_trigger_active_run_lookup(Arc::clone(&local_runtime.turn_state));
+            build_trigger_active_run_lookup(Arc::clone(&trigger_turn_snapshot_source));
         #[cfg(any(test, feature = "test-support"))]
         {
             trigger_conversation_pairing_value =
@@ -2865,7 +2942,7 @@ pub async fn build_reborn_runtime(
         trigger_poller_handle = spawn_trigger_poller(
             trigger_poller,
             TriggerPollerCompositionDeps {
-                repository: Arc::clone(&local_runtime.trigger_repository),
+                repository: trigger_repository,
                 materializer: trigger_poller_services.materializer,
                 trusted_submitter: trigger_poller_services.trusted_submitter,
                 active_run_lookup,

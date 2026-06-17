@@ -547,6 +547,23 @@ impl RebornProductionRuntimeServices {
             Self::Postgres(graph) => Arc::clone(&graph.trigger_repository),
         }
     }
+
+    pub(crate) async fn durable_trigger_conversation_services(
+        &self,
+    ) -> Result<RebornFilesystemConversationServices, InboundTurnError> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => {
+                RebornFilesystemConversationServices::new(Arc::clone(&graph.scoped_filesystem))
+                    .await
+            }
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => {
+                RebornFilesystemConversationServices::new(Arc::clone(&graph.scoped_filesystem))
+                    .await
+            }
+        }
+    }
 }
 
 #[cfg(any(feature = "libsql", feature = "postgres"))]
