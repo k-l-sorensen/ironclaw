@@ -291,11 +291,7 @@ pub fn upload_file(
     let response = host::http_request("POST", &url, &headers, Some(body.as_bytes()), None)?;
 
     if response.status < 200 || response.status >= 300 {
-        let body_text = String::from_utf8_lossy(&response.body);
-        return Err(format!(
-            "Upload failed with status {}: {}",
-            response.status, body_text
-        ));
+        return Err(api_status_error("Drive", response.status, &response.body));
     }
 
     let parsed: serde_json::Value = serde_json::from_str(

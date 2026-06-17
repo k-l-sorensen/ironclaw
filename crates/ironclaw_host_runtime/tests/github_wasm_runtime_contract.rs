@@ -420,6 +420,67 @@ async fn host_runtime_services_maps_google_drive_wasm_401_to_auth_required() {
 }
 
 #[tokio::test]
+async fn host_runtime_services_maps_google_drive_upload_wasm_401_to_auth_required() {
+    let capability_id = CapabilityId::new("google-drive.upload_file").unwrap();
+    let scope = sample_scope(InvocationId::new());
+    let policy = google_drive_policy();
+    let network = RecordingNetworkHttpEgress::with_status_body(
+        401,
+        br#"{"error":{"status":"UNAUTHENTICATED","message":"Invalid Credentials"}}"#.to_vec(),
+    );
+    let secret_store = Arc::new(InMemorySecretStore::new());
+    let account_access_secret = SecretHandle::new("google_drive_upload_access").unwrap();
+    let required_scopes = vec!["https://www.googleapis.com/auth/drive".to_string()];
+    let services = google_wasm_services_for_test!(
+        "google-drive",
+        policy.clone(),
+        network.clone(),
+        Arc::clone(&secret_store),
+        account_access_secret.clone(),
+        required_scopes,
+    );
+    secret_store
+        .put(
+            scope.clone(),
+            account_access_secret,
+            SecretMaterial::from("ya29.expired_upload_fixture_token"),
+        )
+        .await
+        .unwrap();
+
+    let outcome = services
+        .host_runtime_for_local_testing()
+        .invoke_capability(wasm_runtime_request_for_scope(
+            capability_id.clone(),
+            scope,
+            json!({
+                "name": "report.txt",
+                "content": "stale token upload",
+                "mime_type": "text/plain"
+            }),
+        ))
+        .await
+        .unwrap();
+
+    match outcome {
+        RuntimeCapabilityOutcome::AuthRequired(gate) => {
+            assert_eq!(gate.capability_id, capability_id);
+            assert!(gate.required_secrets.is_empty());
+            assert!(gate.credential_requirements.is_empty());
+        }
+        other => panic!("expected auth-required outcome, got {other:?}"),
+    }
+    let requests = network.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, NetworkMethod::Post);
+    assert!(
+        requests[0]
+            .url
+            .starts_with("https://www.googleapis.com/upload/drive/v3/files?")
+    );
+}
+
+#[tokio::test]
 async fn host_runtime_services_routes_google_docs_wasm_get_document_with_scoped_google_credential()
 {
     let capability_id = CapabilityId::new("google-docs.get_document").unwrap();
