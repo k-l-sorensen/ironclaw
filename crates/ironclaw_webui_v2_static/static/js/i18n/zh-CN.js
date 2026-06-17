@@ -731,6 +731,8 @@ registerPack("zh-CN", {
   "automations.empty.example3":
     "每天下午 3 点提醒我查看待处理的 pull request。",
   "automations.empty.startInChat": "在聊天中开始",
+  "automations.empty.copyPrompt": "复制提示词",
+  "automations.empty.copied": "已复制",
   "automations.refreshing": "正在刷新…",
   "automations.table.name": "活动计划标题",
   "automations.table.schedule": "时刻编排",

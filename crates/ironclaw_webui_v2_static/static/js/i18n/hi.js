@@ -731,6 +731,8 @@ registerPack("hi", {
   "automations.empty.example3":
     "हर दोपहर 3 बजे मुझे खुले pull requests की समीक्षा करने की याद दिलाएँ।",
   "automations.empty.startInChat": "चैट में शुरू करें",
+  "automations.empty.copyPrompt": "प्रॉम्प्ट कॉपी करें",
+  "automations.empty.copied": "कॉपी किया गया",
   "automations.refreshing": "ताज़ा किया जा रहा है…",
   "automations.table.name": "नाम",
   "automations.table.schedule": "शेड्यूल",

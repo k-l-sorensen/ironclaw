@@ -731,6 +731,8 @@ registerPack("ar", {
   "automations.empty.example3":
     "ذكّرني بمراجعة طلبات السحب المفتوحة كل بعد ظهر في الساعة 3.",
   "automations.empty.startInChat": "ابدأ في المحادثة",
+  "automations.empty.copyPrompt": "نسخ الموجّه",
+  "automations.empty.copied": "تم النسخ",
   "automations.refreshing": "جارٍ التحديث…",
   "automations.table.name": "الاسم",
   "automations.table.schedule": "الجدول الزمني",

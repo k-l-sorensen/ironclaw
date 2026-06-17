@@ -731,6 +731,8 @@ registerPack("ja", {
   "automations.empty.example3":
     "毎日午後3時に、未対応のプルリクエストを確認するようリマインドして。",
   "automations.empty.startInChat": "チャットで始める",
+  "automations.empty.copyPrompt": "プロンプトをコピー",
+  "automations.empty.copied": "コピーしました",
   "automations.refreshing": "更新中…",
   "automations.table.name": "名前",
   "automations.table.schedule": "スケジュール",

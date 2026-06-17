@@ -731,6 +731,8 @@ registerPack("uk", {
   "automations.empty.example3":
     "Нагадуй мені переглядати відкриті pull request щодня о 15:00.",
   "automations.empty.startInChat": "Почати в чаті",
+  "automations.empty.copyPrompt": "Скопіювати запит",
+  "automations.empty.copied": "Скопійовано",
   "automations.refreshing": "Оновлення…",
   "automations.table.name": "Назва",
   "automations.table.schedule": "Розклад",

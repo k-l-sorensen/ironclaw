@@ -75,7 +75,7 @@ export function AutomationsList({
             >
               <${Icon}
                 name="retry"
-                className=${cn("h-4 w-4", isRefreshing && "animate-spin")}
+                className=${cn("h-4 w-4", isRefreshing && "v2-spin")}
               />
             <//>
           </div>

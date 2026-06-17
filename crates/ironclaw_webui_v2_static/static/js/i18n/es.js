@@ -731,6 +731,8 @@ registerPack("es", {
   "automations.empty.example3":
     "Recuérdame revisar las pull requests abiertas cada tarde a las 15:00.",
   "automations.empty.startInChat": "Empezar en el chat",
+  "automations.empty.copyPrompt": "Copiar prompt",
+  "automations.empty.copied": "Copiado",
   "automations.refreshing": "Actualizando…",
   "automations.table.name": "Nombre",
   "automations.table.schedule": "Programación",

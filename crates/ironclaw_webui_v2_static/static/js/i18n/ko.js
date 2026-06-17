@@ -731,6 +731,8 @@ registerPack("ko", {
   "automations.empty.example3":
     "매일 오후 3시에 열려 있는 풀 리퀘스트를 검토하라고 알려 줘.",
   "automations.empty.startInChat": "채팅에서 시작",
+  "automations.empty.copyPrompt": "프롬프트 복사",
+  "automations.empty.copied": "복사됨",
   "automations.refreshing": "새로고침 중…",
   "automations.table.name": "이름",
   "automations.table.schedule": "일정",
