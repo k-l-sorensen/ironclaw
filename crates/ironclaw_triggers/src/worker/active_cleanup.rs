@@ -1,4 +1,7 @@
-use crate::{ActiveTriggerScanCursor, ClearActiveFireRequest, TriggerError, TriggerRecord};
+use crate::{
+    ActiveTriggerScanCursor, ClearActiveFireRequest, TriggerError, TriggerRecord,
+    TriggerRunHistoryStatus,
+};
 
 use super::{
     TriggerActiveRunState, TriggerActiveRunStateRequest, TriggerPollerFailureReason,
@@ -112,7 +115,16 @@ impl TriggerPollerWorker {
                 }
             };
             match state {
-                TriggerActiveRunState::Terminal { status } => {
+                TriggerActiveRunState::Terminal { .. } | TriggerActiveRunState::Blocked => {
+                    // A blocked run is parked on a human-interaction gate that
+                    // an unattended fire cannot satisfy; clear it and record the
+                    // fire as failed so it stops holding the active lock. A
+                    // terminal run clears with whatever status it reached.
+                    let blocked = matches!(state, TriggerActiveRunState::Blocked);
+                    let status = match state {
+                        TriggerActiveRunState::Terminal { status } => status,
+                        _ => TriggerRunHistoryStatus::Error,
+                    };
                     if self
                         .deps
                         .repository
@@ -126,11 +138,16 @@ impl TriggerPollerWorker {
                         .await?
                         .is_some()
                     {
+                        let outcome = if blocked {
+                            TriggerPollerFireOutcome::ClearedBlockedActive { run_id }
+                        } else {
+                            TriggerPollerFireOutcome::ClearedTerminalActive { run_id }
+                        };
                         report.results.push(TriggerPollerFireReport {
                             tenant_id: record.tenant_id,
                             trigger_id: record.trigger_id,
                             fire_slot,
-                            outcome: TriggerPollerFireOutcome::ClearedTerminalActive { run_id },
+                            outcome,
                         });
                     } else {
                         report.results.push(TriggerPollerFireReport {
