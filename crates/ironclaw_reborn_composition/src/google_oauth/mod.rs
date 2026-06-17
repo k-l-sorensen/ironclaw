@@ -8,6 +8,5 @@ pub(crate) fn google_provider_spec() -> HostOAuthProviderSpec {
         secret_handle_prefix: "google",
         resource: None,
         exchange_scope_policy: ExchangeScopePolicy::RequireProviderScope,
-        requires_refresh_token_on_exchange: true,
     }
 }

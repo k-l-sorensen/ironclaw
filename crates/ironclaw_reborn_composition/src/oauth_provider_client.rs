@@ -38,7 +38,6 @@ pub(crate) struct HostOAuthProviderSpec {
     pub(crate) secret_handle_prefix: &'static str,
     pub(crate) resource: Option<&'static str>,
     pub(crate) exchange_scope_policy: ExchangeScopePolicy,
-    pub(crate) requires_refresh_token_on_exchange: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -432,9 +431,6 @@ impl AuthProviderClient for HostOAuthProviderClient {
                 false,
             )
             .await?;
-        if self.spec.requires_refresh_token_on_exchange && token_response.refresh_token.is_none() {
-            return Err(AuthProductError::TokenExchangeFailed);
-        }
         let scopes = scopes_for_exchange(&self.spec, &token_response, &request.scopes)?;
         let stored_tokens = self
             .store_tokens(callback_scope, context.flow_id, token_response)

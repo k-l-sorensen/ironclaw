@@ -391,6 +391,8 @@ async fn webui_event_stream_creates_google_oauth_prompt_for_runtime_credential_g
                     url.starts_with("https://accounts.google.com/")
                         && url.contains("https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fcalendar.readonly")
                 )
+                && prompt.body.contains("offline access")
+                && prompt.body.contains("reconnect it through this link")
                 && prompt.account_label.is_none()
     )), "events: {events:#?}");
 }

@@ -112,7 +112,7 @@ async fn google_exchange_fails_closed_when_response_omits_scope() {
 }
 
 #[tokio::test]
-async fn google_exchange_fails_closed_when_response_omits_refresh_token() {
+async fn google_exchange_allows_access_only_response_without_blocking_callback() {
     let egress = Arc::new(RecordingEgress::ok(
         br#"{"access_token":"access-token","scope":"gmail.readonly","expires_in":3600}"#.to_vec(),
     ));
@@ -127,19 +127,23 @@ async fn google_exchange_fails_closed_when_response_omits_refresh_token() {
     )
     .unwrap();
 
-    let error = client
+    let exchange = client
         .exchange_callback(
             exchange_context(),
             callback_request("google", "work google", &["gmail.readonly"]),
         )
         .await
-        .expect_err("google accounts must be refresh-capable after setup");
+        .expect("missing refresh token should not block production callbacks");
 
-    assert_eq!(
-        error.code(),
-        ironclaw_auth::AuthErrorCode::TokenExchangeFailed
+    assert!(exchange.refresh_secret.is_none());
+    assert_eq!(store.put_handles().len(), 1);
+    assert!(
+        store
+            .put_handles()
+            .iter()
+            .all(|handle| !handle.contains("refresh")),
+        "access-only exchanges should not fabricate a refresh secret"
     );
-    assert!(store.put_handles().is_empty());
 }
 
 #[tokio::test]
@@ -365,7 +369,6 @@ fn google_spec() -> HostOAuthProviderSpec {
         secret_handle_prefix: "google",
         resource: None,
         exchange_scope_policy: ExchangeScopePolicy::RequireProviderScope,
-        requires_refresh_token_on_exchange: true,
     }
 }
 
@@ -377,7 +380,6 @@ fn notion_spec() -> HostOAuthProviderSpec {
         secret_handle_prefix: "notion",
         resource: Some("https://mcp.notion.com/mcp"),
         exchange_scope_policy: ExchangeScopePolicy::FallbackToRequested,
-        requires_refresh_token_on_exchange: false,
     }
 }
 

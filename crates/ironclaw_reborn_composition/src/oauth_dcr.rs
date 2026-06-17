@@ -1169,7 +1169,6 @@ mod tests {
                     resource: Some("https://mcp.notion.com/mcp"),
                     exchange_scope_policy:
                         crate::oauth_provider_client::ExchangeScopePolicy::FallbackToRequested,
-                    requires_refresh_token_on_exchange: false,
                 },
                 callback_origin: "http://127.0.0.1:3000".to_string(),
                 client_name: "Ironclaw".to_string(),
@@ -1615,7 +1614,6 @@ mod tests {
                     resource: Some("https://mcp.notion.com/mcp"),
                     exchange_scope_policy:
                         crate::oauth_provider_client::ExchangeScopePolicy::FallbackToRequested,
-                    requires_refresh_token_on_exchange: false,
                 },
                 callback_origin: "http://127.0.0.1:3000".to_string(),
                 client_name: "Ironclaw".to_string(),
@@ -1678,7 +1676,6 @@ mod tests {
                 resource: Some("https://mcp.notion.com/mcp"),
                 exchange_scope_policy:
                     crate::oauth_provider_client::ExchangeScopePolicy::FallbackToRequested,
-                requires_refresh_token_on_exchange: false,
             },
             callback_origin: "http://127.0.0.1:3000".to_string(),
             client_name: "Ironclaw".to_string(),

@@ -1,12 +1,20 @@
 use async_trait::async_trait;
 use ironclaw_auth::{
-    AuthProductError, AuthProviderId, CredentialAccountLabel, OAuthAuthorizationUrl,
+    AuthProductError, AuthProviderId, CredentialAccountLabel, GOOGLE_PROVIDER_ID,
+    OAuthAuthorizationUrl,
 };
 use ironclaw_host_api::{RuntimeCredentialAccountSetup, UserId};
 use ironclaw_product_adapters::{
     AuthPromptChallengeKind, AuthPromptView, ProductAdapterError, RedactedString,
 };
 use ironclaw_turns::{TurnRunId, TurnScope};
+
+const GOOGLE_OAUTH_REFRESH_GUIDANCE: &str = concat!(
+    "Sign in with Google using the authorization link. ",
+    "The link requests offline access and fresh consent so Ironclaw can renew the credential ",
+    "automatically. If the account still expires after about an hour, reconnect it through this ",
+    "link and approve the Google consent screen again."
+);
 
 /// Redacted view of a pending auth challenge used for product auth prompt
 /// enrichment. Contains only data safe to surface over product adapters.
@@ -135,10 +143,14 @@ pub(crate) async fn auth_prompt_view_for_blocked_auth(
         authorization_url: None,
         expires_at: None,
     };
-    Ok(match challenge {
+    let view = match challenge {
         Some(c) => c.enrich(base_view),
         None => auth_prompt_from_credential_requirement(base_view, credential_requirements),
-    })
+    };
+    Ok(with_google_oauth_refresh_guidance(
+        view,
+        credential_requirements,
+    ))
 }
 
 fn auth_prompt_from_credential_requirement(
@@ -160,4 +172,31 @@ fn auth_prompt_from_credential_requirement(
     }
     view.provider = Some(provider);
     view
+}
+
+fn with_google_oauth_refresh_guidance(
+    mut view: AuthPromptView,
+    credential_requirements: &[ironclaw_host_api::RuntimeCredentialAuthRequirement],
+) -> AuthPromptView {
+    if credential_requirements
+        .iter()
+        .any(is_google_oauth_requirement)
+        && !view.body.contains(GOOGLE_OAUTH_REFRESH_GUIDANCE)
+    {
+        if !view.body.trim().is_empty() {
+            view.body.push_str("\n\n");
+        }
+        view.body.push_str(GOOGLE_OAUTH_REFRESH_GUIDANCE);
+    }
+    view
+}
+
+fn is_google_oauth_requirement(
+    requirement: &ironclaw_host_api::RuntimeCredentialAuthRequirement,
+) -> bool {
+    requirement.provider.as_str() == GOOGLE_PROVIDER_ID
+        && matches!(
+            requirement.setup,
+            RuntimeCredentialAccountSetup::OAuth { .. }
+        )
 }
