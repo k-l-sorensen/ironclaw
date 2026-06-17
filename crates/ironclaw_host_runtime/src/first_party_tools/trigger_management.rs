@@ -199,7 +199,13 @@ struct TriggerCreateInput {
     name: String,
     prompt: String,
     cron: String,
-    timezone: String,
+    // Optional: a fixed-interval schedule ("every N minutes") is timezone-
+    // independent, so requiring a timezone forced an unnecessary clarifying
+    // round-trip (or a deserialization failure) that read as a routine-creation
+    // failure. Defaults to UTC at the call site; the model should still supply a
+    // real IANA zone for wall-clock schedules (e.g. "daily at 9am") when known.
+    #[serde(default)]
+    timezone: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -221,7 +227,8 @@ async fn create_trigger(
     now: DateTime<Utc>,
 ) -> Result<Value, FirstPartyCapabilityError> {
     let input: TriggerCreateInput = serde_json::from_value(input).map_err(|_| input_error())?;
-    let schedule = TriggerSchedule::cron_with_timezone(input.cron, input.timezone)
+    let timezone = input.timezone.as_deref().unwrap_or("UTC");
+    let schedule = TriggerSchedule::cron_with_timezone(input.cron, timezone)
         .map_err(trigger_input_error)?;
     let next_run_at = next_run_at_for_schedule(&schedule, now)?;
     let record = TriggerRecord {
@@ -482,17 +489,22 @@ mod tests {
     }
 
     #[test]
-    fn trigger_create_input_rejects_missing_timezone() {
+    fn trigger_create_input_defaults_missing_timezone_to_utc() {
         let input = serde_json::json!({
-            "name": "daily",
-            "prompt": "check mail",
-            "cron": "0 9 * * *"
+            "name": "every-5-min",
+            "prompt": "ping endpoint",
+            "cron": "*/5 * * * *"
         });
-        let result: Result<TriggerCreateInput, _> = serde_json::from_value(input);
-        assert!(
-            result.is_err(),
-            "missing timezone must fail deserialization"
-        );
+        let parsed: TriggerCreateInput =
+            serde_json::from_value(input).expect("missing timezone deserializes (now optional)");
+        assert!(parsed.timezone.is_none(), "missing timezone parses as None");
+        // The create path defaults to UTC for an interval schedule.
+        let timezone = parsed.timezone.as_deref().unwrap_or("UTC");
+        let schedule = TriggerSchedule::cron_with_timezone(parsed.cron, timezone)
+            .expect("interval schedule with default UTC accepted");
+        match &schedule {
+            TriggerSchedule::Cron { timezone, .. } => assert_eq!(timezone, "UTC"),
+        }
     }
 
     #[test]
@@ -504,7 +516,8 @@ mod tests {
             "timezone": "Not/A/Timezone"
         });
         let parsed: TriggerCreateInput = serde_json::from_value(input).expect("deserialize");
-        let result = TriggerSchedule::cron_with_timezone(parsed.cron, parsed.timezone);
+        let timezone = parsed.timezone.as_deref().unwrap_or("UTC");
+        let result = TriggerSchedule::cron_with_timezone(parsed.cron, timezone);
         assert!(result.is_err(), "invalid timezone must be rejected");
         let error_msg = result.unwrap_err().to_string();
         assert!(
@@ -522,7 +535,8 @@ mod tests {
             "timezone": "America/Los_Angeles"
         });
         let parsed: TriggerCreateInput = serde_json::from_value(input).expect("deserialize");
-        let schedule = TriggerSchedule::cron_with_timezone(parsed.cron, &parsed.timezone)
+        let timezone = parsed.timezone.as_deref().expect("timezone present");
+        let schedule = TriggerSchedule::cron_with_timezone(parsed.cron, timezone)
             .expect("valid timezone accepted");
         match &schedule {
             TriggerSchedule::Cron { timezone, .. } => {
