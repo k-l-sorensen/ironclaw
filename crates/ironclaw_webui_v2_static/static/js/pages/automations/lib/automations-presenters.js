@@ -446,4 +446,3 @@ function normalizeDayOfWeek(value) {
   };
   return aliases[upper] || value;
 }
-
