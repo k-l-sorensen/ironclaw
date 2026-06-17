@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use ironclaw_reborn_composition::TriggerPollerSettings;
+use ironclaw_reborn_config::RebornProfile;
 
 use super::RuntimeInputCaller;
 
@@ -81,10 +82,10 @@ fn truncate_env_value_for_display(raw: &str) -> String {
 ///    absent here falls through to the compiled default.
 /// 3. Compiled default — `TriggerPollerSettings::default()` (all limits at the
 ///    `ironclaw_triggers` crate defaults). The `enabled` default depends on the
-///    caller: the local `serve` surface enables the scheduler by default so
-///    automations actually run, while every other caller defaults to disabled.
-///    Config and env still override this (an env kill-switch wins), because
-///    this layer is applied first.
+///    caller/profile: local-dev `serve` enables the scheduler by default so
+///    automations actually run, while production and every other caller default
+///    to disabled. Config and env still override this (an env kill-switch wins),
+///    because this layer is applied first.
 ///
 /// V1 invariant: `max_concurrent_fires_per_trigger` must be exactly 1. Passing
 /// any other value (via config or, were an env override ever added, env) returns
@@ -95,12 +96,18 @@ fn truncate_env_value_for_display(raw: &str) -> String {
 pub(super) fn trigger_poller_settings(
     config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
     caller: RuntimeInputCaller,
+    profile: RebornProfile,
 ) -> anyhow::Result<TriggerPollerSettings> {
-    // Layer 3: compiled default. `enabled` is on by default for the local
-    // `serve` surface (so scheduled automations actually fire) and off
-    // everywhere else; config/env below still override it.
+    // Layer 3: compiled default. `enabled` is on by default for local-dev
+    // `serve` (so scheduled automations actually fire) and off everywhere
+    // else; production launch has no wired poller runtime yet.
     let mut settings = TriggerPollerSettings::default();
-    if caller == RuntimeInputCaller::Serve {
+    if caller == RuntimeInputCaller::Serve
+        && matches!(
+            profile,
+            RebornProfile::LocalDev | RebornProfile::LocalDevYolo
+        )
+    {
         settings.enabled = true;
     }
 
@@ -206,9 +213,25 @@ pub(super) fn trigger_poller_settings(
 #[cfg(test)]
 mod tests {
     use super::super::test_env::{EnvGuard, lock_trigger_env};
-    use super::{RuntimeInputCaller, trigger_poller_settings};
-    use ironclaw_reborn_config::TriggerPollerConfigSection;
+    use super::RuntimeInputCaller;
+    use ironclaw_reborn_composition::TriggerPollerSettings;
+    use ironclaw_reborn_config::{RebornProfile, TriggerPollerConfigSection};
     use std::time::Duration;
+
+    fn trigger_poller_settings(
+        config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+        caller: RuntimeInputCaller,
+    ) -> anyhow::Result<TriggerPollerSettings> {
+        trigger_poller_settings_for_profile(config_file, caller, RebornProfile::LocalDev)
+    }
+
+    fn trigger_poller_settings_for_profile(
+        config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+        caller: RuntimeInputCaller,
+        profile: RebornProfile,
+    ) -> anyhow::Result<TriggerPollerSettings> {
+        super::trigger_poller_settings(config_file, caller, profile)
+    }
 
     fn make_config_with_trigger_poller(
         section: TriggerPollerConfigSection,
@@ -237,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn trigger_poller_settings_serve_default_is_enabled() {
+    fn trigger_poller_settings_local_dev_serve_default_is_enabled() {
         // Regression: the local `serve` surface must default the scheduler on so
         // scheduled automations actually fire, while other callers stay off.
         let _lock = lock_trigger_env();
@@ -248,6 +271,28 @@ mod tests {
             .expect("serve trigger poller settings");
 
         assert!(settings.enabled, "serve must default the scheduler on");
+    }
+
+    #[test]
+    fn trigger_poller_settings_production_serve_default_is_disabled() {
+        // Production launch does not currently wire the poller runtime. A bare
+        // production `serve` must therefore keep the poller off unless the
+        // operator explicitly opts into an unsupported config/env setting.
+        let _lock = lock_trigger_env();
+        let _enabled = EnvGuard::clear("IRONCLAW_TRIGGER_POLLER_ENABLED");
+        let _interval = EnvGuard::clear("IRONCLAW_TRIGGER_POLLER_INTERVAL_SECS");
+
+        let settings = trigger_poller_settings_for_profile(
+            None,
+            RuntimeInputCaller::Serve,
+            RebornProfile::Production,
+        )
+        .expect("production serve trigger poller settings");
+
+        assert!(
+            !settings.enabled,
+            "production serve must not implicitly enable the scheduler"
+        );
     }
 
     #[test]
@@ -264,6 +309,33 @@ mod tests {
         assert!(
             !settings.enabled,
             "env kill-switch must override the serve-on default"
+        );
+    }
+
+    #[test]
+    fn trigger_poller_settings_production_explicit_config_enabled_still_wins() {
+        // Keep layer precedence simple: production defaults are disabled, but an
+        // explicit operator enable remains visible so runtime composition can
+        // fail closed with the production-not-wired error.
+        let _lock = lock_trigger_env();
+        let _enabled = EnvGuard::clear("IRONCLAW_TRIGGER_POLLER_ENABLED");
+        let _interval = EnvGuard::clear("IRONCLAW_TRIGGER_POLLER_INTERVAL_SECS");
+
+        let config = make_config_with_trigger_poller(TriggerPollerConfigSection {
+            enabled: Some(true),
+            ..Default::default()
+        });
+
+        let settings = trigger_poller_settings_for_profile(
+            Some(&config),
+            RuntimeInputCaller::Serve,
+            RebornProfile::Production,
+        )
+        .expect("explicit production trigger poller settings");
+
+        assert!(
+            settings.enabled,
+            "explicit production config must override the disabled default"
         );
     }
 

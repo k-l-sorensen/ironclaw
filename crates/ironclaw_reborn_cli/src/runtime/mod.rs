@@ -365,6 +365,7 @@ pub(crate) fn build_runtime_input_with_options(
         .with_trigger_poller_settings(trigger_poller_settings(
             runtime_services.config_file.as_ref(),
             caller,
+            runtime_services.profile,
         )?)
         .with_poll_settings(PollSettings {
             interval: Duration::from_millis(200),
@@ -405,6 +406,7 @@ pub(crate) fn build_runtime_input_with_options(
 
 pub(crate) struct RuntimeServicesInput {
     pub(crate) services_input: RebornBuildInput,
+    profile: RebornProfile,
     config_file: Option<ironclaw_reborn_config::RebornConfigFile>,
 }
 
@@ -481,6 +483,7 @@ pub(crate) fn build_services_input_with_options(
 
     Ok(RuntimeServicesInput {
         services_input,
+        profile,
         config_file,
     })
 }
@@ -1268,6 +1271,41 @@ default_profile = "secure_default"
 
         let runtime_input =
             build_runtime_input(&config, RuntimeInputCaller::Run).expect("runtime input");
+        let services = runtime_input.services.expect("services input");
+        assert_eq!(services.profile(), RebornCompositionProfile::Production);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn build_runtime_input_production_serve_defaults_trigger_poller_disabled() {
+        let _lock = lock_trigger_env();
+        let (_enabled, _interval) = clear_trigger_poller_env();
+        let _postgres_url = EnvGuard::set(
+            "IRONCLAW_REBORN_POSTGRES_URL",
+            "postgres://localhost/ironclaw_reborn_cli_test",
+        );
+        let _secret_master_key =
+            EnvGuard::set("IRONCLAW_REBORN_SECRET_MASTER_KEY", "test-master-key");
+        let (_temp, config) = boot_config_with_config_toml(
+            "production",
+            r#"
+[storage]
+backend = "postgres"
+url_env = "IRONCLAW_REBORN_POSTGRES_URL"
+secret_master_key_env = "IRONCLAW_REBORN_SECRET_MASTER_KEY"
+
+[policy]
+deployment_mode = "hosted_multi_tenant"
+default_profile = "secure_default"
+"#,
+        );
+
+        let runtime_input =
+            build_runtime_input(&config, RuntimeInputCaller::Serve).expect("runtime input");
+        assert!(
+            !runtime_input.trigger_poller.enabled,
+            "production serve must not implicitly enable the local-only trigger poller"
+        );
         let services = runtime_input.services.expect("services input");
         assert_eq!(services.profile(), RebornCompositionProfile::Production);
     }
