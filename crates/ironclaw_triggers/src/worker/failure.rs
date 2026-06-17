@@ -95,6 +95,13 @@ fn trigger_error_reason_text(error: &TriggerError) -> Option<&str> {
         // the curated category label ("trigger backend temporarily
         // unavailable") so raw backend errors never reach the persisted reason.
         TriggerError::Backend { .. } | TriggerError::NotFound => None,
+        // These reasons are curated boundary-safe at every construction site that
+        // can reach the persist path: the trusted-submit materializer maps raw
+        // inbound/prompt-safety/id-construction errors to fixed labels and logs
+        // the cause at `debug!`, and authorization denials carry only the curated
+        // checker reason. So persisting/surfacing them does not leak
+        // ids/paths/backend text; `SanitizedFailureReason` is the length/charset
+        // backstop on top.
         TriggerError::InvalidTriggerId { reason }
         | TriggerError::InvalidFireIdentityComponent { reason, .. }
         | TriggerError::InvalidRecord { reason }

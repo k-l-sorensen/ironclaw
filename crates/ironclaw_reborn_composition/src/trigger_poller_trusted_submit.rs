@@ -413,14 +413,25 @@ fn rejected_trigger_materialization(reason: &'static str) -> TriggerError {
 }
 
 fn trigger_prompt_safety_rejection(error: PromptSafetyRejection) -> TriggerError {
+    // The raw rejection can echo prompt content/injection detail. This reason is
+    // persisted to `failure_reason` and surfaced in Automations, so curate it and
+    // keep the cause in the debug log only (the `failure.rs` persistence whitelist
+    // trusts `InvalidMaterialization` reasons to be boundary-safe).
+    tracing::debug!(%error, "trusted trigger prompt rejected by safety policy");
     TriggerError::InvalidMaterialization {
-        reason: error.to_string(),
+        reason: "trusted trigger prompt rejected by safety policy".to_string(),
     }
 }
 
 fn conversation_id<T>(result: Result<T, InboundTurnError>) -> Result<T, TriggerError> {
-    result.map_err(|error| TriggerError::InvalidMaterialization {
-        reason: error.to_string(),
+    result.map_err(|error| {
+        // Internal ID-construction invariants over trusted binding constants/ids;
+        // the raw inbound error must not reach the persisted/surfaced
+        // `failure_reason`. Curate and keep the cause in the debug log.
+        tracing::debug!(%error, "trusted trigger conversation id construction failed");
+        TriggerError::InvalidMaterialization {
+            reason: "trusted trigger inbound request rejected".to_string(),
+        }
     })
 }
 
@@ -1749,7 +1760,7 @@ mod tests {
             .expect_err("authorization denial rejects before materialization side effects");
 
         assert!(
-            matches!(error, TriggerError::InvalidMaterialization { reason } if reason == "trusted trigger fire authorization denied")
+            matches!(error, TriggerError::InvalidMaterialization { reason } if reason == "trigger fire not authorized: creator no longer authorized for project")
         );
         assert_eq!(fixture.authorizer.requests(), vec![fixture.auth_request]);
         assert_no_prompt_threads(&fixture.thread_service, fixture.thread_scope).await;
@@ -1770,7 +1781,7 @@ mod tests {
             );
 
         assert!(
-            matches!(error, TriggerError::Backend { reason } if reason == "trusted trigger fire authorization retryable failure")
+            matches!(error, TriggerError::Backend { reason } if reason == "trusted trigger fire authorization retryable failure: creator authorization backend unavailable")
         );
         assert_eq!(fixture.authorizer.requests(), vec![fixture.auth_request]);
         assert_no_prompt_threads(&fixture.thread_service, fixture.thread_scope).await;
@@ -1802,7 +1813,7 @@ mod tests {
             .expect_err("foreign tenant fire is rejected before materialization side effects");
 
         assert!(
-            matches!(error, TriggerError::InvalidMaterialization { reason } if reason == "trusted trigger fire authorization denied")
+            matches!(error, TriggerError::InvalidMaterialization { reason } if reason == "trigger fire not authorized: trigger tenant is outside this trusted poller scope")
         );
         let threads = thread_service
             .list_threads_for_scope(ListThreadsForScopeRequest {

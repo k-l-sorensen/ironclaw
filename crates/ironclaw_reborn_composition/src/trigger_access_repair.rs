@@ -87,6 +87,10 @@ pub struct TriggerAccessRepairReport {
     /// will deny, the trigger is left untouched (ownership unchanged) and stays
     /// visible to a re-run. Recover by reassigning to a non-revoked target.
     pub skipped_revoked_target: usize,
+    /// The target user id *requested* for a reassign pass (`None` for non-reassign
+    /// actions). This is the requested target, not a guarantee every stranded
+    /// trigger landed on it — read `reassigned` for how many actually moved and
+    /// `skipped_revoked_target` for how many were left behind.
     pub reassigned_to: Option<String>,
 }
 
@@ -144,10 +148,15 @@ pub async fn repair_local_trigger_access(
     tenant_id: &TenantId,
     action: TriggerAccessRepairAction,
 ) -> Result<TriggerAccessRepairReport, TriggerAccessRepairError> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|err| {
-            TriggerAccessRepairError::Access(format!("create substrate dir: {err}"))
-        })?;
+    // Fail loud if the substrate DB is missing rather than silently creating an
+    // empty one: a mispointed home/path would otherwise build a fresh DB and
+    // report "0 stranded", a false-negative repair result. (`serve`/`run` create
+    // this file; repair only ever reads/edits an existing local-dev substrate.)
+    if !path.exists() {
+        return Err(TriggerAccessRepairError::Access(format!(
+            "local-dev substrate DB not found at {}",
+            path.display()
+        )));
     }
     let db = Arc::new(
         libsql::Builder::new_local(path)
@@ -189,7 +198,7 @@ pub async fn repair_local_trigger_access(
                 .as_ref()
                 .map(|id| id.as_str().to_string()),
             access_state: *state,
-            trigger_state: format!("{:?}", trigger.state),
+            trigger_state: trigger.state.as_str().to_string(),
         })
         .collect();
 
@@ -236,12 +245,11 @@ pub async fn repair_local_trigger_access(
             .await?;
             report.reassigned = outcome.reassigned;
             report.skipped_revoked_target = outcome.skipped_revoked_target;
-            // Name the landing target only when a trigger actually moved. If every
-            // stranded trigger was skipped (revoked target), `reassigned_to` would
-            // otherwise advertise a target that ended up owning nothing.
-            if outcome.reassigned > 0 {
-                report.reassigned_to = Some(target.as_str().to_string());
-            }
+            // The target *requested* for this pass. How many triggers actually
+            // moved is `reassigned`; the skip line also references this target, so
+            // record it unconditionally and let the CLI guard the "reassigned N"
+            // message on `reassigned > 0`.
+            report.reassigned_to = Some(target.as_str().to_string());
         }
         TriggerAccessRepairAction::ReassignToCurrentSsoOwner => {
             let target = resolve_current_sso_owner(&access, tenant_id).await?;
@@ -261,12 +269,11 @@ pub async fn repair_local_trigger_access(
             .await?;
             report.reassigned = outcome.reassigned;
             report.skipped_revoked_target = outcome.skipped_revoked_target;
-            // Name the landing target only when a trigger actually moved. If every
-            // stranded trigger was skipped (revoked target), `reassigned_to` would
-            // otherwise advertise a target that ended up owning nothing.
-            if outcome.reassigned > 0 {
-                report.reassigned_to = Some(target.as_str().to_string());
-            }
+            // The target *requested* for this pass. How many triggers actually
+            // moved is `reassigned`; the skip line also references this target, so
+            // record it unconditionally and let the CLI guard the "reassigned N"
+            // message on `reassigned > 0`.
+            report.reassigned_to = Some(target.as_str().to_string());
         }
     }
 
@@ -428,6 +435,21 @@ mod tests {
         let repo = LibSqlTriggerRepository::new(db);
         repo.run_migrations().await.expect("migrate");
         repo.upsert_trigger(record).await.expect("seed trigger");
+    }
+
+    /// Build + migrate an empty substrate DB (no triggers) so `repair_*` sees an
+    /// existing file rather than failing its missing-DB guard.
+    async fn create_empty_substrate(path: &std::path::Path) {
+        let db = Arc::new(
+            libsql::Builder::new_local(path)
+                .build()
+                .await
+                .expect("build db"),
+        );
+        LibSqlTriggerRepository::new(db)
+            .run_migrations()
+            .await
+            .expect("migrate");
     }
 
     fn db_path(dir: &tempfile::TempDir) -> PathBuf {
@@ -605,8 +627,9 @@ mod tests {
         );
         assert_eq!(applied.skipped_revoked_target, 1);
         assert_eq!(
-            applied.reassigned_to, None,
-            "no trigger landed on the target, so it must not be advertised as the new owner"
+            applied.reassigned_to.as_deref(),
+            Some(target.as_str()),
+            "the requested target is recorded even when nothing moved, so the CLI skip line can name it"
         );
 
         // Ownership is unchanged: the upsert never ran.
@@ -726,6 +749,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = db_path(&dir);
         let tenant = TenantId::new("reborn-cli").expect("tenant");
+        // The substrate exists but holds no triggers (distinct from a missing DB,
+        // which now fails loud).
+        create_empty_substrate(&path).await;
 
         // No triggers seeded at all: nothing scanned, nothing stranded.
         let report = repair_local_trigger_access(&path, &tenant, TriggerAccessRepairAction::Report)
@@ -744,5 +770,26 @@ mod tests {
         assert_eq!(applied.reseeded, 0);
         assert_eq!(applied.skipped_revoked, 0);
         assert_eq!(applied.stranded.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn repair_fails_loud_when_substrate_db_is_missing() {
+        // A mispointed path must NOT silently create an empty DB and report
+        // "0 stranded" — that would be a false-negative repair.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("does-not-exist.db");
+        let tenant = TenantId::new("reborn-cli").expect("tenant");
+
+        let error = repair_local_trigger_access(&path, &tenant, TriggerAccessRepairAction::Report)
+            .await
+            .expect_err("missing substrate DB must fail loud");
+        assert!(
+            matches!(error, TriggerAccessRepairError::Access(reason) if reason.contains("not found")),
+            "expected a missing-DB access error, got a different failure"
+        );
+        assert!(
+            !path.exists(),
+            "repair must not have created the substrate file"
+        );
     }
 }

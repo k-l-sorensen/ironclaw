@@ -58,7 +58,7 @@ export function RecentRunRow({ run, onOpenRun, onOpenLogs }) {
             run.thread_id
               ? "truncate text-iron-400"
               : run.failure_reason
-                ? "text-red-300"
+                ? "truncate text-red-300"
                 : "truncate text-iron-400",
           )}
         >

@@ -194,7 +194,9 @@ fn confirm_action(action: &TriggerAccessRepairAction, stranded: usize) -> anyhow
         TriggerAccessRepairAction::Report => return Ok(true),
     };
     print!("{prompt}");
-    io::stdout().flush().ok();
+    io::stdout()
+        .flush()
+        .context("failed to flush confirmation prompt")?;
     let mut answer = String::new();
     io::stdin()
         .read_line(&mut answer)

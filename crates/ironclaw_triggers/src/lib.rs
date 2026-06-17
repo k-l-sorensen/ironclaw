@@ -413,6 +413,19 @@ pub enum TriggerState {
     Completed,
 }
 
+impl TriggerState {
+    /// Stable snake_case label for diagnostics/operator output. Use this instead
+    /// of `format!("{:?}", state)` so the rendered contract does not drift with
+    /// enum refactors (per `.claude/rules/types.md`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Scheduled => "scheduled",
+            Self::Paused => "paused",
+            Self::Completed => "completed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TriggerCompletionPolicy {
@@ -491,6 +504,9 @@ impl SanitizedFailureReason {
     /// when the input is empty after sanitization.
     pub fn sanitize(raw: &str) -> Option<Self> {
         let mut collapsed = String::new();
+        // Track the char count as we build instead of re-scanning `collapsed`
+        // every iteration (that is O(n^2) in the cap).
+        let mut char_len = 0usize;
         let mut last_was_space = false;
         for ch in raw.chars() {
             let mapped = if ch.is_control() || ch.is_whitespace() || is_unsafe_display_char(ch) {
@@ -506,10 +522,11 @@ impl SanitizedFailureReason {
             } else {
                 last_was_space = false;
             }
-            if collapsed.chars().count() >= MAX_FAILURE_REASON_LEN {
+            if char_len >= MAX_FAILURE_REASON_LEN {
                 break;
             }
             collapsed.push(mapped);
+            char_len += 1;
         }
         let trimmed = collapsed.trim_end();
         if trimmed.is_empty() {

@@ -373,7 +373,7 @@ impl RebornLibSqlLocalTriggerAccessStore {
     }
 
     /// Return the effective [`LocalAccessState`] for the exact
-    /// tenant/agent/project/user scope, distinguishing an active grant from an
+    /// tenant/user/agent/project scope, distinguishing an active grant from an
     /// operator revocation (inactive row) and from a never-seeded scope (no
     /// row). Fire-time authorization uses this to self-heal stranded triggers
     /// without overriding a deliberate revocation.
