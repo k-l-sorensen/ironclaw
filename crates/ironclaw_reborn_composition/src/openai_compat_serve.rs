@@ -8,19 +8,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use ironclaw_attachments::InboundAttachment;
 use ironclaw_filesystem::{RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{
     AgentId, InvocationId, MountAlias, MountGrant, MountPermissions, MountView, ProjectId,
     ResourceScope, TenantId, UserId, VirtualPath,
 };
 use ironclaw_product_adapters::{
-    AdapterInstallationId, ProductAdapterId, ProductInboundAck, ProductOutboundEnvelope,
-    ProductWorkflow, ProjectionReadRequest, ProjectionStream,
+    AdapterInstallationId, ProductAdapterError, ProductAdapterId, ProductInboundAck,
+    ProductInboundEnvelope, ProductOutboundEnvelope, ProductOutboundPayload, ProductProjectionItem,
+    ProductProjectionState, ProductWorkflow, ProjectionCursor, ProjectionReadRequest,
+    ProjectionStream, ProjectionSubscriptionRequest,
 };
 use ironclaw_product_workflow::{
-    DefaultInboundTurnService, DefaultProductWorkflow, ProductActorUserResolutionRequest,
-    ProductActorUserResolver, ProductConversationBindingService, ProductInstallationKey,
-    ProductInstallationScope, ProductWorkflowError, StaticProductInstallationResolver,
+    DefaultInboundTurnService, DefaultProductWorkflow, InboundAttachmentLander,
+    ProductActorUserResolutionRequest, ProductActorUserResolver, ProductConversationBindingService,
+    ProductInstallationKey, ProductInstallationScope, ProductWorkflowError,
+    StaticProductInstallationResolver,
 };
 use ironclaw_product_workflow_storage::RebornFilesystemIdempotencyLedger;
 use ironclaw_reborn_openai_compat::{
@@ -28,12 +32,13 @@ use ironclaw_reborn_openai_compat::{
     OpenAiChatCompletionProjection, OpenAiChatCompletionProjectionReader,
     OpenAiChatCompletionProjectionRequest, OpenAiChatCompletionsWorkflow,
     OpenAiChatProjectionStreamRequest, OpenAiCompatErrorKind, OpenAiCompatHttpError,
-    OpenAiCompatProjectionStreamer, OpenAiCompatRefStore, OpenAiCompatResourceBinding,
-    OpenAiCompatRouterState, OpenAiResponseObject, OpenAiResponseOutputItem,
-    OpenAiResponseOutputItemStatus, OpenAiResponseProjection,
-    OpenAiResponseProjectionStreamRequest, OpenAiResponseReadRequest, OpenAiResponseStatus,
-    OpenAiResponseWaitRequest, OpenAiResponsesMessageRole, OpenAiResponsesProjectionReader,
-    OpenAiResponsesWorkflow, openai_compat_router_with_state, openai_compat_routes,
+    OpenAiCompatInboundAttachmentSubmit, OpenAiCompatProjectionStreamer, OpenAiCompatRefStore,
+    OpenAiCompatResourceBinding, OpenAiCompatRouterState, OpenAiResponseErrorObject,
+    OpenAiResponseObject, OpenAiResponseOutputItem, OpenAiResponseOutputItemStatus,
+    OpenAiResponseProjection, OpenAiResponseProjectionStreamRequest, OpenAiResponseReadRequest,
+    OpenAiResponseStatus, OpenAiResponseWaitRequest, OpenAiResponsesMessageRole,
+    OpenAiResponsesProjectionReader, OpenAiResponsesWorkflow, openai_compat_router_with_state,
+    openai_compat_routes,
 };
 use ironclaw_reborn_openai_compat_storage::FilesystemOpenAiCompatRefStore;
 use ironclaw_threads::{
@@ -43,6 +48,9 @@ use ironclaw_threads::{
 use crate::RebornBuildError;
 use crate::RebornRuntime;
 use crate::webui_serve::ProtectedRouteMount;
+
+#[cfg(test)]
+mod tests;
 
 const OPENAI_COMPAT_LEDGER_USER_ID: &str = "openai-compat";
 const OPENAI_COMPAT_LEDGER_ENGINE_ROOT: &str = "/engine";
@@ -87,12 +95,32 @@ pub async fn build_openai_compat_route_mount(
         installation_scope,
     )]);
     let binding = ProductConversationBindingService::new(conversation_port, installation_resolver);
-    let inbound = Arc::new(DefaultInboundTurnService::new(
+    let mut inbound_turn_service = DefaultInboundTurnService::new(
         binding.clone(),
         runtime.webui_thread_service(),
         runtime.webui_turn_coordinator(),
-    ));
-    let product_workflow: Arc<dyn ProductWorkflow> = Arc::new(
+    );
+    // Lands inline image bytes (vision, #4644) through the same project-scoped
+    // workspace authority the agent's file tools resolve through, so an image
+    // attached to an OpenAI-compatible chat completion reaches the model.
+    if let Some(workspace_filesystem) = runtime.webui_workspace_filesystem() {
+        let lander: Arc<dyn InboundAttachmentLander> = Arc::new(
+            crate::attachment_landing::ProjectScopedAttachmentLander::new(workspace_filesystem),
+        );
+        inbound_turn_service = inbound_turn_service.with_inbound_attachments(lander);
+    }
+    let inbound = Arc::new(inbound_turn_service);
+    // `.with_delivered_gate_routes` is intentionally omitted here. The
+    // OpenAI-compat surface never produces `ApprovalResolution`,
+    // `ScopedApprovalResolution`, or `AuthResolution` payloads (verified: no
+    // such payload constructions exist in `crates/ironclaw_reborn_openai_compat/`),
+    // so the delivered-route conversation-fingerprint fallback is unreachable on
+    // this surface. The workflow falls back to the default in-memory no-op store,
+    // which is correct for this surface.
+    // Keep the concrete type so the same instance can back both the bytes-free
+    // `ProductWorkflow` door and the inline-attachment native door (vision,
+    // #4644), the latter via `OpenAiCompatAttachmentSubmitAdapter`.
+    let default_product_workflow = Arc::new(
         DefaultProductWorkflow::new(
             inbound,
             Arc::new(RebornFilesystemIdempotencyLedger::new(
@@ -111,6 +139,11 @@ pub async fn build_openai_compat_route_mount(
         .with_approval_interaction_service(runtime.webui_approval_interaction_service())
         .with_auth_interaction_service(runtime.webui_auth_interaction_service()),
     );
+    let attachment_submit: Arc<dyn OpenAiCompatInboundAttachmentSubmit> =
+        Arc::new(OpenAiCompatAttachmentSubmitAdapter {
+            workflow: default_product_workflow.clone(),
+        });
+    let product_workflow: Arc<dyn ProductWorkflow> = default_product_workflow;
 
     let ref_filesystem: Arc<dyn RootFilesystem> = local_runtime.extension_filesystem.clone();
     let ref_store: Arc<dyn OpenAiCompatRefStore> =
@@ -121,11 +154,13 @@ pub async fn build_openai_compat_route_mount(
     let chat_projection_reader = Arc::new(OpenAiChatCompletionThreadProjectionReader::new(
         runtime.webui_thread_service(),
     ));
+    let projection_stream = runtime.webui_event_stream();
     let responses_projection_reader = Arc::new(OpenAiResponsesThreadProjectionReader::new(
         runtime.webui_thread_service(),
+        projection_stream.clone(),
     ));
     let projection_streamer = Arc::new(OpenAiCompatRuntimeProjectionStreamer::new(
-        runtime.webui_event_stream(),
+        projection_stream,
     ));
     let chat_workflow = Arc::new(
         OpenAiChatCompletionsWorkflow::new(
@@ -133,7 +168,8 @@ pub async fn build_openai_compat_route_mount(
             ref_store.clone(),
             chat_projection_reader,
         )
-        .with_projection_streamer(projection_streamer.clone()),
+        .with_projection_streamer(projection_streamer.clone())
+        .with_attachment_submit(attachment_submit),
     );
     let responses_workflow = Arc::new(
         OpenAiResponsesWorkflow::new(product_workflow, ref_store, responses_projection_reader)
@@ -146,6 +182,27 @@ pub async fn build_openai_compat_route_mount(
         ),
         openai_compat_routes(),
     ))
+}
+
+/// Bridges the route crate's [`OpenAiCompatInboundAttachmentSubmit`] door to the
+/// product-workflow's native attachment landing. Lives here (not in the route
+/// crate) because the route crate must not depend on `ironclaw_product_workflow`
+/// (enforced by `reborn_dependency_boundaries`).
+struct OpenAiCompatAttachmentSubmitAdapter {
+    workflow: Arc<DefaultProductWorkflow>,
+}
+
+#[async_trait]
+impl OpenAiCompatInboundAttachmentSubmit for OpenAiCompatAttachmentSubmitAdapter {
+    async fn submit_inbound_with_attachments(
+        &self,
+        envelope: ProductInboundEnvelope,
+        attachments: Vec<InboundAttachment>,
+    ) -> Result<ProductInboundAck, ProductAdapterError> {
+        self.workflow
+            .submit_inbound_with_attachments(envelope, attachments)
+            .await
+    }
 }
 
 struct OpenAiCompatRuntimeProjectionStreamer {
@@ -279,13 +336,18 @@ impl OpenAiChatCompletionProjectionReader for OpenAiChatCompletionThreadProjecti
 
 struct OpenAiResponsesThreadProjectionReader {
     thread_service: Arc<dyn SessionThreadService>,
+    projection_stream: Arc<dyn ProjectionStream>,
     poll_interval: Duration,
 }
 
 impl OpenAiResponsesThreadProjectionReader {
-    fn new(thread_service: Arc<dyn SessionThreadService>) -> Self {
+    fn new(
+        thread_service: Arc<dyn SessionThreadService>,
+        projection_stream: Arc<dyn ProjectionStream>,
+    ) -> Self {
         Self {
             thread_service,
+            projection_stream,
             poll_interval: OPENAI_COMPAT_PROJECTION_POLL_INTERVAL,
         }
     }
@@ -327,6 +389,27 @@ impl OpenAiResponsesThreadProjectionReader {
             }
         }
     }
+
+    async fn read_projected_response_status(
+        &self,
+        request: &ProjectionReadRequest,
+        submitted_run_id: &str,
+        after_cursor: Option<ProjectionCursor>,
+    ) -> Result<ProjectedResponseStatusRead, OpenAiCompatHttpError> {
+        let events = self
+            .projection_stream
+            .drain(ProjectionSubscriptionRequest {
+                actor: request.actor.clone(),
+                scope: request.scope.clone(),
+                after_cursor,
+            })
+            .await?;
+        let next_cursor = events.last().map(|event| event.projection_cursor().clone());
+        Ok(ProjectedResponseStatusRead {
+            status: response_status_from_projection_events(&events, submitted_run_id),
+            next_cursor,
+        })
+    }
 }
 
 #[async_trait]
@@ -341,6 +424,7 @@ impl OpenAiResponsesProjectionReader for OpenAiResponsesThreadProjectionReader {
             } => submitted_run_id.to_string(),
             _ => return Err(OpenAiCompatHttpError::internal()),
         };
+        let mut projection_after_cursor = request.projection_read.after_cursor.clone();
         loop {
             if let Some(content) = self
                 .read_finalized_response_message(&request.projection_read, submitted_run_id.clone())
@@ -354,6 +438,30 @@ impl OpenAiResponsesProjectionReader for OpenAiResponsesThreadProjectionReader {
                     Some(content),
                 )));
             }
+            let projected = self
+                .read_projected_response_status(
+                    &request.projection_read,
+                    &submitted_run_id,
+                    projection_after_cursor.clone(),
+                )
+                .await?;
+            if let Some(next_cursor) = projected.next_cursor {
+                projection_after_cursor = Some(next_cursor);
+            }
+            if let Some(status) = projected.status
+                && matches!(
+                    status,
+                    OpenAiResponseStatus::Failed | OpenAiResponseStatus::Cancelled
+                )
+            {
+                return Ok(OpenAiResponseProjection::new(response_object(
+                    request.public_id,
+                    request.mapping.created_at,
+                    request.requested_model,
+                    status,
+                    None,
+                )));
+            }
             tokio::time::sleep(self.poll_interval).await;
         }
     }
@@ -364,12 +472,26 @@ impl OpenAiResponsesProjectionReader for OpenAiResponsesThreadProjectionReader {
     ) -> Result<OpenAiResponseObject, OpenAiCompatHttpError> {
         let submitted_run_id = response_turn_run_ref_from_mapping(&request)?;
         let content = self
-            .read_finalized_response_message(&request.projection_read, submitted_run_id)
+            .read_finalized_response_message(&request.projection_read, submitted_run_id.clone())
             .await?;
-        let status = if content.is_some() {
-            OpenAiResponseStatus::Completed
+        let projected_status = if content.is_some() {
+            None
         } else {
-            OpenAiResponseStatus::InProgress
+            self.read_projected_response_status(
+                &request.projection_read,
+                &submitted_run_id,
+                request.projection_read.after_cursor.clone(),
+            )
+            .await?
+            .status
+        };
+        let status = match (content.is_some(), projected_status) {
+            (true, _) => OpenAiResponseStatus::Completed,
+            (false, Some(OpenAiResponseStatus::Completed | OpenAiResponseStatus::InProgress)) => {
+                OpenAiResponseStatus::InProgress
+            }
+            (false, Some(status)) => status,
+            (false, None) => OpenAiResponseStatus::InProgress,
         };
         Ok(response_object(
             request.public_id,
@@ -381,6 +503,11 @@ impl OpenAiResponsesProjectionReader for OpenAiResponsesThreadProjectionReader {
             content,
         ))
     }
+}
+
+struct ProjectedResponseStatusRead {
+    status: Option<OpenAiResponseStatus>,
+    next_cursor: Option<ProjectionCursor>,
 }
 
 fn response_turn_run_ref_from_mapping(
@@ -397,6 +524,55 @@ fn response_turn_run_ref_from_mapping(
         )));
     };
     Ok(turn_run_ref.as_str().to_string())
+}
+
+fn response_status_from_projection_events(
+    events: &[ProductOutboundEnvelope],
+    submitted_run_id: &str,
+) -> Option<OpenAiResponseStatus> {
+    events.iter().rev().find_map(|event| match event.payload() {
+        ProductOutboundPayload::ProjectionSnapshot { state }
+        | ProductOutboundPayload::ProjectionUpdate { state } => {
+            response_status_from_projection_state(state, submitted_run_id)
+        }
+        ProductOutboundPayload::FinalReply(_)
+        | ProductOutboundPayload::Progress(_)
+        | ProductOutboundPayload::CapabilityActivity(_)
+        | ProductOutboundPayload::CapabilityDisplayPreview(_)
+        | ProductOutboundPayload::GatePrompt(_)
+        | ProductOutboundPayload::AuthPrompt(_)
+        | ProductOutboundPayload::KeepAlive => None,
+    })
+}
+
+fn response_status_from_projection_state(
+    state: &ProductProjectionState,
+    submitted_run_id: &str,
+) -> Option<OpenAiResponseStatus> {
+    state.items.iter().rev().find_map(|item| match item {
+        ProductProjectionItem::RunStatus { run_id, status, .. }
+            if run_id.to_string() == submitted_run_id =>
+        {
+            response_status_from_projection_run_status(status)
+        }
+        ProductProjectionItem::Text { .. }
+        | ProductProjectionItem::Thinking { .. }
+        | ProductProjectionItem::CapabilityActivity(_)
+        | ProductProjectionItem::WorkSummary { .. }
+        | ProductProjectionItem::RunStatus { .. }
+        | ProductProjectionItem::Gate { .. }
+        | ProductProjectionItem::SkillActivation { .. } => None,
+    })
+}
+
+fn response_status_from_projection_run_status(status: &str) -> Option<OpenAiResponseStatus> {
+    match status {
+        "running" => Some(OpenAiResponseStatus::InProgress),
+        "completed" => Some(OpenAiResponseStatus::Completed),
+        "failed" | "killed" => Some(OpenAiResponseStatus::Failed),
+        "cancelled" => Some(OpenAiResponseStatus::Cancelled),
+        _ => None,
+    }
 }
 
 fn response_object(
@@ -416,6 +592,13 @@ fn response_object(
             }]
         })
         .unwrap_or_default();
+    let error = if matches!(status, OpenAiResponseStatus::Failed) {
+        Some(OpenAiResponseErrorObject::from_kind(
+            OpenAiCompatErrorKind::Internal,
+        ))
+    } else {
+        None
+    };
     OpenAiResponseObject {
         id,
         object: "response".to_string(),
@@ -423,7 +606,7 @@ fn response_object(
         status,
         model,
         output,
-        error: None,
+        error,
         incomplete_details: None,
         usage: None,
     }

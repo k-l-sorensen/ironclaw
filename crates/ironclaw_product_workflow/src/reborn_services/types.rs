@@ -19,6 +19,142 @@ const OUTBOUND_DELIVERY_CHANNEL_MAX_BYTES: usize = 128;
 const OUTBOUND_DELIVERY_DISPLAY_NAME_MAX_BYTES: usize = 256;
 const OUTBOUND_DELIVERY_DESCRIPTION_MAX_BYTES: usize = 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornOperatorStatusState {
+    Ready,
+    Degraded,
+    Blocked,
+    Unsupported,
+    NotConfigured,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornOperatorStatusSeverity {
+    Info,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornOperatorStatusCheck {
+    pub id: String,
+    pub status: RebornOperatorStatusState,
+    pub severity: RebornOperatorStatusSeverity,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornOperatorStatusResponse {
+    pub generated_at: DateTime<Utc>,
+    pub overall: RebornOperatorStatusState,
+    pub checks: Vec<RebornOperatorStatusCheck>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RebornLogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornLogQueryRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<RebornLogLevel>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub tail: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornLogEntry {
+    pub id: String,
+    pub timestamp: DateTime<Utc>,
+    pub level: RebornLogLevel,
+    pub target: String,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornLogQueryResponse {
+    pub source: String,
+    pub entries: Vec<RebornLogEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_cursor: Option<String>,
+    pub tail_supported: bool,
+    pub follow_supported: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornServiceLifecycleAction {
+    Install,
+    Start,
+    Stop,
+    Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornServiceLifecycleState {
+    Installed,
+    Running,
+    Stopped,
+    Unsupported,
+    Failed,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornServiceLifecycleRequest {
+    pub action: RebornServiceLifecycleAction,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornServiceLifecycleResponse {
+    pub action: RebornServiceLifecycleAction,
+    pub state: RebornServiceLifecycleState,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remediation: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebornConnectableChannelListResponse {
     pub channels: Vec<RebornConnectableChannelInfo>,
@@ -84,12 +220,22 @@ pub enum RebornSubmitTurnResponse {
         resolved_run_profile_version: u64,
         event_cursor: EventCursor,
     },
-    DeferredBusy {
+    RejectedBusy {
         thread_id: ThreadId,
         accepted_message_ref: AcceptedMessageRef,
-        active_run_id: TurnRunId,
-        status: TurnStatus,
-        event_cursor: EventCursor,
+        /// The run that was blocking at the time of rejection.
+        ///
+        /// `Some` on a fresh `ThreadBusy` rejection (the run is known and
+        /// still queryable). `None` on an idempotent replay where the original
+        /// blocking run may have already terminated and its id cannot be
+        /// recovered from the stored message record.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        active_run_id: Option<TurnRunId>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<TurnStatus>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        event_cursor: Option<EventCursor>,
+        notice: String,
     },
     AlreadySubmitted {
         thread_id: ThreadId,
@@ -130,6 +276,27 @@ pub struct RebornTimelineResponse {
     /// start of the thread and there is nothing more to load.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_cursor: Option<String>,
+}
+
+/// Request the raw bytes of one landed attachment, addressed by the thread and
+/// message that carry it plus the attachment's per-message id. The triple is
+/// required because an attachment id is only unique within its message, not
+/// across a thread. The caller's authority comes from the authenticated session
+/// (the scope is derived server-side), never from these path values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornAttachmentRequest {
+    pub thread_id: String,
+    pub message_id: String,
+    pub attachment_id: String,
+}
+
+/// Raw bytes of one landed attachment plus the metadata a browser needs to
+/// render or download it. Returned by [`super::RebornServicesApi::read_attachment`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebornAttachmentBytes {
+    pub mime_type: String,
+    pub filename: Option<String>,
+    pub bytes: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -255,6 +422,16 @@ pub struct RebornListThreadsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebornListAutomationsResponse {
     pub automations: Vec<RebornAutomationInfo>,
+    /// Whether the background trigger poller (scheduler) is running. When
+    /// `false`, listed schedule automations will never actually fire, and the
+    /// browser surfaces a "scheduling is off" notice. Defaults to `true` on the
+    /// wire so an older payload without the field is not misreported as off.
+    #[serde(default = "default_scheduler_enabled")]
+    pub scheduler_enabled: bool,
+}
+
+fn default_scheduler_enabled() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -706,7 +883,11 @@ pub enum RebornAutomationRecentRunStatus {
 pub struct RebornAutomationRecentRunInfo {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<TurnRunId>,
-    pub thread_id: ThreadId,
+    /// Canonical thread id for this run, or `None` if no canonical conversation
+    /// thread has been established yet (e.g. pre-acceptance or failed runs).
+    /// The WebUI panel must not render a chat link when this field is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<ThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fire_slot: Option<DateTime<Utc>>,
     #[serde(default)]
@@ -807,7 +988,12 @@ pub struct RebornAutomationInfo {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RebornAutomationSource {
-    Schedule { cron: String },
+    Schedule {
+        cron: String,
+        /// IANA timezone name in which the cron expression is evaluated
+        /// (e.g. "America/New_York"). Always "UTC" for legacy rows.
+        timezone: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1052,6 +1238,12 @@ pub struct RebornOperatorCommandPlaneResponse {
     pub area: RebornOperatorArea,
     pub status: RebornOperatorSurfaceStatus,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operator_status: Option<RebornOperatorStatusResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logs: Option<RebornLogQueryResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_lifecycle: Option<RebornServiceLifecycleResponse>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<RebornOperatorConfigDiagnostic>,
 }
@@ -1081,6 +1273,44 @@ pub struct RebornOperatorSetupRequest {
     pub webui_access_token: Option<SecretString>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornOperatorSetupResponse {
+    pub area: RebornOperatorArea,
+    pub status: RebornOperatorSetupStatus,
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_provider_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub steps: Vec<RebornOperatorSetupStep>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<RebornOperatorConfigDiagnostic>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornOperatorSetupStatus {
+    Complete,
+    Incomplete,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RebornOperatorSetupStep {
+    pub name: String,
+    pub status: RebornOperatorSetupStepStatus,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RebornOperatorSetupStepStatus {
+    Complete,
+    Required,
+    Unsupported,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RebornOperatorConfigValidateRequest {
     #[serde(default)]
@@ -1093,6 +1323,24 @@ pub struct RebornOperatorLogsQuery {
     pub limit: Option<u32>,
     #[serde(default)]
     pub cursor: Option<String>,
+    #[serde(default)]
+    pub level: Option<RebornLogLevel>,
+    #[serde(default)]
+    pub target: Option<String>,
+    #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub tool_name: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub tail: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

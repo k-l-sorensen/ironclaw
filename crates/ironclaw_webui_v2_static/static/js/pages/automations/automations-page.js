@@ -1,14 +1,17 @@
 import { React, html } from "../../lib/html.js";
 import { useT } from "../../lib/i18n.js";
+import { AutomationDeliveryDefaultsPanel } from "./components/automation-delivery-defaults-panel.js";
 import { AutomationsList } from "./components/automations-list.js";
 import { AutomationsSummaryStrip } from "./components/automations-summary-strip.js";
 import { useAutomations } from "./hooks/useAutomations.js";
+import { useOutboundDeliveryDefaults } from "./hooks/useOutboundDeliveryDefaults.js";
 
 export function AutomationsPage() {
   const t = useT();
   const [filter, setFilter] = React.useState("all");
   const [selectedAutomationId, setSelectedAutomationId] = React.useState(null);
   const automationsState = useAutomations();
+  const deliveryState = useOutboundDeliveryDefaults();
   const showErrorOnly =
     automationsState.error &&
     !automationsState.isLoading &&
@@ -43,7 +46,23 @@ export function AutomationsPage() {
           ${showErrorOnly
             ? null
             : html`
+                ${!automationsState.isLoading &&
+                !automationsState.schedulerEnabled &&
+                html`
+                  <div
+                    role="status"
+                    className="rounded-xl border border-amber-400/30 bg-amber-500/10 px-4 py-3"
+                  >
+                    <div className="text-sm font-semibold text-amber-200">
+                      ${t("automations.schedulerOff.title")}
+                    </div>
+                    <div className="mt-0.5 text-xs leading-5 text-amber-200/80">
+                      ${t("automations.schedulerOff.description")}
+                    </div>
+                  </div>
+                `}
                 <${AutomationsSummaryStrip} summary=${automationsState.summary} />
+                <${AutomationDeliveryDefaultsPanel} deliveryState=${deliveryState} />
 
                 ${automationsState.isLoading
                   ? html`
