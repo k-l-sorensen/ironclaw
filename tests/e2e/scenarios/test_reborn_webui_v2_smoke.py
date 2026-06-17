@@ -245,14 +245,23 @@ async def _create_thread(client: httpx.AsyncClient, base_url: str) -> str:
 
 
 async def _send_message(
-    client: httpx.AsyncClient, base_url: str, thread_id: str, content: str
-) -> None:
+    client: httpx.AsyncClient,
+    base_url: str,
+    thread_id: str,
+    content: str,
+    *,
+    allow_rejected_busy: bool = False,
+) -> dict:
     response = await client.post(
         f"{base_url}/api/webchat/v2/threads/{thread_id}/messages",
         json={"client_action_id": _client_action_id(), "content": content},
         timeout=30,
     )
     assert response.status_code in (200, 202), response.text
+    body = response.json()
+    if body.get("outcome") == "rejected_busy" and not allow_rejected_busy:
+        raise AssertionError(f"message send was rejected busy: {body}")
+    return body
 
 
 async def _wait_for_assistant_message(
@@ -517,20 +526,42 @@ async def _send_and_settle(
 ) -> None:
     """Send a text turn and wait until `expected` assistant replies are finalized.
 
-    Sending while a prior turn is still running defers the message
-    (`deferred_busy`), so each turn must settle before the next is sent.
+    A prior turn may still hold the thread lock briefly after its assistant
+    reply is persisted. In that case POST /messages returns rejected_busy, so
+    retry until this turn is actually accepted before waiting on the timeline.
     """
-    await _send_message(client, base_url, thread_id, content)
+    loop = asyncio.get_running_loop()
+    send_deadline = loop.time() + 30
+    last_send: dict = {}
+    while True:
+        last_send = await _send_message(
+            client,
+            base_url,
+            thread_id,
+            content,
+            allow_rejected_busy=True,
+        )
+        if last_send.get("outcome") != "rejected_busy":
+            break
+        if loop.time() >= send_deadline:
+            raise AssertionError(
+                f"Thread {thread_id} stayed busy while sending {content!r}: {last_send}"
+            )
+        await asyncio.sleep(0.5)
+
+    last_timeline: dict = {}
     for _ in range(90):
         response = await client.get(
             f"{base_url}/api/webchat/v2/threads/{thread_id}/timeline", timeout=15
         )
         response.raise_for_status()
-        if _finalized_assistant_count(response.json()) >= expected:
+        last_timeline = response.json()
+        if _finalized_assistant_count(last_timeline) >= expected:
             return
         await asyncio.sleep(0.5)
     raise AssertionError(
-        f"Thread {thread_id} did not reach {expected} finalized assistant replies"
+        f"Thread {thread_id} did not reach {expected} finalized assistant replies. "
+        f"Last send: {last_send}. Last timeline: {last_timeline}"
     )
 
 
