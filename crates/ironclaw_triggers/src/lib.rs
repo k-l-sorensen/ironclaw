@@ -775,6 +775,37 @@ pub trait TriggerRepository: Send + Sync {
         limit: usize,
     ) -> Result<Vec<TriggerRecord>, TriggerError>;
 
+    /// Lists due triggers for one exact host scope.
+    ///
+    /// Production host pollers should prefer this over the global
+    /// [`TriggerRepository::list_due_triggers`] path so one tenant/agent host
+    /// cannot claim another scope's due trigger before fire-time authorization.
+    async fn list_due_triggers_for_scope(
+        &self,
+        tenant_id: TenantId,
+        agent_id: Option<AgentId>,
+        project_id: Option<ProjectId>,
+        now: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<TriggerRecord>, TriggerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut records = self
+            .list_due_triggers(now, MAX_DUE_TRIGGER_POLL_LIMIT)
+            .await?;
+        records.retain(|record| {
+            trigger_record_matches_host_scope(
+                record,
+                &tenant_id,
+                agent_id.as_ref(),
+                project_id.as_ref(),
+            )
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
+
     /// Lists active trigger fires across all tenants for trusted poller cleanup.
     ///
     /// # Safety / Authorization
@@ -801,6 +832,36 @@ pub trait TriggerRepository: Send + Sync {
         after: Option<ActiveTriggerScanCursor>,
         limit: usize,
     ) -> Result<Vec<TriggerRecord>, TriggerError>;
+
+    /// Lists active trigger fires for one exact host scope.
+    ///
+    /// This keeps hosted cleanup from loading or mutating another served
+    /// tenant/agent/project scope.
+    async fn list_active_triggers_after_for_scope(
+        &self,
+        tenant_id: TenantId,
+        agent_id: Option<AgentId>,
+        project_id: Option<ProjectId>,
+        after: Option<ActiveTriggerScanCursor>,
+        limit: usize,
+    ) -> Result<Vec<TriggerRecord>, TriggerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut records = self
+            .list_active_triggers_after(after, MAX_DUE_TRIGGER_POLL_LIMIT)
+            .await?;
+        records.retain(|record| {
+            trigger_record_matches_host_scope(
+                record,
+                &tenant_id,
+                agent_id.as_ref(),
+                project_id.as_ref(),
+            )
+        });
+        records.truncate(limit);
+        Ok(records)
+    }
 
     async fn claim_due_fire(
         &self,
@@ -916,6 +977,17 @@ pub trait TriggerRepository: Send + Sync {
         }
         Ok(runs_by_trigger)
     }
+}
+
+fn trigger_record_matches_host_scope(
+    record: &TriggerRecord,
+    tenant_id: &TenantId,
+    agent_id: Option<&AgentId>,
+    project_id: Option<&ProjectId>,
+) -> bool {
+    record.tenant_id == *tenant_id
+        && record.agent_id.as_ref() == agent_id
+        && record.project_id.as_ref() == project_id
 }
 
 /// Feature-gated durable libSQL repository type for composition/test wiring.
@@ -1106,6 +1178,50 @@ impl TriggerRepository for InMemoryTriggerRepository {
             .collect())
     }
 
+    async fn list_due_triggers_for_scope(
+        &self,
+        tenant_id: TenantId,
+        agent_id: Option<AgentId>,
+        project_id: Option<ProjectId>,
+        now: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<TriggerRecord>, TriggerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(MAX_DUE_TRIGGER_POLL_LIMIT);
+        let state = self.lock_state()?;
+        let mut selected_keys = state
+            .records
+            .iter()
+            .filter(|(_, record)| {
+                trigger_record_matches_host_scope(
+                    record,
+                    &tenant_id,
+                    agent_id.as_ref(),
+                    project_id.as_ref(),
+                ) && record.is_due_at(now)
+                    && !record.has_active_fire()
+            })
+            .map(|(key, record)| {
+                (
+                    record.next_run_at,
+                    record.tenant_id.clone(),
+                    record.trigger_id,
+                    key.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        selected_keys.sort_by_key(|(next_run_at, tenant_id, trigger_id, _)| {
+            (*next_run_at, tenant_id.clone(), *trigger_id)
+        });
+        selected_keys.truncate(limit);
+        Ok(selected_keys
+            .into_iter()
+            .filter_map(|(_, _, _, key)| state.records.get(&key).cloned())
+            .collect())
+    }
+
     async fn list_active_triggers(&self, limit: usize) -> Result<Vec<TriggerRecord>, TriggerError> {
         self.list_active_triggers_after(None, limit).await
     }
@@ -1149,6 +1265,65 @@ impl TriggerRepository for InMemoryTriggerRepository {
                 .collect::<Vec<_>>()
         };
         selected_records.sort_by_key(|(active_fire_slot, tenant_id, trigger_id, _record)| {
+            (*active_fire_slot, tenant_id.clone(), *trigger_id)
+        });
+        selected_records.truncate(limit);
+        Ok(selected_records
+            .into_iter()
+            .map(|(_, _, _, record)| record)
+            .collect())
+    }
+
+    async fn list_active_triggers_after_for_scope(
+        &self,
+        tenant_id: TenantId,
+        agent_id: Option<AgentId>,
+        project_id: Option<ProjectId>,
+        after: Option<ActiveTriggerScanCursor>,
+        limit: usize,
+    ) -> Result<Vec<TriggerRecord>, TriggerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(MAX_DUE_TRIGGER_POLL_LIMIT);
+        let mut selected_records = {
+            let state = self.lock_state()?;
+            state
+                .records
+                .values()
+                .filter(|record| {
+                    trigger_record_matches_host_scope(
+                        record,
+                        &tenant_id,
+                        agent_id.as_ref(),
+                        project_id.as_ref(),
+                    )
+                })
+                .filter_map(|record| {
+                    let active_fire_slot = record.active_fire_slot?;
+                    Some((
+                        active_fire_slot,
+                        record.tenant_id.clone(),
+                        record.trigger_id,
+                        record.clone(),
+                    ))
+                })
+                .filter(
+                    |(active_fire_slot, tenant_id, trigger_id, _record)| match after.as_ref() {
+                        Some(cursor) => {
+                            (*active_fire_slot, tenant_id, *trigger_id)
+                                > (
+                                    cursor.active_fire_slot(),
+                                    cursor.tenant_id(),
+                                    cursor.trigger_id(),
+                                )
+                        }
+                        None => true,
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        selected_records.sort_by_key(|(active_fire_slot, tenant_id, trigger_id, _)| {
             (*active_fire_slot, tenant_id.clone(), *trigger_id)
         });
         selected_records.truncate(limit);

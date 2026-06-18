@@ -323,6 +323,51 @@ impl TriggerRepository for PostgresTriggerRepository {
         rows.into_iter().map(|row| row_to_record(&row)).collect()
     }
 
+    async fn list_due_triggers_for_scope(
+        &self,
+        tenant_id: TenantId,
+        agent_id: Option<AgentId>,
+        project_id: Option<ProjectId>,
+        now: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<TriggerRecord>, TriggerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(super::MAX_DUE_TRIGGER_POLL_LIMIT) as i64;
+        let agent_id = agent_id.as_ref().map(AgentId::as_str);
+        let project_id = project_id.as_ref().map(ProjectId::as_str);
+        let client = self.connect().await?;
+        let now = fmt_ts(&now);
+        let rows = client
+            .query(
+                &format!(
+                    "SELECT {TRIGGER_COLUMNS}
+                     FROM {TRIGGER_TABLE}
+                     WHERE state = $1
+                       AND next_run_at <= $2
+                       AND tenant_id = $3
+                       AND agent_id IS NOT DISTINCT FROM $4
+                       AND project_id IS NOT DISTINCT FROM $5
+                       AND active_fire_slot IS NULL
+                       AND active_run_ref IS NULL
+                     ORDER BY next_run_at, tenant_id, trigger_id
+                     LIMIT $6"
+                ),
+                &[
+                    &state_text(TriggerState::Scheduled),
+                    &now,
+                    &tenant_id.as_str(),
+                    &agent_id,
+                    &project_id,
+                    &limit,
+                ],
+            )
+            .await
+            .map_err(|error| backend_error("query scoped due trigger records", error))?;
+        rows.into_iter().map(|row| row_to_record(&row)).collect()
+    }
+
     async fn list_active_triggers(&self, limit: usize) -> Result<Vec<TriggerRecord>, TriggerError> {
         self.list_active_triggers_after(None, limit).await
     }
@@ -380,6 +425,74 @@ impl TriggerRepository for PostgresTriggerRepository {
             }
         }
         .map_err(|error| backend_error("query active trigger records", error))?;
+        rows.into_iter().map(|row| row_to_record(&row)).collect()
+    }
+
+    async fn list_active_triggers_after_for_scope(
+        &self,
+        tenant_id: TenantId,
+        agent_id: Option<AgentId>,
+        project_id: Option<ProjectId>,
+        after: Option<ActiveTriggerScanCursor>,
+        limit: usize,
+    ) -> Result<Vec<TriggerRecord>, TriggerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(super::MAX_DUE_TRIGGER_POLL_LIMIT) as i64;
+        let agent_id = agent_id.as_ref().map(AgentId::as_str);
+        let project_id = project_id.as_ref().map(ProjectId::as_str);
+        let client = self.connect().await?;
+        let rows = match after {
+            Some(cursor) => {
+                let active_fire_slot = fmt_ts(&cursor.active_fire_slot());
+                let trigger_id = cursor.trigger_id().to_string();
+                client
+                    .query(
+                        &format!(
+                            "SELECT {TRIGGER_COLUMNS}
+                             FROM {TRIGGER_TABLE}
+                             WHERE active_fire_slot IS NOT NULL
+                               AND tenant_id = $1
+                               AND agent_id IS NOT DISTINCT FROM $2
+                               AND project_id IS NOT DISTINCT FROM $3
+                               AND (
+                                 active_fire_slot > $4
+                                 OR (active_fire_slot = $4 AND trigger_id > $5)
+                               )
+                             ORDER BY active_fire_slot, tenant_id, trigger_id
+                             LIMIT $6"
+                        ),
+                        &[
+                            &tenant_id.as_str(),
+                            &agent_id,
+                            &project_id,
+                            &active_fire_slot,
+                            &trigger_id,
+                            &limit,
+                        ],
+                    )
+                    .await
+            }
+            None => {
+                client
+                    .query(
+                        &format!(
+                            "SELECT {TRIGGER_COLUMNS}
+                             FROM {TRIGGER_TABLE}
+                             WHERE active_fire_slot IS NOT NULL
+                               AND tenant_id = $1
+                               AND agent_id IS NOT DISTINCT FROM $2
+                               AND project_id IS NOT DISTINCT FROM $3
+                             ORDER BY active_fire_slot, tenant_id, trigger_id
+                             LIMIT $4"
+                        ),
+                        &[&tenant_id.as_str(), &agent_id, &project_id, &limit],
+                    )
+                    .await
+            }
+        }
+        .map_err(|error| backend_error("query scoped active trigger records", error))?;
         rows.into_iter().map(|row| row_to_record(&row)).collect()
     }
 

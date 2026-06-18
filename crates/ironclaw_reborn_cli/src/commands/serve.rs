@@ -1046,6 +1046,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn serve_trigger_access_checker_uses_local_store_for_local_dev_profile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let tenant_id = TenantId::new("serve-dispatch-tenant").expect("tenant id");
+        let user_id = UserId::new("serve-dispatch-user").expect("user id");
+        let agent_id = AgentId::new("serve-dispatch-agent").expect("agent id");
+        let project_id = ProjectId::new("serve-dispatch-project").expect("project id");
+        let user_store_path = dir.path().join("reborn-local-dev.db");
+        let runtime_input =
+            RebornRuntimeInput::from_services(RebornBuildInput::local_dev(
+                "serve-dispatch-owner",
+                dir.path().join("runtime"),
+            ))
+            .with_trigger_poller_settings(
+                ironclaw_reborn_composition::TriggerPollerSettings::enabled(),
+            );
+
+        let runtime_input = with_serve_trigger_fire_access_checker(
+            runtime_input,
+            &user_store_path,
+            &tenant_id,
+            &user_id,
+            &agent_id,
+            Some(&project_id),
+        )
+        .await
+        .expect("serve local-dev trigger access checker");
+
+        assert!(
+            user_store_path.exists(),
+            "local-dev serve trigger access must use the local access store"
+        );
+        let checker = runtime_input
+            .trigger_fire_access_checker
+            .expect("checker is wired");
+        let decision = checker
+            .check_trigger_fire_access(ironclaw_reborn_composition::TriggerFireAccessCheck {
+                tenant_id,
+                creator_user_id: user_id,
+                agent_id: Some(agent_id),
+                project_id: Some(project_id),
+                trigger_id: ironclaw_reborn_composition::TriggerId::new(),
+                fire_slot: chrono::Utc::now(),
+            })
+            .await
+            .expect("check local-dev trigger fire access");
+
+        assert_eq!(
+            decision,
+            ironclaw_reborn_composition::TriggerFireAccessDecision::Allowed
+        );
+    }
+
+    #[tokio::test]
     async fn trigger_poller_bootstrap_seeds_no_project_local_access_checker() {
         let dir = tempfile::tempdir().expect("tempdir");
         let tenant_id = TenantId::new("serve-trigger-no-project-tenant").expect("tenant id");

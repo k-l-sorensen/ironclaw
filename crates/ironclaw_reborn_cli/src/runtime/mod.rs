@@ -126,6 +126,19 @@ async fn with_run_local_trigger_fire_access_checker(
         if !runtime_input.trigger_poller.enabled {
             return Ok(runtime_input);
         }
+        let is_local_profile = runtime_input
+            .services
+            .as_ref()
+            .map(|services| {
+                matches!(
+                    services.profile(),
+                    RebornCompositionProfile::LocalDev | RebornCompositionProfile::LocalDevYolo
+                )
+            })
+            .unwrap_or(false);
+        if !is_local_profile {
+            return Ok(runtime_input);
+        }
 
         let config_file = read_config_file(config)?;
         let tenant_id = TenantId::new(&runtime_input.identity.tenant_id).with_context(|| {
@@ -1891,6 +1904,66 @@ enabled = true
                 reason: "trigger creator does not have active local access for this scope"
                     .to_string(),
             }
+        );
+    }
+
+    #[cfg(all(feature = "webui-v2-beta", feature = "postgres"))]
+    #[allow(clippy::await_holding_lock, reason = "serializes env guards")]
+    #[tokio::test]
+    async fn run_trigger_poller_skips_local_access_checker_for_production_profile() {
+        let _lock = lock_trigger_env();
+        let (_enabled, _interval) = clear_trigger_poller_env();
+        let _postgres_url = EnvGuard::set(
+            "IRONCLAW_REBORN_POSTGRES_URL",
+            "postgres://localhost/ironclaw_reborn_cli_test",
+        );
+        let _secret_master_key =
+            EnvGuard::set("IRONCLAW_REBORN_SECRET_MASTER_KEY", "test-master-key");
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let reborn_home = temp.path().join("reborn-home");
+        std::fs::create_dir_all(&reborn_home).expect("mkdir");
+        std::fs::write(
+            reborn_home.join("config.toml"),
+            r#"
+[storage]
+backend = "postgres"
+url_env = "IRONCLAW_REBORN_POSTGRES_URL"
+secret_master_key_env = "IRONCLAW_REBORN_SECRET_MASTER_KEY"
+
+[policy]
+deployment_mode = "hosted_multi_tenant"
+default_profile = "secure_default"
+
+[trigger_poller]
+enabled = true
+"#,
+        )
+        .expect("write config");
+        let config = RebornBootConfig::resolve_from_env_parts(
+            Some(reborn_home.clone().into_os_string()),
+            None,
+            None,
+            Some("production".into()),
+        )
+        .expect("boot config");
+        let runtime_input =
+            build_runtime_input(&config, RuntimeInputCaller::Run).expect("runtime input");
+
+        let runtime_input = with_run_local_trigger_fire_access_checker(runtime_input, &config)
+            .await
+            .expect("production run trigger access checker wiring");
+
+        assert!(
+            runtime_input.trigger_fire_access_checker.is_none(),
+            "production run must not authorize trigger fires from the local-dev access store"
+        );
+        assert!(
+            !reborn_home
+                .join("local-dev")
+                .join("reborn-local-dev.db")
+                .exists(),
+            "production run must not create the local-dev trigger access sidecar"
         );
     }
 

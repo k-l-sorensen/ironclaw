@@ -547,6 +547,60 @@ impl TriggerRepository for LibSqlTriggerRepository {
         Ok(records)
     }
 
+    async fn list_due_triggers_for_scope(
+        &self,
+        tenant_id: TenantId,
+        agent_id: Option<AgentId>,
+        project_id: Option<ProjectId>,
+        now: Timestamp,
+        limit: usize,
+    ) -> Result<Vec<TriggerRecord>, TriggerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(super::MAX_DUE_TRIGGER_POLL_LIMIT);
+        let agent_id = agent_id.as_ref().map(AgentId::as_str);
+        let project_id = project_id.as_ref().map(ProjectId::as_str);
+        let conn = self.connect().await?;
+        let mut rows = conn
+            .query(
+                &format!(
+                    "SELECT {TRIGGER_COLUMNS}
+                     FROM {TRIGGER_TABLE}
+                     WHERE state = ?1
+                       AND next_run_at <= ?2
+                       AND tenant_id = ?3
+                       AND agent_id IS ?4
+                       AND project_id IS ?5
+                       AND active_fire_slot IS NULL
+                       AND active_run_ref IS NULL
+                     ORDER BY next_run_at, tenant_id, trigger_id
+                     LIMIT ?6"
+                ),
+                params![
+                    state_text(TriggerState::Scheduled),
+                    fmt_ts(&now),
+                    tenant_id.as_str(),
+                    agent_id,
+                    project_id,
+                    limit as i64,
+                ],
+            )
+            .await
+            .map_err(|error| backend_error("query scoped due trigger records", error))?;
+        let mut records = Vec::new();
+        loop {
+            match rows.next().await {
+                Ok(Some(row)) => records.push(row_to_record(&row)?),
+                Ok(None) => break,
+                Err(error) => {
+                    return Err(backend_error("read scoped due trigger record row", error));
+                }
+            }
+        }
+        Ok(records)
+    }
+
     async fn list_active_triggers(&self, limit: usize) -> Result<Vec<TriggerRecord>, TriggerError> {
         self.list_active_triggers_after(None, limit).await
     }
@@ -606,6 +660,83 @@ impl TriggerRepository for LibSqlTriggerRepository {
                 Ok(Some(row)) => records.push(row_to_record(&row)?),
                 Ok(None) => break,
                 Err(error) => return Err(backend_error("read active trigger record row", error)),
+            }
+        }
+        Ok(records)
+    }
+
+    async fn list_active_triggers_after_for_scope(
+        &self,
+        tenant_id: TenantId,
+        agent_id: Option<AgentId>,
+        project_id: Option<ProjectId>,
+        after: Option<ActiveTriggerScanCursor>,
+        limit: usize,
+    ) -> Result<Vec<TriggerRecord>, TriggerError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(super::MAX_DUE_TRIGGER_POLL_LIMIT);
+        let agent_id = agent_id.as_ref().map(AgentId::as_str);
+        let project_id = project_id.as_ref().map(ProjectId::as_str);
+        let conn = self.connect().await?;
+        let mut rows = match after {
+            Some(cursor) => {
+                conn.query(
+                    &format!(
+                        "SELECT {TRIGGER_COLUMNS}
+                         FROM {TRIGGER_TABLE}
+                         WHERE active_fire_slot IS NOT NULL
+                           AND tenant_id = ?1
+                           AND agent_id IS ?2
+                           AND project_id IS ?3
+                           AND (
+                             active_fire_slot > ?4
+                             OR (active_fire_slot = ?4 AND trigger_id > ?5)
+                           )
+                         ORDER BY active_fire_slot, tenant_id, trigger_id
+                         LIMIT ?6"
+                    ),
+                    params![
+                        tenant_id.as_str(),
+                        agent_id,
+                        project_id,
+                        fmt_ts(&cursor.active_fire_slot()),
+                        cursor.trigger_id().to_string(),
+                        limit as i64,
+                    ],
+                )
+                .await
+            }
+            None => {
+                conn.query(
+                    &format!(
+                        "SELECT {TRIGGER_COLUMNS}
+                         FROM {TRIGGER_TABLE}
+                         WHERE active_fire_slot IS NOT NULL
+                           AND tenant_id = ?1
+                           AND agent_id IS ?2
+                           AND project_id IS ?3
+                         ORDER BY active_fire_slot, tenant_id, trigger_id
+                         LIMIT ?4"
+                    ),
+                    params![tenant_id.as_str(), agent_id, project_id, limit as i64],
+                )
+                .await
+            }
+        }
+        .map_err(|error| backend_error("query scoped active trigger records", error))?;
+        let mut records = Vec::new();
+        loop {
+            match rows.next().await {
+                Ok(Some(row)) => records.push(row_to_record(&row)?),
+                Ok(None) => break,
+                Err(error) => {
+                    return Err(backend_error(
+                        "read scoped active trigger record row",
+                        error,
+                    ));
+                }
             }
         }
         Ok(records)

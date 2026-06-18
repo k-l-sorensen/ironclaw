@@ -129,15 +129,17 @@ pub trait TriggerFireAccessChecker: Send + Sync {
 /// configured tenant, creator, optional agent, and optional project exactly.
 /// `None` remains a real no-value dimension, not a wildcard.
 #[derive(Debug, Clone)]
-pub struct ExactScopeTriggerFireAccessChecker {
+#[cfg(test)]
+pub(crate) struct ExactScopeTriggerFireAccessChecker {
     tenant_id: TenantId,
     creator_user_id: UserId,
     agent_id: Option<AgentId>,
     project_id: Option<ProjectId>,
 }
 
+#[cfg(test)]
 impl ExactScopeTriggerFireAccessChecker {
-    pub fn new(
+    pub(crate) fn new(
         tenant_id: TenantId,
         creator_user_id: UserId,
         agent_id: Option<AgentId>,
@@ -151,7 +153,7 @@ impl ExactScopeTriggerFireAccessChecker {
         }
     }
 
-    pub fn for_default_agent(
+    pub(crate) fn for_default_agent(
         tenant_id: TenantId,
         creator_user_id: UserId,
         default_agent_id: AgentId,
@@ -173,6 +175,7 @@ impl ExactScopeTriggerFireAccessChecker {
 }
 
 #[async_trait]
+#[cfg(test)]
 impl TriggerFireAccessChecker for ExactScopeTriggerFireAccessChecker {
     async fn check_trigger_fire_access(
         &self,

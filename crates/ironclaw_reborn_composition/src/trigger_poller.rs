@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 #[cfg(feature = "slack-v2-host-beta")]
 use std::sync::OnceLock;
@@ -221,7 +221,7 @@ impl TriggerActiveRunLookup for SnapshotActiveRunLookup {
         request: TriggerActiveRunStateRequest,
     ) -> Result<TriggerActiveRunState, TriggerError> {
         let snapshot = self.snapshot_source.snapshot().await?;
-        let run_index = active_run_index(&snapshot);
+        let run_index = active_run_index_for_requests(&snapshot, std::slice::from_ref(&request));
         Ok(active_run_state_from_index(&run_index, &request))
     }
 
@@ -246,7 +246,7 @@ impl TriggerActiveRunLookup for SnapshotActiveRunLookup {
                     .collect();
             }
         };
-        let run_index = active_run_index(&snapshot);
+        let run_index = active_run_index_for_requests(&snapshot, &requests);
         requests
             .iter()
             .map(|request| Ok(active_run_state_from_index(&run_index, request)))
@@ -254,12 +254,18 @@ impl TriggerActiveRunLookup for SnapshotActiveRunLookup {
     }
 }
 
-fn active_run_index(
+fn active_run_index_for_requests(
     snapshot: &TurnPersistenceSnapshot,
+    requests: &[TriggerActiveRunStateRequest],
 ) -> HashMap<(ironclaw_host_api::TenantId, ironclaw_turns::TurnRunId), TriggerActiveRunState> {
+    let requested_runs = requests
+        .iter()
+        .map(|request| (request.tenant_id.clone(), request.run_id))
+        .collect::<HashSet<_>>();
     snapshot
         .runs
         .iter()
+        .filter(|run| requested_runs.contains(&(run.scope.tenant_id.clone(), run.run_id)))
         .map(|run| {
             let state = if run.status.is_terminal() {
                 TriggerActiveRunState::Terminal {
