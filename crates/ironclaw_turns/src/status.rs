@@ -322,6 +322,12 @@ pub struct TurnRunState {
     pub event_cursor: EventCursor,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub product_context: Option<ProductTurnContext>,
+    #[serde(
+        rename = "auth_resume_disposition",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub resume_disposition: Option<crate::GateResumeDisposition>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

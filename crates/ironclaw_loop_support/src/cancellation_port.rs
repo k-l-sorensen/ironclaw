@@ -601,6 +601,7 @@ mod tests {
             failure: None,
             event_cursor: EventCursor(1),
             product_context: None,
+            resume_disposition: None,
         }
     }
 

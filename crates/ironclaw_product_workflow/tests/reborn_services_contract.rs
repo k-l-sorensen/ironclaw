@@ -88,6 +88,16 @@ fn caller() -> WebUiAuthenticatedCaller {
     caller_for_user("user-alpha")
 }
 
+/// Wait until the wall clock is strictly past `floor`, so the next thread
+/// created/used gets a later activity timestamp — deterministic regardless
+/// of clock resolution. Uses async sleep to avoid blocking the test runtime
+/// (`std::thread::sleep` would block the tokio executor).
+async fn wait_until_after(floor: chrono::DateTime<Utc>) {
+    while Utc::now() <= floor {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+}
+
 fn caller_for_user(user_id: &str) -> WebUiAuthenticatedCaller {
     caller_for_user_with_project(user_id, Some("project-alpha"))
 }
@@ -146,6 +156,8 @@ fn fake_thread_history(owner: &WebUiAuthenticatedCaller, thread_id: &str) -> Thr
             title: Some("M2 facade contract thread".to_string()),
             metadata_json: None,
             goal: None,
+            created_at: None,
+            updated_at: None,
         },
         messages: vec![ThreadMessageRecord {
             message_id: ThreadMessageId::new(),
@@ -458,6 +470,7 @@ impl TurnCoordinator for FakeTurnCoordinator {
             failure: None,
             event_cursor: EventCursor(17),
             product_context: None,
+            resume_disposition: None,
         })
     }
 }
@@ -553,6 +566,7 @@ impl TurnCoordinator for BlockingSubmitCoordinator {
             failure: None,
             event_cursor: EventCursor(29),
             product_context: None,
+            resume_disposition: None,
         })
     }
 }
@@ -598,12 +612,10 @@ impl ApprovalInteractionService for RecordingApprovalInteractionService {
                 })
             }
             ApprovalInteractionDecision::Deny => {
-                ResolveApprovalInteractionResponse::Denied(CancelRunResponse {
+                ResolveApprovalInteractionResponse::Resumed(ResumeTurnResponse {
                     run_id,
-                    status: TurnStatus::Cancelled,
+                    status: TurnStatus::Queued,
                     event_cursor: EventCursor(23),
-                    already_terminal: false,
-                    actor: None,
                 })
             }
         })
@@ -1558,6 +1570,8 @@ impl SessionThreadService for ScriptedThreadService {
                     title: None,
                     metadata_json: None,
                     goal: None,
+                    created_at: None,
+                    updated_at: None,
                 },
                 messages: Vec::new(),
                 summary_artifacts: Vec::new(),
@@ -3807,7 +3821,7 @@ async fn approval_gate_denial_uses_approval_interaction_service_and_returns_canc
         .await
         .expect("approval gate denial succeeds");
 
-    assert!(matches!(response, RebornResolveGateResponse::Cancelled(_)));
+    assert!(matches!(response, RebornResolveGateResponse::Resumed(_)));
     assert_eq!(approval_interactions.resolution_count(), 1);
     assert_eq!(coordinator.cancellation_count(), 0);
     assert_eq!(
@@ -3923,6 +3937,75 @@ async fn hook_auth_gate_denial_uses_auth_interaction_service() {
     let resolution = auth_interactions.last_resolution().expect("resolution");
     assert_eq!(resolution.gate_ref.as_str(), "gate:hook-auth-alpha");
     assert_eq!(resolution.decision, AuthInteractionDecision::Deny);
+    assert_eq!(coordinator.cancellation_count(), 0);
+}
+
+/// A minimal auth-interaction stub that returns `Resumed` for every
+/// Deny decision, mirroring the production path where the model is resumed
+/// so it can surface the denial to the user.
+struct DeniedResumedAuthInteractionService;
+
+#[async_trait]
+impl AuthInteractionService for DeniedResumedAuthInteractionService {
+    async fn list_pending(
+        &self,
+        _request: ListPendingAuthInteractionsRequest,
+    ) -> Result<ListPendingAuthInteractionsResponse, ProductWorkflowError> {
+        Ok(ListPendingAuthInteractionsResponse {
+            auth_interactions: vec![],
+        })
+    }
+
+    async fn resolve(
+        &self,
+        request: ResolveAuthInteractionRequest,
+    ) -> Result<ResolveAuthInteractionResponse, ProductWorkflowError> {
+        let run_id = request.run_id_hint.expect("webui passes run_id");
+        Ok(ResolveAuthInteractionResponse::Resumed(
+            ResumeTurnResponse {
+                run_id,
+                status: TurnStatus::Queued,
+                event_cursor: EventCursor(37),
+            },
+        ))
+    }
+}
+
+#[tokio::test]
+async fn hook_auth_gate_denial_maps_to_reborn_resumed() {
+    // Verifies that a Deny decision (which produces `Resumed` from
+    // `resume_denied_auth`) maps to `RebornResolveGateResponse::Resumed`
+    // through the facade.
+    let coordinator = Arc::new(FakeTurnCoordinator::default());
+    let auth_interactions = Arc::new(DeniedResumedAuthInteractionService);
+    let services = RebornServices::new(
+        Arc::new(InMemorySessionThreadService::default()),
+        coordinator.clone(),
+    )
+    .with_auth_interactions(auth_interactions);
+    create_thread_for(&services, caller(), "thread-alpha").await;
+
+    let response = services
+        .resolve_gate(
+            caller(),
+            serde_json::from_value::<WebUiResolveGateRequest>(json!({
+                "client_action_id": "gate-auth-denial-resumed",
+                "thread_id": "thread-alpha",
+                "run_id": run_id_string(),
+                "gate_ref": "gate:hook-auth-denial-resumed",
+                "resolution": "denied"
+            }))
+            .expect("request"),
+        )
+        .await
+        .expect(
+            "Resumed from auth-interaction service must map to RebornResolveGateResponse::Resumed",
+        );
+
+    assert!(
+        matches!(response, RebornResolveGateResponse::Resumed(_)),
+        "expected Resumed, got: {response:?}"
+    );
     assert_eq!(coordinator.cancellation_count(), 0);
 }
 
@@ -8130,6 +8213,8 @@ async fn list_threads_breaks_out_when_cursor_does_not_advance_for_automation_thr
             "trigger-scheduled-summary",
         )),
         goal: None,
+        created_at: None,
+        updated_at: None,
     };
     let stalled_cursor = "cursor-stalled".to_string();
     let thread_service = Arc::new(ScriptedThreadService::list_pages(vec![
@@ -8193,6 +8278,8 @@ async fn list_threads_caps_filtered_pages_when_automation_threads_dominate() {
             "trigger-scheduled-summary",
         )),
         goal: None,
+        created_at: None,
+        updated_at: None,
     };
     let responses = (0..20)
         .map(|index| ListThreadsForScopeResponse {
@@ -8253,6 +8340,34 @@ async fn list_threads_skips_hidden_automation_threads_when_filling_page() {
     let second_visible_thread_id =
         ThreadId::new("thread-c-visible").expect("second visible thread id");
 
+    // Threads list newest-activity first, so create them oldest → newest:
+    // second visible, then first visible, then the automation thread last.
+    // That yields a candidate order of [automation, first, second], so the
+    // facade has to skip the leading hidden automation thread while filling
+    // the first page — the behavior under test. Waiting past each stamp
+    // keeps the `created_at` order strict regardless of clock resolution.
+    let second = thread_service
+        .ensure_thread(EnsureThreadRequest {
+            scope: thread_scope_for(&caller),
+            thread_id: Some(second_visible_thread_id.clone()),
+            created_by_actor_id: caller.user_id.as_str().to_string(),
+            title: Some("Second visible chat".to_string()),
+            metadata_json: Some(json!({ "source": "webui" }).to_string()),
+        })
+        .await
+        .expect("second visible thread");
+    wait_until_after(second.updated_at.expect("activity stamp")).await;
+    let first = thread_service
+        .ensure_thread(EnsureThreadRequest {
+            scope: thread_scope_for(&caller),
+            thread_id: Some(first_visible_thread_id.clone()),
+            created_by_actor_id: caller.user_id.as_str().to_string(),
+            title: Some("First visible chat".to_string()),
+            metadata_json: Some(json!({ "source": "webui" }).to_string()),
+        })
+        .await
+        .expect("first visible thread");
+    wait_until_after(first.updated_at.expect("activity stamp")).await;
     thread_service
         .ensure_thread(EnsureThreadRequest {
             scope: thread_scope_for(&caller),
@@ -8265,26 +8380,6 @@ async fn list_threads_skips_hidden_automation_threads_when_filling_page() {
         })
         .await
         .expect("automation thread");
-    thread_service
-        .ensure_thread(EnsureThreadRequest {
-            scope: thread_scope_for(&caller),
-            thread_id: Some(first_visible_thread_id.clone()),
-            created_by_actor_id: caller.user_id.as_str().to_string(),
-            title: Some("First visible chat".to_string()),
-            metadata_json: Some(json!({ "source": "webui" }).to_string()),
-        })
-        .await
-        .expect("first visible thread");
-    thread_service
-        .ensure_thread(EnsureThreadRequest {
-            scope: thread_scope_for(&caller),
-            thread_id: Some(second_visible_thread_id.clone()),
-            created_by_actor_id: caller.user_id.as_str().to_string(),
-            title: Some("Second visible chat".to_string()),
-            metadata_json: Some(json!({ "source": "webui" }).to_string()),
-        })
-        .await
-        .expect("second visible thread");
 
     let first_page = services
         .list_threads(

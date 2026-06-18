@@ -151,7 +151,7 @@ fn onboarding(package_id: &str) -> Option<LifecycleExtensionOnboarding> {
             "Web Access does not need credentials. Activate it to make web search and saved-result retrieval tools available.",
             Some("No credentials are required for Web Access."),
             None,
-            "Install Web Access, then activate it to publish its tools.",
+            "Activate Web Access to publish its tools.",
         )),
         _ => None,
     }
@@ -672,6 +672,7 @@ fn github_assets() -> Vec<AvailableExtensionAsset> {
         github_schema_asset!("get_pull_request_files.input.v1.json"),
         github_schema_asset!("get_pull_request_reviews.input.v1.json"),
         github_schema_asset!("get_repo.input.v1.json"),
+        github_schema_asset!("get_authenticated_user.input.v1.json"),
         github_schema_asset!("get_workflow_runs.input.v1.json"),
         github_schema_asset!("handle_webhook.input.v1.json"),
         github_schema_asset!("list_branches.input.v1.json"),
@@ -708,6 +709,7 @@ fn github_assets() -> Vec<AvailableExtensionAsset> {
         github_prompt_asset!("get_pull_request_files.md"),
         github_prompt_asset!("get_pull_request_reviews.md"),
         github_prompt_asset!("get_repo.md"),
+        github_prompt_asset!("get_authenticated_user.md"),
         github_prompt_asset!("get_workflow_runs.md"),
         github_prompt_asset!("handle_webhook.md"),
         github_prompt_asset!("list_branches.md"),
@@ -1686,6 +1688,7 @@ mod tests {
         }
 
         assert!(allowed_read_only.contains("github.get_repo"));
+        assert!(allowed_read_only.contains("github.get_authenticated_user"));
         assert!(allowed_read_only.contains("github.list_branches"));
         assert!(ask_required.contains("github.search_code"));
         assert!(ask_required.contains("github.create_issue"));
@@ -1802,6 +1805,12 @@ mod tests {
                                 && !step.contains("Install")
                         }),
                     "{extension_id} configure next step should describe activation after saving credentials"
+                );
+            } else if extension_id == "web-access" {
+                assert_eq!(
+                    onboarding.credential_next_step.as_deref(),
+                    Some("Activate Web Access to publish its tools."),
+                    "web-access configure next step should not repeat install-first copy"
                 );
             } else {
                 assert!(
