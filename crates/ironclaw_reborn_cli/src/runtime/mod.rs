@@ -771,6 +771,14 @@ fn reject_unsupported_runtime_sections(
     {
         sections.push("[policy]");
     }
+    if file.storage.is_some()
+        && !matches!(
+            profile,
+            RebornProfile::Production | RebornProfile::MigrationDryRun
+        )
+    {
+        sections.push("[storage]");
+    }
     if file.drivers.is_some() {
         sections.push("[drivers]");
     }
@@ -1078,6 +1086,31 @@ default_profile = "secure_default"
         assert!(
             err.to_string().contains("[policy]"),
             "error must mention policy section, got: {err:#}"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn build_runtime_input_for_hosted_volume_rejects_storage_section() {
+        let _lock = lock_trigger_env();
+        let (_enabled, _interval) = clear_trigger_poller_env();
+        let (_temp, config) = boot_config_with_config_toml(
+            "hosted-single-tenant-volume",
+            r#"
+[storage]
+backend = "postgres"
+url_env = "IRONCLAW_REBORN_POSTGRES_URL"
+secret_master_key_env = "IRONCLAW_REBORN_SECRET_MASTER_KEY"
+"#,
+        );
+
+        let err = build_runtime_input(&config, RuntimeInputCaller::Run)
+            .err()
+            .expect("hosted volume profile must reject production storage section");
+
+        assert!(
+            err.to_string().contains("[storage]"),
+            "error must mention storage section, got: {err:#}"
         );
     }
 
