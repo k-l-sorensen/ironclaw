@@ -280,15 +280,13 @@ impl ServeCommand {
                  value is {token_byte_len} bytes — generate one with e.g. `openssl rand -hex 32`."
             ));
         }
-        // Substrate DB the reborn local-dev runtime opens (a second handle to
-        // the same `reborn-local-dev.db`). It backs the local trigger-fire
+        // Sidecar DB used by the local-runtime trigger-fire access checker. It
+        // backs the local trigger-fire
         // access store used to seed default-user and SSO-user trigger access;
         // canonical identity itself lives on the runtime's scoped filesystem,
         // not in this file.
-        let user_store_path = boot_config
-            .home()
-            .path()
-            .join("local-dev")
+        let profile = crate::runtime::effective_profile(boot_config, config_file.as_ref())?;
+        let user_store_path = crate::runtime::local_runtime_storage_root(boot_config, profile)
             .join("reborn-local-dev.db");
         // CORS allow-origin list. Empty = fail-closed on every
         // cross-origin preflight; operators MUST opt in to the

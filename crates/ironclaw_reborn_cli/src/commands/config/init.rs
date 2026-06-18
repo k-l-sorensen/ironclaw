@@ -146,8 +146,9 @@ fn config_stub() -> String {
 api_version = "{api_version}"
 
 [boot]
-# Composition profile. One of: local-dev, local-dev-yolo, production, migration-dry-run.
-# Today local-dev and local-dev-yolo are wired end-to-end.
+# Composition profile. One of: local-dev, local-dev-yolo, hosted-single-tenant,
+# production, migration-dry-run.
+# Today local-dev, local-dev-yolo, and hosted-single-tenant are wired end-to-end.
 # local-dev-yolo also requires --confirm-host-access at runtime.
 profile = "local-dev"
 
@@ -190,8 +191,9 @@ poll_interval_ms        = 200
 regex_activation_enabled = true
 
 # [storage]
-# # Production storage selection. The database URL value is env-only; this
-# # file may name the variable but must never contain the raw URL.
+# # PostgreSQL storage selection for hosted-single-tenant / production. The
+# # database URL value is env-only; this file may name the variable but must
+# # never contain the raw URL.
 # # Managed remote Postgres providers must use TLS, e.g. append
 # # `sslmode=require` to IRONCLAW_REBORN_POSTGRES_URL.
 # backend = "postgres"

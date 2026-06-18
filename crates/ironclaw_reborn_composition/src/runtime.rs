@@ -252,7 +252,9 @@ fn enforce_runtime_cutover_gate(
         RebornCompositionProfile::Disabled => Err(RebornRuntimeError::InvalidArgument {
             reason: "profile=disabled must not start live Reborn runtime traffic".to_string(),
         }),
-        RebornCompositionProfile::LocalDev | RebornCompositionProfile::LocalDevYolo => Ok(()),
+        RebornCompositionProfile::LocalDev
+        | RebornCompositionProfile::LocalDevYolo
+        | RebornCompositionProfile::HostedSingleTenant => Ok(()),
     }
 }
 
@@ -1063,10 +1065,14 @@ impl RebornRuntime {
         // rows into the same libSQL substrate. Reading that SQL table is a
         // substrate-level concern, so it lives here in the host layer (not the
         // identity crate) and binds each row into the filesystem-backed store.
-        if let Err(err) =
-            fold_legacy_webui_identities(&local.identity_substrate_db, tenant_id, &store).await
+        #[cfg(feature = "libsql")]
         {
-            return Some(Err(err));
+            if let Some(identity_substrate_db) = &local.identity_substrate_db
+                && let Err(err) =
+                    fold_legacy_webui_identities(identity_substrate_db, tenant_id, &store).await
+            {
+                return Some(Err(err));
+            }
         }
         Some(Ok(
             Arc::new(store) as Arc<dyn ironclaw_reborn_identity::RebornIdentityResolver>
@@ -2147,7 +2153,8 @@ impl RebornRuntime {
 /// the returned `RebornRuntime` is ready to accept `send_user_message` calls.
 ///
 /// **Currently supported profiles:** `RebornCompositionProfile::LocalDev`,
-/// `RebornCompositionProfile::LocalDevYolo`, and
+/// `RebornCompositionProfile::LocalDevYolo`,
+/// `RebornCompositionProfile::HostedSingleTenant`, and
 /// `RebornCompositionProfile::Production` are wired end-to-end here. Production
 /// starts only after readiness diagnostics validate that live traffic can be
 /// exposed without a partial cutover.
@@ -2186,6 +2193,7 @@ pub async fn build_reborn_runtime(
     match profile {
         RebornCompositionProfile::LocalDev
         | RebornCompositionProfile::LocalDevYolo
+        | RebornCompositionProfile::HostedSingleTenant
         | RebornCompositionProfile::Production => {}
         RebornCompositionProfile::MigrationDryRun => {
             return Err(RebornRuntimeError::InvalidArgument {
@@ -2231,7 +2239,9 @@ pub async fn build_reborn_runtime(
     enforce_runtime_cutover_gate(profile, &services.readiness)?;
 
     let runtime_parts = match profile {
-        RebornCompositionProfile::LocalDev | RebornCompositionProfile::LocalDevYolo => {
+        RebornCompositionProfile::LocalDev
+        | RebornCompositionProfile::LocalDevYolo
+        | RebornCompositionProfile::HostedSingleTenant => {
             let local_runtime =
                 services
                     .local_runtime
@@ -7446,12 +7456,14 @@ mod tests {
         // Seed a legacy pre-#4381 WebUI identity into the SAME substrate DB the
         // runtime owns, exactly as the old store wrote it.
         let substrate = Arc::clone(
-            &runtime
+            runtime
                 .services
                 .local_runtime
                 .as_ref()
                 .expect("local runtime substrate")
-                .identity_substrate_db,
+                .identity_substrate_db
+                .as_ref()
+                .expect("libSQL identity substrate"),
         );
         let seed = substrate.connect().expect("substrate connection");
         seed.execute_batch(
@@ -7544,12 +7556,14 @@ mod tests {
 
         // Seed a legacy pre-#4381 WebUI Google identity with a VERIFIED email.
         let substrate = Arc::clone(
-            &runtime
+            runtime
                 .services
                 .local_runtime
                 .as_ref()
                 .expect("local runtime substrate")
-                .identity_substrate_db,
+                .identity_substrate_db
+                .as_ref()
+                .expect("libSQL identity substrate"),
         );
         let seed = substrate.connect().expect("substrate connection");
         seed.execute_batch(

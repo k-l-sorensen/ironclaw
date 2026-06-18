@@ -90,6 +90,7 @@ fn local_runtime_policy(
         RebornCompositionProfile::LocalDev => RuntimeProfile::LocalDev,
         RebornCompositionProfile::LocalDevYolo => RuntimeProfile::LocalYolo,
         RebornCompositionProfile::Disabled
+        | RebornCompositionProfile::HostedSingleTenant
         | RebornCompositionProfile::Production
         | RebornCompositionProfile::MigrationDryRun => {
             return Err(RebornLocalRuntimeProfileError::UnsupportedProfile { profile });

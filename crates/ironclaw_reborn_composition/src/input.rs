@@ -199,6 +199,14 @@ pub(crate) enum RebornStorageInput {
         workspace_root: Option<PathBuf>,
         host_home_root: Option<PathBuf>,
     },
+    #[cfg(feature = "postgres")]
+    LocalRuntimePostgres {
+        root: PathBuf,
+        workspace_root: Option<PathBuf>,
+        host_home_root: Option<PathBuf>,
+        pool: deadpool_postgres::Pool,
+        secret_master_key: ironclaw_secrets::SecretMaterial,
+    },
     #[cfg(feature = "libsql")]
     Libsql {
         db: Arc<libsql::Database>,
@@ -281,24 +289,74 @@ impl RebornBuildInput {
         )
     }
 
-    pub fn with_local_dev_workspace_root(mut self, workspace_root: PathBuf) -> Self {
-        if let RebornStorageInput::LocalDev {
-            workspace_root: root,
+    #[cfg(feature = "postgres")]
+    pub fn hosted_single_tenant_postgres_from_config_and_env(
+        profile: RebornCompositionProfile,
+        owner_id: impl Into<String>,
+        root: PathBuf,
+        config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+    ) -> Result<Self, RebornBuildError> {
+        if profile != RebornCompositionProfile::HostedSingleTenant {
+            return Err(RebornBuildError::InvalidConfig {
+                reason: format!(
+                    "hosted single-tenant Postgres storage requires profile=hosted-single-tenant; got profile={profile}"
+                ),
+            });
+        }
+        let ResolvedPostgresStorage {
+            pool,
+            secret_master_key,
             ..
-        } = &mut self.storage
-        {
-            *root = Some(workspace_root);
+        } = resolve_postgres_storage_from_config_and_env(profile, config_file)?;
+        Ok(Self::new(
+            profile,
+            owner_id,
+            RebornStorageInput::LocalRuntimePostgres {
+                root,
+                workspace_root: None,
+                host_home_root: None,
+                pool,
+                secret_master_key,
+            },
+        ))
+    }
+
+    pub fn with_local_dev_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+        match &mut self.storage {
+            RebornStorageInput::LocalDev {
+                workspace_root: root,
+                ..
+            } => {
+                *root = Some(workspace_root);
+            }
+            #[cfg(feature = "postgres")]
+            RebornStorageInput::LocalRuntimePostgres {
+                workspace_root: root,
+                ..
+            } => {
+                *root = Some(workspace_root);
+            }
+            _ => {}
         }
         self
     }
 
     pub fn with_local_dev_confirmed_host_home_root(mut self, host_home_root: PathBuf) -> Self {
-        if let RebornStorageInput::LocalDev {
-            host_home_root: root,
-            ..
-        } = &mut self.storage
-        {
-            *root = Some(host_home_root);
+        match &mut self.storage {
+            RebornStorageInput::LocalDev {
+                host_home_root: root,
+                ..
+            } => {
+                *root = Some(host_home_root);
+            }
+            #[cfg(feature = "postgres")]
+            RebornStorageInput::LocalRuntimePostgres {
+                host_home_root: root,
+                ..
+            } => {
+                *root = Some(host_home_root);
+            }
+            _ => {}
         }
         self
     }
@@ -403,56 +461,12 @@ impl RebornBuildInput {
         owner_id: impl Into<String>,
         config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
     ) -> Result<Self, RebornBuildError> {
-        let storage = config_file
-            .and_then(|file| file.storage.as_ref())
-            .ok_or_else(|| RebornBuildError::InvalidConfig {
-                reason: format!(
-                    "profile={profile} requires [storage] backend = \"postgres\" with url_env naming \
-                     an environment variable such as {DEFAULT_REBORN_POSTGRES_URL_ENV}"
-                ),
-            })?;
-        match storage.backend.as_ref() {
-            Some(StorageBackend::Postgres) => {}
-            Some(StorageBackend::Unknown(backend)) => {
-                return Err(RebornBuildError::InvalidConfig {
-                    reason: format!(
-                        "production storage supports only [storage].backend = \"postgres\" in this slice; got `{backend}`"
-                    ),
-                });
-            }
-            None => {
-                return Err(RebornBuildError::InvalidConfig {
-                    reason: format!("profile={profile} requires [storage].backend = \"postgres\""),
-                });
-            }
-        }
-        let url_env = storage
-            .url_env
-            .as_deref()
-            .unwrap_or(DEFAULT_REBORN_POSTGRES_URL_ENV);
-        let secret_master_key_env = storage
-            .secret_master_key_env
-            .as_deref()
-            .unwrap_or(DEFAULT_REBORN_SECRET_MASTER_KEY_ENV);
-        let database_url = required_production_url_env(
-            url_env,
-            "Reborn production PostgreSQL URL",
-            "storage.url_env",
-        )?;
-        let secret_master_key = required_production_key_env(
-            secret_master_key_env,
-            "Reborn production secret master key",
-            "storage.secret_master_key_env",
-        )?;
-        let pool_max_size = storage
-            .pool_max_size
-            .unwrap_or(ironclaw_reborn_event_store::DEFAULT_POSTGRES_POOL_MAX_SIZE);
-        let tls_options = postgres_pool_tls_options_from_env()?;
-        let pool = ironclaw_reborn_event_store::open_postgres_pool_with_tls_options(
-            database_url.clone(),
-            pool_max_size,
+        let ResolvedPostgresStorage {
+            pool,
+            url,
             tls_options,
-        )?;
+            secret_master_key,
+        } = resolve_postgres_storage_from_config_and_env(profile, config_file)?;
         let runtime_policy = resolve_production_runtime_policy(profile, config_file)?;
         let trust_policy = crate::builtin_first_party_trust_policy()?;
 
@@ -461,7 +475,7 @@ impl RebornBuildInput {
             owner_id,
             RebornStorageInput::Postgres {
                 pool,
-                url: database_url,
+                url,
                 tls_options,
                 secret_master_key: Some(secret_master_key),
             },
@@ -655,6 +669,75 @@ impl RebornBuildInput {
             nearai_mcp_bootstrap_config: None,
         }
     }
+}
+
+#[cfg(feature = "postgres")]
+struct ResolvedPostgresStorage {
+    pool: deadpool_postgres::Pool,
+    url: ironclaw_secrets::SecretMaterial,
+    tls_options: PostgresPoolTlsOptions,
+    secret_master_key: ironclaw_secrets::SecretMaterial,
+}
+
+#[cfg(feature = "postgres")]
+fn resolve_postgres_storage_from_config_and_env(
+    profile: RebornCompositionProfile,
+    config_file: Option<&ironclaw_reborn_config::RebornConfigFile>,
+) -> Result<ResolvedPostgresStorage, RebornBuildError> {
+    let storage = config_file
+        .and_then(|file| file.storage.as_ref())
+        .ok_or_else(|| RebornBuildError::InvalidConfig {
+            reason: format!(
+                "profile={profile} requires [storage] backend = \"postgres\" with url_env naming \
+                 an environment variable such as {DEFAULT_REBORN_POSTGRES_URL_ENV}"
+            ),
+        })?;
+    match storage.backend.as_ref() {
+        Some(StorageBackend::Postgres) => {}
+        Some(StorageBackend::Unknown(backend)) => {
+            return Err(RebornBuildError::InvalidConfig {
+                reason: format!(
+                    "PostgreSQL-backed Reborn storage supports only [storage].backend = \"postgres\" in this slice; got `{backend}`"
+                ),
+            });
+        }
+        None => {
+            return Err(RebornBuildError::InvalidConfig {
+                reason: format!("profile={profile} requires [storage].backend = \"postgres\""),
+            });
+        }
+    }
+    let url_env = storage
+        .url_env
+        .as_deref()
+        .unwrap_or(DEFAULT_REBORN_POSTGRES_URL_ENV);
+    let secret_master_key_env = storage
+        .secret_master_key_env
+        .as_deref()
+        .unwrap_or(DEFAULT_REBORN_SECRET_MASTER_KEY_ENV);
+    let database_url =
+        required_production_url_env(url_env, "Reborn PostgreSQL URL", "storage.url_env")?;
+    let secret_master_key = required_production_key_env(
+        secret_master_key_env,
+        "Reborn secret master key",
+        "storage.secret_master_key_env",
+    )?;
+    let pool_max_size = storage
+        .pool_max_size
+        .unwrap_or(ironclaw_reborn_event_store::DEFAULT_POSTGRES_POOL_MAX_SIZE);
+    let tls_options = postgres_pool_tls_options_from_env()?;
+    let pool = ironclaw_reborn_event_store::open_postgres_pool_with_tls_options(
+        database_url.clone(),
+        pool_max_size,
+        tls_options,
+    )?;
+
+    Ok(ResolvedPostgresStorage {
+        pool,
+        url: database_url,
+        tls_options,
+        secret_master_key,
+    })
 }
 
 #[cfg(feature = "postgres")]

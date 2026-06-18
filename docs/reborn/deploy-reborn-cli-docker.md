@@ -83,9 +83,12 @@ builds the `ironclaw-reborn serve` arguments from `PORT` and
 `IRONCLAW_REBORN_SERVE_HOST`; Railway does not shell-expand `$VAR` placeholders
 in Docker command arguments before they reach the entrypoint.
 
-Minimum Railway variables:
+Minimum Railway variables for the hosted single-tenant Postgres profile:
 
 ```bash
+IRONCLAW_REBORN_PROFILE=hosted-single-tenant
+IRONCLAW_REBORN_POSTGRES_URL=<postgres-url>
+IRONCLAW_REBORN_SECRET_MASTER_KEY=<random-secret-master-key>
 IRONCLAW_REBORN_WEBUI_TOKEN=<random-hex-32-bytes-or-longer>
 IRONCLAW_REBORN_WEBUI_USER_ID=reborn-cli
 NEARAI_API_KEY=<nearai-api-key>
@@ -98,13 +101,17 @@ selects a different provider.
 
 Do not use `IRONCLAW_REBORN_PROFILE=local-dev-yolo` for a public Railway
 listener. That profile grants trusted host access and `serve` refuses to bind it
-to a non-loopback host. Use the default `local-dev` container config until the
-production Reborn deployment profile is fully wired for this service.
+to a non-loopback host. Use `hosted-single-tenant` for the preview deployment
+path that keeps the local-dev product surface while storing runtime state in
+Postgres.
 
 Set `IRONCLAW_REBORN_HOME` to a mounted volume path if state should survive
-redeploys. The image default is `/data/ironclaw-reborn`; without a Railway
-volume, that path is ephemeral. The container workdir is `/workspace` so the
-local-dev workspace root stays separate from Reborn's state and skill roots.
+redeploys. The hosted single-tenant profile stores runtime/control-plane state
+in Postgres, but project files, system extension packages, and current skill
+file storage still live under the local filesystem root. The image default is
+`/data/ironclaw-reborn`; without a Railway volume, that path is ephemeral. The
+container workdir is `/workspace` so the workspace root stays separate from
+Reborn's state and skill roots.
 
 To seed a custom config instead of the bundled default, mount it under
 `/opt/ironclaw/` and set `IRONCLAW_REBORN_DEFAULT_CONFIG` to that path. On first
