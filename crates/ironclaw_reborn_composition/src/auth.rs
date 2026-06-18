@@ -715,12 +715,12 @@ impl RebornProductAuthServices {
         self
     }
 
-    /// Enable WebUI/local-dev auth-flow projection source.
+    /// Enable WebUI auth-flow projection from a scoped flow record source.
     ///
     /// Exported `pub` so integration-test harnesses outside the crate can
-    /// wire an in-memory fake. Not part of the stable product API — do not
-    /// call this from production composition paths; use `as_auth_challenge_provider()`
-    /// only when `product_auth` exposes a `flow_record_source` via the bundle.
+    /// wire an in-memory fake. Production composition should only pass the
+    /// durable product-auth backend for the same scoped store used by the flow
+    /// manager.
     #[doc(hidden)]
     pub fn with_flow_record_source(mut self, source: Arc<dyn AuthFlowRecordSource>) -> Self {
         self.flow_record_source = Some(source);

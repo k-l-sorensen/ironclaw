@@ -13,7 +13,7 @@ use ironclaw_product_workflow::{
 };
 use ironclaw_turns::{GateRef, TurnPersistenceSnapshot, TurnRunId, TurnScope, TurnStatus};
 
-use crate::factory::LocalDevTurnStateStore;
+use super::TurnPersistenceSnapshotSource;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BlockedAuthRun {
@@ -22,7 +22,7 @@ struct BlockedAuthRun {
 }
 
 pub(super) struct LocalDevAuthInteractionReadModel {
-    turn_state: Arc<LocalDevTurnStateStore>,
+    turn_state: Arc<dyn TurnPersistenceSnapshotSource>,
     flow_records: Arc<dyn AuthFlowRecordSource>,
 }
 
@@ -47,7 +47,7 @@ impl AuthInteractionService for UnavailableAuthInteractionService {
 
 impl LocalDevAuthInteractionReadModel {
     pub(super) fn new(
-        turn_state: Arc<LocalDevTurnStateStore>,
+        turn_state: Arc<dyn TurnPersistenceSnapshotSource>,
         flow_records: Arc<dyn AuthFlowRecordSource>,
     ) -> Self {
         Self {
@@ -57,17 +57,10 @@ impl LocalDevAuthInteractionReadModel {
     }
 
     async fn snapshot(&self) -> Result<TurnPersistenceSnapshot, ProductWorkflowError> {
-        #[cfg(feature = "libsql")]
-        {
-            self.turn_state
-                .persistence_snapshot()
-                .await
-                .map_err(|_| auth_read_model_unavailable())
-        }
-        #[cfg(not(feature = "libsql"))]
-        {
-            Ok(self.turn_state.persistence_snapshot())
-        }
+        self.turn_state
+            .interaction_snapshot()
+            .await
+            .map_err(|_| auth_read_model_unavailable())
     }
 
     async fn blocked_auth_runs(

@@ -87,7 +87,7 @@ use ironclaw_resources::{
     BroadcastBudgetEventSink, BudgetGateStore, FilesystemBudgetGateStore,
     FilesystemResourceGovernorStore, PersistentResourceGovernor, ResourceGovernor,
 };
-#[cfg(feature = "libsql")]
+#[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_run_state::{FilesystemApprovalRequestStore, FilesystemRunStateStore};
 #[cfg(not(feature = "libsql"))]
 use ironclaw_run_state::{InMemoryApprovalRequestStore, InMemoryRunStateStore};
@@ -584,6 +584,9 @@ where
     pub(crate) active_extension_registry: Arc<SharedExtensionRegistry>,
     pub(crate) trust_policy: Arc<HostTrustPolicy>,
     pub(crate) turn_state: Arc<FilesystemTurnStateStore<F>>,
+    pub(crate) approval_requests: Arc<FilesystemApprovalRequestStore<F>>,
+    pub(crate) capability_leases: Arc<FilesystemCapabilityLeaseStore<F>>,
+    pub(crate) persistent_approval_policies: Arc<FilesystemPersistentApprovalPolicyStore<F>>,
     pub(crate) checkpoint_state_store: Arc<dyn CheckpointStateStore>,
     pub(crate) thread_service: Arc<dyn SessionThreadService>,
     pub(crate) trigger_repository: Arc<dyn TriggerRepository>,
@@ -652,6 +655,43 @@ impl RebornProductionRuntimeServices {
             Self::LibSql(graph) => graph.turn_state.clone(),
             #[cfg(feature = "postgres")]
             Self::Postgres(graph) => graph.turn_state.clone(),
+        }
+    }
+
+    pub(crate) fn approval_requests(&self) -> Arc<dyn ironclaw_run_state::ApprovalRequestStore> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.approval_requests)
+                as Arc<dyn ironclaw_run_state::ApprovalRequestStore>,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.approval_requests)
+                as Arc<dyn ironclaw_run_state::ApprovalRequestStore>,
+        }
+    }
+
+    pub(crate) fn capability_leases(
+        &self,
+    ) -> Arc<dyn ironclaw_authorization::CapabilityLeaseStore> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.capability_leases)
+                as Arc<dyn ironclaw_authorization::CapabilityLeaseStore>,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.capability_leases)
+                as Arc<dyn ironclaw_authorization::CapabilityLeaseStore>,
+        }
+    }
+
+    pub(crate) fn persistent_approval_policies(
+        &self,
+    ) -> Arc<dyn ironclaw_approvals::PersistentApprovalPolicyStore> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.persistent_approval_policies)
+                as Arc<dyn ironclaw_approvals::PersistentApprovalPolicyStore>,
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.persistent_approval_policies)
+                as Arc<dyn ironclaw_approvals::PersistentApprovalPolicyStore>,
         }
     }
 
@@ -3113,6 +3153,7 @@ where
 {
     filesystem: Arc<F>,
     scoped_filesystem: Arc<ScopedFilesystem<F>>,
+    approval_requests: Arc<FilesystemApprovalRequestStore<F>>,
     leases: Arc<FilesystemCapabilityLeaseStore<F>>,
     persistent_approval_policies: Arc<FilesystemPersistentApprovalPolicyStore<F>>,
     secret_credentials: FilesystemSecretCredentialStores<F>,
@@ -3130,6 +3171,9 @@ where
         event_store: ironclaw_reborn_event_store::RebornEventStoreConfig,
     ) -> Result<Self, RebornBuildError> {
         let scoped_filesystem = crate::wrap_scoped(Arc::clone(&filesystem));
+        let approval_requests = Arc::new(FilesystemApprovalRequestStore::new(Arc::clone(
+            &scoped_filesystem,
+        )));
         let leases = Arc::new(FilesystemCapabilityLeaseStore::new(Arc::clone(
             &scoped_filesystem,
         )));
@@ -3144,6 +3188,7 @@ where
         Ok(Self {
             filesystem,
             scoped_filesystem,
+            approval_requests,
             leases,
             persistent_approval_policies,
             secret_credentials,
@@ -3249,6 +3294,12 @@ where
     )?;
     let product_auth_filesystem = Arc::clone(&stores.scoped_filesystem);
     let production_trust_policy = Arc::clone(&production_wiring.trust_policy);
+    let run_state = Arc::new(FilesystemRunStateStore::new(Arc::clone(
+        &stores.scoped_filesystem,
+    )));
+    let approval_requests = Arc::clone(&stores.approval_requests);
+    let capability_leases = Arc::clone(&stores.leases);
+    let persistent_approval_policies = Arc::clone(&stores.persistent_approval_policies);
     let services = HostRuntimeServices::new(
         Arc::clone(&extension_registry),
         Arc::clone(&stores.filesystem),
@@ -3259,8 +3310,10 @@ where
     )
     .with_trust_policy(Arc::clone(&production_trust_policy))
     .with_runtime_policy(production_wiring.runtime_policy)
-    .with_capability_leases(stores.leases)
-    .with_persistent_approval_policies(stores.persistent_approval_policies)
+    .with_run_state(run_state)
+    .with_approval_requests(Arc::clone(&approval_requests))
+    .with_capability_leases(Arc::clone(&capability_leases))
+    .with_persistent_approval_policies(Arc::clone(&persistent_approval_policies))
     .with_secret_store(Arc::clone(&stores.secret_credentials.secret_store))
     .with_credential_broker(stores.secret_credentials.credential_broker)
     .with_security_audit_sink(Arc::new(ironclaw_events::TracingSecurityAuditSink))
@@ -3272,7 +3325,6 @@ where
     )?
     .with_resource_governor(Arc::clone(&resource_governor))
     .with_production_reborn_event_stores(event_stores)
-    .with_filesystem_run_state(Arc::clone(&stores.scoped_filesystem))
     .with_turn_state_and_transition_port(Arc::clone(&turn_state))
     .with_run_profile_resolver(planned_run_profile_resolver()?)
     .with_turn_run_wake_notifier_dyn(production_wiring.turn_run_wake_notifier);
@@ -3302,25 +3354,43 @@ where
 
     let turn_coordinator: Arc<dyn ironclaw_turns::TurnCoordinator> =
         Arc::new(services.turn_coordinator_for_production()?);
-    let product_auth_ports = product_auth_ports.unwrap_or_else(|| {
-        let durable = Arc::new(FilesystemAuthProductServices::new(
-            product_auth_filesystem,
-            Arc::clone(&secret_store),
-        ));
-        RebornProductAuthServicePorts::from_shared_with_provider(
-            durable,
-            provider_composition
+    let product_auth_services = match product_auth_ports {
+        Some(ports) => compose_product_auth_services(
+            ports,
+            turn_coordinator.clone(),
+            provider_composition,
+            security_audit_sink,
+        ),
+        None => {
+            let durable = Arc::new(FilesystemAuthProductServices::new(
+                product_auth_filesystem,
+                Arc::clone(&secret_store),
+            ));
+            let provider_client: Arc<dyn AuthProviderClient> = provider_composition
                 .client
                 .clone()
-                .unwrap_or_else(|| Arc::new(UnavailableAuthProviderClient)),
-        )
-    });
-    let product_auth_services = compose_product_auth_services(
-        product_auth_ports,
-        turn_coordinator.clone(),
-        provider_composition,
-        security_audit_sink,
-    );
+                .unwrap_or_else(|| Arc::new(UnavailableAuthProviderClient));
+            let services = RebornProductAuthServicePorts::from_shared_with_provider(
+                Arc::clone(&durable),
+                provider_client,
+            )
+            .into_services(auth_continuation_dispatcher(turn_coordinator.clone()))
+            .with_flow_record_source(durable);
+            let services = match security_audit_sink {
+                Some(sink) => services.with_security_audit_sink(sink),
+                None => services,
+            };
+            let services = match provider_composition.dcr_registry {
+                Some(registry) => services.with_dcr_oauth_registry(registry),
+                None => services,
+            };
+            let services = match provider_composition.gate_registry {
+                Some(registry) => services.with_oauth_gate_registry(registry),
+                None => services,
+            };
+            Arc::new(services)
+        }
+    };
     let product_auth_ready = true;
     // Wire ProductAuthAccount runtime credential resolver before
     // host_runtime_for_production so WASM extensions whose manifest declares a
@@ -3368,6 +3438,9 @@ where
         active_extension_registry,
         trust_policy: production_trust_policy,
         turn_state: Arc::clone(&turn_state),
+        approval_requests,
+        capability_leases,
+        persistent_approval_policies,
         checkpoint_state_store: Arc::clone(&checkpoint_state_store),
         thread_service,
         trigger_repository,

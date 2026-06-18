@@ -88,6 +88,8 @@ use ironclaw_threads::{
     SessionThreadService, ThreadHistoryRequest, ThreadScope,
 };
 use ironclaw_triggers::TriggerRepository;
+#[cfg(not(feature = "libsql"))]
+use ironclaw_turns::InMemoryTurnStateStore;
 use ironclaw_turns::run_profile::UserProfileContext;
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunRequest, CancelRunResponse, GetRunStateRequest, IdempotencyKey,
@@ -102,7 +104,7 @@ use ironclaw_turns::{
 };
 
 use crate::default_system_prompt::DefaultSystemPromptIdentitySource;
-use crate::factory::{LocalDevRootFilesystem, LocalDevTurnStateStore, builtin_extension_registry};
+use crate::factory::{LocalDevRootFilesystem, builtin_extension_registry};
 use crate::local_dev_capability_policy::local_dev_capability_policy;
 use crate::outbound_preferences::{
     MutableOutboundDeliveryTargetRegistry, OutboundDeliveryTargetProvider,
@@ -152,6 +154,30 @@ impl HostUserProfileSource for MemoryBackedUserProfileSourceAdapter {
     }
 }
 
+#[async_trait::async_trait]
+pub(super) trait TurnPersistenceSnapshotSource: Send + Sync {
+    async fn interaction_snapshot(&self) -> Result<TurnPersistenceSnapshot, TurnError>;
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[async_trait::async_trait]
+impl<F> TurnPersistenceSnapshotSource for ironclaw_turns::FilesystemTurnStateStore<F>
+where
+    F: RootFilesystem + 'static,
+{
+    async fn interaction_snapshot(&self) -> Result<TurnPersistenceSnapshot, TurnError> {
+        self.persistence_snapshot().await
+    }
+}
+
+#[cfg(not(feature = "libsql"))]
+#[async_trait::async_trait]
+impl TurnPersistenceSnapshotSource for InMemoryTurnStateStore {
+    async fn interaction_snapshot(&self) -> Result<TurnPersistenceSnapshot, TurnError> {
+        Ok(self.persistence_snapshot())
+    }
+}
+
 struct PlannedRuntimeProfileWiring {
     capability_factory: Arc<dyn LoopCapabilityPortFactory>,
     capability_input_resolver: Arc<dyn LoopCapabilityInputResolver>,
@@ -182,6 +208,7 @@ struct RuntimeStoreParts<'a> {
     budget_gate_store: Arc<dyn ironclaw_resources::BudgetGateStore>,
     broadcast_budget_event_sink: Arc<ironclaw_resources::BroadcastBudgetEventSink>,
     subagent_goal_store: Arc<dyn RuntimeSubagentGoalStore>,
+    approval_requests: Option<Arc<dyn ironclaw_run_state::ApprovalRequestStore>>,
     trigger_repository: Option<Arc<dyn ironclaw_triggers::TriggerRepository>>,
     trigger_turn_snapshot_source: Arc<dyn TriggerTurnSnapshotSource>,
 }
@@ -209,6 +236,8 @@ fn local_runtime_parts(
         budget_gate_store: Arc::clone(&local_runtime.budget_gate_store),
         broadcast_budget_event_sink: Arc::clone(&local_runtime.broadcast_budget_event_sink),
         subagent_goal_store,
+        approval_requests: Some(Arc::clone(&local_runtime.approval_requests)
+            as Arc<dyn ironclaw_run_state::ApprovalRequestStore>),
         trigger_repository: Some(Arc::clone(&local_runtime.trigger_repository)),
         trigger_turn_snapshot_source: Arc::new(TriggerTurnStateSnapshotSource::new(Arc::clone(
             &local_runtime.turn_state,
@@ -238,10 +267,28 @@ where
         subagent_goal_store: Arc::new(FilesystemSubagentGoalStore::new(Arc::clone(
             &graph.scoped_filesystem,
         ))) as Arc<dyn RuntimeSubagentGoalStore>,
+        approval_requests: Some(Arc::clone(&graph.approval_requests)
+            as Arc<dyn ironclaw_run_state::ApprovalRequestStore>),
         trigger_repository: Some(Arc::clone(&graph.trigger_repository)),
         trigger_turn_snapshot_source: Arc::new(TriggerTurnStateSnapshotSource::new(Arc::clone(
             &graph.turn_state,
         ))),
+    }
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn production_turn_snapshot_source(
+    runtime: &crate::factory::RebornProductionRuntimeServices,
+) -> Arc<dyn TurnPersistenceSnapshotSource> {
+    match runtime {
+        #[cfg(feature = "libsql")]
+        crate::factory::RebornProductionRuntimeServices::LibSql(graph) => {
+            Arc::clone(&graph.turn_state) as Arc<dyn TurnPersistenceSnapshotSource>
+        }
+        #[cfg(feature = "postgres")]
+        crate::factory::RebornProductionRuntimeServices::Postgres(graph) => {
+            Arc::clone(&graph.turn_state) as Arc<dyn TurnPersistenceSnapshotSource>
+        }
     }
 }
 
@@ -717,29 +764,22 @@ fn build_trigger_active_run_lookup(
     Arc::new(SnapshotActiveRunLookup::new(snapshot_source))
 }
 
-struct LocalDevApprovalTurnRunLocator {
-    turn_state: Arc<LocalDevTurnStateStore>,
+struct RuntimeApprovalTurnRunLocator {
+    turn_state: Arc<dyn TurnPersistenceSnapshotSource>,
 }
 
-impl LocalDevApprovalTurnRunLocator {
-    fn new(turn_state: Arc<LocalDevTurnStateStore>) -> Self {
+impl RuntimeApprovalTurnRunLocator {
+    fn new(turn_state: Arc<dyn TurnPersistenceSnapshotSource>) -> Self {
         Self { turn_state }
     }
 
     async fn snapshot(
         &self,
     ) -> Result<TurnPersistenceSnapshot, ironclaw_product_workflow::ProductWorkflowError> {
-        #[cfg(feature = "libsql")]
-        {
-            self.turn_state
-                .persistence_snapshot()
-                .await
-                .map_err(|_| approval_turn_locator_unavailable())
-        }
-        #[cfg(not(feature = "libsql"))]
-        {
-            Ok(self.turn_state.persistence_snapshot())
-        }
+        self.turn_state
+            .interaction_snapshot()
+            .await
+            .map_err(|_| approval_turn_locator_unavailable())
     }
 }
 
@@ -778,7 +818,7 @@ fn approval_request_id_from_gate_ref(gate_ref: &LoopGateRef) -> Option<ApprovalR
 }
 
 #[async_trait::async_trait]
-impl ApprovalTurnRunLocator for LocalDevApprovalTurnRunLocator {
+impl ApprovalTurnRunLocator for RuntimeApprovalTurnRunLocator {
     async fn blocked_approval_runs(
         &self,
         scope: &ApprovalInteractionScope,
@@ -2376,6 +2416,7 @@ pub async fn build_reborn_runtime(
         budget_gate_store,
         broadcast_budget_event_sink,
         subagent_goal_store,
+        approval_requests,
         trigger_repository,
         trigger_turn_snapshot_source,
     } = runtime_parts;
@@ -2550,11 +2591,10 @@ pub async fn build_reborn_runtime(
         Arc::clone(&loop_checkpoint_store) as Arc<dyn ironclaw_turns::LoopCheckpointStore>,
         thread_scope.clone(),
     );
-    if let Some(local_runtime) = local_runtime {
+    if let Some(approval_requests) = approval_requests.as_ref() {
         loop_exit_evidence = loop_exit_evidence.with_approval_gate_evidence(Arc::new(
             LocalDevApprovalGateEvidence {
-                approval_requests: Arc::clone(&local_runtime.approval_requests)
-                    as Arc<dyn ironclaw_run_state::ApprovalRequestStore>,
+                approval_requests: Arc::clone(approval_requests),
             },
         ));
     }
@@ -2577,10 +2617,9 @@ pub async fn build_reborn_runtime(
         Arc::clone(&event_log),
         validated_identity.reply_target_binding_ref.clone(),
     );
-    if let Some(local_runtime) = local_runtime {
-        projection_services = projection_services
-            .with_approval_requests(Arc::clone(&local_runtime.approval_requests)
-                as Arc<dyn ironclaw_run_state::ApprovalRequestStore>);
+    if let Some(approval_requests) = approval_requests.as_ref() {
+        projection_services =
+            projection_services.with_approval_requests(Arc::clone(approval_requests));
     }
     let live_projection_publisher =
         projection_services.live_projection_publisher(actor_user_id.clone());
@@ -2935,9 +2974,10 @@ pub async fn build_reborn_runtime(
         if let (Some(local_runtime), Some(local_dev_capability_policy)) =
             (local_runtime, profile_wiring.local_dev_capability_policy)
         {
-            let approval_turn_runs = Arc::new(LocalDevApprovalTurnRunLocator::new(Arc::clone(
+            let approval_turn_runs = Arc::new(RuntimeApprovalTurnRunLocator::new(Arc::clone(
                 &local_runtime.turn_state,
-            )));
+            )
+                as Arc<dyn TurnPersistenceSnapshotSource>));
             let approval_read_model = Arc::new(RunStateApprovalInteractionReadModel::new(
                 local_runtime.approval_requests.clone(),
                 approval_turn_runs,
@@ -2968,16 +3008,101 @@ pub async fn build_reborn_runtime(
                 .with_persistent_policy_store(local_runtime.persistent_approval_policies.clone()),
             )
         } else {
-            Arc::new(UnavailableApprovalInteractionService)
+            #[cfg(any(feature = "libsql", feature = "postgres"))]
+            {
+                if let Some(production_runtime) = services.production_runtime.as_ref() {
+                    let local_dev_capability_policy =
+                    Arc::new(local_dev_capability_policy().map_err(|error| {
+                        tracing::error!(%error, "production approval capability policy is invalid");
+                        RebornRuntimeError::InvalidArgument {
+                            reason: format!(
+                                "production approval capability policy is invalid: {error}"
+                            ),
+                        }
+                    })?);
+                    let approval_scope = ResourceScope {
+                        tenant_id: thread_scope.tenant_id.clone(),
+                        user_id: actor_user_id.clone(),
+                        agent_id: Some(thread_scope.agent_id.clone()),
+                        project_id: thread_scope.project_id.clone(),
+                        mission_id: thread_scope.mission_id.clone(),
+                        thread_id: None,
+                        invocation_id: InvocationId::new(),
+                    };
+                    let approval_mounts =
+                        crate::invocation_mount_view(&approval_scope).map_err(|error| {
+                            RebornRuntimeError::InvalidArgument {
+                                reason: format!(
+                                    "production approval mount view is invalid: {error}"
+                                ),
+                            }
+                        })?;
+                    let approval_turn_runs = Arc::new(RuntimeApprovalTurnRunLocator::new(
+                        production_turn_snapshot_source(production_runtime),
+                    ));
+                    let approval_read_model = Arc::new(RunStateApprovalInteractionReadModel::new(
+                        production_runtime.approval_requests(),
+                        approval_turn_runs,
+                    ));
+                    let approval_resolver = Arc::new(
+                        ApprovalResolverPort::new(
+                            production_runtime.approval_requests(),
+                            production_runtime.capability_leases(),
+                        )
+                        .with_audit_sink(approval_audit_sink.clone()),
+                    );
+                    Arc::new(
+                        DefaultApprovalInteractionService::new(
+                            approval_read_model,
+                            Arc::new(approval::LocalDevApprovalLeaseTermsProvider::new(
+                                local_dev_capability_policy,
+                                production_runtime.active_extension_registry().snapshot(),
+                                approval_mounts.clone(),
+                                approval_mounts.clone(),
+                                approval_mounts,
+                                local_dev::extension_surface::LocalDevExtensionSurfaceSource::new(
+                                    Some(production_runtime.extension_management()),
+                                ),
+                            )),
+                            approval_resolver,
+                            Arc::clone(&planned_turn_coordinator),
+                        )
+                        .with_persistent_policy_store(
+                            production_runtime.persistent_approval_policies(),
+                        ),
+                    )
+                } else {
+                    Arc::new(UnavailableApprovalInteractionService)
+                }
+            }
+            #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+            {
+                Arc::new(UnavailableApprovalInteractionService)
+            }
         };
     let auth_interaction_service = if let Some(local_runtime) = local_runtime {
         build_webui_auth_interaction_service(
             services.product_auth.as_deref(),
-            Arc::clone(&local_runtime.turn_state),
+            Arc::clone(&local_runtime.turn_state) as Arc<dyn TurnPersistenceSnapshotSource>,
             Arc::clone(&planned_turn_coordinator),
         )
     } else {
-        Arc::new(auth_interaction::UnavailableAuthInteractionService)
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        {
+            if let Some(production_runtime) = services.production_runtime.as_ref() {
+                build_webui_auth_interaction_service(
+                    services.product_auth.as_deref(),
+                    production_turn_snapshot_source(production_runtime),
+                    Arc::clone(&planned_turn_coordinator),
+                )
+            } else {
+                Arc::new(auth_interaction::UnavailableAuthInteractionService)
+            }
+        }
+        #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+        {
+            Arc::new(auth_interaction::UnavailableAuthInteractionService)
+        }
     };
     let turn_event_source: Arc<dyn TurnEventProjectionSource> = turn_state_store.clone();
     let mut projection_services = projection_services
@@ -3178,7 +3303,7 @@ pub async fn build_reborn_runtime(
 
 fn build_webui_auth_interaction_service(
     product_auth: Option<&RebornProductAuthServices>,
-    turn_state_store: Arc<LocalDevTurnStateStore>,
+    turn_state_store: Arc<dyn TurnPersistenceSnapshotSource>,
     turn_coordinator: Arc<dyn TurnCoordinator>,
 ) -> Arc<dyn AuthInteractionService> {
     // `AuthFlowRecordSource` is optional on the product-auth bundle because
@@ -3839,6 +3964,62 @@ mod tests {
             approval_policy: ApprovalPolicy::AskDestructive,
             audit_mode: AuditMode::LocalMinimal,
         }
+    }
+
+    #[cfg(feature = "libsql")]
+    async fn libsql_production_runtime_input(
+        id: &str,
+        runtime_profile: RuntimeProfile,
+        approval_policy: ApprovalPolicy,
+    ) -> (tempfile::TempDir, RebornRuntimeInput) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            libsql::Builder::new_local(dir.path().join("reborn.db"))
+                .build()
+                .await
+                .expect("libsql db"),
+        );
+        let gateway = Arc::new(RecordingGateway {
+            reply: format!("{id} reply"),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::libsql(
+                crate::RebornCompositionProfile::Production,
+                format!("{id}-owner"),
+                db,
+                dir.path().join("events.db").to_string_lossy(),
+                None,
+                ironclaw_secrets::SecretMaterial::from("01234567890123456789012345678901"),
+            )
+            .with_production_trust_policy(Arc::new(
+                crate::builtin_first_party_trust_policy().expect("trust policy"),
+            ))
+            .with_runtime_policy(EffectiveRuntimePolicy {
+                deployment: DeploymentMode::HostedMultiTenant,
+                requested_profile: runtime_profile,
+                resolved_profile: runtime_profile,
+                filesystem_backend: FilesystemBackendKind::ScopedVirtual,
+                process_backend: ProcessBackendKind::TenantSandbox,
+                network_mode: NetworkMode::Deny,
+                secret_mode: SecretMode::BrokeredHandles,
+                approval_policy,
+                audit_mode: AuditMode::Standard,
+            })
+            .with_runtime_process_binding(RebornRuntimeProcessBinding::tenant_sandbox(Arc::new(
+                ironclaw_host_runtime::TenantSandboxProcessPort::new(Arc::new(
+                    RecordingSandboxTransport,
+                )),
+            ))),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: format!("{id}-tenant"),
+            agent_id: format!("{id}-agent"),
+            source_binding_id: format!("{id}-source"),
+            reply_target_binding_id: format!("{id}-reply"),
+        })
+        .with_model_gateway_override(gateway);
+        (dir, input)
     }
 
     #[derive(Debug)]
@@ -5431,6 +5612,215 @@ mod tests {
             "production WebUI registry should include bundled Notion MCP extension, got {package_ids:?}"
         );
 
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[cfg(all(feature = "libsql", feature = "webui-v2-beta"))]
+    #[tokio::test]
+    async fn production_webui_approval_gate_streams_from_durable_store_for_sso_user() {
+        let (_dir, input) = libsql_production_runtime_input(
+            "runtime-production-webui-approval",
+            RuntimeProfile::SecureDefault,
+            ApprovalPolicy::AskAlways,
+        )
+        .await;
+        let runtime = build_reborn_runtime(input)
+            .await
+            .expect("production runtime starts");
+        stop_turn_runner_worker_for_manual_state_test(&runtime).await;
+        let bundle = build_webui_services(&runtime, None).expect("webui bundle");
+        let caller = WebUiAuthenticatedCaller::new(
+            TenantId::new("runtime-production-webui-approval-tenant").expect("tenant"),
+            UserId::new("runtime-production-webui-approval-sso-user").expect("sso user"),
+            Some(AgentId::new("runtime-production-webui-approval-agent").expect("agent")),
+            None,
+        );
+        let created = bundle
+            .api
+            .create_thread(
+                caller.clone(),
+                WebUiCreateThreadRequest {
+                    client_action_id: Some("create-production-approval-thread".to_string()),
+                    requested_thread_id: None,
+                },
+            )
+            .await
+            .expect("create production thread");
+        let scope = caller.turn_scope(created.thread.thread_id.clone());
+        let actor = caller.actor();
+        let submitted = runtime
+            .turn_coordinator
+            .submit_turn(SubmitTurnRequest {
+                scope: scope.clone(),
+                actor: actor.clone(),
+                accepted_message_ref: AcceptedMessageRef::new("msg:production-approval").unwrap(),
+                source_binding_ref: SourceBindingRef::new("src:production-approval").unwrap(),
+                reply_target_binding_ref: ReplyTargetBindingRef::new("reply:production-approval")
+                    .unwrap(),
+                requested_run_profile: None,
+                idempotency_key: IdempotencyKey::new("submit-production-approval").unwrap(),
+                received_at: chrono::Utc::now(),
+                requested_run_id: None,
+                parent_run_id: None,
+                subagent_depth: 0,
+                spawn_tree_root_run_id: None,
+                product_context: None,
+            })
+            .await
+            .expect("submit production turn");
+        let run_id = match submitted {
+            SubmitTurnResponse::Accepted { run_id, .. } => run_id,
+        };
+        let production_runtime = runtime
+            .services
+            .production_runtime
+            .as_ref()
+            .expect("production runtime services");
+        let (turn_state, approval_requests) = match production_runtime {
+            crate::factory::RebornProductionRuntimeServices::LibSql(graph) => (
+                Arc::clone(&graph.turn_state),
+                Arc::clone(&graph.approval_requests)
+                    as Arc<dyn ironclaw_run_state::ApprovalRequestStore>,
+            ),
+            #[cfg(feature = "postgres")]
+            crate::factory::RebornProductionRuntimeServices::Postgres(_) => {
+                panic!("test builds a libSQL production runtime")
+            }
+        };
+        let runner_id = TurnRunnerId::new();
+        let lease_token = TurnLeaseToken::new();
+        let claimed = turn_state
+            .claim_next_run(ClaimRunRequest {
+                runner_id,
+                lease_token,
+                scope_filter: Some(scope.clone()),
+            })
+            .await
+            .expect("claim production run")
+            .expect("claimed production run");
+        assert_eq!(claimed.state.run_id, run_id);
+
+        let request_id = ApprovalRequestId::new();
+        let gate_ref = approval_gate_ref(request_id).expect("approval gate");
+        turn_state
+            .block_run(BlockRunRequest {
+                run_id,
+                runner_id,
+                lease_token,
+                checkpoint_id: TurnCheckpointId::new(),
+                state_ref: LoopCheckpointStateRef::new("checkpoint:production-approval").unwrap(),
+                reason: BlockedReason::Approval {
+                    gate_ref: gate_ref.clone(),
+                },
+            })
+            .await
+            .expect("block production approval");
+        let resource_scope = ResourceScope {
+            tenant_id: scope.tenant_id.clone(),
+            user_id: actor.user_id.clone(),
+            agent_id: scope.agent_id.clone(),
+            project_id: scope.project_id.clone(),
+            mission_id: None,
+            thread_id: Some(scope.thread_id.clone()),
+            invocation_id: InvocationId::new(),
+        };
+        approval_requests
+            .save_pending(
+                resource_scope,
+                ApprovalRequest {
+                    id: request_id,
+                    correlation_id: CorrelationId::new(),
+                    requested_by: Principal::User(actor.user_id.clone()),
+                    action: Box::new(Action::Dispatch {
+                        capability: CapabilityId::new("demo.echo").expect("capability"),
+                        estimated_resources: ResourceEstimate::default(),
+                    }),
+                    invocation_fingerprint: None,
+                    reason: "production approval prompt".to_string(),
+                    reusable_scope: None,
+                },
+            )
+            .await
+            .expect("save production approval");
+
+        let streamed = bundle
+            .api
+            .stream_events(
+                caller,
+                RebornStreamEventsRequest {
+                    thread_id: scope.thread_id.to_string(),
+                    after_cursor: None,
+                },
+            )
+            .await
+            .expect("production approval gate event stream");
+        assert!(
+            streamed.events.iter().any(|event| {
+                matches!(
+                    event.payload(),
+                    ProductOutboundPayload::GatePrompt(prompt)
+                        if prompt.turn_run_id == run_id
+                            && prompt.gate_ref == gate_ref.as_str()
+                            && prompt.headline == "Approval required"
+                )
+            }),
+            "production approval state should surface as a WebUI gate prompt"
+        );
+
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[cfg(all(feature = "libsql", feature = "webui-v2-beta"))]
+    #[tokio::test]
+    async fn production_webui_auth_gate_routes_through_durable_interaction_service_for_sso_user() {
+        let (_dir, input) = libsql_production_runtime_input(
+            "runtime-production-webui-auth",
+            RuntimeProfile::SecureDefault,
+            ApprovalPolicy::AskAlways,
+        )
+        .await;
+        let runtime = build_reborn_runtime(input)
+            .await
+            .expect("production runtime starts");
+        let bundle = build_webui_services(&runtime, None).expect("webui bundle");
+        let caller = WebUiAuthenticatedCaller::new(
+            TenantId::new("runtime-production-webui-auth-tenant").expect("tenant"),
+            UserId::new("runtime-production-webui-auth-sso-user").expect("sso user"),
+            Some(AgentId::new("runtime-production-webui-auth-agent").expect("agent")),
+            None,
+        );
+        let created = bundle
+            .api
+            .create_thread(
+                caller.clone(),
+                WebUiCreateThreadRequest {
+                    client_action_id: Some("create-production-auth-thread".to_string()),
+                    requested_thread_id: None,
+                },
+            )
+            .await
+            .expect("create production thread");
+
+        let err = bundle
+            .api
+            .resolve_gate(
+                caller,
+                WebUiResolveGateRequest {
+                    client_action_id: Some("resolve-production-auth-gate".to_string()),
+                    thread_id: Some(created.thread.thread_id.to_string()),
+                    run_id: Some(TurnRunId::new().to_string()),
+                    gate_ref: Some("gate:hook-auth-missing".to_string()),
+                    resolution: Some("denied".to_string()),
+                    always: None,
+                    credential_ref: None,
+                },
+            )
+            .await
+            .expect_err("missing auth gate should reach production auth interaction service");
+
+        assert_eq!(err.code, RebornServicesErrorCode::NotFound);
+        assert_eq!(err.kind, RebornServicesErrorKind::BlockedAuthentication);
+        assert_eq!(err.status_code, 404);
         runtime.shutdown().await.expect("runtime shutdown");
     }
 
