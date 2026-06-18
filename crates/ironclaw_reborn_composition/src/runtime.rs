@@ -2707,6 +2707,7 @@ pub async fn build_reborn_runtime(
             worker: TurnRunnerWorkerConfig {
                 heartbeat_interval: runner.heartbeat_interval,
                 poll_interval: runner.poll_interval,
+                max_driver_duration: runner.max_driver_duration,
                 scope_filter: None,
             },
             ..DefaultPlannedRuntimeConfig::default()

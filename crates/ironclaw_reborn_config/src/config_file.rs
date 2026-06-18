@@ -155,6 +155,7 @@ pub struct HarnessSection {
 pub struct RunnerSection {
     pub heartbeat_interval_secs: Option<u64>,
     pub poll_interval_ms: Option<u64>,
+    pub max_driver_duration_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1160,6 +1161,7 @@ id = "red-team"
 [runner]
 heartbeat_interval_secs = 5
 poll_interval_ms = 200
+max_driver_duration_secs = 300
 
 [skills]
 regex_activation_enabled = false

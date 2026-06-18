@@ -92,6 +92,11 @@ pub struct TurnRunnerWorkerConfig {
     /// Fallback poll interval when no wake signal arrives.
     pub poll_interval: Duration,
 
+    /// Maximum wall-clock time a single driver invocation may keep a run
+    /// active. This bounds wedged LLM/network futures that would otherwise
+    /// keep heartbeating forever and hold the thread active lock.
+    pub max_driver_duration: Duration,
+
     /// Optional scope filter to restrict which runs this worker claims.
     pub scope_filter: Option<TurnScope>,
 }
@@ -101,6 +106,7 @@ impl Default for TurnRunnerWorkerConfig {
         Self {
             heartbeat_interval: Duration::from_secs(10),
             poll_interval: Duration::from_secs(5),
+            max_driver_duration: Duration::from_secs(300),
             scope_filter: None,
         }
     }
@@ -394,6 +400,8 @@ impl TurnRunnerWorker {
             // unknown partial state, so fail the active run with a sanitized category.
             let driver = AssertUnwindSafe(self.invoke_driver(&claimed)).catch_unwind();
             tokio::pin!(driver);
+            let driver_timeout = tokio::time::sleep(self.config.max_driver_duration);
+            tokio::pin!(driver_timeout);
 
             let exit_result = tokio::select! {
                 result = &mut driver => match result {
@@ -404,6 +412,9 @@ impl TurnRunnerWorker {
                     Ok(()) => Err(DriverInvocationError::HeartbeatStopped),
                     Err(err) => Err(DriverInvocationError::HeartbeatFailed(err)),
                 },
+                () = &mut driver_timeout => Err(DriverInvocationError::DriverTimedOut {
+                    timeout: self.config.max_driver_duration,
+                }),
                 () = cancel.cancelled() => Err(DriverInvocationError::WorkerCancelled),
             };
 
@@ -646,6 +657,7 @@ impl TurnRunnerWorker {
                         unreachable!("failed driver errors handled above")
                     }
                     DriverInvocationError::DriverPanic => "driver_panic",
+                    DriverInvocationError::DriverTimedOut { .. } => "driver_timeout",
                     DriverInvocationError::HeartbeatFailed(_) => "heartbeat_failed",
                     // WorkerCancelled and HeartbeatStopped handled by relinquish branch above.
                     DriverInvocationError::WorkerCancelled
@@ -796,6 +808,7 @@ enum DriverInvocationError {
     RouteSnapshotPersistenceFailed(TurnError),
     DriverError(AgentLoopDriverError),
     DriverPanic,
+    DriverTimedOut { timeout: Duration },
     HeartbeatFailed(TurnError),
     HeartbeatStopped,
     WorkerCancelled,
@@ -811,6 +824,9 @@ impl std::fmt::Display for DriverInvocationError {
             }
             Self::DriverError(err) => write!(f, "driver error: {err}"),
             Self::DriverPanic => write!(f, "driver panicked before returning loop exit"),
+            Self::DriverTimedOut { timeout } => {
+                write!(f, "driver did not return loop exit within {timeout:?}")
+            }
             Self::HeartbeatFailed(err) => write!(f, "heartbeat failed: {err}"),
             Self::HeartbeatStopped => write!(f, "heartbeat stopped before driver completed"),
             Self::WorkerCancelled => write!(f, "worker cancelled before driver completed"),
