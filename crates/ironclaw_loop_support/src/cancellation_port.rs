@@ -403,12 +403,54 @@ impl RunCancellationFactory for TurnStateRunCancellationFactory {
         Ok(handle)
     }
 
+    fn product_live_cancellation_probe(&self) -> Option<Box<dyn ProductLiveCancellationProbe>> {
+        let run_id = TurnRunId::new();
+        let handle = RunCancellationHandle::default();
+        self.register(run_id, handle.requester());
+        Some(Box::new(TurnStateRunCancellationProbe {
+            run_id,
+            handle,
+            handles: Arc::clone(&self.handles),
+        }))
+    }
+
     fn notify_run_wake(&self, wake: &TurnRunWake) {
         if wake.status == TurnStatus::CancelRequested {
             self.notify_cancel_requested(wake.run_id);
         } else if wake.status.is_terminal() {
             self.remove_run(wake.run_id);
         }
+    }
+}
+
+struct TurnStateRunCancellationProbe {
+    run_id: TurnRunId,
+    handle: RunCancellationHandle,
+    handles: Arc<RwLock<HashMap<TurnRunId, Vec<RunCancellationRequester>>>>,
+}
+
+impl ProductLiveCancellationProbe for TurnStateRunCancellationProbe {
+    fn request_cancellation(
+        &self,
+        reason_kind: LoopCancelReasonKind,
+    ) -> Result<(), AgentLoopHostError> {
+        let requesters = self.handles.write().remove(&self.run_id);
+        if let Some(requesters) = requesters {
+            for requester in requesters {
+                requester.request(reason_kind);
+            }
+        }
+        Ok(())
+    }
+
+    fn is_cancellation_observed(&self) -> Result<bool, AgentLoopHostError> {
+        Ok(self.handle.is_requested())
+    }
+}
+
+impl Drop for TurnStateRunCancellationProbe {
+    fn drop(&mut self) {
+        remove_run_handles(&self.handles, self.run_id);
     }
 }
 

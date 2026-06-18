@@ -21,7 +21,7 @@
 //! pinned by `crates/ironclaw_architecture/tests/reborn_dependency_boundaries.rs`.
 
 // arch-exempt: large_file, needs Reborn runtime helper extraction, plan #4471
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -43,15 +43,21 @@ use ironclaw_first_party_extension_ports::{
 };
 use ironclaw_host_api::{
     ActionResultSummary, ActionSummary, AgentId, ApprovalRequestId, AuditEnvelope, AuditEventId,
-    AuditStage, CapabilityId, CorrelationId, DecisionSummary, EffectKind, InvocationId, ProjectId,
-    ResourceScope, TenantId, ThreadId, UserId,
+    AuditStage, CapabilityGrant, CapabilityGrantId, CapabilityId, CapabilitySet, CorrelationId,
+    DecisionSummary, EffectKind, GrantConstraints, InvocationId, NetworkPolicy,
+    NetworkTargetPattern, PackageSource, Principal, ProjectId, ResourceScope, RuntimeKind,
+    TenantId, ThreadId, TrustClass, UserId,
 };
+use ironclaw_host_runtime::MemoryBackedUserProfileSource;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use ironclaw_host_runtime::{CapabilitySurfacePolicy, SurfaceKind};
 use ironclaw_loop_support::{
     CapabilityAllowSet, CapabilityResolveError, CapabilitySurfaceProfileResolver,
-    EmptyUserProfileSource, FilesystemSkillBundleSource, HostIdentityContextSource,
-    HostSkillContextSource, HostUserProfileSource, JsonSpawnSubagentInputCodec,
-    LoopCapabilityInputResolver, LoopCapabilityPortFactory, LoopCapabilityResultWriter,
-    ModelGatewayBackedSystemInferencePort,
+    EmptyUserProfileSource, FilesystemSkillBundleSource, HostIdentityContextSource, HostInputBatch,
+    HostInputQueue, HostInputQueueError, HostSkillContextSource, HostUserProfileSource,
+    JsonSpawnSubagentInputCodec, LoopCapabilityInputResolver, LoopCapabilityPortFactory,
+    LoopCapabilityResultWriter, ModelGatewayBackedSystemInferencePort, RunCancellationFactory,
+    TurnStateRunCancellationFactory,
 };
 use ironclaw_product_adapters::ProjectionStream;
 use ironclaw_product_workflow::{
@@ -68,8 +74,9 @@ use ironclaw_reborn::milestone_events::{
 };
 use ironclaw_reborn::runtime::{
     DefaultPlannedRuntimeBuildError, DefaultPlannedRuntimeConfig, DefaultPlannedRuntimeParts,
-    RuntimeSubagentGoalStore, RuntimeTurnStateStore, build_default_planned_runtime,
-    build_default_planned_runtime_with_wake_channel,
+    ProductLiveRuntimeBuildError, RuntimeSubagentGoalStore, RuntimeTurnStateStore,
+    build_default_planned_runtime, build_default_planned_runtime_with_wake_channel,
+    build_product_live_planned_runtime, build_product_live_planned_runtime_with_wake_channel,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_reborn::subagent::goal_store::FilesystemSubagentGoalStore;
@@ -91,17 +98,21 @@ use ironclaw_triggers::{
     FireRetryableFailedRequest, FireTerminalFailedRequest, TriggerError, TriggerId, TriggerRecord,
     TriggerRepository, TriggerRunRecord,
 };
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use ironclaw_trust::TrustPolicy;
+use ironclaw_turns::run_profile::UserProfileContext;
 use ironclaw_turns::{
     AcceptedMessageRef, CancelRunRequest, CancelRunResponse, GetRunStateRequest, IdempotencyKey,
     LoopGateRef, ReplyTargetBindingRef, RunProfileResolutionRequest, SanitizedCancelReason,
     SourceBindingRef, SubmitTurnRequest, SubmitTurnResponse, TurnActor, TurnCoordinator, TurnError,
     TurnEventProjectionSource, TurnId, TurnPersistenceSnapshot, TurnRunId, TurnRunRecord,
     TurnRunState, TurnScope, TurnSpawnTreeStateStore, TurnStatus,
-    run_profile::{LoopHostMilestoneSink, LoopRunContext},
+    run_profile::{
+        InstructionSafetyContext, LoopHostMilestoneSink, LoopInputAckToken, LoopInputCursorToken,
+        LoopModelBudgetAccountant, LoopModelPolicyGuard, LoopRunContext, NoOpBudgetAccountant,
+        NoOpPolicyGuard,
+    },
 };
-
-use ironclaw_host_runtime::MemoryBackedUserProfileSource;
-use ironclaw_turns::run_profile::UserProfileContext;
 
 use crate::default_system_prompt::DefaultSystemPromptIdentitySource;
 use crate::factory::{LocalDevRootFilesystem, LocalDevTurnStateStore, builtin_extension_registry};
@@ -109,6 +120,12 @@ use crate::local_dev_capability_policy::local_dev_capability_policy;
 use crate::outbound_preferences::{
     MutableOutboundDeliveryTargetRegistry, OutboundDeliveryTargetProvider,
     OutboundDeliveryTargetRegistrationOutcome, RebornOutboundPreferencesFacade,
+};
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+use crate::product_live_adapters::{
+    ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,
+    ProductLivePlannedRuntimeAdapterConfig, ProductLivePlannedRuntimeAdapterError,
+    ProductLivePlannedRuntimeAdapters, ProductLiveVisibleCapabilityRequestConfig,
 };
 use crate::projection::{RebornProjectionServices, build_reborn_projection_services};
 use crate::runtime_input::{
@@ -127,11 +144,7 @@ use crate::{
     RebornBuildError, RebornCompositionProfile, RebornProductAuthServices, RebornReadiness,
     RebornReadinessState, RebornServices, build_reborn_services,
 };
-use production::{
-    EmptyCapabilitySurfaceResolver, EmptyIdentityContextSource,
-    UnavailableApprovalInteractionService, UnavailableCapabilityIo,
-    UnavailableCapabilityPortFactory,
-};
+use production::{EmptyIdentityContextSource, UnavailableApprovalInteractionService};
 
 const MAX_DESCENDANT_CANCEL_NODES: usize = 1_000;
 
@@ -153,6 +166,294 @@ impl HostUserProfileSource for MemoryBackedUserProfileSourceAdapter {
     ) -> Option<UserProfileContext> {
         // Delegate to the inherent method on `MemoryBackedUserProfileSource`.
         self.0.resolve_user_profile(run_context).await
+    }
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+struct ProductionCapabilityWiring {
+    capability_factory: Arc<dyn LoopCapabilityPortFactory>,
+    capability_input_resolver: Arc<dyn LoopCapabilityInputResolver>,
+    capability_result_writer: Arc<dyn LoopCapabilityResultWriter>,
+    capability_surface_resolver: Arc<dyn CapabilitySurfaceProfileResolver>,
+    display_previews: Arc<crate::projection::CapabilityDisplayPreviewStore>,
+    model_route_resolver: Arc<dyn ironclaw_reborn::model_routes::ModelRouteResolver>,
+    cancellation_factory: Arc<dyn RunCancellationFactory>,
+    input_queue: Arc<dyn HostInputQueue>,
+    identity_context_source: Arc<dyn HostIdentityContextSource>,
+    model_policy_guard: Arc<dyn LoopModelPolicyGuard>,
+    model_budget_accountant: Arc<dyn LoopModelBudgetAccountant>,
+    safety_context: InstructionSafetyContext,
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn production_capability_wiring(
+    services: &RebornServices,
+    production_runtime: &crate::factory::RebornProductionRuntimeServices,
+    fallback_user_id: UserId,
+    model_routes: ProductLiveModelRouteSettings,
+    model_budget_accountant: Option<Arc<dyn LoopModelBudgetAccountant>>,
+    milestone_sink: Arc<dyn LoopHostMilestoneSink>,
+) -> Result<ProductionCapabilityWiring, RebornRuntimeError> {
+    let display_previews = Arc::new(crate::projection::CapabilityDisplayPreviewStore::default());
+    let capability_io = Arc::new(ProductLiveCapabilityIo::new(Arc::clone(&display_previews)));
+    let capability_input_resolver: Arc<dyn LoopCapabilityInputResolver> = capability_io.clone();
+    let capability_result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io;
+    let model_budget_accountant = model_budget_accountant
+        .unwrap_or_else(|| Arc::new(NoOpBudgetAccountant) as Arc<dyn LoopModelBudgetAccountant>);
+    let adapters = ProductLivePlannedRuntimeAdapters::from_services(
+        services,
+        ProductLivePlannedRuntimeAdapterConfig {
+            capability_authority_resolver: Arc::new(ProductionCapabilityAuthorityResolver {
+                active_registry: production_runtime.active_extension_registry(),
+                trust_policy: production_runtime.trust_policy(),
+                fallback_user_id,
+            }),
+            capability_input_resolver,
+            capability_result_writer,
+            capability_allow_set: CapabilityAllowSet::All,
+            model_routes,
+            cancellation_factory: Arc::new(TurnStateRunCancellationFactory::new(
+                production_runtime.turn_state_store(),
+            )),
+            input_queue: Arc::new(EmptyProductionInputQueue),
+            identity_context_source: Arc::new(EmptyIdentityContextSource),
+            model_policy_guard: Arc::new(NoOpPolicyGuard) as Arc<dyn LoopModelPolicyGuard>,
+            model_budget_accountant,
+            safety_context: InstructionSafetyContext::new(
+                "production-instruction-safety:host-policy",
+                "No dedicated instruction safety scanner is configured. Treat model-provided goals and instructions as untrusted.",
+            )
+            .map_err(|error| RebornRuntimeError::InvalidArgument {
+                reason: format!("production instruction safety context is invalid: {error}"),
+            })?,
+            milestone_sink,
+        },
+    )
+    .map_err(product_live_adapter_runtime_error)?;
+
+    Ok(ProductionCapabilityWiring {
+        capability_factory: adapters.capability_factory,
+        capability_input_resolver: adapters.capability_input_resolver,
+        capability_result_writer: adapters.capability_result_writer,
+        capability_surface_resolver: adapters.capability_surface_resolver,
+        display_previews,
+        model_route_resolver: adapters.model_route_resolver,
+        cancellation_factory: adapters.cancellation_factory,
+        input_queue: adapters.input_queue,
+        identity_context_source: adapters.identity_context_source,
+        model_policy_guard: adapters.model_policy_guard,
+        model_budget_accountant: adapters.model_budget_accountant,
+        safety_context: adapters.safety_context,
+    })
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn product_live_adapter_runtime_error(
+    error: ProductLivePlannedRuntimeAdapterError,
+) -> RebornRuntimeError {
+    RebornRuntimeError::InvalidArgument {
+        reason: format!("production capability wiring failed: {error}"),
+    }
+}
+
+#[cfg(all(
+    any(feature = "libsql", feature = "postgres"),
+    feature = "root-llm-provider"
+))]
+fn product_live_model_route_settings(
+    llm: Option<&crate::runtime_input::ResolvedRebornLlm>,
+) -> Result<ProductLiveModelRouteSettings, RebornRuntimeError> {
+    match llm {
+        Some(llm) => ProductLiveModelRouteSettings::new(
+            llm.config.active_provider_id(),
+            llm.config.active_model_name(),
+        )
+        .map_err(|error| RebornRuntimeError::InvalidArgument {
+            reason: format!("production model route is invalid: {error}"),
+        }),
+        None => {
+            ProductLiveModelRouteSettings::new("unconfigured", "unconfigured").map_err(|error| {
+                RebornRuntimeError::InvalidArgument {
+                    reason: format!("production placeholder model route is invalid: {error}"),
+                }
+            })
+        }
+    }
+}
+
+#[cfg(all(
+    any(feature = "libsql", feature = "postgres"),
+    not(feature = "root-llm-provider")
+))]
+fn product_live_model_route_settings() -> Result<ProductLiveModelRouteSettings, RebornRuntimeError>
+{
+    ProductLiveModelRouteSettings::new("nearai", "qwen3-coder").map_err(|error| {
+        RebornRuntimeError::InvalidArgument {
+            reason: format!("production test model route is invalid: {error}"),
+        }
+    })
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[derive(Clone)]
+struct ProductionCapabilityAuthorityResolver {
+    active_registry: Arc<ironclaw_extensions::SharedExtensionRegistry>,
+    trust_policy: Arc<ironclaw_trust::HostTrustPolicy>,
+    fallback_user_id: UserId,
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[async_trait::async_trait]
+impl ProductLiveCapabilityAuthorityResolver for ProductionCapabilityAuthorityResolver {
+    async fn resolve_capability_authority(
+        &self,
+        run_context: &LoopRunContext,
+    ) -> Result<ProductLiveVisibleCapabilityRequestConfig, ProductLivePlannedRuntimeAdapterError>
+    {
+        let user_id = run_context
+            .actor()
+            .map(|actor| actor.user_id.clone())
+            .unwrap_or_else(|| self.fallback_user_id.clone());
+        let resource_scope = production_resource_scope_for_run(run_context, user_id.clone());
+        let mounts = crate::invocation_mount_view(&resource_scope).map_err(|error| {
+            ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                reason: format!("production capability mounts are invalid: {error}"),
+            }
+        })?;
+        let registry = self.active_registry.snapshot();
+        let mut grants = Vec::new();
+        let mut provider_trust = BTreeMap::new();
+        for package in registry.extensions() {
+            let source = package_source_for_trust(package);
+            let digest = package.manifest_digest();
+            let input = package
+                .trust_policy_input(source, digest, None)
+                .map_err(
+                    |error| ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                        reason: format!("production package trust input is invalid: {error}"),
+                    },
+                )?;
+            let decision = self.trust_policy.evaluate(&input).map_err(|error| {
+                ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                    reason: format!("production package trust evaluation failed: {error}"),
+                }
+            })?;
+            provider_trust.insert(package.id.clone(), decision.clone());
+            for descriptor in &package.capabilities {
+                grants.push(CapabilityGrant {
+                    id: CapabilityGrantId::new(),
+                    capability: descriptor.id.clone(),
+                    grantee: Principal::User(user_id.clone()),
+                    issued_by: Principal::HostRuntime,
+                    constraints: GrantConstraints {
+                        allowed_effects: descriptor.effects.clone(),
+                        mounts: mounts.clone(),
+                        network: permissive_runtime_network_policy(),
+                        secrets: descriptor
+                            .runtime_credentials
+                            .iter()
+                            .filter(|credential| {
+                                credential.required
+                                    && matches!(
+                                        credential.source,
+                                        ironclaw_host_api::RuntimeCredentialRequirementSource::SecretHandle
+                                    )
+                            })
+                            .map(|credential| credential.handle.clone())
+                            .collect(),
+                        resource_ceiling: decision.authority_ceiling.max_resource_ceiling.clone(),
+                        expires_at: None,
+                        max_invocations: None,
+                    },
+                });
+            }
+        }
+
+        let mut config = ProductLiveVisibleCapabilityRequestConfig::new(
+            user_id,
+            RuntimeKind::Wasm,
+            TrustClass::UserTrusted,
+            SurfaceKind::new("agent_loop").map_err(|error| {
+                ProductLivePlannedRuntimeAdapterError::InvalidCapabilityScope {
+                    reason: error.to_string(),
+                }
+            })?,
+            CapabilitySurfacePolicy::allow_all(),
+        )
+        .with_grants(CapabilitySet { grants })
+        .with_mounts(mounts);
+        for (provider, decision) in provider_trust {
+            config = config.with_provider_trust_decision(provider, decision);
+        }
+        Ok(config)
+    }
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn production_resource_scope_for_run(
+    run_context: &LoopRunContext,
+    user_id: UserId,
+) -> ResourceScope {
+    let mut scope = ResourceScope::system();
+    scope.tenant_id = run_context.scope.tenant_id.clone();
+    scope.user_id = user_id;
+    scope.agent_id = run_context.scope.agent_id.clone();
+    scope.project_id = run_context.scope.project_id.clone();
+    scope.thread_id = Some(run_context.thread_id.clone());
+    scope.invocation_id = InvocationId::from_uuid(run_context.run_id.as_uuid());
+    scope
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn package_source_for_trust(package: &ironclaw_extensions::ExtensionPackage) -> PackageSource {
+    match package.manifest.source {
+        ironclaw_extensions::ManifestSource::HostBundled => PackageSource::Bundled,
+        ironclaw_extensions::ManifestSource::InstalledLocal => PackageSource::LocalManifest {
+            path: package.root.as_str().to_string(),
+        },
+        ironclaw_extensions::ManifestSource::RegistryInstalled => PackageSource::Registry {
+            url: package.root.as_str().to_string(),
+        },
+    }
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+fn permissive_runtime_network_policy() -> NetworkPolicy {
+    NetworkPolicy {
+        allowed_targets: vec![NetworkTargetPattern {
+            scheme: None,
+            host_pattern: "*".to_string(),
+            port: None,
+        }],
+        deny_private_ip_ranges: false,
+        max_egress_bytes: None,
+    }
+}
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+struct EmptyProductionInputQueue;
+
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[async_trait::async_trait]
+impl HostInputQueue for EmptyProductionInputQueue {
+    async fn next_after(
+        &self,
+        _run_id: TurnRunId,
+        after: LoopInputCursorToken,
+        _limit: usize,
+    ) -> Result<HostInputBatch, HostInputQueueError> {
+        Ok(HostInputBatch {
+            inputs: Vec::new(),
+            next_cursor: after,
+        })
+    }
+
+    async fn ack_consumed(
+        &self,
+        _run_id: TurnRunId,
+        _tokens: Vec<LoopInputAckToken>,
+    ) -> Result<(), HostInputQueueError> {
+        Ok(())
     }
 }
 
@@ -729,6 +1030,14 @@ impl From<TurnError> for RebornRuntimeError {
 
 impl From<DefaultPlannedRuntimeBuildError> for RebornRuntimeError {
     fn from(value: DefaultPlannedRuntimeBuildError) -> Self {
+        Self::InvalidArgument {
+            reason: value.to_string(),
+        }
+    }
+}
+
+impl From<ProductLiveRuntimeBuildError> for RebornRuntimeError {
+    fn from(value: ProductLiveRuntimeBuildError) -> Self {
         Self::InvalidArgument {
             reason: value.to_string(),
         }
@@ -2716,6 +3025,17 @@ pub async fn build_reborn_runtime(
         owner_user_id: Some(actor_user_id.clone()),
         mission_id: None,
     };
+    #[cfg(any(feature = "libsql", feature = "postgres"))]
+    let product_live_model_routes = {
+        #[cfg(feature = "root-llm-provider")]
+        {
+            product_live_model_route_settings(llm.as_ref())?
+        }
+        #[cfg(not(feature = "root-llm-provider"))]
+        {
+            product_live_model_route_settings()?
+        }
+    };
 
     // Resolve the model gateway in three flat steps so the cfg gates
     // don't multiply into a 4-way permutation:
@@ -2904,6 +3224,15 @@ pub async fn build_reborn_runtime(
         durable_milestone_sink,
         live_projection_publisher,
     );
+    let mut model_route_resolver: Option<
+        Arc<dyn ironclaw_reborn::model_routes::ModelRouteResolver>,
+    > = None;
+    let mut cancellation_factory: Option<Arc<dyn RunCancellationFactory>> = None;
+    let mut input_queue: Option<Arc<dyn HostInputQueue>> = None;
+    let mut production_identity_context_source: Option<Arc<dyn HostIdentityContextSource>> = None;
+    let mut planned_model_policy_guard: Option<Arc<dyn LoopModelPolicyGuard>> = None;
+    let mut planned_model_budget_accountant = model_budget_accountant;
+    let mut planned_safety_context: Option<InstructionSafetyContext> = None;
     let (
         capability_factory,
         capability_input_resolver,
@@ -2956,20 +3285,48 @@ pub async fn build_reborn_runtime(
                     .to_string(),
             });
         }
-        let capability_io = Arc::new(UnavailableCapabilityIo);
-        let capability_input_resolver: Arc<dyn LoopCapabilityInputResolver> = capability_io.clone();
-        let capability_result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io;
-        let capability_factory: Arc<dyn LoopCapabilityPortFactory> =
-            Arc::new(UnavailableCapabilityPortFactory);
-        (
-            capability_factory,
-            capability_input_resolver,
-            capability_result_writer,
-            Arc::new(EmptyCapabilitySurfaceResolver) as Arc<dyn CapabilitySurfaceProfileResolver>,
-            model_gateway,
-            None,
-            None,
-        )
+        #[cfg(not(any(feature = "libsql", feature = "postgres")))]
+        {
+            return Err(RebornRuntimeError::InvalidArgument {
+                reason: "production runtime requires a durable storage feature".to_string(),
+            });
+        }
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        {
+            let production_runtime = services.production_runtime.as_ref().ok_or(
+                RebornRuntimeError::InvalidArgument {
+                    reason: "production RebornServices did not provide runtime substrate"
+                        .to_string(),
+                },
+            )?;
+            let production_capabilities = production_capability_wiring(
+                &services,
+                production_runtime,
+                actor_user_id.clone(),
+                product_live_model_routes,
+                planned_model_budget_accountant.clone(),
+                milestone_sink.clone(),
+            )?;
+            model_route_resolver = Some(Arc::clone(&production_capabilities.model_route_resolver));
+            cancellation_factory = Some(Arc::clone(&production_capabilities.cancellation_factory));
+            input_queue = Some(Arc::clone(&production_capabilities.input_queue));
+            production_identity_context_source =
+                Some(Arc::clone(&production_capabilities.identity_context_source));
+            planned_model_policy_guard =
+                Some(Arc::clone(&production_capabilities.model_policy_guard));
+            planned_model_budget_accountant =
+                Some(Arc::clone(&production_capabilities.model_budget_accountant));
+            planned_safety_context = Some(production_capabilities.safety_context.clone());
+            (
+                production_capabilities.capability_factory,
+                production_capabilities.capability_input_resolver,
+                production_capabilities.capability_result_writer,
+                production_capabilities.capability_surface_resolver,
+                model_gateway,
+                None,
+                Some(production_capabilities.display_previews),
+            )
+        }
     };
     // Hook framework activation (#3934 + third-party projection), gated behind
     // the typed `HooksActivationConfig` carried in `RebornRuntimeInput` (master
@@ -3099,10 +3456,10 @@ pub async fn build_reborn_runtime(
             },
             ..DefaultPlannedRuntimeConfig::default()
         },
-        model_route_resolver: None,
-        cancellation_factory: None,
+        model_route_resolver,
+        cancellation_factory,
         skill_context_source,
-        input_queue: None,
+        input_queue,
         identity_context_source: match local_runtime {
             Some(local_runtime) => Arc::new(
                 // Local-dev seeding validates the prompt path first, so non-file prompt paths fail
@@ -3115,7 +3472,8 @@ pub async fn build_reborn_runtime(
                     reason: error.to_string(),
                 })?,
             ) as Arc<dyn HostIdentityContextSource>,
-            None => Arc::new(EmptyIdentityContextSource) as Arc<dyn HostIdentityContextSource>,
+            None => production_identity_context_source
+                .unwrap_or_else(|| Arc::new(EmptyIdentityContextSource)),
         },
         // Resolve the per-user agent-context profile (timezone/locale/location) from
         // `context/profile.json` via the workspace filesystem. When a local-dev workspace
@@ -3127,13 +3485,9 @@ pub async fn build_reborn_runtime(
         // full virtual paths via `profile_scope_and_path` and does not use the
         // `ScopedFilesystem` mount view, so the raw `RootFilesystem` is correct here.
         //
-        // NOTE: this `Some(local_runtime) => real / None => Empty` guard intentionally
-        // mirrors `identity_context_source` directly above. The production-graph path
-        // (`production_runtime_parts`, `local_runtime: None`) currently wires NEITHER the
-        // identity source NOR this profile source — both degrade to Empty there today.
-        // Wiring the production-graph composition for these optional context sources is a
-        // single deferred follow-up (identity + profile together, to keep them paired);
-        // do not wire only one of them here, or they will diverge. See issue #5013.
+        // Production still degrades user profile context to empty until a
+        // durable profile source is wired; the launch-critical identity source
+        // above is supplied by the production capability wiring.
         user_profile_source: match local_runtime {
             Some(local_runtime) => Arc::new(MemoryBackedUserProfileSourceAdapter(
                 MemoryBackedUserProfileSource::new(Arc::clone(&local_runtime.extension_filesystem)
@@ -3141,20 +3495,32 @@ pub async fn build_reborn_runtime(
             )) as Arc<dyn HostUserProfileSource>,
             None => Arc::new(EmptyUserProfileSource) as Arc<dyn HostUserProfileSource>,
         },
-        model_policy_guard: None,
-        model_budget_accountant,
-        safety_context: None,
+        model_policy_guard: planned_model_policy_guard,
+        model_budget_accountant: planned_model_budget_accountant,
+        safety_context: planned_safety_context,
         hook_security_audit_sink: Some(Arc::new(ironclaw_events::TracingSecurityAuditSink)),
         turn_event_sink: Some(trace_capture_sink),
         hook_dispatcher_builder_factory,
         communication_context_provider,
     };
-    let composition = match planned_runtime_wake_channel {
-        Some(wake_channel) => {
-            build_default_planned_runtime_with_wake_channel(planned_runtime_parts, wake_channel)
+    let composition = if profile == RebornCompositionProfile::Production {
+        match planned_runtime_wake_channel {
+            Some(wake_channel) => build_product_live_planned_runtime_with_wake_channel(
+                planned_runtime_parts,
+                wake_channel,
+            ),
+            None => build_product_live_planned_runtime(planned_runtime_parts),
         }
-        None => build_default_planned_runtime(planned_runtime_parts),
-    }?;
+        .map_err(RebornRuntimeError::from)?
+    } else {
+        match planned_runtime_wake_channel {
+            Some(wake_channel) => {
+                build_default_planned_runtime_with_wake_channel(planned_runtime_parts, wake_channel)
+            }
+            None => build_default_planned_runtime(planned_runtime_parts),
+        }
+        .map_err(RebornRuntimeError::from)?
+    };
     let default_resolved_run_profile = composition
         .run_profile_resolver
         .resolve_run_profile(RunProfileResolutionRequest::interactive_default())
@@ -5389,7 +5755,7 @@ mod tests {
 
     #[cfg(feature = "libsql")]
     #[tokio::test]
-    async fn build_reborn_runtime_allows_validated_production_readiness() {
+    async fn production_runtime_sends_user_message_with_durable_capability_wiring() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = Arc::new(
             libsql::Builder::new_local(dir.path().join("reborn.db"))
@@ -5449,6 +5815,18 @@ mod tests {
         );
         assert!(runtime.services().readiness.diagnostics.is_empty());
         assert!(runtime.services().readiness.workers.turn_runner);
+
+        let conversation = runtime.new_conversation().await.expect("conversation");
+        let reply = tokio::time::timeout(
+            RUNTIME_SEND_TIMEOUT,
+            runtime.send_user_message(&conversation, "ping"),
+        )
+        .await
+        .expect("production send should finish")
+        .expect("production send should succeed");
+
+        assert_eq!(reply.status, TurnStatus::Completed);
+        assert_eq!(reply.text.as_deref(), Some("validated production runtime"));
 
         runtime.shutdown().await.expect("runtime shutdown");
     }

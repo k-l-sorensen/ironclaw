@@ -581,6 +581,8 @@ where
     /// Registry used by the production host runtime for extension descriptors.
     #[allow(dead_code)]
     pub(crate) extension_registry: Arc<ExtensionRegistry>,
+    pub(crate) active_extension_registry: Arc<SharedExtensionRegistry>,
+    pub(crate) trust_policy: Arc<HostTrustPolicy>,
     pub(crate) turn_state: Arc<FilesystemTurnStateStore<F>>,
     pub(crate) checkpoint_state_store: Arc<dyn CheckpointStateStore>,
     pub(crate) thread_service: Arc<dyn SessionThreadService>,
@@ -623,6 +625,33 @@ impl RebornProductionRuntimeServices {
             Self::LibSql(graph) => Arc::clone(&graph.runtime_http_egress),
             #[cfg(feature = "postgres")]
             Self::Postgres(graph) => Arc::clone(&graph.runtime_http_egress),
+        }
+    }
+
+    pub(crate) fn active_extension_registry(&self) -> Arc<SharedExtensionRegistry> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.active_extension_registry),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.active_extension_registry),
+        }
+    }
+
+    pub(crate) fn trust_policy(&self) -> Arc<HostTrustPolicy> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => Arc::clone(&graph.trust_policy),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => Arc::clone(&graph.trust_policy),
+        }
+    }
+
+    pub(crate) fn turn_state_store(&self) -> Arc<dyn ironclaw_turns::TurnStateStore> {
+        match self {
+            #[cfg(feature = "libsql")]
+            Self::LibSql(graph) => graph.turn_state.clone(),
+            #[cfg(feature = "postgres")]
+            Self::Postgres(graph) => graph.turn_state.clone(),
         }
     }
 
@@ -3254,7 +3283,7 @@ where
     let extension_management = build_extension_management_port(
         extension_filesystem,
         services.shared_extension_registry(),
-        production_trust_policy,
+        Arc::clone(&production_trust_policy),
         Arc::new(InvalidationBus::new()),
         None,
     )
@@ -3320,11 +3349,14 @@ where
     })?;
     let services = services.with_first_party_capabilities(Arc::new(first_party_registry));
 
+    let active_extension_registry = services.shared_extension_registry();
     let host_runtime: Arc<dyn ironclaw_host_runtime::HostRuntime> =
         Arc::new(services.host_runtime_for_production(&wiring_config)?);
     let production_runtime_graph = Arc::new(RebornProductionRuntimeStoreGraph {
         scoped_filesystem: Arc::clone(&stores.scoped_filesystem),
         extension_registry: Arc::clone(&extension_registry),
+        active_extension_registry,
+        trust_policy: production_trust_policy,
         turn_state: Arc::clone(&turn_state),
         checkpoint_state_store: Arc::clone(&checkpoint_state_store),
         thread_service,

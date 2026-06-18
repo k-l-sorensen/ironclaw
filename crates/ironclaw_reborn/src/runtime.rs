@@ -275,7 +275,27 @@ impl Error for ProductLiveRuntimeBuildError {
 }
 
 pub fn build_product_live_planned_runtime<G>(
+    parts: DefaultPlannedRuntimeParts<G>,
+) -> Result<RebornRuntimeLoopComposition<dyn SessionThreadService, G>, ProductLiveRuntimeBuildError>
+where
+    G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
+{
+    build_product_live_planned_runtime_inner(parts, None)
+}
+
+pub fn build_product_live_planned_runtime_with_wake_channel<G>(
+    parts: DefaultPlannedRuntimeParts<G>,
+    wake_channel: PlannedRuntimeWakeChannel,
+) -> Result<RebornRuntimeLoopComposition<dyn SessionThreadService, G>, ProductLiveRuntimeBuildError>
+where
+    G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
+{
+    build_product_live_planned_runtime_inner(parts, Some(wake_channel))
+}
+
+fn build_product_live_planned_runtime_inner<G>(
     mut parts: DefaultPlannedRuntimeParts<G>,
+    wake_channel: Option<PlannedRuntimeWakeChannel>,
 ) -> Result<RebornRuntimeLoopComposition<dyn SessionThreadService, G>, ProductLiveRuntimeBuildError>
 where
     G: HostManagedModelGateway + ?Sized + Send + Sync + 'static,
@@ -333,7 +353,11 @@ where
         .with_checkpoint_state_store(Arc::clone(&parts.checkpoint_state_store))
         .with_cancellation_factory(cancellation_factory),
     );
-    build_default_planned_runtime(parts).map_err(ProductLiveRuntimeBuildError::Runtime)
+    match wake_channel {
+        Some(wake_channel) => build_default_planned_runtime_with_wake_channel(parts, wake_channel),
+        None => build_default_planned_runtime(parts),
+    }
+    .map_err(ProductLiveRuntimeBuildError::Runtime)
 }
 
 fn local_development_noop_safety_context() -> InstructionSafetyContext {
