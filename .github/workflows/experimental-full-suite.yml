@@ -1,0 +1,566 @@
+name: Experimental Full Suite Measurement
+
+on:
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: experimental-full-suite-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  BUDGET_SECONDS: "1800"
+  SHARDS: "4"
+  IRONCLAW_DISABLE_OS_KEYCHAIN: "1"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+  CARGO_PROFILE_TEST_DEBUG: "0"
+
+jobs:
+  build-archive:
+    name: Build nextest archive (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTC_WRAPPER: sccache
+      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+      SCCACHE_GHA_ENABLED: "true"
+      # If mold still OOMs on Reborn-heavy links, flip this single job-local knob:
+      # CARGO_BUILD_JOBS: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: all-features
+            cargo_flags: "--all-features"
+          - label: default
+            cargo_flags: ""
+          - label: libsql-only
+            cargo_flags: "--no-default-features --features libsql"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Free runner disk space
+        run: |
+          set -euo pipefail
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          docker system prune -af || true
+          df -h /
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          targets: wasm32-wasip2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Install mold and clang
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y clang mold
+          clang --version
+          mold --version
+
+      - name: Verify mold is selected by clang
+        run: |
+          set -euo pipefail
+          printf 'int main(void) { return 0; }\n' > /tmp/mold-probe.c
+          clang -fuse-ld=mold -Wl,--version /tmp/mold-probe.c -o /tmp/mold-probe 2>&1 | tee /tmp/mold-probe.log || true
+          if ! grep -iq mold /tmp/mold-probe.log; then
+            echo "::error::clang -fuse-ld=mold did not invoke mold"
+            cat /tmp/mold-probe.log
+            exit 1
+          fi
+          printf 'fn main() {}\n' > /tmp/rust-mold-probe.rs
+          RUSTC_WRAPPER= rustc /tmp/rust-mold-probe.rs \
+            -C linker=clang \
+            -C link-arg=-fuse-ld=mold \
+            -C link-arg=-Wl,--version \
+            -o /tmp/rust-mold-probe 2>&1 | tee /tmp/rust-mold-probe.log || true
+          if ! grep -iq mold /tmp/rust-mold-probe.log; then
+            echo "::error::rustc linker probe did not invoke mold"
+            cat /tmp/rust-mold-probe.log
+            exit 1
+          fi
+
+      - name: Start sccache
+        uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: experimental-full-suite-${{ matrix.label }}
+
+      - name: Build nextest archive
+        env:
+          LABEL: ${{ matrix.label }}
+          CARGO_FLAGS: ${{ matrix.cargo_flags }}
+        run: |
+          set -euo pipefail
+
+          archive_file="nextest-${LABEL}.tar.zst"
+          build_json="build-${LABEL}.json"
+          sccache_stats="sccache-stats-${LABEL}.txt"
+          cargo_flags=()
+          if [ -n "${CARGO_FLAGS}" ]; then
+            # shellcheck disable=SC2206 # GitHub matrix flags are intentional Cargo argv.
+            cargo_flags=(${CARGO_FLAGS})
+          fi
+
+          start="$(date +%s)"
+          archive_scope="workspace-all-targets"
+          primary_status=0
+
+          set +e
+          cargo nextest archive --profile ci --workspace --all-targets "${cargo_flags[@]}" --archive-file "${archive_file}"
+          status="$?"
+          set -e
+
+          if [ "${status}" -ne 0 ]; then
+            primary_status="${status}"
+            archive_scope="workspace-fallback"
+            echo "::warning::cargo nextest archive --workspace --all-targets failed for ${LABEL}; retrying --workspace without --all-targets"
+            rm -f "${archive_file}"
+            set +e
+            cargo nextest archive --profile ci --workspace "${cargo_flags[@]}" --archive-file "${archive_file}"
+            status="$?"
+            set -e
+          fi
+
+          end="$(date +%s)"
+          build_seconds="$((end - start))"
+
+          sccache --show-stats | tee "${sccache_stats}" || true
+
+          export ARCHIVE_SCOPE="${archive_scope}"
+          export ARCHIVE_STATUS="${status}"
+          export BUILD_SECONDS="${build_seconds}"
+          export PRIMARY_STATUS="${primary_status}"
+
+          python3 - "${build_json}" "${sccache_stats}" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          output_path, stats_path = sys.argv[1:3]
+          label = os.environ["LABEL"]
+          status = int(os.environ["ARCHIVE_STATUS"])
+          primary_status = int(os.environ["PRIMARY_STATUS"])
+          build_seconds = int(os.environ["BUILD_SECONDS"])
+          text = ""
+          try:
+              text = open(stats_path, encoding="utf-8").read()
+          except OSError:
+              pass
+
+          def stat(name):
+              match = re.search(rf"^{re.escape(name)}\s+(\d+)\s*$", text, re.MULTILINE)
+              return int(match.group(1)) if match else None
+
+          hits = stat("Cache hits")
+          misses = stat("Cache misses")
+          requests = (hits or 0) + (misses or 0)
+          hit_rate = (hits / requests) if requests else None
+
+          payload = {
+              "config": label,
+              "label": label,
+              "cargo_flags": os.environ["CARGO_FLAGS"],
+              "archive_scope": os.environ["ARCHIVE_SCOPE"],
+              "primary_archive_status": primary_status,
+              "archive_status": status,
+              "build_seconds": build_seconds,
+              "sccache_hits": hits,
+              "sccache_misses": misses,
+              "sccache_hit_rate": hit_rate,
+              "mold_active": True,
+              "rustflags": os.environ.get("RUSTFLAGS", ""),
+              "cargo_build_jobs": os.environ.get("CARGO_BUILD_JOBS"),
+              "parallel_linking": os.environ.get("CARGO_BUILD_JOBS") != "1",
+              "parallel_linking_succeeded_without_oom": status == 0 and os.environ.get("CARGO_BUILD_JOBS") != "1",
+          }
+          with open(output_path, "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2, sort_keys=True)
+              f.write("\n")
+          PY
+
+          exit "${status}"
+
+      - name: Upload nextest archive
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: nextest-archive-${{ matrix.label }}
+          path: nextest-${{ matrix.label }}.tar.zst
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Upload build measurement
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: experimental-full-suite-build-${{ matrix.label }}
+          path: |
+            build-${{ matrix.label }}.json
+            sccache-stats-${{ matrix.label }}.txt
+          if-no-files-found: warn
+          retention-days: 14
+
+  test-shard:
+    name: Run shard ${{ matrix.shard_index }}/4 (${{ matrix.label }})
+    needs: build-archive
+    if: always() && needs.build-archive.result != 'cancelled'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        label:
+          - all-features
+          - default
+          - libsql-only
+        shard_index:
+          - 1
+          - 2
+          - 3
+          - 4
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ironclaw_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost/ironclaw_test
+      IRONCLAW_REQUIRE_POSTGRES: "1"
+      ANTHROPIC_API_KEY: ""
+      GEMINI_API_KEY: ""
+      GOOGLE_API_KEY: ""
+      GROQ_API_KEY: ""
+      LLM_API_KEY: ""
+      LLM_BACKEND: ""
+      LLM_USE_CODEX_AUTH: "false"
+      MISTRAL_API_KEY: ""
+      NEARAI_API_KEY: ""
+      NOUS_API_KEY: ""
+      OLLAMA_BASE_URL: ""
+      OPENAI_API_KEY: ""
+      OPENROUTER_API_KEY: ""
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Download matching archive
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: nextest-archive-${{ matrix.label }}
+          path: .
+
+      - name: Run archive shard
+        env:
+          LABEL: ${{ matrix.label }}
+          SHARD_INDEX: ${{ matrix.shard_index }}
+        run: |
+          set -euo pipefail
+
+          archive_file="nextest-${LABEL}.tar.zst"
+          events_jsonl="nextest-events-${LABEL}-${SHARD_INDEX}.jsonl"
+          durations_json="durations-${LABEL}-${SHARD_INDEX}.json"
+          shard_json="shard-${LABEL}-${SHARD_INDEX}.json"
+
+          if [ ! -f "${archive_file}" ]; then
+            echo "::error::Missing archive ${archive_file}"
+            python3 - "${durations_json}" "${shard_json}" <<'PY'
+          import json
+          import os
+          import sys
+
+          durations_path, shard_path = sys.argv[1:3]
+          label = os.environ["LABEL"]
+          shard_index = int(os.environ["SHARD_INDEX"])
+          shards = int(os.environ["SHARDS"])
+          partition = f"count:{shard_index}/{shards}"
+          with open(durations_path, "w", encoding="utf-8") as f:
+              json.dump({
+                  "label": label,
+                  "config": label,
+                  "shard_index": shard_index,
+                  "shards": shards,
+                  "partition": partition,
+                  "format": "nextest libtest-json-plus 0.1",
+                  "durations": [],
+                  "raw_events": [],
+              }, f, indent=2, sort_keys=True)
+              f.write("\n")
+
+          payload = {
+              "label": label,
+              "config": label,
+              "shard_index": shard_index,
+              "shards": shards,
+              "partition": partition,
+              "shard_seconds": None,
+              "exit_code": 66,
+              "status": "missing-archive",
+          }
+          with open(shard_path, "w", encoding="utf-8") as f:
+              json.dump(payload, f, indent=2, sort_keys=True)
+              f.write("\n")
+          PY
+            exit 66
+          fi
+
+          start="$(date +%s)"
+          set +e
+          NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1 cargo nextest run \
+            --profile ci \
+            --archive-file "${archive_file}" \
+            --workspace-remap . \
+            --partition "count:${SHARD_INDEX}/${SHARDS}" \
+            --message-format libtest-json-plus \
+            --message-format-version 0.1 \
+            | tee "${events_jsonl}"
+          status="${PIPESTATUS[0]}"
+          set -e
+          end="$(date +%s)"
+          shard_seconds="$((end - start))"
+          export NEXTEST_STATUS="${status}"
+          export SHARD_SECONDS="${shard_seconds}"
+
+          python3 - "${events_jsonl}" "${durations_json}" "${shard_json}" <<'PY'
+          import json
+          import os
+          import sys
+
+          events_path, durations_path, shard_path = sys.argv[1:4]
+          events = []
+          durations = []
+          try:
+              with open(events_path, encoding="utf-8") as f:
+                  for line in f:
+                      line = line.strip()
+                      if not line:
+                          continue
+                      try:
+                          event = json.loads(line)
+                      except json.JSONDecodeError:
+                          continue
+                      events.append(event)
+                      if event.get("type") == "test" and "exec_time" in event:
+                          durations.append({
+                              "name": event.get("name"),
+                              "event": event.get("event"),
+                              "exec_time_seconds": event.get("exec_time"),
+                              "nextest": event.get("nextest"),
+                          })
+          except OSError:
+              pass
+
+          label = os.environ["LABEL"]
+          shard_index = int(os.environ["SHARD_INDEX"])
+          shards = int(os.environ["SHARDS"])
+          status = int(os.environ["NEXTEST_STATUS"])
+          shard_seconds = int(os.environ["SHARD_SECONDS"])
+
+          with open(durations_path, "w", encoding="utf-8") as f:
+              json.dump({
+                  "label": label,
+                  "config": label,
+                  "shard_index": shard_index,
+                  "shards": shards,
+                  "partition": f"count:{shard_index}/{shards}",
+                  "format": "nextest libtest-json-plus 0.1",
+                  "durations": durations,
+                  "raw_events": events,
+              }, f, indent=2, sort_keys=True)
+              f.write("\n")
+
+          with open(shard_path, "w", encoding="utf-8") as f:
+              json.dump({
+                  "label": label,
+                  "config": label,
+                  "shard_index": shard_index,
+                  "shards": shards,
+                  "partition": f"count:{shard_index}/{shards}",
+                  "shard_seconds": shard_seconds,
+                  "exit_code": status,
+                  "status": "success" if status == 0 else "failed",
+                  "duration_events": len(durations),
+              }, f, indent=2, sort_keys=True)
+              f.write("\n")
+          PY
+
+          exit "${status}"
+
+      - name: Upload shard measurement
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: experimental-full-suite-shard-${{ matrix.label }}-${{ matrix.shard_index }}
+          path: |
+            shard-${{ matrix.label }}-${{ matrix.shard_index }}.json
+            durations-${{ matrix.label }}-${{ matrix.shard_index }}.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  report:
+    name: Measurement report
+    needs:
+      - build-archive
+      - test-shard
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Download build measurements
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: experimental-full-suite-build-*
+          path: artifacts/build
+          merge-multiple: true
+
+      - name: Download shard measurements
+        continue-on-error: true
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: experimental-full-suite-shard-*
+          path: artifacts/shards
+          merge-multiple: true
+
+      - name: Produce timing summary
+        run: |
+          set -euo pipefail
+          python3 <<'PY'
+          import glob
+          import json
+          import os
+          import statistics
+
+          labels = ["all-features", "default", "libsql-only"]
+          budget = int(os.environ["BUDGET_SECONDS"])
+
+          builds = {}
+          for path in glob.glob("artifacts/build/build-*.json"):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      data = json.load(f)
+              except (OSError, json.JSONDecodeError):
+                  continue
+              builds[data.get("label") or data.get("config")] = data
+
+          shards = {label: [] for label in labels}
+          for path in glob.glob("artifacts/shards/shard-*.json"):
+              try:
+                  with open(path, encoding="utf-8") as f:
+                      data = json.load(f)
+              except (OSError, json.JSONDecodeError):
+                  continue
+              label = data.get("label") or data.get("config")
+              if label in shards:
+                  shards[label].append(data)
+
+          def seconds(value):
+              if value is None:
+                  return "n/a"
+              return f"{int(value)}s"
+
+          def rate(value):
+              if value is None:
+                  return "n/a"
+              return f"{value * 100:.1f}%"
+
+          def verdict(total):
+              if total is None:
+                  return "NO DATA"
+              return "PASS" if total <= budget else "FAIL"
+
+          summary = os.environ["GITHUB_STEP_SUMMARY"]
+          with open(summary, "a", encoding="utf-8") as out:
+              out.write("# Experimental full-suite timing report\n\n")
+              out.write(
+                  "Build once into a `cargo nextest archive`, then run 4 round-robin `count:` shards from the archive with `--workspace-remap .`. "
+                  "This is a non-blocking measurement spike; duration-balanced LPT sharding is a follow-up.\n\n"
+              )
+              out.write("| Config | Archive scope | Build | sccache hit rate | Shards | p50 shard | Max shard | Estimated wall clock | 30m verdict | mold / parallel link |\n")
+              out.write("| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- | --- |\n")
+
+              verdict_lines = []
+              for label in labels:
+                  build = builds.get(label)
+                  shard_rows = sorted(shards[label], key=lambda row: row.get("shard_index") or 0)
+                  shard_seconds = [
+                      row.get("shard_seconds")
+                      for row in shard_rows
+                      if isinstance(row.get("shard_seconds"), (int, float))
+                  ]
+                  build_seconds = build.get("build_seconds") if build else None
+                  max_shard = max(shard_seconds) if shard_seconds else None
+                  p50_shard = statistics.median(shard_seconds) if shard_seconds else None
+                  total = build_seconds + max_shard if build_seconds is not None and max_shard is not None else None
+                  budget_verdict = verdict(total)
+
+                  if build:
+                      mold = "yes" if build.get("mold_active") else "no"
+                      parallel = "yes" if build.get("parallel_linking_succeeded_without_oom") else "no/unknown"
+                      scope = build.get("archive_scope") or "n/a"
+                      hit_rate = rate(build.get("sccache_hit_rate"))
+                  else:
+                      mold = "n/a"
+                      parallel = "n/a"
+                      scope = "missing"
+                      hit_rate = "n/a"
+
+                  failed_shards = [row for row in shard_rows if row.get("exit_code") not in (0, None)]
+                  shard_cell = f"{len(shard_seconds)}/{os.environ['SHARDS']}"
+                  if failed_shards:
+                      shard_cell += f" ({len(failed_shards)} failed)"
+
+                  out.write(
+                      f"| `{label}` | {scope} | {seconds(build_seconds)} | {hit_rate} | {shard_cell} | "
+                      f"{seconds(p50_shard)} | {seconds(max_shard)} | {seconds(total)} | **{budget_verdict}** | "
+                      f"mold: {mold}; parallel without OOM: {parallel} |\n"
+                  )
+                  verdict_lines.append(
+                      f"- `{label}`: {budget_verdict} for build + slowest shard "
+                      f"({seconds(total)} against {budget // 60}m budget)."
+                  )
+
+              out.write("\n## Verdicts\n\n")
+              out.write("\n".join(verdict_lines))
+              out.write("\n\n")
+              out.write("Notes: `count:` partitioning is intentionally v1. The shard duration artifacts are uploaded as `durations-<label>-<index>.json` so a follow-up can implement duration-balanced LPT scheduling from measured data.\n")
+          PY
