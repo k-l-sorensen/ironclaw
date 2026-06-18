@@ -53,9 +53,9 @@ pub(crate) struct LocalTriggerAccessBootstrapConfig {
 /// resolver and hands the result to the ingress signed-session builder.
 ///
 /// `identity_resolver` is the resolver the runtime opened on its own
-/// substrate handle. It is `None` only when the runtime carries no
-/// local-runtime substrate; with SSO configured that is unrecoverable, so
-/// this fails closed rather than minting users against a missing store.
+/// durable substrate. It is `None` only when the runtime carries no identity
+/// substrate; with SSO configured that is unrecoverable, so this fails closed
+/// rather than minting users against a missing store.
 ///
 /// When `local_trigger_access` is present and SSO is configured, admitted
 /// users get a local-dev trigger-access row seeded on each login (via the
@@ -86,7 +86,7 @@ pub(crate) async fn build_webui_auth_surface(
     let identity_resolver = identity_resolver.ok_or_else(|| {
         anyhow!(
             "WebChat v2 SSO is configured but the runtime exposes no identity \
-             resolver (no local-runtime substrate); refusing to start"
+             resolver; refusing to start"
         )
     })?;
 
@@ -194,9 +194,9 @@ mod tests {
     #[tokio::test]
     async fn sso_without_identity_resolver_fails_closed() {
         // SSO providers configured but the runtime exposes no identity
-        // resolver (no local-runtime substrate). Admitting logins against a
-        // missing user source would silently mint users into nothing, so the
-        // surface must refuse to start rather than fall back or panic.
+        // resolver. Admitting logins against a missing user source would
+        // silently mint users into nothing, so the surface must refuse to
+        // start rather than fall back or panic.
         let sso = SsoStartupConfig {
             providers: Vec::new(),
             base_url: "https://app.example.com".to_string(),

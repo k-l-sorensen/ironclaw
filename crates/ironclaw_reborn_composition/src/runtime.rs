@@ -33,8 +33,10 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use ironclaw_events::{DurableAuditLog, DurableEventLog, InMemoryAuditSink, RuntimeEvent};
-#[cfg(any(feature = "libsql", feature = "postgres"))]
+#[cfg(any(feature = "libsql", feature = "postgres", feature = "webui-v2-beta"))]
 use ironclaw_filesystem::RootFilesystem;
+#[cfg(feature = "webui-v2-beta")]
+use ironclaw_filesystem::ScopedFilesystem;
 use ironclaw_first_party_extension_ports::{
     FirstPartySkillsExtension, FirstPartySkillsExtensionHandles, SelectableSkillContextSource,
     SkillActivationSelectorConfig, SkillExecutionAdapter,
@@ -1295,6 +1297,24 @@ where
     Ok(())
 }
 
+#[cfg(feature = "webui-v2-beta")]
+fn filesystem_reborn_identity_resolver<F>(
+    filesystem: Arc<ScopedFilesystem<F>>,
+    tenant_id: TenantId,
+    user_id: UserId,
+    agent_id: AgentId,
+    project_id: Option<ProjectId>,
+) -> Arc<dyn ironclaw_reborn_identity::RebornIdentityResolver>
+where
+    F: RootFilesystem + 'static,
+{
+    Arc::new(
+        ironclaw_reborn_identity::FilesystemRebornIdentityStore::new(
+            filesystem, tenant_id, user_id, agent_id, project_id,
+        ),
+    ) as Arc<dyn ironclaw_reborn_identity::RebornIdentityResolver>
+}
+
 impl RebornRuntime {
     /// Snapshot of the substrate facades produced by `build_reborn_services`.
     /// Exposed for diagnostics / readiness reporting; **not** for traffic.
@@ -1420,15 +1440,14 @@ impl RebornRuntime {
         self.trigger_conversation_pairing.as_ref().map(Arc::clone)
     }
 
-    /// Open the canonical Reborn identity resolver on the runtime's existing
-    /// local-dev libSQL substrate handle, running the store's idempotent
-    /// schema migrations plus the one-time legacy WebUI identity fold under
-    /// `tenant_id`. Rides the same `reborn-local-dev.db` handle the runtime
-    /// already owns rather than opening a second handle to that file (the
-    /// host filesystem abstraction owns the substrate, not the caller).
-    /// Returns `None` when the runtime was built without a local-runtime
-    /// substrate, so callers fail closed instead of synthesizing a second
-    /// identity store outside the host-owned substrate.
+    /// Open the canonical Reborn identity resolver on the runtime-owned
+    /// durable scoped filesystem. Local-dev also runs the one-time legacy
+    /// WebUI identity fold against the libSQL substrate handle it already
+    /// owns, so upgraded SSO users keep their original `UserId`.
+    ///
+    /// Returns `None` only when the runtime was built without any durable
+    /// identity substrate, so callers fail closed instead of synthesizing a
+    /// second identity store outside the host-owned substrate.
     #[cfg(feature = "webui-v2-beta")]
     pub async fn open_reborn_identity_resolver(
         &self,
@@ -1439,29 +1458,61 @@ impl RebornRuntime {
             ironclaw_reborn_identity::RebornIdentityError,
         >,
     > {
-        let local = self.services.local_runtime.as_ref()?;
-        // Build the store on the host scoped filesystem (same substrate
-        // boundary as every other durable store), scoped by the runtime-owner
-        // caller identity. Data is partitioned by tenant in the record path.
-        let store = ironclaw_reborn_identity::FilesystemRebornIdentityStore::new(
-            Arc::clone(&local.identity_filesystem),
-            self.thread_scope.tenant_id.clone(),
-            self.actor_user_id.clone(),
-            self.thread_scope.agent_id.clone(),
-            self.thread_scope.project_id.clone(),
-        );
-        // One-time legacy fold: the pre-#4381 WebUI store wrote `user_identities`
-        // rows into the same libSQL substrate. Reading that SQL table is a
-        // substrate-level concern, so it lives here in the host layer (not the
-        // identity crate) and binds each row into the filesystem-backed store.
-        if let Err(err) =
-            fold_legacy_webui_identities(&local.identity_substrate_db, tenant_id, &store).await
-        {
-            return Some(Err(err));
+        if let Some(local) = self.services.local_runtime.as_ref() {
+            // Build the store on the host scoped filesystem (same substrate
+            // boundary as every other durable store), scoped by the
+            // runtime-owner caller identity. Data is partitioned by tenant in
+            // the record path.
+            let store = ironclaw_reborn_identity::FilesystemRebornIdentityStore::new(
+                Arc::clone(&local.identity_filesystem),
+                self.thread_scope.tenant_id.clone(),
+                self.actor_user_id.clone(),
+                self.thread_scope.agent_id.clone(),
+                self.thread_scope.project_id.clone(),
+            );
+            // One-time legacy fold: the pre-#4381 WebUI store wrote
+            // `user_identities` rows into the same libSQL substrate. Reading
+            // that SQL table is a substrate-level concern, so it lives here in
+            // the host layer (not the identity crate) and binds each row into
+            // the filesystem-backed store.
+            if let Err(err) =
+                fold_legacy_webui_identities(&local.identity_substrate_db, tenant_id, &store).await
+            {
+                return Some(Err(err));
+            }
+            return Some(Ok(
+                Arc::new(store) as Arc<dyn ironclaw_reborn_identity::RebornIdentityResolver>
+            ));
         }
-        Some(Ok(
-            Arc::new(store) as Arc<dyn ironclaw_reborn_identity::RebornIdentityResolver>
-        ))
+
+        #[cfg(any(feature = "libsql", feature = "postgres"))]
+        if let Some(production_runtime) = self.services.production_runtime.as_ref() {
+            let resolver = match production_runtime {
+                #[cfg(feature = "libsql")]
+                crate::factory::RebornProductionRuntimeServices::LibSql(graph) => {
+                    filesystem_reborn_identity_resolver(
+                        Arc::clone(&graph.scoped_filesystem),
+                        self.thread_scope.tenant_id.clone(),
+                        self.actor_user_id.clone(),
+                        self.thread_scope.agent_id.clone(),
+                        self.thread_scope.project_id.clone(),
+                    )
+                }
+                #[cfg(feature = "postgres")]
+                crate::factory::RebornProductionRuntimeServices::Postgres(graph) => {
+                    filesystem_reborn_identity_resolver(
+                        Arc::clone(&graph.scoped_filesystem),
+                        self.thread_scope.tenant_id.clone(),
+                        self.actor_user_id.clone(),
+                        self.thread_scope.agent_id.clone(),
+                        self.thread_scope.project_id.clone(),
+                    )
+                }
+            };
+            return Some(Ok(resolver));
+        }
+
+        None
     }
 
     pub(crate) fn webui_thread_service(&self) -> Arc<dyn SessionThreadService> {
@@ -5398,6 +5449,98 @@ mod tests {
         );
         assert!(runtime.services().readiness.diagnostics.is_empty());
         assert!(runtime.services().readiness.workers.turn_runner);
+
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[cfg(all(feature = "libsql", feature = "webui-v2-beta"))]
+    #[tokio::test]
+    async fn production_runtime_exposes_durable_identity_resolver_for_sso() {
+        use ironclaw_reborn_identity::{
+            ExternalSubjectId, ProviderKind, ResolveExternalIdentity, SurfaceKind,
+        };
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(
+            libsql::Builder::new_local(dir.path().join("reborn.db"))
+                .build()
+                .await
+                .expect("libsql db"),
+        );
+        let gateway = Arc::new(RecordingGateway {
+            reply: "production identity resolver".to_string(),
+            requests: Arc::new(StdMutex::new(Vec::new())),
+        });
+
+        let input = RebornRuntimeInput::from_services(
+            RebornBuildInput::libsql(
+                crate::RebornCompositionProfile::Production,
+                "runtime-production-identity-owner",
+                db,
+                dir.path().join("events.db").to_string_lossy(),
+                None,
+                ironclaw_secrets::SecretMaterial::from("01234567890123456789012345678901"),
+            )
+            .with_production_trust_policy(Arc::new(
+                crate::builtin_first_party_trust_policy().expect("trust policy"),
+            ))
+            .with_runtime_policy(EffectiveRuntimePolicy {
+                deployment: DeploymentMode::HostedMultiTenant,
+                requested_profile: RuntimeProfile::SecureDefault,
+                resolved_profile: RuntimeProfile::SecureDefault,
+                filesystem_backend: FilesystemBackendKind::ScopedVirtual,
+                process_backend: ProcessBackendKind::TenantSandbox,
+                network_mode: NetworkMode::Deny,
+                secret_mode: SecretMode::BrokeredHandles,
+                approval_policy: ApprovalPolicy::AskAlways,
+                audit_mode: AuditMode::Standard,
+            })
+            .with_runtime_process_binding(RebornRuntimeProcessBinding::tenant_sandbox(Arc::new(
+                ironclaw_host_runtime::TenantSandboxProcessPort::new(Arc::new(
+                    RecordingSandboxTransport,
+                )),
+            ))),
+        )
+        .with_identity(RebornRuntimeIdentity {
+            tenant_id: "runtime-production-identity-tenant".to_string(),
+            agent_id: "runtime-production-identity-agent".to_string(),
+            source_binding_id: "runtime-production-identity-source".to_string(),
+            reply_target_binding_id: "runtime-production-identity-reply".to_string(),
+        })
+        .with_model_gateway_override(gateway);
+
+        let runtime = build_reborn_runtime(input)
+            .await
+            .expect("production runtime starts");
+        let tenant = TenantId::new("runtime-production-identity-tenant").expect("tenant");
+        let resolver = runtime
+            .open_reborn_identity_resolver(&tenant)
+            .await
+            .expect("production runtime exposes durable identity resolver")
+            .expect("identity resolver opens");
+
+        let identity = || ResolveExternalIdentity {
+            tenant_id: tenant.clone(),
+            surface_kind: SurfaceKind::Oauth,
+            provider_kind: ProviderKind::new("google").expect("provider"),
+            provider_instance_id: None,
+            external_subject_id: ExternalSubjectId::new("prod-sso-subject").expect("subject"),
+            email: Some("prod-sso@example.com".to_string()),
+            email_verified: true,
+            display_name: Some("Prod SSO".to_string()),
+        };
+        let created = resolver
+            .resolve_or_create(identity())
+            .await
+            .expect("production SSO identity resolves");
+        let returning = resolver
+            .resolve_or_create(identity())
+            .await
+            .expect("returning production SSO identity resolves");
+        assert_eq!(
+            created, returning,
+            "production SSO must resolve returning users through the durable identity store"
+        );
 
         runtime.shutdown().await.expect("runtime shutdown");
     }

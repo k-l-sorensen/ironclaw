@@ -397,15 +397,13 @@ impl ServeCommand {
             .context("failed to compose OpenAI-compatible Reborn routes")?;
 
             // Open the canonical Reborn identity resolver on the runtime's
-            // existing substrate handle (the same `reborn-local-dev.db` the
-            // runtime owns) rather than opening a second handle to the file.
-            // Only SSO-enabled WebUI needs it: an env-bearer-only deployment
-            // resolves its single configured user without any identity store,
-            // so skip opening (and its legacy migration) when SSO is disabled
-            // — otherwise a disabled-SSO deployment could fail startup on an
-            // unused identity backend. `None` also covers the case where the
-            // runtime carries no local-runtime substrate; the auth surface
-            // fails closed when SSO is configured but no resolver is available.
+            // existing durable substrate rather than opening an out-of-band
+            // store. Only SSO-enabled WebUI needs it: an env-bearer-only
+            // deployment resolves its single configured user without any
+            // identity store, so skip opening (and local-dev's legacy
+            // migration) when SSO is disabled. `None` covers runtimes without
+            // any identity substrate; the auth surface fails closed when SSO
+            // is configured but no resolver is available.
             let identity_resolver = if sso_startup.is_some() {
                 match runtime.open_reborn_identity_resolver(&tenant_id).await {
                     Some(result) => {
