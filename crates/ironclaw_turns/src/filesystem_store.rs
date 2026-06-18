@@ -31,6 +31,7 @@
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, MutexGuard, OnceLock, Weak},
+    time::{Duration, Instant},
 };
 
 use async_trait::async_trait;
@@ -63,9 +64,35 @@ use crate::{
 /// cross-process contention on filesystem mounts is what the
 /// [`TurnError::Unavailable`] return shape is meant to surface.
 const FILESYSTEM_CAS_RETRIES: usize = 8;
+const SNAPSHOT_READ_CACHE_TTL: Duration = Duration::from_millis(500);
 
 const TURNS_PREFIX: &str = "/turns";
 const TURNS_SNAPSHOT_FILE: &str = "state.json";
+
+#[derive(Clone)]
+struct CachedSnapshot {
+    snapshot: TurnPersistenceSnapshot,
+    version: Option<RecordVersion>,
+    loaded_at: Instant,
+}
+
+impl CachedSnapshot {
+    fn new(snapshot: TurnPersistenceSnapshot, version: Option<RecordVersion>) -> Self {
+        Self {
+            snapshot,
+            version,
+            loaded_at: Instant::now(),
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        self.loaded_at.elapsed() <= SNAPSHOT_READ_CACHE_TTL
+    }
+
+    fn parts(&self) -> (TurnPersistenceSnapshot, Option<RecordVersion>) {
+        (self.snapshot.clone(), self.version)
+    }
+}
 
 /// Filesystem-backed turn-state store under the `/turns` mount alias.
 ///
@@ -84,7 +111,7 @@ where
     filesystem: Arc<ScopedFilesystem<F>>,
     limits: InMemoryTurnStateStoreLimits,
     admission_limit_provider: Arc<dyn TurnAdmissionLimitProvider>,
-    snapshot_cache: Mutex<Option<(TurnPersistenceSnapshot, Option<RecordVersion>)>>,
+    snapshot_cache: Mutex<Option<CachedSnapshot>>,
 }
 
 impl<F> FilesystemTurnStateStore<F>
@@ -127,6 +154,9 @@ where
         let path = snapshot_path()?;
         let record_lock = filesystem_record_lock(self.filesystem.as_ref(), &path);
         let _guard = record_lock.lock().await;
+        if let Some(snapshot) = self.fresh_cached_snapshot() {
+            return Ok(snapshot);
+        }
         self.read_snapshot_unlocked().await
     }
 
@@ -152,15 +182,30 @@ where
 
     fn cached_snapshot(&self) -> Option<(TurnPersistenceSnapshot, Option<RecordVersion>)> {
         match self.snapshot_cache.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
+            Ok(guard) => guard.as_ref().map(CachedSnapshot::parts),
+            Err(poisoned) => poisoned.into_inner().as_ref().map(CachedSnapshot::parts),
+        }
+    }
+
+    fn fresh_cached_snapshot(&self) -> Option<(TurnPersistenceSnapshot, Option<RecordVersion>)> {
+        match self.snapshot_cache.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .filter(|snapshot| snapshot.is_fresh())
+                .map(CachedSnapshot::parts),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .as_ref()
+                .filter(|snapshot| snapshot.is_fresh())
+                .map(CachedSnapshot::parts),
         }
     }
 
     fn store_snapshot_cache(&self, snapshot: (TurnPersistenceSnapshot, Option<RecordVersion>)) {
+        let cached = CachedSnapshot::new(snapshot.0, snapshot.1);
         match self.snapshot_cache.lock() {
-            Ok(mut guard) => *guard = Some(snapshot),
-            Err(poisoned) => *poisoned.into_inner() = Some(snapshot),
+            Ok(mut guard) => *guard = Some(cached),
+            Err(poisoned) => *poisoned.into_inner() = Some(cached),
         }
     }
 
@@ -623,6 +668,25 @@ impl RunProfileResolver for PreResolvedRunProfileResolver {
         _request: crate::RunProfileResolutionRequest,
     ) -> Result<crate::ResolvedRunProfile, crate::RunProfileResolutionError> {
         self.result.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_snapshot_freshness_is_bounded() {
+        let snapshot = TurnPersistenceSnapshot::default();
+        let fresh = CachedSnapshot::new(snapshot.clone(), None);
+        assert!(fresh.is_fresh());
+
+        let stale = CachedSnapshot {
+            snapshot,
+            version: None,
+            loaded_at: Instant::now() - SNAPSHOT_READ_CACHE_TTL - Duration::from_millis(1),
+        };
+        assert!(!stale.is_fresh());
     }
 }
 

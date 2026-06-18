@@ -2,10 +2,17 @@
 //! [`ScopedFilesystem`] over [`LocalFilesystem`]. The persistent shape is a
 //! single `/turns/state.json` snapshot keyed by the [`MountView`] target.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 
+use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
-use ironclaw_filesystem::{FilesystemError, LocalFilesystem, RootFilesystem, ScopedFilesystem};
+use ironclaw_filesystem::{
+    BackendCapabilities, CasExpectation, DirEntry, Entry, FileStat, FilesystemError,
+    LocalFilesystem, RecordVersion, RootFilesystem, ScopedFilesystem, VersionedEntry,
+};
 use ironclaw_host_api::{
     AgentId, HostPath, MountAlias, MountGrant, MountPermissions, MountView, ProjectId, TenantId,
     ThreadId, UserId, VirtualPath,
@@ -32,6 +39,61 @@ fn engine_filesystem() -> LocalFilesystem {
     )
     .unwrap();
     fs
+}
+
+struct CountingFilesystem {
+    inner: LocalFilesystem,
+    get_calls: AtomicUsize,
+}
+
+impl CountingFilesystem {
+    fn new(inner: LocalFilesystem) -> Self {
+        Self {
+            inner,
+            get_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn reset_get_calls(&self) {
+        self.get_calls.store(0, Ordering::SeqCst);
+    }
+
+    fn get_calls(&self) -> usize {
+        self.get_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl RootFilesystem for CountingFilesystem {
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn put(
+        &self,
+        path: &VirtualPath,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        self.inner.put(path, entry, cas).await
+    }
+
+    async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        self.get_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.get(path).await
+    }
+
+    async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+        self.inner.list_dir(path).await
+    }
+
+    async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+        self.inner.stat(path).await
+    }
+
+    async fn delete(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+        self.inner.delete(path).await
+    }
 }
 
 /// Wrap a [`RootFilesystem`] in a [`ScopedFilesystem`] that exposes the
@@ -184,6 +246,37 @@ async fn filesystem_turn_state_store_persists_submit_and_reopens() {
         .unwrap();
     assert_eq!(state.run_id, run_id);
     assert_eq!(state.status, TurnStatus::Queued);
+}
+
+#[tokio::test]
+async fn filesystem_turn_state_store_reuses_fresh_snapshot_for_read_only_lookup() {
+    let backend = Arc::new(CountingFilesystem::new(engine_filesystem()));
+    let scoped = scoped_turns_fs(Arc::clone(&backend));
+    let store = FilesystemTurnStateStore::new(scoped);
+    let resolver = InMemoryRunProfileResolver::default();
+
+    let request = submit_request_for(turn_scope("thread-fs-read-cache"), "idem-fs-read-cache");
+    let response = store
+        .submit_turn(request.clone(), &AllowAllTurnAdmissionPolicy, &resolver)
+        .await
+        .unwrap();
+    let run_id = accepted_run_id(&response);
+
+    backend.reset_get_calls();
+    let state = store
+        .get_run_state(GetRunStateRequest {
+            scope: request.scope,
+            run_id,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(state.run_id, run_id);
+    assert_eq!(
+        backend.get_calls(),
+        0,
+        "fresh read-only turn-state lookups should reuse the in-process snapshot cache"
+    );
 }
 
 #[tokio::test]
