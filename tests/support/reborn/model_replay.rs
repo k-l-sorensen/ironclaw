@@ -52,6 +52,11 @@ pub enum RebornModelReplayStep {
         response: HostManagedModelResponse,
         expected_tool_results: Vec<ExpectedToolResult>,
     },
+    AssertProviderToolsThenProviderToolCalls {
+        capability_ids: Vec<CapabilityId>,
+        calls: Vec<RebornScriptedProviderToolCall>,
+        expected_tool_results: Vec<ExpectedToolResult>,
+    },
     ResponseForRequest {
         request_contains: String,
         response: HostManagedModelResponse,
@@ -139,6 +144,10 @@ enum ReplayOutput {
         capability_ids: Vec<CapabilityId>,
         response: HostManagedModelResponse,
     },
+    AssertProviderToolsThenProviderToolCalls {
+        capability_ids: Vec<CapabilityId>,
+        calls: Vec<RebornScriptedProviderToolCall>,
+    },
     DelayedResponse {
         response: HostManagedModelResponse,
         delay: Duration,
@@ -205,6 +214,18 @@ impl RebornTraceReplayModelGateway {
                         output: ReplayOutput::AssertProviderToolsThenResponse {
                             capability_ids,
                             response,
+                        },
+                        request_contains: None,
+                        expected_tool_results,
+                    },
+                    RebornModelReplayStep::AssertProviderToolsThenProviderToolCalls {
+                        capability_ids,
+                        calls,
+                        expected_tool_results,
+                    } => ReplayStep {
+                        output: ReplayOutput::AssertProviderToolsThenProviderToolCalls {
+                            capability_ids,
+                            calls,
                         },
                         request_contains: None,
                         expected_tool_results,
@@ -309,6 +330,12 @@ impl HostManagedModelGateway for RebornTraceReplayModelGateway {
                     "trace replay provider tool assertions require capability-aware model streaming",
                 ))
             }
+            ReplayOutput::AssertProviderToolsThenProviderToolCalls { .. } => {
+                Err(HostManagedModelError::safe(
+                    HostManagedModelErrorKind::InvalidRequest,
+                    "trace replay provider tool assertions require capability-aware model streaming",
+                ))
+            }
             ReplayOutput::DelayedResponse { response, delay } => {
                 tokio::time::sleep(delay).await;
                 Ok(response)
@@ -337,6 +364,13 @@ impl HostManagedModelGateway for RebornTraceReplayModelGateway {
             } => {
                 assert_provider_tools(capabilities, &capability_ids).await?;
                 Ok(response)
+            }
+            ReplayOutput::AssertProviderToolsThenProviderToolCalls {
+                capability_ids,
+                calls,
+            } => {
+                assert_provider_tools(capabilities.clone(), &capability_ids).await?;
+                provider_tool_calls_response(&request, capabilities, calls).await
             }
             ReplayOutput::DelayedResponse { response, delay } => {
                 tokio::time::sleep(delay).await;
