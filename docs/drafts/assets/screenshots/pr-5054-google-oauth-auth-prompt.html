@@ -1,0 +1,312 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PR 5054 Google OAuth Auth Prompt Preview</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --ink: #172033;
+      --muted: #5f6b7a;
+      --line: #d9dee7;
+      --blue: #2563eb;
+      --blue-weak: #eef4ff;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 48px;
+      background: var(--bg);
+      color: var(--ink);
+    }
+
+    .frame {
+      width: min(980px, 100%);
+      overflow: hidden;
+      border: 1px solid #cfd6e2;
+      border-radius: 10px;
+      background: #eef1f5;
+      box-shadow: 0 24px 80px rgba(23, 32, 51, 0.16);
+    }
+
+    .topbar {
+      height: 46px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 18px;
+      border-bottom: 1px solid #cfd6e2;
+      background: #fafbfc;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .dots {
+      display: flex;
+      gap: 8px;
+    }
+
+    .dot {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      background: #c7ced9;
+    }
+
+    .dot:nth-child(1) {
+      background: #ef4444;
+    }
+
+    .dot:nth-child(2) {
+      background: #f59e0b;
+    }
+
+    .dot:nth-child(3) {
+      background: #22c55e;
+    }
+
+    .content {
+      min-height: 540px;
+      display: grid;
+      grid-template-columns: 280px 1fr;
+    }
+
+    .sidebar {
+      padding: 22px 18px;
+      border-right: 1px solid #d7dde7;
+      background: #f9fafb;
+    }
+
+    .nav-title {
+      margin-bottom: 14px;
+      color: #6b7280;
+      font-size: 12px;
+      letter-spacing: .08em;
+      text-transform: uppercase;
+    }
+
+    .nav-item {
+      margin-bottom: 6px;
+      padding: 10px 12px;
+      border-radius: 7px;
+      color: #344054;
+      font-size: 14px;
+    }
+
+    .nav-item.active {
+      border: 1px solid #c9ddff;
+      background: var(--blue-weak);
+      color: #1d4ed8;
+    }
+
+    .main {
+      padding: 30px;
+      background: var(--panel);
+    }
+
+    .thread-label {
+      margin-bottom: 18px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .message {
+      margin-bottom: 16px;
+      padding: 18px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+    }
+
+    .message.agent {
+      border-left: 4px solid var(--blue);
+    }
+
+    .message.user {
+      max-width: 78%;
+      margin-left: auto;
+      background: #f8fafc;
+    }
+
+    .author {
+      margin-bottom: 8px;
+      color: #536070;
+      font-size: 12px;
+      font-weight: 700;
+      letter-spacing: .06em;
+      text-transform: uppercase;
+    }
+
+    .text {
+      color: #243044;
+      font-size: 15px;
+      line-height: 1.55;
+    }
+
+    .auth-card {
+      margin-top: 18px;
+      overflow: hidden;
+      border: 1px solid #cfd8e6;
+      border-radius: 8px;
+      background: #fbfcfe;
+    }
+
+    .auth-card-header {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 16px 18px;
+      border-bottom: 1px solid #dbe2ed;
+      background: #f7f9fc;
+    }
+
+    .icon {
+      width: 34px;
+      height: 34px;
+      display: grid;
+      place-items: center;
+      border: 1px solid #d9dee7;
+      border-radius: 8px;
+      background: #fff;
+      color: #4285f4;
+      font-size: 18px;
+      font-weight: 800;
+    }
+
+    .headline {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 700;
+    }
+
+    .provider {
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .auth-card-body {
+      padding: 18px;
+    }
+
+    .auth-copy {
+      margin: 0 0 16px;
+      color: #334155;
+      font-size: 14px;
+      line-height: 1.6;
+    }
+
+    .guidance {
+      margin-bottom: 16px;
+      padding: 13px 14px;
+      border: 1px solid #fed7aa;
+      border-radius: 7px;
+      background: #fff7ed;
+      color: #7c2d12;
+      font-size: 13px;
+      line-height: 1.55;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .button {
+      height: 38px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 0 14px;
+      border: 1px solid #1d4ed8;
+      border-radius: 7px;
+      background: var(--blue);
+      color: white;
+      font-size: 14px;
+      font-weight: 650;
+      text-decoration: none;
+    }
+
+    .meta {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .status {
+      width: fit-content;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      margin-top: 15px;
+      padding: 5px 9px;
+      border: 1px solid #bbf7d0;
+      border-radius: 999px;
+      background: #f0fdf4;
+      color: #166534;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <section class="frame" aria-label="Ironclaw WebUI auth prompt preview">
+    <div class="topbar">
+      <div class="dots" aria-hidden="true"><span class="dot"></span><span class="dot"></span><span class="dot"></span></div>
+      <div>Ironclaw WebUI - PR #5054 preview</div>
+      <div>Auth prompt</div>
+    </div>
+    <div class="content">
+      <aside class="sidebar">
+        <div class="nav-title">Workspace</div>
+        <div class="nav-item active">Chat</div>
+        <div class="nav-item">Credentials</div>
+        <div class="nav-item">Extensions</div>
+        <div class="nav-item">Settings</div>
+      </aside>
+      <main class="main">
+        <div class="thread-label">Thread - Google Calendar request</div>
+        <div class="message user">
+          <div class="author">User</div>
+          <div class="text">Can you check my calendar for tomorrow afternoon?</div>
+        </div>
+        <div class="message agent">
+          <div class="author">Ironclaw</div>
+          <div class="text">Google authentication is required before this run can continue.</div>
+          <section class="auth-card" aria-label="Authentication required">
+            <div class="auth-card-header">
+              <div class="icon" aria-hidden="true">G</div>
+              <div>
+                <h1 class="headline">Authentication required</h1>
+                <div class="provider">Provider: google - Challenge: OAuth URL</div>
+              </div>
+            </div>
+            <div class="auth-card-body">
+              <p class="auth-copy">Authenticate to continue this run.</p>
+              <div class="guidance">
+                Sign in with Google using the authorization link. The link requests offline access and fresh consent so Ironclaw can renew the credential automatically. If the account still expires after about an hour, reconnect it through this link and approve the Google consent screen again.
+              </div>
+              <div class="actions">
+                <a class="button" href="#">Open Google authorization</a>
+                <span class="meta">Expires in 10 minutes</span>
+              </div>
+              <div class="status">Expected: no manual token refresh per use</div>
+            </div>
+          </section>
+        </div>
+      </main>
+    </div>
+  </section>
+</body>
+</html>
