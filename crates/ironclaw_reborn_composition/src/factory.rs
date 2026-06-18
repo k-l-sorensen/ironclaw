@@ -736,7 +736,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
                 workspace_root,
                 host_home_root,
                 LocalDevStorageBackendInput::LocalDefault,
-                None,
+                None::<ironclaw_secrets::SecretMaterial>,
             ),
             #[cfg(feature = "postgres")]
             RebornStorageInput::LocalRuntimePostgres {

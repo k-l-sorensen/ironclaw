@@ -636,6 +636,16 @@ mod tests {
             }))
         }
 
+        async fn metadata_for_scope(
+            &self,
+            _scope: &ResourceScope,
+        ) -> Result<Vec<SecretMetadata>, SecretStoreError> {
+            Ok(vec![SecretMetadata {
+                scope: self.scope.clone(),
+                handle: self.handle.clone(),
+            }])
+        }
+
         async fn delete(
             &self,
             _scope: &ResourceScope,
@@ -711,6 +721,14 @@ mod tests {
         ) -> Result<Option<SecretMetadata>, SecretStoreError> {
             Self::yield_to_tokio().await;
             self.inner.metadata(scope, handle).await
+        }
+
+        async fn metadata_for_scope(
+            &self,
+            scope: &ResourceScope,
+        ) -> Result<Vec<SecretMetadata>, SecretStoreError> {
+            Self::yield_to_tokio().await;
+            self.inner.metadata_for_scope(scope).await
         }
 
         async fn delete(

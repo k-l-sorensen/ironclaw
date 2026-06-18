@@ -2921,6 +2921,16 @@ impl SecretStore for StaticSecretStore {
         }))
     }
 
+    async fn metadata_for_scope(
+        &self,
+        scope: &ResourceScope,
+    ) -> Result<Vec<SecretMetadata>, SecretStoreError> {
+        Ok(vec![SecretMetadata {
+            scope: scope.clone(),
+            handle: self.handle.clone(),
+        }])
+    }
+
     async fn delete(
         &self,
         _scope: &ResourceScope,
