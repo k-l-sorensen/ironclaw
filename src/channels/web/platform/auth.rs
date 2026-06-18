@@ -972,8 +972,10 @@ pub(crate) fn check_email_domain(
 /// would leak via server logs, Referer headers, and browser history.
 ///
 /// Allowed endpoints:
-/// - SSE: `/api/chat/events`, `/api/logs/events` (EventSource can't set headers)
-/// - WebSocket: `/api/chat/ws` (WS upgrade can't set custom headers)
+/// - SSE: `/api/chat/events`, `/api/logs/events`,
+///   `/api/webchat/v2/threads/{thread_id}/events` (EventSource can't set headers)
+/// - WebSocket: `/api/chat/ws`, `/api/webchat/v2/threads/{thread_id}/ws`
+///   (WS upgrade can't set custom headers)
 ///
 /// If you add a new SSE or WebSocket endpoint, add its path here.
 fn allows_query_token_auth(request: &Request) -> bool {
@@ -981,9 +983,21 @@ fn allows_query_token_auth(request: &Request) -> bool {
         return false;
     }
 
+    let path = request.uri().path();
     matches!(
-        request.uri().path(),
+        path,
         "/api/chat/events" | "/api/logs/events" | "/api/chat/ws"
+    ) || is_webchat_v2_stream_path(path)
+}
+
+fn is_webchat_v2_stream_path(path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/api/webchat/v2/threads/") else {
+        return false;
+    };
+    let mut segments = rest.split('/');
+    matches!(
+        (segments.next(), segments.next(), segments.next()),
+        (Some(thread_id), Some("events" | "ws"), None) if !thread_id.is_empty()
     )
 }
 
@@ -1269,6 +1283,15 @@ mod tests {
             .route("/api/chat/events", get(dummy_handler))
             .route("/api/logs/events", get(dummy_handler))
             .route("/api/chat/ws", get(dummy_handler))
+            .route(
+                "/api/webchat/v2/threads/{thread_id}/events",
+                get(dummy_handler),
+            )
+            .route("/api/webchat/v2/threads/{thread_id}/ws", get(dummy_handler))
+            .route(
+                "/api/webchat/v2/threads/{thread_id}/messages",
+                get(dummy_handler),
+            )
             .route("/api/chat/history", get(dummy_handler))
             .route("/api/chat/send", post(dummy_handler))
             .layer(middleware::from_fn_with_state(state, auth_middleware))
@@ -1329,6 +1352,45 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_query_token_allowed_for_webchat_v2_events() {
+        let app = test_app(TEST_AUTH_SECRET_TOKEN);
+        let req = Request::builder()
+            .uri(format!(
+                "/api/webchat/v2/threads/thread-x/events?token={TEST_AUTH_SECRET_TOKEN}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_query_token_allowed_for_webchat_v2_ws() {
+        let app = test_app(TEST_AUTH_SECRET_TOKEN);
+        let req = Request::builder()
+            .uri(format!(
+                "/api/webchat/v2/threads/thread-x/ws?token={TEST_AUTH_SECRET_TOKEN}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_query_token_rejected_for_webchat_v2_non_stream_path() {
+        let app = test_app(TEST_AUTH_SECRET_TOKEN);
+        let req = Request::builder()
+            .uri(format!(
+                "/api/webchat/v2/threads/thread-x/messages?token={TEST_AUTH_SECRET_TOKEN}"
+            ))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

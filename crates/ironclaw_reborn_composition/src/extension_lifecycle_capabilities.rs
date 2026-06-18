@@ -57,30 +57,26 @@ fn manifests() -> Result<Vec<CapabilityManifest>, ExtensionError> {
     Ok(vec![
         lifecycle_manifest(
             EXTENSION_SEARCH_CAPABILITY_ID,
-            "Search the local Reborn extension catalog by extension, product, provider, or service name. The catalog includes host-bundled extensions that are not installed yet and installed extensions that are inactive. For connect, enable, install, or integrate requests, use this for discovery only, then continue with builtin.extension_install for the matching extension instead of asking the user to configure credentials from search results.",
-            vec![EffectKind::ReadFilesystem],
+            "Search the Reborn extension catalog by extension, product, provider, or service name. The catalog includes host-bundled extensions that are not installed yet and installed extensions that are inactive. For connect, enable, install, or integrate requests, use this for discovery only, then continue with builtin.extension_install for the matching extension instead of asking the user to configure credentials from search results.",
+            Vec::new(),
             PermissionMode::Allow,
         )?,
         lifecycle_manifest(
             EXTENSION_INSTALL_CAPABILITY_ID,
-            "Install a searched Reborn extension into durable local-dev lifecycle state. Installation does not require credentials. After install succeeds, immediately call builtin.extension_activate for the same extension so activation can publish tools or raise the auth gate. If install fails because the extension is already installed, use builtin.extension_activate instead.",
-            vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
+            "Install a searched Reborn extension into durable lifecycle state. Installation does not require credentials. After install succeeds, immediately call builtin.extension_activate for the same extension so activation can publish tools or raise the auth gate. If install fails because the extension is already installed, use builtin.extension_activate instead.",
+            vec![EffectKind::ModifyExtension],
             PermissionMode::Ask,
         )?,
         lifecycle_manifest(
             EXTENSION_ACTIVATE_CAPABILITY_ID,
             "Activate an installed Reborn extension for the model-visible local-dev capability surface. Use after install succeeds or when install reports the extension is already installed. This is the step that opens the credential/auth gate when required; do not ask the user for credentials before calling it.",
-            vec![
-                EffectKind::ReadFilesystem,
-                EffectKind::WriteFilesystem,
-                EffectKind::Network,
-            ],
+            vec![EffectKind::ModifyExtension, EffectKind::Network],
             PermissionMode::Ask,
         )?,
         lifecycle_manifest(
             EXTENSION_REMOVE_CAPABILITY_ID,
-            "Remove an installed Reborn extension from durable local-dev lifecycle state",
-            vec![EffectKind::ReadFilesystem, EffectKind::WriteFilesystem],
+            "Remove an installed Reborn extension from durable lifecycle state",
+            vec![EffectKind::ModifyExtension],
             PermissionMode::Ask,
         )?,
     ])
@@ -306,6 +302,10 @@ mod tests {
         let search = descriptor_for(&surface, EXTENSION_SEARCH_CAPABILITY_ID);
         assert_eq!(search.default_permission, PermissionMode::Allow);
         assert!(
+            search.effects.is_empty(),
+            "extension_search should not require invocation filesystem services; it reads the lifecycle catalog through the host lifecycle port"
+        );
+        assert!(
             search.description.contains("host-bundled")
                 && search.description.contains("not installed")
                 && search
@@ -326,6 +326,7 @@ mod tests {
 
         let install = descriptor_for(&surface, EXTENSION_INSTALL_CAPABILITY_ID);
         assert_eq!(install.default_permission, PermissionMode::Ask);
+        assert_eq!(install.effects, vec![EffectKind::ModifyExtension]);
         assert!(
             install.description.contains("already installed")
                 && install
@@ -342,6 +343,10 @@ mod tests {
         );
 
         let activate = descriptor_for(&surface, EXTENSION_ACTIVATE_CAPABILITY_ID);
+        assert_eq!(
+            activate.effects,
+            vec![EffectKind::ModifyExtension, EffectKind::Network]
+        );
         assert!(
             activate.description.contains("credential/auth gate")
                 && activate.description.contains("do not ask the user"),
@@ -353,6 +358,9 @@ mod tests {
             activate.effects.contains(&EffectKind::Network),
             "hosted MCP activation needs runtime HTTP egress for discovery"
         );
+
+        let remove = descriptor_for(&surface, EXTENSION_REMOVE_CAPABILITY_ID);
+        assert_eq!(remove.effects, vec![EffectKind::ModifyExtension]);
     }
 
     #[tokio::test]
@@ -1038,6 +1046,7 @@ mod tests {
             EffectKind::DispatchCapability,
             EffectKind::ReadFilesystem,
             EffectKind::WriteFilesystem,
+            EffectKind::ModifyExtension,
             EffectKind::Network,
         ]
     }

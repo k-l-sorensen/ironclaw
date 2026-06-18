@@ -803,6 +803,7 @@ mod tests {
                 EffectKind::SpawnProcess,
                 EffectKind::ExecuteCode,
                 EffectKind::Network,
+                EffectKind::ModifyExtension,
                 EffectKind::ExternalWrite
             ]
         );
@@ -909,7 +910,7 @@ mod tests {
         let extension_search_grant = grant_for(EXTENSION_SEARCH_CAPABILITY_ID);
         assert_eq!(
             extension_search_grant.constraints.allowed_effects,
-            vec![EffectKind::DispatchCapability, EffectKind::ReadFilesystem]
+            vec![EffectKind::DispatchCapability]
         );
         assert!(extension_search_grant.constraints.mounts.mounts.is_empty());
         assert_eq!(
@@ -922,7 +923,10 @@ mod tests {
             EXTENSION_REMOVE_CAPABILITY_ID,
         ] {
             let grant = grant_for(capability_id);
-            assert_eq!(grant.constraints.allowed_effects, local_dev_allowed_effects);
+            assert_eq!(
+                grant.constraints.allowed_effects,
+                vec![EffectKind::DispatchCapability, EffectKind::ModifyExtension]
+            );
             assert!(grant.constraints.mounts.mounts.is_empty());
             assert_eq!(grant.constraints.network, NetworkPolicy::default());
         }
@@ -931,8 +935,7 @@ mod tests {
             extension_activate_grant.constraints.allowed_effects,
             vec![
                 EffectKind::DispatchCapability,
-                EffectKind::ReadFilesystem,
-                EffectKind::WriteFilesystem,
+                EffectKind::ModifyExtension,
                 EffectKind::Network
             ]
         );

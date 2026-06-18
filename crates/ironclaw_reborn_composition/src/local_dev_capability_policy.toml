@@ -9,6 +9,7 @@ authority_effects = [
     "spawn_process",
     "execute_code",
     "network",
+    "modify_extension",
     "external_write",
 ]
 
@@ -197,25 +198,25 @@ network = "default"
 
 [[grants]]
 capability = "builtin.extension_search"
-effects = ["dispatch_capability", "read_filesystem"]
+effects = ["dispatch_capability"]
 mounts = "ambient"
 network = "default"
 
 [[grants]]
 capability = "builtin.extension_install"
-effects = ["dispatch_capability", "read_filesystem", "write_filesystem"]
+effects = ["dispatch_capability", "modify_extension"]
 mounts = "ambient"
 network = "default"
 
 [[grants]]
 capability = "builtin.extension_activate"
-effects = ["dispatch_capability", "read_filesystem", "write_filesystem", "network"]
+effects = ["dispatch_capability", "modify_extension", "network"]
 mounts = "ambient"
 network = "local_dev_wildcard"
 
 [[grants]]
 capability = "builtin.extension_remove"
-effects = ["dispatch_capability", "read_filesystem", "write_filesystem"]
+effects = ["dispatch_capability", "modify_extension"]
 mounts = "ambient"
 network = "default"
 

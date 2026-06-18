@@ -239,6 +239,7 @@ fn allowed_effects() -> Vec<EffectKind> {
         EffectKind::DispatchCapability,
         EffectKind::ReadFilesystem,
         EffectKind::WriteFilesystem,
+        EffectKind::ModifyExtension,
         EffectKind::Network,
     ]
 }

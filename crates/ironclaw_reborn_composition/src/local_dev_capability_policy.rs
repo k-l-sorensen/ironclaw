@@ -475,6 +475,7 @@ mod tests {
                 EffectKind::SpawnProcess,
                 EffectKind::ExecuteCode,
                 EffectKind::Network,
+                EffectKind::ModifyExtension,
                 EffectKind::ExternalWrite,
             ]
         );

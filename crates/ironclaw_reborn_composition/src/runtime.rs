@@ -41,9 +41,11 @@ use ironclaw_first_party_extension_ports::{
     FirstPartySkillsExtension, FirstPartySkillsExtensionHandles, SelectableSkillContextSource,
     SkillActivationSelectorConfig, SkillExecutionAdapter,
 };
+#[cfg(feature = "webui-v2-beta")]
+use ironclaw_host_api::ProjectId;
 use ironclaw_host_api::{
     ActionResultSummary, ActionSummary, AgentId, ApprovalRequestId, AuditEnvelope, AuditEventId,
-    AuditStage, CapabilityId, CorrelationId, DecisionSummary, EffectKind, InvocationId, ProjectId,
+    AuditStage, CapabilityId, CorrelationId, DecisionSummary, EffectKind, InvocationId,
     ResourceScope, TenantId, ThreadId, UserId,
 };
 use ironclaw_host_runtime::MemoryBackedUserProfileSource;
@@ -918,7 +920,6 @@ fn snapshot_run_actor_matches(
         .any(|turn| turn.turn_id == run.turn_id && turn.scope == run.scope && turn.actor == *actor)
 }
 
-#[cfg(feature = "libsql")]
 fn approval_turn_locator_unavailable() -> ironclaw_product_workflow::ProductWorkflowError {
     ironclaw_product_workflow::ProductWorkflowError::Transient {
         reason: "approval turn-run locator unavailable".to_string(),
