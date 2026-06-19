@@ -1,0 +1,299 @@
+name: Experimental sccache A/B
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Tests must never touch the real OS keychain (macOS Keychain auth dialog /
+  # Linux Secret Service). Guarded by src/secrets/keychain.rs::os_keychain_suppressed:
+  # cfg!(test) covers unit tests; this covers integration/e2e that link the
+  # non-cfg(test) library.
+  IRONCLAW_DISABLE_OS_KEYCHAIN: "1"
+  # PR #5086 measured mold linking the heaviest Reborn build in parallel with
+  # no OOM, so keep Cargo's default parallelism. If runner OOMs recur, restore
+  # the previous one-job Cargo build serialization as the one-line fallback.
+  RUSTFLAGS: "-C linker=clang -C link-arg=--ld-path=/usr/bin/mold"
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+
+jobs:
+  measure:
+    name: Measure ${{ matrix.arm }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        arm: [rust-cache, sccache]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache/CodeQL || true
+          docker system prune -af || true
+          df -h /
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@62b0f2dec647a8e604c6a0fda0e38530180dce20 # v2
+        with:
+          tool: cargo-nextest
+
+      - name: Install mold and clang
+        run: sudo apt-get update && sudo apt-get install -y clang mold
+
+      - name: Verify mold linker is active
+        run: |
+          clang_output="$(
+            printf 'int main(void) { return 0; }\n' \
+              | clang --ld-path=/usr/bin/mold -Wl,--version -x c - -o /tmp/clang-mold-check 2>&1
+          )"
+          printf '%s\n' "$clang_output"
+          grep -qi mold <<< "$clang_output"
+
+          printf 'fn main() { println!("mold-link-ok"); }\n' > /tmp/mold-link-check.rs
+          rustc /tmp/mold-link-check.rs \
+            -C linker=clang \
+            -C link-arg=--ld-path=/usr/bin/mold \
+            -o /tmp/mold-link-check
+          test "$(/tmp/mold-link-check)" = "mold-link-ok"
+
+      - name: Restore Rust cache
+        if: matrix.arm == 'rust-cache'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: experimental-sccache-ab-rust-cache
+          save-if: "true"
+
+      - name: Restore Cargo registry and git cache
+        if: matrix.arm == 'sccache'
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: experimental-sccache-ab-cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            experimental-sccache-ab-cargo-${{ runner.os }}-
+
+      - name: Install sccache
+        if: matrix.arm == 'sccache'
+        uses: mozilla-actions/sccache-action@9e7fa8a12102821edf02ca5dbea1acd0f89a2696 # v0.0.10
+
+      - name: Configure sccache
+        if: matrix.arm == 'sccache'
+        run: |
+          echo "SCCACHE_GHA_ENABLED=true" >> "$GITHUB_ENV"
+          echo "RUSTC_WRAPPER=sccache" >> "$GITHUB_ENV"
+          echo "CARGO_INCREMENTAL=0" >> "$GITHUB_ENV"
+
+      - name: Measure full and incremental rebuild
+        env:
+          ARM: ${{ matrix.arm }}
+        run: |
+          set +e
+
+          arm="$ARM"
+          archive_file="nextest-${arm}.tar.zst"
+          probe_file="crates/ironclaw_reborn_composition/src/lib.rs"
+
+          start="$(date +%s)"
+          rm -f "$archive_file"
+          cargo nextest archive -p ironclaw_reborn_composition --all-targets --archive-file "$archive_file"
+          full_status="$?"
+          full_seconds="$(( $(date +%s) - start ))"
+
+          printf '\n// sccache-ab incremental probe %s\n' "$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" >> "$probe_file"
+
+          start="$(date +%s)"
+          rm -f "$archive_file"
+          cargo nextest archive -p ironclaw_reborn_composition --all-targets --archive-file "$archive_file"
+          incremental_status="$?"
+          incremental_seconds="$(( $(date +%s) - start ))"
+
+          git checkout -- "$probe_file"
+
+          if [ "$full_status" -eq 0 ] && [ "$incremental_status" -eq 0 ]; then
+            compile_status="success"
+          elif [ "$full_status" -ne 0 ] && [ "$incremental_status" -ne 0 ]; then
+            compile_status="full_failed_incremental_failed"
+          elif [ "$full_status" -ne 0 ]; then
+            compile_status="full_failed"
+          else
+            compile_status="incremental_failed"
+          fi
+
+          {
+            printf 'full_seconds=%s\n' "$full_seconds"
+            printf 'incremental_seconds=%s\n' "$incremental_seconds"
+            printf 'full_status=%s\n' "$full_status"
+            printf 'incremental_status=%s\n' "$incremental_status"
+            printf 'compile_status=%s\n' "$compile_status"
+          } > measurement.env
+
+          exit 0
+
+      - name: Capture sccache stats
+        if: ${{ always() && matrix.arm == 'sccache' }}
+        run: |
+          "${SCCACHE_PATH:-sccache}" --show-stats | tee sccache-stats.txt || true
+
+      - name: Emit measurement JSON
+        if: always()
+        env:
+          ARM: ${{ matrix.arm }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          arm = os.environ["ARM"]
+          values = {
+              "full_seconds": None,
+              "incremental_seconds": None,
+              "full_status": None,
+              "incremental_status": None,
+              "compile_status": "not_measured",
+          }
+
+          env_path = Path("measurement.env")
+          if env_path.exists():
+              for line in env_path.read_text().splitlines():
+                  key, _, value = line.partition("=")
+                  if not key:
+                      continue
+                  values[key] = value
+
+          def optional_int(value):
+              if value in (None, ""):
+                  return None
+              return int(value)
+
+          sccache_hit_rate = None
+          stats_path = Path("sccache-stats.txt")
+          if stats_path.exists():
+              for line in stats_path.read_text(errors="replace").splitlines():
+                  if line.startswith("Cache hit rate"):
+                      match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*%", line)
+                      if match:
+                          sccache_hit_rate = float(match.group(1))
+                          break
+
+          payload = {
+              "arm": arm,
+              "full_seconds": optional_int(values["full_seconds"]),
+              "incremental_seconds": optional_int(values["incremental_seconds"]),
+              "sccache_hit_rate": sccache_hit_rate,
+              "run_attempt": optional_int(os.environ["RUN_ATTEMPT"]),
+              "compile_status": values["compile_status"],
+              "full_status": optional_int(values["full_status"]),
+              "incremental_status": optional_int(values["incremental_status"]),
+          }
+
+          Path(f"build-{arm}.json").write_text(json.dumps(payload, indent=2) + "\n")
+          PY
+
+      - name: Upload measurement artifact
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sccache-ab-${{ matrix.arm }}
+          path: build-${{ matrix.arm }}.json
+          if-no-files-found: warn
+          retention-days: 14
+
+  report:
+    name: Report sccache A/B
+    runs-on: ubuntu-latest
+    if: always()
+    needs: measure
+    steps:
+      - name: Download measurement artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        continue-on-error: true
+        with:
+          pattern: sccache-ab-*
+          path: measurements
+          merge-multiple: true
+
+      - name: Write measurement summary
+        run: |
+          python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          arms = ["rust-cache", "sccache"]
+          measurements = {}
+          for path in Path("measurements").glob("build-*.json"):
+              data = json.loads(path.read_text())
+              measurements[data["arm"]] = data
+
+          def seconds(value):
+              return "n/a" if value is None else str(value)
+
+          def hit_rate(value):
+              return "n/a" if value is None else f"{value:.1f}%"
+
+          def delta(metric):
+              rust = measurements.get("rust-cache", {}).get(metric)
+              sccache = measurements.get("sccache", {}).get(metric)
+              if rust in (None, 0) or sccache is None:
+                  return "n/a"
+              pct = (rust - sccache) / rust * 100.0
+              if pct >= 0:
+                  return f"+{pct:.1f}% faster"
+              return f"{pct:.1f}% slower"
+
+          lines = [
+              "## Experimental sccache A/B",
+              "",
+              "| Arm | Compile status | Full build (s) | Warm incremental rebuild (s) | sccache hit rate |",
+              "| --- | --- | ---: | ---: | ---: |",
+          ]
+
+          for arm in arms:
+              data = measurements.get(arm)
+              if data is None:
+                  lines.append(f"| {arm} | missing | n/a | n/a | n/a |")
+                  continue
+              lines.append(
+                  "| {arm} | {compile_status} | {full} | {incremental} | {hit_rate} |".format(
+                      arm=arm,
+                      compile_status=data.get("compile_status", "unknown"),
+                      full=seconds(data.get("full_seconds")),
+                      incremental=seconds(data.get("incremental_seconds")),
+                      hit_rate=hit_rate(data.get("sccache_hit_rate")),
+                  )
+              )
+
+          lines.extend(
+              [
+                  "",
+                  f"Decision metric: sccache vs rust-cache on warm incremental rebuild is {delta('incremental_seconds')}. Full-build delta is {delta('full_seconds')}.",
+                  "",
+                  "Note: first run is cold; re-run 1-2x via `gh run rerun` or `workflow_dispatch` to populate the GHA cache, then read the warm runs. The repo's ~10 GB GHA cache quota means sccache may get LRU-evicted between runs. If warm hit-rate stays low, that's the signal that an S3 backend, not GHA, is needed.",
+              ]
+          )
+
+          Path("summary.md").write_text("\n".join(lines) + "\n")
+          with Path("summary.md").open() as summary:
+              print(summary.read())
+          with Path(os.environ["GITHUB_STEP_SUMMARY"]).open("a") as step_summary:
+              step_summary.write("\n".join(lines) + "\n")
+          PY
