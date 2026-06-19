@@ -31,7 +31,11 @@ impl FilesystemExtensionInstallationStore {
                 state.load_into(&inner).await?;
             }
             Err(FilesystemError::NotFound { .. }) => {}
-            Err(error) => return Err(invalid_installation_error(error)),
+            Err(_) => {
+                return Err(invalid_installation_error(
+                    "failed to load extension installation state",
+                ));
+            }
         }
         Ok(Self {
             filesystem,
@@ -286,6 +290,26 @@ mod tests {
     use ironclaw_host_api::HostPortCatalog;
 
     use super::*;
+
+    #[tokio::test]
+    async fn load_at_treats_not_found_as_empty_state() {
+        let filesystem: Arc<dyn RootFilesystem> = Arc::new(InMemoryBackend::new());
+        let state_path =
+            VirtualPath::new("/tenants/acme/system/extensions/.installations/missing-state.json")
+                .expect("valid state path");
+
+        let store = FilesystemExtensionInstallationStore::load_at(filesystem, state_path)
+            .await
+            .expect("missing state file loads as empty");
+
+        assert!(
+            store
+                .list_installations()
+                .await
+                .expect("list installations")
+                .is_empty()
+        );
+    }
 
     #[tokio::test]
     async fn load_at_persists_state_to_custom_path() {

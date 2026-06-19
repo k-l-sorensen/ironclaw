@@ -374,7 +374,7 @@ impl WebuiProjectionBatch {
             self.cursor.runtime = Some(max_projection_cursor(final_cursor, item_cursor));
             self.cursor.runtime_item = None;
             self.cursor.runtime_payloads_delivered = 0;
-            self.push(ProductOutboundPayload::KeepAlive);
+            self.push_runtime_or_live(ProductOutboundPayload::KeepAlive);
             return Ok(true);
         }
 
@@ -403,7 +403,7 @@ impl WebuiProjectionBatch {
                 self.cursor.runtime_item = Some(item_cursor.runtime);
                 self.cursor.runtime_payloads_delivered = delivered;
             }
-            self.push(payload);
+            self.push_runtime_or_live(payload);
         }
         Ok(self.cursor.runtime_payloads_delivered == 0)
     }
@@ -418,7 +418,7 @@ impl WebuiProjectionBatch {
         }
         self.runtime_payloads_pushed += 1;
         self.cursor.live = Some(cursor);
-        self.push(payload);
+        self.push_runtime_or_live(payload);
         true
     }
 
@@ -503,11 +503,15 @@ impl WebuiProjectionBatch {
 
     fn push_turn(&mut self, cursor: TurnEventProjectionCursor, payload: ProductOutboundPayload) {
         self.cursor.turn = Some(cursor);
-        self.push(payload);
+        self.push_preserving_runtime_cursor_advance(payload);
     }
 
-    fn push(&mut self, payload: ProductOutboundPayload) {
+    fn push_runtime_or_live(&mut self, payload: ProductOutboundPayload) {
         self.pending_runtime_cursor_advance = None;
+        self.push_preserving_runtime_cursor_advance(payload);
+    }
+
+    fn push_preserving_runtime_cursor_advance(&mut self, payload: ProductOutboundPayload) {
         self.payloads.push((self.cursor.clone(), payload));
     }
 

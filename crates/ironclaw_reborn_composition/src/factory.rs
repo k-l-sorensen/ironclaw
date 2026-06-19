@@ -839,10 +839,15 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
     // Clone the raw libSQL handle for the canonical identity store before
     // `filesystem` moves out of the bundle, so the resolver rides the same
     // substrate DB the runtime owns rather than a second handle.
-    #[cfg(feature = "libsql")]
+    #[cfg(all(feature = "libsql", feature = "postgres"))]
     let identity_substrate_db = match &filesystem_bundle.durable_backend {
         LocalDevDurableBackend::LibSql(database) => Some(Arc::clone(database)),
-        _ => None,
+        LocalDevDurableBackend::Postgres(_) => None,
+    };
+    #[cfg(all(feature = "libsql", not(feature = "postgres")))]
+    let identity_substrate_db = {
+        let LocalDevDurableBackend::LibSql(database) = &filesystem_bundle.durable_backend;
+        Some(Arc::clone(database))
     };
     let trigger_repository =
         local_dev_trigger_repository(&filesystem_bundle.durable_backend).await?;

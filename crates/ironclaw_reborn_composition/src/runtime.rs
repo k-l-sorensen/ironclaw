@@ -1350,6 +1350,18 @@ impl RebornRuntime {
             .map(|rt| Arc::clone(&rt.budget_gate_store))
     }
 
+    /// Test-only lookup scope for budget gates opened by a run in this
+    /// conversation. Durable gate stores route by the run's resource scope;
+    /// tests must not use `ResourceScope::system()` because the in-memory
+    /// store ignores scope while filesystem-backed stores do not.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn budget_gate_scope_for_conversation(
+        &self,
+        conversation: &ConversationId,
+    ) -> ironclaw_host_api::ResourceScope {
+        self.turn_scope_for(&conversation.0).to_resource_scope()
+    }
+
     /// Apply the outcome of a resolved [`BudgetApprovalGate`]: when the
     /// gate is approved, raise the affected account's limit so a
     /// subsequent `send_user_message` can re-issue the reservation that
