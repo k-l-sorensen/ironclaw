@@ -112,8 +112,11 @@ pub(super) fn capability_wiring(
     );
     let capability_input_resolver: Arc<dyn LoopCapabilityInputResolver> = capability_io.clone();
     let capability_result_writer: Arc<dyn LoopCapabilityResultWriter> = capability_io.clone();
+    // Shared per-runtime catalog (owned by local_runtime services) so the
+    // OpenAI-compatible Responses surface and this loop host see the same
+    // run-scoped external-tool state.
     let external_tool_catalog: Arc<dyn ExternalToolCatalog> =
-        Arc::new(ironclaw_turns::InMemoryExternalToolCatalog::new());
+        Arc::clone(&local_runtime.external_tool_catalog);
     let capability_factory: Arc<dyn LoopCapabilityPortFactory> =
         Arc::new(LocalDevLoopCapabilityPortFactory {
             runtime,

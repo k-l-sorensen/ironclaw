@@ -110,7 +110,10 @@ use ironclaw_trust::{AdminConfig, AdminEntry, HostTrustAssignment, HostTrustPoli
 use ironclaw_turns::FilesystemTurnStateStore;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_turns::InMemoryRunProfileResolver;
-use ironclaw_turns::{CheckpointStateStore, DefaultTurnCoordinator, LoopCheckpointStore};
+use ironclaw_turns::{
+    CheckpointStateStore, DefaultTurnCoordinator, ExternalToolCatalog, InMemoryExternalToolCatalog,
+    LoopCheckpointStore,
+};
 #[cfg(not(feature = "libsql"))]
 use ironclaw_turns::{
     InMemoryCheckpointStateStore, InMemoryLoopCheckpointStore, InMemoryTurnStateStore,
@@ -406,6 +409,11 @@ pub(crate) struct RebornLocalRuntimeServices {
     pub(crate) extension_lifecycle_surface_context: LifecycleProductSurfaceContext,
     pub(crate) approval_requests: Arc<LocalDevApprovalRequestStore>,
     pub(crate) capability_leases: Arc<LocalDevCapabilityLeaseStore>,
+    /// Per-runtime catalog of client-supplied ("external") tools. Shared between
+    /// the loop capability host (which offers them to the model and parks calls)
+    /// and the OpenAI-compatible Responses surface (which registers tool specs
+    /// and submits client outputs), so both see the same run-scoped state.
+    pub(crate) external_tool_catalog: Arc<dyn ExternalToolCatalog>,
     pub(crate) runtime_policy: Option<EffectiveRuntimePolicy>,
     // Used in approval_test_support (cfg(test) only); suppress the dead-code
     // lint on non-test builds where that module is not compiled in.
@@ -1381,6 +1389,7 @@ fn build_local_dev_store_graph(
         extension_lifecycle_surface_context,
         approval_requests: Arc::clone(&approval_requests),
         capability_leases: Arc::clone(&capability_leases),
+        external_tool_catalog: Arc::new(InMemoryExternalToolCatalog::new()),
         runtime_policy,
         capability_policy: Arc::clone(&capability_policy),
         persistent_approval_policies: Arc::clone(&persistent_approval_policies),
@@ -1515,6 +1524,7 @@ fn build_local_dev_store_graph(
         extension_lifecycle_surface_context,
         approval_requests: Arc::clone(&approval_requests),
         capability_leases: Arc::clone(&capability_leases),
+        external_tool_catalog: Arc::new(InMemoryExternalToolCatalog::new()),
         runtime_policy,
         capability_policy: Arc::clone(&capability_policy),
         persistent_approval_policies: Arc::clone(&persistent_approval_policies),
@@ -3600,6 +3610,7 @@ mod tests {
                 .clone(),
             approval_requests: Arc::clone(&base_runtime.approval_requests),
             capability_leases: Arc::clone(&base_runtime.capability_leases),
+            external_tool_catalog: Arc::clone(&base_runtime.external_tool_catalog),
             runtime_policy: base_runtime.runtime_policy.clone(),
             capability_policy: Arc::clone(&base_runtime.capability_policy),
             persistent_approval_policies: Arc::clone(&base_runtime.persistent_approval_policies),
