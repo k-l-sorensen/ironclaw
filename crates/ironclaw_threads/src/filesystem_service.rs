@@ -32,6 +32,7 @@
 //! that directory and matches `source_binding_id`+`external_event_id` against
 //! the persisted record body.
 
+mod message_lookup_index;
 mod message_sequence_index;
 
 use std::{
@@ -68,6 +69,7 @@ use crate::{
     ThreadMessageRecord, ThreadScope, ToolResultReferenceEnvelope, UpdateAssistantDraftRequest,
     UpdateToolResultReferenceRequest,
 };
+use message_lookup_index::MessageLookupIndexStore;
 use message_sequence_index::MessageSequenceIndexStore;
 
 /// Bound on the CAS retry loop. Mirrors the run-state / authorization
@@ -131,12 +133,6 @@ struct InboundIdempotencyRecord {
     scope: ThreadScope,
     source_binding_id: String,
     external_event_id: String,
-    thread_id: ThreadId,
-    message_id: ThreadMessageId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct MessageLookupIndexRecord {
     thread_id: ThreadId,
     message_id: ThreadMessageId,
 }
@@ -247,62 +243,9 @@ where
         thread_id: &ThreadId,
         message: &ThreadMessageRecord,
     ) -> Result<(), SessionThreadError> {
-        if message.kind == MessageKind::Assistant
-            && let Some(turn_run_id) = message.turn_run_id.as_deref()
-        {
-            self.write_message_lookup_index(
-                scope,
-                &assistant_run_index_path(scope, thread_id, turn_run_id)?,
-                thread_id,
-                message.message_id,
-            )
-            .await?;
-        }
-        if message.kind == MessageKind::ToolResultReference
-            && let (Some(turn_run_id), Some(result_ref)) = (
-                message.turn_run_id.as_deref(),
-                message.tool_result_ref.as_deref(),
-            )
-        {
-            self.write_message_lookup_index(
-                scope,
-                &tool_result_index_path(scope, thread_id, turn_run_id, result_ref)?,
-                thread_id,
-                message.message_id,
-            )
-            .await?;
-        }
-        Ok(())
-    }
-
-    async fn write_message_lookup_index(
-        &self,
-        scope: &ThreadScope,
-        path: &ScopedPath,
-        thread_id: &ThreadId,
-        message_id: ThreadMessageId,
-    ) -> Result<(), SessionThreadError> {
-        let record = MessageLookupIndexRecord {
-            thread_id: thread_id.clone(),
-            message_id,
-        };
-        let body = serialize_pretty(&record)?;
-        let entry = Entry::bytes(body).with_content_type(ContentType::json());
-        put_with_cas(
-            self.filesystem.as_ref(),
-            &scope.to_resource_scope(),
-            path,
-            entry,
-            CasExpectation::Any,
-        )
-        .await
-        .map_err(|error| match error {
-            PutError::VersionMismatch => SessionThreadError::Backend(format!(
-                "filesystem CAS Any rejected message lookup index at {}",
-                path.as_str()
-            )),
-            PutError::Other(error) => error,
-        })
+        MessageLookupIndexStore::new(self.filesystem.as_ref())
+            .write_for_message(scope, thread_id, message)
+            .await
     }
 
     async fn write_new_message(
@@ -378,29 +321,6 @@ where
         Ok(messages)
     }
 
-    async fn read_message_lookup_index(
-        &self,
-        scope: &ThreadScope,
-        thread_id: &ThreadId,
-        path: &ScopedPath,
-    ) -> Result<Option<ThreadMessageRecord>, SessionThreadError> {
-        let Some(versioned) = self
-            .filesystem
-            .get(&scope.to_resource_scope(), path)
-            .await?
-        else {
-            return Ok(None);
-        };
-        let record = deserialize::<MessageLookupIndexRecord>(&versioned.entry.body)?;
-        if &record.thread_id != thread_id {
-            return Ok(None);
-        }
-        Ok(self
-            .read_message_versioned(scope, thread_id, record.message_id)
-            .await?
-            .map(|(message, _)| message))
-    }
-
     async fn find_assistant_message_by_run(
         &self,
         scope: &ThreadScope,
@@ -408,13 +328,14 @@ where
         turn_run_id: &str,
         required_status: Option<MessageStatus>,
     ) -> Result<Option<ThreadMessageRecord>, SessionThreadError> {
-        let path = assistant_run_index_path(scope, thread_id, turn_run_id)?;
-        if let Some(message) = self
-            .read_message_lookup_index(scope, thread_id, &path)
+        let index_store = MessageLookupIndexStore::new(self.filesystem.as_ref());
+        if let Some(message_id) = index_store
+            .read_assistant_run(scope, thread_id, turn_run_id)
             .await?
-            && message.kind == MessageKind::Assistant
-            && message.turn_run_id.as_deref() == Some(turn_run_id)
-            && required_status.is_none_or(|status| message.status == status)
+            && let Some((message, _)) = self
+                .read_message_versioned(scope, thread_id, message_id)
+                .await?
+            && assistant_message_matches_run(&message, turn_run_id, required_status)
         {
             return Ok(Some(message));
         }
@@ -423,11 +344,7 @@ where
             .list_thread_messages(scope, thread_id)
             .await?
             .into_iter()
-            .find(|message| {
-                message.kind == MessageKind::Assistant
-                    && message.turn_run_id.as_deref() == Some(turn_run_id)
-                    && required_status.is_none_or(|status| message.status == status)
-            });
+            .find(|message| assistant_message_matches_run(message, turn_run_id, required_status));
         if let Some(message) = found.as_ref() {
             self.write_message_lookup_indexes(scope, thread_id, message)
                 .await?;
@@ -442,10 +359,13 @@ where
         turn_run_id: &str,
         result_ref: &str,
     ) -> Result<Option<ThreadMessageRecord>, SessionThreadError> {
-        let path = tool_result_index_path(scope, thread_id, turn_run_id, result_ref)?;
-        if let Some(message) = self
-            .read_message_lookup_index(scope, thread_id, &path)
+        let index_store = MessageLookupIndexStore::new(self.filesystem.as_ref());
+        if let Some(message_id) = index_store
+            .read_tool_result(scope, thread_id, turn_run_id, result_ref)
             .await?
+            && let Some((message, _)) = self
+                .read_message_versioned(scope, thread_id, message_id)
+                .await?
             && matches_tool_result_reference(&message, turn_run_id, result_ref)
         {
             return Ok(Some(message));
@@ -1985,46 +1905,6 @@ fn message_record_path(
     ))
 }
 
-fn assistant_run_index_path(
-    scope: &ThreadScope,
-    thread_id: &ThreadId,
-    turn_run_id: &str,
-) -> Result<ScopedPath, SessionThreadError> {
-    #[derive(Serialize)]
-    struct AssistantRunIndexKey<'a> {
-        turn_run_id: &'a str,
-    }
-    let key = lookup_index_key("assistant-run", &AssistantRunIndexKey { turn_run_id })?;
-    scoped_path(&format!(
-        "{}/indexes/assistant-runs/{key}.json",
-        thread_root_string(scope, thread_id)
-    ))
-}
-
-fn tool_result_index_path(
-    scope: &ThreadScope,
-    thread_id: &ThreadId,
-    turn_run_id: &str,
-    result_ref: &str,
-) -> Result<ScopedPath, SessionThreadError> {
-    #[derive(Serialize)]
-    struct ToolResultIndexKey<'a> {
-        turn_run_id: &'a str,
-        result_ref: &'a str,
-    }
-    let key = lookup_index_key(
-        "tool-result",
-        &ToolResultIndexKey {
-            turn_run_id,
-            result_ref,
-        },
-    )?;
-    scoped_path(&format!(
-        "{}/indexes/tool-results/{key}.json",
-        thread_root_string(scope, thread_id)
-    ))
-}
-
 fn summaries_root(
     scope: &ThreadScope,
     thread_id: &ThreadId,
@@ -2052,20 +1932,6 @@ fn idempotency_root() -> Result<ScopedPath, SessionThreadError> {
 
 fn idempotency_record_path(record_key: &str) -> Result<ScopedPath, SessionThreadError> {
     scoped_path(&format!("{}/idempotency/{record_key}.json", THREADS_PREFIX))
-}
-
-fn lookup_index_key<T: Serialize>(prefix: &str, key: &T) -> Result<String, SessionThreadError> {
-    let payload = serialize_pretty(key)?;
-    let digest = Sha256::digest(&payload);
-    let mut output = String::with_capacity(prefix.len() + 1 + digest.len() * 2);
-    output.push_str(prefix);
-    output.push('-');
-    for byte in digest {
-        use std::fmt::Write as _;
-        write!(&mut output, "{byte:02x}")
-            .map_err(|error| SessionThreadError::Serialization(error.to_string()))?;
-    }
-    Ok(output)
 }
 
 /// Build the alias-relative per-thread root for a scope under `/threads`.
@@ -2226,6 +2092,16 @@ fn matches_tool_result_reference(
         && message.status == MessageStatus::Finalized
         && message.turn_run_id.as_deref() == Some(turn_run_id)
         && message.tool_result_ref.as_deref() == Some(result_ref)
+}
+
+fn assistant_message_matches_run(
+    message: &ThreadMessageRecord,
+    turn_run_id: &str,
+    required_status: Option<MessageStatus>,
+) -> bool {
+    message.kind == MessageKind::Assistant
+        && message.turn_run_id.as_deref() == Some(turn_run_id)
+        && required_status.is_none_or(|status| message.status == status)
 }
 
 const REDACTED_SUMMARY_CONTENT: &str = "[redacted]";

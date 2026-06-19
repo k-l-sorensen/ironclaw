@@ -886,7 +886,8 @@ mod tests {
         assert!(envelope.validate().is_err());
 
         let mut envelope = provider_reference();
-        envelope.response_reasoning = Some("raw provider error included a stack trace".to_string());
+        let leaked_token = format!("sk-proj-{}", "b".repeat(24));
+        envelope.response_reasoning = Some(format!("raw provider error leaked {leaked_token}"));
         assert!(envelope.validate().is_err());
     }
 
