@@ -28,7 +28,7 @@ jobs:
     env:
       CARGO_INCREMENTAL: "0"
       RUSTC_WRAPPER: sccache
-      RUSTFLAGS: "-C linker=clang -C link-arg=-fuse-ld=mold"
+      RUSTFLAGS: "-C linker=clang -C link-arg=--ld-path=/usr/bin/mold"
       SCCACHE_GHA_ENABLED: "true"
       # If mold still OOMs on Reborn-heavy links, flip this single job-local knob:
       # CARGO_BUILD_JOBS: "1"
@@ -74,27 +74,33 @@ jobs:
           clang --version
           mold --version
 
-      - name: Verify mold is selected by clang
+      - name: Verify mold linker works
         run: |
           set -euo pipefail
+          MOLD_BIN="$(command -v mold)"
+          echo "Using mold at: ${MOLD_BIN}"
+          # 1) Positive proof mold is invoked. clang forwards the linker's stdout,
+          #    so -Wl,--version prints mold's banner. Use explicit --ld-path: unlike
+          #    -fuse-ld=mold it needs no ld.mold name resolution and cannot silently
+          #    fall back to GNU ld.
           printf 'int main(void) { return 0; }\n' > /tmp/mold-probe.c
-          clang -fuse-ld=mold -Wl,--version /tmp/mold-probe.c -o /tmp/mold-probe 2>&1 | tee /tmp/mold-probe.log || true
+          clang --ld-path="${MOLD_BIN}" -Wl,--version /tmp/mold-probe.c -o /tmp/mold-probe 2>&1 | tee /tmp/mold-probe.log || true
           if ! grep -iq mold /tmp/mold-probe.log; then
-            echo "::error::clang -fuse-ld=mold did not invoke mold"
+            echo "::error::clang --ld-path did not invoke mold"
             cat /tmp/mold-probe.log
             exit 1
           fi
-          printf 'fn main() {}\n' > /tmp/rust-mold-probe.rs
+          # 2) End-to-end: rustc -> clang -> mold must produce a runnable binary.
+          #    rustc swallows the linker's stdout on a successful link, so assert a
+          #    working link instead of grepping output for "mold" (that grep was a
+          #    false-negative trap: it can never match a silent successful link).
+          printf 'fn main() { println!("ok"); }\n' > /tmp/rust-mold-probe.rs
           RUSTC_WRAPPER= rustc /tmp/rust-mold-probe.rs \
             -C linker=clang \
-            -C link-arg=-fuse-ld=mold \
-            -C link-arg=-Wl,--version \
-            -o /tmp/rust-mold-probe 2>&1 | tee /tmp/rust-mold-probe.log || true
-          if ! grep -iq mold /tmp/rust-mold-probe.log; then
-            echo "::error::rustc linker probe did not invoke mold"
-            cat /tmp/rust-mold-probe.log
-            exit 1
-          fi
+            -C link-arg=--ld-path="${MOLD_BIN}" \
+            -o /tmp/rust-mold-probe
+          test -x /tmp/rust-mold-probe
+          /tmp/rust-mold-probe
 
       - name: Start sccache
         uses: mozilla-actions/sccache-action@1583d6b38d7be47f593cb472781bbb21cab4321e # v0.0.10
