@@ -200,7 +200,7 @@ pub(crate) enum RebornStorageInput {
         host_home_root: Option<PathBuf>,
     },
     #[cfg(feature = "postgres")]
-    LocalRuntimePostgres {
+    HostedSingleTenantPostgres {
         root: PathBuf,
         workspace_root: Option<PathBuf>,
         host_home_root: Option<PathBuf>,
@@ -311,7 +311,7 @@ impl RebornBuildInput {
         Ok(Self::new(
             profile,
             owner_id,
-            RebornStorageInput::LocalRuntimePostgres {
+            RebornStorageInput::HostedSingleTenantPostgres {
                 root,
                 workspace_root: None,
                 host_home_root: None,
@@ -321,7 +321,7 @@ impl RebornBuildInput {
         ))
     }
 
-    pub fn with_local_dev_workspace_root(mut self, workspace_root: PathBuf) -> Self {
+    pub fn with_local_runtime_workspace_root(mut self, workspace_root: PathBuf) -> Self {
         match &mut self.storage {
             RebornStorageInput::LocalDev {
                 workspace_root: root,
@@ -330,7 +330,7 @@ impl RebornBuildInput {
                 *root = Some(workspace_root);
             }
             #[cfg(feature = "postgres")]
-            RebornStorageInput::LocalRuntimePostgres {
+            RebornStorageInput::HostedSingleTenantPostgres {
                 workspace_root: root,
                 ..
             } => {
@@ -341,7 +341,11 @@ impl RebornBuildInput {
         self
     }
 
-    pub fn with_local_dev_confirmed_host_home_root(mut self, host_home_root: PathBuf) -> Self {
+    pub fn with_local_dev_workspace_root(self, workspace_root: PathBuf) -> Self {
+        self.with_local_runtime_workspace_root(workspace_root)
+    }
+
+    pub fn with_local_runtime_confirmed_host_home_root(mut self, host_home_root: PathBuf) -> Self {
         match &mut self.storage {
             RebornStorageInput::LocalDev {
                 host_home_root: root,
@@ -350,7 +354,7 @@ impl RebornBuildInput {
                 *root = Some(host_home_root);
             }
             #[cfg(feature = "postgres")]
-            RebornStorageInput::LocalRuntimePostgres {
+            RebornStorageInput::HostedSingleTenantPostgres {
                 host_home_root: root,
                 ..
             } => {
@@ -361,10 +365,18 @@ impl RebornBuildInput {
         self
     }
 
-    pub fn requires_local_dev_confirmed_host_home_root(&self) -> bool {
+    pub fn with_local_dev_confirmed_host_home_root(self, host_home_root: PathBuf) -> Self {
+        self.with_local_runtime_confirmed_host_home_root(host_home_root)
+    }
+
+    pub fn requires_local_runtime_confirmed_host_home_root(&self) -> bool {
         self.runtime_policy.as_ref().is_some_and(|policy| {
             policy.filesystem_backend == FilesystemBackendKind::HostWorkspaceAndHome
         })
+    }
+
+    pub fn requires_local_dev_confirmed_host_home_root(&self) -> bool {
+        self.requires_local_runtime_confirmed_host_home_root()
     }
 
     pub fn grants_trusted_laptop_access(&self) -> bool {

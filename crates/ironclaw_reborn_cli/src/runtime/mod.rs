@@ -8,7 +8,7 @@ use anyhow::Context;
 use ironclaw_reborn_composition::host_api::UserId;
 use ironclaw_reborn_composition::host_api::{AgentId, TenantId};
 #[cfg(feature = "postgres")]
-use ironclaw_reborn_composition::local_dev_runtime_policy;
+use ironclaw_reborn_composition::hosted_single_tenant_runtime_policy;
 #[cfg(feature = "webui-v2-beta")]
 use ironclaw_reborn_composition::{
     LocalTriggerAccessReconciliation, LocalTriggerAccessRole, LocalTriggerAccessSource,
@@ -464,12 +464,12 @@ pub(crate) fn build_services_input_with_options(
                      got profile={profile}."
                 )
             })?
-            .with_local_dev_workspace_root(workspace_root);
-            if services_input.requires_local_dev_confirmed_host_home_root() {
+            .with_local_runtime_workspace_root(workspace_root);
+            if services_input.requires_local_runtime_confirmed_host_home_root() {
                 let host_home_root =
                     confirmed_host_home_root(options).context("local-dev-yolo host access")?;
                 services_input =
-                    services_input.with_local_dev_confirmed_host_home_root(host_home_root);
+                    services_input.with_local_runtime_confirmed_host_home_root(host_home_root);
             }
             services_input = services_input.with_optional_nearai_mcp_bootstrap_config(
                 nearai_mcp_bootstrap_config_from_env().context("NEAR AI MCP bootstrap config")?,
@@ -516,7 +516,7 @@ fn build_hosted_single_tenant_services_input(
 ) -> anyhow::Result<RebornBuildInput> {
     let workspace_root = std::env::current_dir()
         .context("failed to resolve current directory for hosted single-tenant workspace")?;
-    let runtime_policy = local_dev_runtime_policy()
+    let runtime_policy = hosted_single_tenant_runtime_policy()
         .context("failed to resolve hosted single-tenant runtime policy")?;
     Ok(
         RebornBuildInput::hosted_single_tenant_postgres_from_config_and_env(
@@ -527,7 +527,7 @@ fn build_hosted_single_tenant_services_input(
         )
         .map_err(anyhow::Error::from)?
         .with_runtime_policy(runtime_policy)
-        .with_local_dev_workspace_root(workspace_root)
+        .with_local_runtime_workspace_root(workspace_root)
         .with_optional_nearai_mcp_bootstrap_config(
             nearai_mcp_bootstrap_config_from_env().context("NEAR AI MCP bootstrap config")?,
         ),

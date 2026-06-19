@@ -248,6 +248,34 @@ where
             .await
     }
 
+    async fn write_message_lookup_indexes_best_effort(
+        &self,
+        scope: &ThreadScope,
+        thread_id: &ThreadId,
+        message: &ThreadMessageRecord,
+        context: &'static str,
+    ) {
+        if let Err(error) = self
+            .write_message_lookup_indexes(scope, thread_id, message)
+            .await
+        {
+            // Lookup indexes are acceleration/backfill records. The message
+            // record is the source of truth and lookup reads fall back to a
+            // transcript scan, so index failures must not turn an already
+            // persisted message write into an apparent append/update failure.
+            tracing::debug!(
+                ?error,
+                ?scope,
+                thread_id = %thread_id.as_str(),
+                message_id = %message.message_id,
+                kind = ?message.kind,
+                status = ?message.status,
+                context = context,
+                "message lookup index write failed; continuing with source-of-truth message record",
+            );
+        }
+    }
+
     async fn write_new_message(
         &self,
         scope: &ThreadScope,
@@ -269,8 +297,14 @@ where
             Ok(()) => {
                 self.write_message_sequence_index(scope, thread_id, message)
                     .await?;
-                self.write_message_lookup_indexes(scope, thread_id, message)
-                    .await
+                self.write_message_lookup_indexes_best_effort(
+                    scope,
+                    thread_id,
+                    message,
+                    "new message",
+                )
+                .await;
+                Ok(())
             }
             Err(PutError::VersionMismatch) => Err(SessionThreadError::Backend(format!(
                 "filesystem CAS Absent rejected new {description} at {}",
@@ -396,8 +430,13 @@ where
             .rev()
             .find(|message| assistant_message_matches_run(message, turn_run_id, required_status));
         if let Some(message) = found.as_ref() {
-            self.write_message_lookup_indexes(scope, thread_id, message)
-                .await?;
+            self.write_message_lookup_indexes_best_effort(
+                scope,
+                thread_id,
+                message,
+                "assistant lookup backfill",
+            )
+            .await;
         }
         Ok(found)
     }
@@ -428,8 +467,13 @@ where
             .rev()
             .find(|message| matches_tool_result_reference(message, turn_run_id, result_ref));
         if let Some(message) = found.as_ref() {
-            self.write_message_lookup_indexes(scope, thread_id, message)
-                .await?;
+            self.write_message_lookup_indexes_best_effort(
+                scope,
+                thread_id,
+                message,
+                "tool-result lookup backfill",
+            )
+            .await;
         }
         Ok(found)
     }
@@ -739,8 +783,13 @@ where
             .await
             {
                 Ok(()) => {
-                    self.write_message_lookup_indexes(scope, thread_id, &message)
-                        .await?;
+                    self.write_message_lookup_indexes_best_effort(
+                        scope,
+                        thread_id,
+                        &message,
+                        "message update",
+                    )
+                    .await;
                     return Ok(message);
                 }
                 Err(PutError::VersionMismatch) => continue,

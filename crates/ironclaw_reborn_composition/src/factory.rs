@@ -732,9 +732,8 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
                 if profile == RebornCompositionProfile::HostedSingleTenant =>
             {
                 return Err(RebornBuildError::InvalidConfig {
-                    reason:
-                        "profile=hosted-single-tenant requires local-runtime postgres storage input"
-                            .to_string(),
+                    reason: "profile=hosted-single-tenant requires hosted single-tenant Postgres storage input"
+                        .to_string(),
                 });
             }
             RebornStorageInput::LocalDev {
@@ -749,7 +748,7 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
                 None::<ironclaw_secrets::SecretMaterial>,
             ),
             #[cfg(feature = "postgres")]
-            RebornStorageInput::LocalRuntimePostgres {
+            RebornStorageInput::HostedSingleTenantPostgres {
                 root,
                 workspace_root,
                 host_home_root,
@@ -1111,13 +1110,14 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         extension_lifecycle_service,
         active_extensions,
     ));
-    crate::nearai_mcp::bootstrap_local_dev_nearai_mcp(
+    let nearai_mcp_bootstrap_outcome = crate::nearai_mcp::bootstrap_local_dev_nearai_mcp(
         nearai_mcp_bootstrap_config,
         &product_auth,
         &extension_management,
         &owner_user_id_for_nearai_mcp,
     )
     .await?;
+    log_nearai_mcp_bootstrap_outcome(nearai_mcp_bootstrap_outcome);
     if let Some(local_runtime) = Arc::get_mut(&mut store_graph.local_runtime) {
         local_runtime.extension_management = Some(Arc::clone(&extension_management));
         local_runtime.runtime_http_egress = Some(product_auth_runtime_ports.runtime_http_egress());
@@ -1180,6 +1180,28 @@ async fn build_local_dev(input: RebornBuildInput) -> Result<RebornServices, Rebo
         #[cfg(feature = "root-llm-provider")]
         secret_store,
     })
+}
+
+fn log_nearai_mcp_bootstrap_outcome(outcome: crate::nearai_mcp::NearAiMcpBootstrapOutcome) {
+    match outcome {
+        crate::nearai_mcp::NearAiMcpBootstrapOutcome::NotConfigured => {
+            tracing::debug!("NEAR AI MCP bootstrap is not configured")
+        }
+        crate::nearai_mcp::NearAiMcpBootstrapOutcome::SkippedDisabled
+        | crate::nearai_mcp::NearAiMcpBootstrapOutcome::SkippedUnavailable
+        | crate::nearai_mcp::NearAiMcpBootstrapOutcome::SkippedPreservedRemoved
+        | crate::nearai_mcp::NearAiMcpBootstrapOutcome::SkippedNonActivatable => {
+            tracing::info!(
+                ?outcome,
+                "NEAR AI MCP bootstrap skipped; extension will not be auto-activated"
+            )
+        }
+        crate::nearai_mcp::NearAiMcpBootstrapOutcome::ReusedCredential
+        | crate::nearai_mcp::NearAiMcpBootstrapOutcome::SubmittedCredential
+        | crate::nearai_mcp::NearAiMcpBootstrapOutcome::Activated => {
+            tracing::debug!(?outcome, "NEAR AI MCP bootstrap completed")
+        }
+    }
 }
 
 fn backfill_local_dev_legacy_user_skills(
@@ -2885,12 +2907,14 @@ async fn build_production_shaped(
             })
         }
         #[cfg(feature = "postgres")]
-        RebornStorageInput::LocalRuntimePostgres { .. } => Err(RebornBuildError::InvalidConfig {
-            reason: format!(
-                "profile={} requires production-shaped Reborn storage, not local-runtime Postgres storage",
-                profile
-            ),
-        }),
+        RebornStorageInput::HostedSingleTenantPostgres { .. } => {
+            Err(RebornBuildError::InvalidConfig {
+                reason: format!(
+                    "profile={} requires production-shaped Reborn storage, not hosted single-tenant Postgres storage",
+                    profile
+                ),
+            })
+        }
         #[cfg(feature = "libsql")]
         RebornStorageInput::Libsql {
             db,
@@ -3919,7 +3943,7 @@ mod tests {
 
         let error = match build_reborn_services(input).await {
             Ok(_) => {
-                panic!("hosted single-tenant must use durable local-runtime postgres storage")
+                panic!("hosted single-tenant must use hosted single-tenant Postgres storage")
             }
             Err(error) => error,
         };
@@ -3927,7 +3951,7 @@ mod tests {
             panic!("expected invalid config, got {error:?}");
         };
         assert!(
-            reason.contains("local-runtime postgres storage input"),
+            reason.contains("hosted single-tenant Postgres storage input"),
             "reason: {reason}"
         );
     }
@@ -4734,7 +4758,7 @@ mod tests {
             .extension_management
             .as_ref()
             .expect("extension management");
-        crate::nearai_mcp::bootstrap_local_dev_nearai_mcp(
+        let outcome = crate::nearai_mcp::bootstrap_local_dev_nearai_mcp(
             Some(
                 crate::nearai_mcp::NearAiMcpBootstrapConfig::new(
                     "https://private.near.ai",
@@ -4748,6 +4772,10 @@ mod tests {
         )
         .await
         .expect("second NEAR AI MCP bootstrap");
+        assert_eq!(
+            outcome,
+            crate::nearai_mcp::NearAiMcpBootstrapOutcome::ReusedCredential
+        );
         let accounts = first
             .product_auth
             .as_ref()
@@ -4799,7 +4827,7 @@ mod tests {
             .remove(nearai_ref.clone())
             .await
             .expect("disable NEAR AI MCP extension");
-        crate::nearai_mcp::bootstrap_local_dev_nearai_mcp(
+        let outcome = crate::nearai_mcp::bootstrap_local_dev_nearai_mcp(
             Some(
                 crate::nearai_mcp::NearAiMcpBootstrapConfig::new(
                     "https://private.near.ai",
@@ -4813,6 +4841,10 @@ mod tests {
         )
         .await
         .expect("bootstrap should preserve disabled extension");
+        assert_eq!(
+            outcome,
+            crate::nearai_mcp::NearAiMcpBootstrapOutcome::SkippedPreservedRemoved
+        );
         let projection = extension_management
             .project(nearai_ref)
             .await

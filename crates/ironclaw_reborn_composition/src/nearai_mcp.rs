@@ -185,9 +185,9 @@ pub(crate) async fn bootstrap_local_dev_nearai_mcp(
     product_auth: &Arc<RebornProductAuthServices>,
     extension_management: &Arc<RebornLocalExtensionManagementPort>,
     owner_user_id: &UserId,
-) -> Result<(), RebornBuildError> {
+) -> Result<NearAiMcpBootstrapOutcome, RebornBuildError> {
     let Some(config) = config else {
-        return Ok(());
+        return Ok(NearAiMcpBootstrapOutcome::NotConfigured);
     };
     config
         .endpoint()
@@ -214,14 +214,14 @@ pub(crate) async fn bootstrap_local_dev_nearai_mcp(
             tracing::debug!(
                 "NEAR AI MCP credentials are present, but the extension is disabled; preserving explicit disabled state"
             );
-            return Ok(());
+            return Ok(NearAiMcpBootstrapOutcome::SkippedDisabled);
         }
         other => {
             tracing::debug!(
                 phase = ?other,
                 "NEAR AI MCP credentials are present, but the extension is not in an auto-activatable phase"
             );
-            return Ok(());
+            return Ok(NearAiMcpBootstrapOutcome::SkippedNonActivatable);
         }
     }
 
@@ -255,6 +255,7 @@ pub(crate) async fn bootstrap_local_dev_nearai_mcp(
         credential_decision,
         NearAiMcpBootstrapExistingCredentialDecision::ReuseUsable
     );
+    let mut submitted_credential = false;
     match credential_decision {
         NearAiMcpBootstrapExistingCredentialDecision::ReuseUsable => {
             tracing::debug!(
@@ -278,19 +279,20 @@ pub(crate) async fn bootstrap_local_dev_nearai_mcp(
                     tracing::debug!(
                         "NEAR AI MCP credentials are present, but the extension participant is disabled or removed; preserving explicit operator state"
                     );
-                    return Ok(());
+                    return Ok(NearAiMcpBootstrapOutcome::SkippedDisabled);
                 }
                 if is_nearai_mcp_product_auth_temporarily_unavailable(&error) {
                     tracing::debug!(
                         error = ?error,
                         "NEAR AI MCP credential bootstrap is temporarily unavailable; continuing without auto-activating the extension"
                     );
-                    return Ok(());
+                    return Ok(NearAiMcpBootstrapOutcome::SkippedUnavailable);
                 }
                 return Err(RebornBuildError::InvalidConfig {
                     reason: format!("NEAR AI MCP product-auth credential submit failed: {error:?}"),
                 });
             }
+            submitted_credential = true;
         }
     }
 
@@ -298,7 +300,7 @@ pub(crate) async fn bootstrap_local_dev_nearai_mcp(
         tracing::debug!(
             "NEAR AI MCP credential already exists, but the extension is not installed; preserving explicit removed state"
         );
-        return Ok(());
+        return Ok(NearAiMcpBootstrapOutcome::SkippedPreservedRemoved);
     }
 
     if phase == LifecyclePhase::Discovered {
@@ -324,12 +326,27 @@ pub(crate) async fn bootstrap_local_dev_nearai_mcp(
                 .map_err(|error| RebornBuildError::InvalidConfig {
                     reason: format!("NEAR AI MCP extension activation failed: {error}"),
                 })?;
+            Ok(NearAiMcpBootstrapOutcome::Activated)
         }
-        LifecyclePhase::Active => {}
-        LifecyclePhase::Disabled => {}
-        _ => {}
+        LifecyclePhase::Active if submitted_credential => {
+            Ok(NearAiMcpBootstrapOutcome::SubmittedCredential)
+        }
+        LifecyclePhase::Active => Ok(NearAiMcpBootstrapOutcome::ReusedCredential),
+        LifecyclePhase::Disabled => Ok(NearAiMcpBootstrapOutcome::SkippedDisabled),
+        _ => Ok(NearAiMcpBootstrapOutcome::SkippedNonActivatable),
     }
-    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NearAiMcpBootstrapOutcome {
+    NotConfigured,
+    SkippedDisabled,
+    SkippedUnavailable,
+    SkippedPreservedRemoved,
+    SkippedNonActivatable,
+    ReusedCredential,
+    SubmittedCredential,
+    Activated,
 }
 
 fn nearai_mcp_bootstrap_account_is_usable(

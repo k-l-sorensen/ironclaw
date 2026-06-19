@@ -9,8 +9,13 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use chrono::Utc;
-use ironclaw_filesystem::{InMemoryBackend, RootFilesystem, ScopedFilesystem};
+use ironclaw_filesystem::{
+    BackendCapabilities, CasExpectation, DirEntry, Entry, FileStat, FilesystemError,
+    FilesystemOperation, Filter, InMemoryBackend, Page, RecordVersion, RootFilesystem,
+    ScopedFilesystem, VersionedEntry,
+};
 use ironclaw_host_api::{
     AgentId, CapabilityId, InvocationId, MountAlias, MountGrant, MountPermissions, MountView,
     ProjectId, TenantId, ThreadId, UserId, VirtualPath,
@@ -189,6 +194,56 @@ async fn filesystem_finalized_assistant_lookup_by_run_uses_persisted_message() {
         .await
         .unwrap()
         .expect("finalized assistant message is indexed by run");
+    assert_eq!(finalized.message_id, draft.message_id);
+    assert_eq!(finalized.status, MessageStatus::Finalized);
+    assert_eq!(finalized.content.as_deref(), Some("final"));
+}
+
+#[tokio::test]
+async fn filesystem_lookup_index_write_failure_does_not_fail_message_contract() {
+    let backend = Arc::new(LookupIndexWriteFailureBackend::new());
+    let scoped = scoped_threads_fs_at(backend, "tenant-lookup-index-failure", "alice");
+    let service = FilesystemSessionThreadService::new(scoped);
+    let scope = scope("lookup-index-failure");
+    let thread = service
+        .ensure_thread(EnsureThreadRequest {
+            scope: scope.clone(),
+            thread_id: Some(ThreadId::new("thread-lookup-index-failure").unwrap()),
+            created_by_actor_id: "actor-a".into(),
+            title: None,
+            metadata_json: None,
+        })
+        .await
+        .unwrap();
+    let draft = service
+        .append_assistant_draft(AppendAssistantDraftRequest {
+            scope: scope.clone(),
+            thread_id: thread.thread_id.clone(),
+            turn_run_id: "run-lookup-index-failure".into(),
+            content: MessageContent::text("draft"),
+        })
+        .await
+        .expect("message append must not depend on lookup-index write success");
+
+    service
+        .finalize_assistant_message(
+            &scope,
+            &thread.thread_id,
+            draft.message_id,
+            MessageContent::text("final"),
+        )
+        .await
+        .expect("message update must not depend on lookup-index write success");
+
+    let finalized = service
+        .finalized_assistant_message_by_run(FinalizedAssistantMessageByRunRequest {
+            scope,
+            thread_id: thread.thread_id,
+            turn_run_id: "run-lookup-index-failure".into(),
+        })
+        .await
+        .expect("lookup should scan when lookup-index backfill fails")
+        .expect("finalized assistant message should be found without lookup index");
     assert_eq!(finalized.message_id, draft.message_id);
     assert_eq!(finalized.status, MessageStatus::Finalized);
     assert_eq!(finalized.content.as_deref(), Some("final"));
@@ -1581,6 +1636,71 @@ where
     )])
     .expect("mount view");
     Arc::new(ScopedFilesystem::with_fixed_view(backend, mounts))
+}
+
+struct LookupIndexWriteFailureBackend {
+    inner: InMemoryBackend,
+}
+
+impl LookupIndexWriteFailureBackend {
+    fn new() -> Self {
+        Self {
+            inner: InMemoryBackend::new(),
+        }
+    }
+
+    fn is_lookup_index_path(path: &VirtualPath) -> bool {
+        path.as_str().contains("/indexes/assistant-runs/")
+            || path.as_str().contains("/indexes/tool-results/")
+    }
+}
+
+#[async_trait]
+impl RootFilesystem for LookupIndexWriteFailureBackend {
+    fn capabilities(&self) -> BackendCapabilities {
+        self.inner.capabilities()
+    }
+
+    async fn put(
+        &self,
+        path: &VirtualPath,
+        entry: Entry,
+        cas: CasExpectation,
+    ) -> Result<RecordVersion, FilesystemError> {
+        if Self::is_lookup_index_path(path) {
+            return Err(FilesystemError::Backend {
+                path: path.clone(),
+                operation: FilesystemOperation::WriteFile,
+                reason: "lookup index writes disabled by contract test".to_string(),
+            });
+        }
+        self.inner.put(path, entry, cas).await
+    }
+
+    async fn get(&self, path: &VirtualPath) -> Result<Option<VersionedEntry>, FilesystemError> {
+        self.inner.get(path).await
+    }
+
+    async fn list_dir(&self, path: &VirtualPath) -> Result<Vec<DirEntry>, FilesystemError> {
+        self.inner.list_dir(path).await
+    }
+
+    async fn query(
+        &self,
+        path: &VirtualPath,
+        filter: &Filter,
+        page: Page,
+    ) -> Result<Vec<VersionedEntry>, FilesystemError> {
+        self.inner.query(path, filter, page).await
+    }
+
+    async fn stat(&self, path: &VirtualPath) -> Result<FileStat, FilesystemError> {
+        self.inner.stat(path).await
+    }
+
+    async fn delete(&self, path: &VirtualPath) -> Result<(), FilesystemError> {
+        self.inner.delete(path).await
+    }
 }
 
 #[tokio::test]
