@@ -38,10 +38,23 @@ jobs:
             toolchain: stable
             backend: llvm
             runs_on: ubuntu-latest
+            cargo_scope: "--workspace --all-targets --all-features"
           - label: cranelift
             toolchain: nightly
             backend: cranelift
             runs_on: ubuntu-latest
+            cargo_scope: "--workspace --all-targets --all-features"
+          # Measures the compile win of dropping the v1 monolith: build only the
+          # Reborn binary's crate tree. `cargo tree -p ironclaw_reborn_cli -i ironclaw`
+          # confirms reborn_cli does NOT depend on the root `ironclaw` crate, so this
+          # scope skips the root monolith (~55% of workspace compile) entirely. Same
+          # toolchain/backend/flags as the baseline, scoped with -p, so the report's
+          # delta vs llvm-baseline is exactly the dropping-v1 win.
+          - label: reborn-only
+            toolchain: stable
+            backend: llvm
+            runs_on: ubuntu-latest
+            cargo_scope: "-p ironclaw_reborn_cli --all-targets --all-features"
     steps:
       - name: Checkout repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -214,6 +227,7 @@ jobs:
           TOOLCHAIN: ${{ matrix.toolchain }}
           BACKEND: ${{ matrix.backend }}
           RUNS_ON_LABEL: ${{ matrix.runs_on }}
+          CARGO_SCOPE: ${{ matrix.cargo_scope }}
         run: |
           set -euo pipefail
 
@@ -233,11 +247,10 @@ jobs:
           else
             start="$(date +%s)"
             set +e
+            # shellcheck disable=SC2086 # CARGO_SCOPE is intentional cargo argv (word-split on purpose).
             timeout "${ARCHIVE_TIMEOUT}" cargo nextest archive \
               --profile ci \
-              --workspace \
-              --all-targets \
-              --all-features \
+              ${CARGO_SCOPE} \
               --archive-file "${archive_file}" \
               2>&1 | tee -a "${build_log}"
             status="${PIPESTATUS[0]}"
@@ -516,7 +529,7 @@ jobs:
           import math
           import os
 
-          labels = ["llvm-baseline", "cranelift"]
+          labels = ["llvm-baseline", "cranelift", "reborn-only"]
           builds = {}
           for path in glob.glob("artifacts/build/build-*.json"):
               try:
