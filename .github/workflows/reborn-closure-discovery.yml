@@ -1,0 +1,26 @@
+name: Reborn Closure (discovery, non-required)
+
+# Runs ironclaw_reborn_cli's full 53-crate workspace dependency closure on every
+# PR as a NON-REQUIRED check, by calling reborn-tests.yml with full_closure=true.
+# Purpose: surface the real green/red/flake state of the shared crates that have
+# never run in CI, at PR frequency, WITHOUT blocking merges. Promote crates to the
+# required reborn-tests path as they prove green. Do NOT add this to branch
+# protection until the suite is reliably green.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: reborn-closure-discovery-${{ github.event_name }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  closure:
+    uses: ./.github/workflows/reborn-tests.yml
+    with:
+      full_closure: true
+    secrets: inherit
