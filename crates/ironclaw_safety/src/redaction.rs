@@ -1,3 +1,58 @@
+use std::sync::LazyLock;
+
+use regex::Regex;
+
+const SENSITIVE_REDACTION: &str = "[REDACTED - sensitive]";
+
+struct SensitiveRedactionPattern {
+    regex: Regex,
+    replacement: &'static str,
+}
+
+static SENSITIVE_REDACTION_PATTERNS: LazyLock<Vec<SensitiveRedactionPattern>> = LazyLock::new(
+    || {
+        let specs = [
+            (
+                r"(?i)\b([a-z][a-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@[^ \r\n\t]*)",
+                "$1[REDACTED - sensitive]$3",
+            ),
+            (
+                r#"(?im)\b(password|passwd|pwd|api[_-]?key|access[_-]?token|auth[_-]?token|secret|client[_-]?secret)\b(\s*[:=]\s*)(["']?)([^"'\s,;]+)(["']?)"#,
+                "$1$2$3[REDACTED - sensitive]$5",
+            ),
+            (r"(?i)\bsk-(?:proj-)?[a-z0-9_-]{12,}\b", SENSITIVE_REDACTION),
+        ];
+
+        let mut patterns = Vec::with_capacity(specs.len());
+        for (pattern, replacement) in specs {
+            match Regex::new(pattern) {
+                Ok(regex) => patterns.push(SensitiveRedactionPattern { regex, replacement }),
+                Err(error) => {
+                    tracing::debug!(
+                        pattern,
+                        error = %error,
+                        "sensitive redaction pattern failed to compile"
+                    );
+                }
+            }
+        }
+        patterns
+    },
+);
+
+/// Redacts credential-like values from model-visible projections without
+/// rejecting the surrounding content.
+pub fn redact_sensitive_values(content: &str) -> String {
+    let mut redacted = content.to_string();
+    for pattern in SENSITIVE_REDACTION_PATTERNS.iter() {
+        redacted = pattern
+            .regex
+            .replace_all(&redacted, pattern.replacement)
+            .into_owned();
+    }
+    redacted
+}
+
 /// Replaces exact secret values in `text` with `[REDACTED]`.
 ///
 /// Values are applied longest-first so encoded variants such as
@@ -90,7 +145,25 @@ fn lowercase_percent_escapes(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{redact_exact_values, redaction_values_for_secret};
+    use super::{redact_exact_values, redact_sensitive_values, redaction_values_for_secret};
+
+    #[test]
+    fn redact_sensitive_values_masks_secret_like_content_for_display() {
+        let input = concat!(
+            "db: postgres://app:db-pass@db.example/app\n",
+            "password: hunter2\n",
+            "OPENAI_API_KEY=sk-proj-abcdef1234567890"
+        );
+
+        let redacted = redact_sensitive_values(input);
+
+        assert!(redacted.contains("postgres://app:[REDACTED - sensitive]@db.example/app"));
+        assert!(redacted.contains("password: [REDACTED - sensitive]"));
+        assert!(redacted.contains("OPENAI_API_KEY=[REDACTED - sensitive]"));
+        assert!(!redacted.contains("db-pass"));
+        assert!(!redacted.contains("hunter2"));
+        assert!(!redacted.contains("sk-proj-abcdef1234567890"));
+    }
 
     #[test]
     fn redaction_values_include_raw_and_encoded_variants() {

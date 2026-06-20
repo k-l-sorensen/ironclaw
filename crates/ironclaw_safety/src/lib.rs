@@ -31,7 +31,7 @@ pub use provider_validation::{
     validate_optional_provider_metadata_text, validate_provider_arguments,
     validate_provider_identity, validate_provider_token, validate_provider_tool_name,
 };
-pub use redaction::{redact_exact_values, redaction_values_for_secret};
+pub use redaction::{redact_exact_values, redact_sensitive_values, redaction_values_for_secret};
 pub use sanitizer::{InjectionWarning, SanitizedOutput, Sanitizer};
 pub use validator::{ValidationResult, Validator};
 
