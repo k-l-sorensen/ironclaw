@@ -43,14 +43,16 @@ pub fn build_webui_services_with_slack_host_beta_mounts(
     };
     let slack_delivery_connections =
         slack_mounts.map(|mounts| Arc::clone(&mounts.delivery_connection_provider));
-    let outbound_delivery_target_providers = slack_mounts
-        .map(|mounts| vec![Arc::clone(&mounts.outbound_delivery_target_provider)])
-        .unwrap_or_default();
+    if slack_mounts.is_some() && runtime.outbound_delivery_target_provider().is_none() {
+        return Err(RebornBuildError::InvalidConfig {
+            reason: "outbound delivery target providers require local runtime services".to_string(),
+        });
+    }
     build_webui_services_with_connectable_channels(
         runtime,
         event_stream,
         slack_connectable_channels(visibility, slack_delivery_connections),
-        outbound_delivery_target_providers,
+        Vec::new(),
     )
 }
 
