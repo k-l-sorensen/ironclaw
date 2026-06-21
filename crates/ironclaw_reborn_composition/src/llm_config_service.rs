@@ -262,13 +262,27 @@ impl RebornLlmConfigService {
         let definition = custom_definition(&request.provider_id, protocol, base_url.clone(), model);
         let registry = ProviderRegistry::new(vec![definition]);
         let stored_key_allowed = self.probe_matches_persisted_provider(request).await?;
+        // For the persisted/default NEAR AI endpoint, resolve the key from its
+        // env var. The desktop app supplies NEARAI_API_KEY via env (not the
+        // operator key store), and that key is what selects the model-listing
+        // base: with a key the default is cloud-api.near.ai (which lists models);
+        // keyless it falls back to private.near.ai (which does not). Without this
+        // the probe resolves keyless, so list-models returns 0 even though
+        // inference — which DOES read the env key — works. Gated by
+        // stored_key_allowed so it only applies to the user's own persisted
+        // endpoint, never a caller-overridden base_url (no exfiltration surface).
+        let api_key_env = if is_nearai_protocol && stored_key_allowed {
+            Some("NEARAI_API_KEY".to_string())
+        } else {
+            None
+        };
         let selection = LlmSlotSelection {
             provider_id: Some(request.provider_id.clone()),
             model: request
                 .model
                 .clone()
                 .filter(|model| !model.trim().is_empty()),
-            api_key_env: None,
+            api_key_env,
             base_url,
         };
         let mut config = resolve_against_registry(&selection, &registry).map_err(|error| {
