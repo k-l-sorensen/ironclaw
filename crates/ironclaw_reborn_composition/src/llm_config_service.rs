@@ -1120,8 +1120,9 @@ mod tests {
             scope: ResourceScope,
             handle: SecretHandle,
             material: SecretMaterial,
+            expires_at: Option<ironclaw_host_api::Timestamp>,
         ) -> Result<SecretMetadata, SecretStoreError> {
-            self.inner.put(scope, handle, material).await
+            self.inner.put(scope, handle, material, expires_at).await
         }
 
         async fn metadata(

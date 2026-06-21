@@ -651,6 +651,7 @@ mod tests {
             Ok(vec![SecretMetadata {
                 scope: self.scope.clone(),
                 handle: self.handle.clone(),
+                expires_at: None,
             }])
         }
 

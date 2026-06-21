@@ -2934,6 +2934,7 @@ impl SecretStore for StaticSecretStore {
         Ok(vec![SecretMetadata {
             scope: scope.clone(),
             handle: self.handle.clone(),
+            expires_at: None,
         }])
     }
 

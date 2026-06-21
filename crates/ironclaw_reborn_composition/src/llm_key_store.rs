@@ -204,6 +204,7 @@ mod tests {
                 scope(),
                 SecretHandle::new("not_an_llm_key").expect("handle"),
                 SecretMaterial::from("unrelated"),
+                None,
             )
             .await
             .expect("put unrelated");
