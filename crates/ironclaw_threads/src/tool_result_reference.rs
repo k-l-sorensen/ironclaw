@@ -1,7 +1,8 @@
 use ironclaw_host_api::CapabilityId;
 use ironclaw_safety::{
-    validate_optional_provider_metadata_text, validate_provider_arguments,
-    validate_provider_identity, validate_provider_token, validate_provider_tool_name,
+    PROVIDER_METADATA_TEXT_MAX_BYTES, validate_optional_provider_metadata_text,
+    validate_provider_arguments, validate_provider_identity, validate_provider_token,
+    validate_provider_tool_name,
 };
 use serde::{Deserialize, Serialize};
 
@@ -136,13 +137,27 @@ impl ProviderToolCallReferenceEnvelope {
             .map_err(|error| error.to_string())?;
         validate_provider_tool_name(&self.provider_tool_name).map_err(|error| error.to_string())?;
         validate_provider_arguments(&self.arguments).map_err(|error| error.to_string())?;
+        // Reasoning models (e.g. GLM) routinely emit more than the legacy 4 KiB
+        // of reasoning on multi-step turns; capping here below the safety layer's
+        // own bound made the transcript write fail (TranscriptWriteFailed ->
+        // terminal HostUnavailable) and killed the whole turn. Align with the
+        // safety layer's canonical provider-metadata bound so the safety scan,
+        // not this serializer, is the single source of truth for the limit.
         validate_optional_provider_text(
             &self.response_reasoning,
             "provider response reasoning",
-            4096,
+            PROVIDER_METADATA_TEXT_MAX_BYTES,
         )?;
-        validate_optional_provider_text(&self.reasoning, "provider reasoning", 4096)?;
-        validate_optional_provider_text(&self.signature, "provider signature", 4096)?;
+        validate_optional_provider_text(
+            &self.reasoning,
+            "provider reasoning",
+            PROVIDER_METADATA_TEXT_MAX_BYTES,
+        )?;
+        validate_optional_provider_text(
+            &self.signature,
+            "provider signature",
+            PROVIDER_METADATA_TEXT_MAX_BYTES,
+        )?;
         Ok(())
     }
 }
