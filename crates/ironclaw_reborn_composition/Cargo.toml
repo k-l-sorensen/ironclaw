@@ -48,6 +48,7 @@ webui-v2-beta = [
     "dep:tower",
     "dep:tower-http",
     "dep:lru",
+    "dep:reqwest",
 ]
 # Host-mounted Slack Events API ingress fragment for the Reborn ProductAdapter
 # MVP. Off by default; host binaries opt in and mount it behind their Slack
@@ -153,6 +154,7 @@ axum = { version = "0.8", optional = true }
 tower = { version = "0.5", optional = true }
 tower-http = { version = "0.6", optional = true, features = ["cors", "set-header", "limit", "catch-panic"] }
 lru = { version = "0.16", optional = true }
+reqwest = { version = "0.12", optional = true, default-features = false, features = ["json", "rustls-tls-native-roots"] }
 fs4 = "0.6"
 rand = "0.8"
 rust_decimal = { version = "1", features = ["serde", "serde-with-str"] }

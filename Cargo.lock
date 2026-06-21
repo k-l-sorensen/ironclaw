@@ -5081,6 +5081,7 @@ dependencies = [
  "libsql",
  "lru 0.16.4",
  "rand 0.8.6",
+ "reqwest",
  "rust_decimal",
  "rust_decimal_macros",
  "secrecy",

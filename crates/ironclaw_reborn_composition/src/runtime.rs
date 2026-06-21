@@ -1146,6 +1146,13 @@ impl RebornRuntime {
         self.auth_interaction_service.clone()
     }
 
+    /// Owner identity the read-only connector port resolves the provider key
+    /// and connected-account scope against.
+    #[cfg(feature = "webui-v2-beta")]
+    pub(crate) fn webui_actor_user_id(&self) -> UserId {
+        self.actor_user_id.clone()
+    }
+
     pub(crate) fn outbound_delivery_target_provider(
         &self,
     ) -> Option<Arc<dyn OutboundDeliveryTargetProvider>> {

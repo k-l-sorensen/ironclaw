@@ -244,6 +244,23 @@ pub(crate) fn build_webui_services_with_connectable_channels(
         api = api.with_llm_config_service(Arc::new(llm_config));
     }
 
+    // Read-only connector proxy: only composed when the WebUI beta surface is
+    // on (it owns the reqwest-backed Composio client). Wired only when the
+    // profile assembled a product-auth graph to resolve the connected-account
+    // selection from; otherwise the connector routes report `503` (subsystem
+    // not wired). The provider key lives in the runtime's secret store at the
+    // actor's owner scope, so the configure-write and connector-reads share one
+    // owner by construction.
+    #[cfg(feature = "webui-v2-beta")]
+    if let Some(product_auth) = services.product_auth.as_ref() {
+        let port = Arc::new(crate::connectors::ComposioConnectorPort::new(
+            runtime.services().secret_store(),
+            product_auth.runtime_credential_account_selection_service(),
+            runtime.webui_actor_user_id(),
+        ));
+        api = api.with_connector_port(port);
+    }
+
     Ok(RebornWebuiBundle {
         api: Arc::new(api),
         product_auth: services.product_auth.clone(),

@@ -39,6 +39,9 @@ pub const WEBUI_V2_ROUTE_ACTIVATE_EXTENSION: &str = "webui.v2.activate_extension
 pub const WEBUI_V2_ROUTE_REMOVE_EXTENSION: &str = "webui.v2.remove_extension";
 pub const WEBUI_V2_ROUTE_GET_EXTENSION_SETUP: &str = "webui.v2.get_extension_setup";
 pub const WEBUI_V2_ROUTE_SETUP_EXTENSION: &str = "webui.v2.setup_extension";
+pub const WEBUI_V2_ROUTE_CONNECTORS_CONNECTED: &str = "webui.v2.connectors_connected";
+pub const WEBUI_V2_ROUTE_CONNECTORS_READ: &str = "webui.v2.connectors_read";
+pub const WEBUI_V2_ROUTE_CONNECTORS_WRITE: &str = "webui.v2.connectors_write";
 pub const WEBUI_V2_ROUTE_LIST_SKILLS: &str = "webui.v2.list_skills";
 pub const WEBUI_V2_ROUTE_SEARCH_SKILLS: &str = "webui.v2.search_skills";
 pub const WEBUI_V2_ROUTE_INSTALL_SKILL: &str = "webui.v2.install_skill";
@@ -111,6 +114,9 @@ pub const WEBUI_V2_PATTERN_ACTIVATE_EXTENSION: &str =
 pub const WEBUI_V2_PATTERN_REMOVE_EXTENSION: &str =
     "/api/webchat/v2/extensions/{package_id}/remove";
 pub const WEBUI_V2_PATTERN_SETUP_EXTENSION: &str = "/api/webchat/v2/extensions/{package_id}/setup";
+pub const WEBUI_V2_PATTERN_CONNECTORS_CONNECTED: &str = "/api/webchat/v2/connectors/connected";
+pub const WEBUI_V2_PATTERN_CONNECTORS_READ: &str = "/api/webchat/v2/connectors/read";
+pub const WEBUI_V2_PATTERN_CONNECTORS_WRITE: &str = "/api/webchat/v2/connectors/write";
 pub const WEBUI_V2_PATTERN_LIST_SKILLS: &str = "/api/webchat/v2/skills";
 pub const WEBUI_V2_PATTERN_SEARCH_SKILLS: &str = "/api/webchat/v2/skills/search";
 pub const WEBUI_V2_PATTERN_INSTALL_SKILL: &str = "/api/webchat/v2/skills/install";
@@ -183,6 +189,9 @@ pub fn webui_v2_routes() -> Vec<IngressRouteDescriptor> {
         remove_extension_descriptor(),
         get_extension_setup_descriptor(),
         setup_extension_descriptor(),
+        connectors_connected_descriptor(),
+        connectors_read_descriptor(),
+        connectors_write_descriptor(),
         list_skills_descriptor(),
         search_skills_descriptor(),
         install_skill_descriptor(),
@@ -842,6 +851,55 @@ fn setup_extension_descriptor() -> IngressRouteDescriptor {
         WEBUI_V2_PATTERN_SETUP_EXTENSION,
         mutation_policy(
             body_limit_kib(16),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+        ),
+    )
+}
+
+fn connectors_connected_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_CONNECTORS_CONNECTED,
+        NetworkMethod::Get,
+        WEBUI_V2_PATTERN_CONNECTORS_CONNECTED,
+        read_policy(
+            read_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+            StreamingMode::None,
+        ),
+    )
+}
+
+fn connectors_read_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_CONNECTORS_READ,
+        // POST because it carries a JSON body (toolkit/tool/arguments), but the
+        // effect is a server-enforced read-only proxy; writes are rejected with
+        // 400 in the facade before any upstream call.
+        NetworkMethod::Post,
+        WEBUI_V2_PATTERN_CONNECTORS_READ,
+        mutation_policy(
+            body_limit_kib(16),
+            mutation_rate_limit(),
+            AuditTraceClass::UserAction,
+            AllowedEffectPath::ProductWorkflow,
+        ),
+    )
+}
+
+fn connectors_write_descriptor() -> IngressRouteDescriptor {
+    descriptor(
+        WEBUI_V2_ROUTE_CONNECTORS_WRITE,
+        // POST carrying a JSON body; the facade enforces an explicit write
+        // allowlist (draft-creation always; sends only with the gateway send
+        // capability) before any upstream call. A larger body limit than the
+        // read path accommodates draft bodies.
+        NetworkMethod::Post,
+        WEBUI_V2_PATTERN_CONNECTORS_WRITE,
+        mutation_policy(
+            body_limit_kib(64),
             mutation_rate_limit(),
             AuditTraceClass::UserAction,
             AllowedEffectPath::ProductWorkflow,

@@ -59,6 +59,7 @@ use crate::{
     is_approval_gate_ref, is_auth_gate_ref, thread_metadata_is_automation_trigger,
 };
 
+mod connectors;
 mod error;
 mod extension_credentials;
 mod extension_onboarding;
@@ -72,6 +73,11 @@ mod projects;
 mod trace_credits;
 mod types;
 
+pub use connectors::{
+    ConnectorReadError, ConnectorReadPort, ConnectorWriteKind, RebornConnectedAccount,
+    RebornConnectedAccountsResponse, RebornConnectorReadRequest, RebornConnectorReadResponse,
+    RebornConnectorWriteRequest, classify_connector_write, is_read_only_tool,
+};
 pub use error::{RebornServicesError, RebornServicesErrorCode, RebornServicesErrorKind};
 pub use trace_credits::{RebornTraceCreditsResponse, RebornTraceHoldAuthorizeResponse};
 
@@ -1377,6 +1383,46 @@ pub trait RebornServicesApi: Send + Sync {
         request: WebUiSetupExtensionRequest,
     ) -> Result<RebornSetupExtensionResponse, RebornServicesError>;
 
+    /// List the owner's active connected accounts (read-only proxy over the
+    /// connector provider). The provider API key is resolved server-side and
+    /// never crosses this boundary.
+    ///
+    /// The three connector methods default to "service unavailable" so facade
+    /// impls (and test fakes) that don't wire a [`ConnectorReadPort`] inherit a
+    /// safe `503` surface; the default `RebornServices` overrides them.
+    async fn connector_connected(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+    ) -> Result<RebornConnectedAccountsResponse, RebornServicesError> {
+        let _ = caller;
+        Err(RebornServicesError::service_unavailable(false))
+    }
+
+    /// Execute a single read-only connector tool and return its output. The
+    /// implementation enforces a read-only allowlist server-side; any
+    /// write-shaped tool is rejected with `400`.
+    async fn connector_read(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: RebornConnectorReadRequest,
+    ) -> Result<RebornConnectorReadResponse, RebornServicesError> {
+        let _ = (caller, request);
+        Err(RebornServicesError::service_unavailable(false))
+    }
+
+    /// Execute a single GATED write connector tool and return its output. The
+    /// implementation enforces an explicit write allowlist server-side:
+    /// draft-creation tools are always permitted; send/deliver tools only when
+    /// the gateway was started with the send capability enabled.
+    async fn connector_write(
+        &self,
+        caller: WebUiAuthenticatedCaller,
+        request: RebornConnectorWriteRequest,
+    ) -> Result<RebornConnectorReadResponse, RebornServicesError> {
+        let _ = (caller, request);
+        Err(RebornServicesError::service_unavailable(false))
+    }
+
     /// LLM provider configuration: merged catalog + active selection.
     ///
     /// The six LLM-config methods default to "service unavailable" so facade
@@ -1633,6 +1679,7 @@ pub struct RebornServices {
     skill_activation_clearer: Option<Arc<SkillActivationClearer>>,
     llm_config: Option<Arc<dyn LlmConfigService>>,
     thread_operation_locks: Arc<ThreadOperationLocks>,
+    connector_port: Option<Arc<dyn ConnectorReadPort>>,
 }
 
 impl RebornServices {
@@ -1668,6 +1715,7 @@ impl RebornServices {
             skill_activation_clearer: None,
             llm_config: None,
             thread_operation_locks: Arc::new(StdMutex::new(HashMap::new())),
+            connector_port: None,
         }
     }
 
@@ -1731,6 +1779,14 @@ impl RebornServices {
 
     pub fn with_llm_config_service(mut self, llm_config: Arc<dyn LlmConfigService>) -> Self {
         self.llm_config = Some(llm_config);
+        self
+    }
+
+    /// Inject the read-only connector port. Host composition supplies the
+    /// concrete implementation (secret-store-backed key resolution + the
+    /// Composio read path); without it the connector routes report `503`.
+    pub fn with_connector_port(mut self, port: Arc<dyn ConnectorReadPort>) -> Self {
+        self.connector_port = Some(port);
         self
     }
 
@@ -2954,6 +3010,22 @@ impl RebornServicesApi for RebornServices {
         package_ref: LifecyclePackageRef,
         request: WebUiSetupExtensionRequest,
     ) -> Result<RebornSetupExtensionResponse, RebornServicesError> {
+        // The composio extension authenticates with a single API key the user
+        // supplies via `configure`. The lifecycle facade owns no secret store,
+        // so we persist that key through the connector port (which owns both
+        // the secret store and the read path, guaranteeing one owner scope)
+        // instead of routing it through the lifecycle `ExtensionConfigure`
+        // projection. Any non-composio extension, or composio with a
+        // non-configure action, falls through to the lifecycle facade.
+        if let Some(response) = lifecycle_setup::try_configure_composio_secrets(
+            self.connector_port.as_deref(),
+            &package_ref,
+            &request,
+        )
+        .await?
+        {
+            return Ok(response);
+        }
         lifecycle_setup::setup_extension(
             self.lifecycle_facade.as_ref(),
             self.extension_credentials.as_deref(),
@@ -2962,6 +3034,45 @@ impl RebornServicesApi for RebornServices {
             request,
         )
         .await
+    }
+
+    async fn connector_connected(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+    ) -> Result<RebornConnectedAccountsResponse, RebornServicesError> {
+        let port = self
+            .connector_port
+            .as_ref()
+            .ok_or_else(|| RebornServicesError::service_unavailable(false))?;
+        port.connected().await.map_err(connector_error_to_services)
+    }
+
+    async fn connector_read(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: RebornConnectorReadRequest,
+    ) -> Result<RebornConnectorReadResponse, RebornServicesError> {
+        let port = self
+            .connector_port
+            .as_ref()
+            .ok_or_else(|| RebornServicesError::service_unavailable(false))?;
+        port.read(request)
+            .await
+            .map_err(connector_error_to_services)
+    }
+
+    async fn connector_write(
+        &self,
+        _caller: WebUiAuthenticatedCaller,
+        request: RebornConnectorWriteRequest,
+    ) -> Result<RebornConnectorReadResponse, RebornServicesError> {
+        let port = self
+            .connector_port
+            .as_ref()
+            .ok_or_else(|| RebornServicesError::service_unavailable(false))?;
+        port.write(request)
+            .await
+            .map_err(connector_error_to_services)
     }
 
     async fn get_operator_status(
@@ -3313,6 +3424,19 @@ impl RebornServices {
 
 fn automation_unavailable() -> RebornServicesError {
     RebornServicesError::service_unavailable(true)
+}
+
+fn connector_error_to_services(error: ConnectorReadError) -> RebornServicesError {
+    match error {
+        ConnectorReadError::InvalidRequest { .. } => {
+            RebornServicesError::from_status(RebornServicesErrorCode::InvalidRequest, 400, false)
+        }
+        ConnectorReadError::Unavailable { retryable } => {
+            RebornServicesError::service_unavailable(retryable)
+        }
+        ConnectorReadError::Upstream { .. } => RebornServicesError::service_unavailable(false),
+        ConnectorReadError::Internal => RebornServicesError::internal_invariant(),
+    }
 }
 
 fn is_automation_trigger_thread(thread: &SessionThreadRecord) -> bool {
