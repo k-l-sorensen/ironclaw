@@ -52,6 +52,13 @@ pub enum RebornModelReplayStep {
         response: HostManagedModelResponse,
         expected_tool_results: Vec<ExpectedToolResult>,
     },
+    AssertProviderToolSchemaThenResponse {
+        capability_id: CapabilityId,
+        required_properties: Vec<&'static str>,
+        forbidden_properties: Vec<&'static str>,
+        response: HostManagedModelResponse,
+        expected_tool_results: Vec<ExpectedToolResult>,
+    },
     ResponseForRequest {
         request_contains: String,
         response: HostManagedModelResponse,
@@ -123,6 +130,12 @@ enum ReplayOutput {
         capability_ids: Vec<CapabilityId>,
         response: HostManagedModelResponse,
     },
+    AssertProviderToolSchemaThenResponse {
+        capability_id: CapabilityId,
+        required_properties: Vec<&'static str>,
+        forbidden_properties: Vec<&'static str>,
+        response: HostManagedModelResponse,
+    },
     DelayedResponse {
         response: HostManagedModelResponse,
         delay: Duration,
@@ -184,6 +197,22 @@ impl RebornTraceReplayModelGateway {
                     } => ReplayStep {
                         output: ReplayOutput::AssertProviderToolsThenResponse {
                             capability_ids,
+                            response,
+                        },
+                        request_contains: None,
+                        expected_tool_results,
+                    },
+                    RebornModelReplayStep::AssertProviderToolSchemaThenResponse {
+                        capability_id,
+                        required_properties,
+                        forbidden_properties,
+                        response,
+                        expected_tool_results,
+                    } => ReplayStep {
+                        output: ReplayOutput::AssertProviderToolSchemaThenResponse {
+                            capability_id,
+                            required_properties,
+                            forbidden_properties,
                             response,
                         },
                         request_contains: None,
@@ -275,6 +304,12 @@ impl HostManagedModelGateway for RebornTraceReplayModelGateway {
                     "trace replay provider tool assertions require capability-aware model streaming",
                 ))
             }
+            ReplayOutput::AssertProviderToolSchemaThenResponse { .. } => {
+                Err(HostManagedModelError::safe(
+                    HostManagedModelErrorKind::InvalidRequest,
+                    "trace replay provider tool schema assertions require capability-aware model streaming",
+                ))
+            }
             ReplayOutput::DelayedResponse { response, delay } => {
                 tokio::time::sleep(delay).await;
                 Ok(response)
@@ -299,6 +334,21 @@ impl HostManagedModelGateway for RebornTraceReplayModelGateway {
                 response,
             } => {
                 assert_provider_tools(capabilities, &capability_ids).await?;
+                Ok(response)
+            }
+            ReplayOutput::AssertProviderToolSchemaThenResponse {
+                capability_id,
+                required_properties,
+                forbidden_properties,
+                response,
+            } => {
+                assert_provider_tool_schema(
+                    capabilities,
+                    &capability_id,
+                    &required_properties,
+                    &forbidden_properties,
+                )
+                .await?;
                 Ok(response)
             }
             ReplayOutput::DelayedResponse { response, delay } => {
@@ -364,6 +414,63 @@ async fn assert_provider_tools(
                 HostManagedModelErrorKind::InvalidRequest,
                 format!(
                     "expected capability {} was not advertised to the model",
+                    capability_id.as_str()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn assert_provider_tool_schema(
+    capabilities: Arc<dyn LoopCapabilityPort>,
+    capability_id: &CapabilityId,
+    required_properties: &[&'static str],
+    forbidden_properties: &[&'static str],
+) -> Result<(), HostManagedModelError> {
+    let definitions = provider_tool_definitions(&capabilities).await?;
+    let definition = definitions
+        .iter()
+        .find(|definition| &definition.capability_id == capability_id)
+        .ok_or_else(|| {
+            HostManagedModelError::safe(
+                HostManagedModelErrorKind::InvalidRequest,
+                format!(
+                    "expected capability {} was not advertised to the model",
+                    capability_id.as_str()
+                ),
+            )
+        })?;
+    let properties = definition
+        .parameters
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .ok_or_else(|| {
+            HostManagedModelError::safe(
+                HostManagedModelErrorKind::InvalidRequest,
+                format!(
+                    "capability {} provider schema has no object properties",
+                    capability_id.as_str()
+                ),
+            )
+        })?;
+    for property in required_properties {
+        if !properties.contains_key(*property) {
+            return Err(HostManagedModelError::safe(
+                HostManagedModelErrorKind::InvalidRequest,
+                format!(
+                    "expected capability {} provider schema to include property {property}",
+                    capability_id.as_str()
+                ),
+            ));
+        }
+    }
+    for property in forbidden_properties {
+        if properties.contains_key(*property) {
+            return Err(HostManagedModelError::safe(
+                HostManagedModelErrorKind::InvalidRequest,
+                format!(
+                    "expected capability {} provider schema to omit property {property}",
                     capability_id.as_str()
                 ),
             ));
