@@ -97,10 +97,14 @@ NEARAI_API_KEY=<nearai-api-key>
 For managed Postgres providers with a small session-pool cap, set
 `IRONCLAW_REBORN_POSTGRES_POOL_MAX_SIZE=1` or `2` rather than relying on the
 provider to queue excess sessions.
-If blue-green deployments can leave the old container holding sessions for
-longer than the default 5-minute startup wait, set
-`IRONCLAW_FILESYSTEM_POSTGRES_MIGRATION_CONNECT_MAX_WAIT_SECS` to a larger
-value.
+For `hosted-single-tenant`, `ironclaw-reborn serve` binds the WebUI listener
+and serves `/api/health` before PostgreSQL-backed runtime assembly finishes.
+Non-health routes return `503` until the runtime router is ready. This lets
+Railway drain the old deployment and release PgBouncer session-mode
+connections before the new deployment needs one for startup migrations.
+`IRONCLAW_FILESYSTEM_POSTGRES_MIGRATION_CONNECT_MAX_WAIT_SECS` still controls
+how long runtime assembly waits for PostgreSQL once the healthcheck listener is
+up; the default is 5 minutes.
 
 `ironclaw-reborn serve` exits before binding the HTTP listener if the WebUI
 token/user variables are missing. The bundled config selects NearAI as the

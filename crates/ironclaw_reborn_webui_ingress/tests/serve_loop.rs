@@ -13,8 +13,11 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::{Router, extract::ConnectInfo, routing::get};
-use ironclaw_reborn_webui_ingress::{RebornWebuiServeOptions, serve_webui_v2};
+use ironclaw_reborn_webui_ingress::{
+    RebornWebuiServeOptions, deferred_webui_v2_startup_router, serve_webui_v2,
+};
 use tokio::sync::oneshot;
+use tower::ServiceExt;
 
 async fn build_test_router() -> Router {
     Router::new()
@@ -148,4 +151,61 @@ async fn serve_webui_v2_shuts_down_when_shutdown_sender_drops() {
         .expect("serve loop must exit within 2s of shutdown-sender drop")
         .expect("serve loop join handle must not panic");
     outcome.expect("serve loop must return Ok after shutdown-sender drop");
+}
+
+#[tokio::test]
+async fn deferred_startup_router_serves_health_then_delegates_when_ready() {
+    let (startup_router, ready_handle) = deferred_webui_v2_startup_router();
+
+    let health_response = startup_router
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/api/health")
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("health response");
+    assert_eq!(
+        health_response.status(),
+        http::StatusCode::OK,
+        "startup health must pass before runtime assembly finishes"
+    );
+
+    let before_ready = startup_router
+        .clone()
+        .oneshot(
+            http::Request::builder()
+                .uri("/ping")
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("pre-ready response");
+    assert_eq!(
+        before_ready.status(),
+        http::StatusCode::SERVICE_UNAVAILABLE,
+        "non-health routes must not accept traffic before the runtime router is ready"
+    );
+
+    let ready_router = build_test_router().await;
+    ready_handle
+        .publish_ready_router(ready_router)
+        .expect("startup router should still be listening");
+
+    let after_ready = startup_router
+        .oneshot(
+            http::Request::builder()
+                .uri("/ping")
+                .body(axum::body::Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("ready response");
+    assert_eq!(
+        after_ready.status(),
+        http::StatusCode::OK,
+        "startup router must delegate to the ready WebUI router without rebinding"
+    );
 }

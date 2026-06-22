@@ -21,11 +21,13 @@ use ironclaw_reborn_composition::{
     SlackOperatorRouteVisibility, build_slack_host_beta_mounts,
     build_webui_services_with_slack_host_beta_mounts,
 };
-use ironclaw_reborn_config::{IdentitySection, seed_default_config_file_if_missing};
+use ironclaw_reborn_config::{IdentitySection, RebornProfile, seed_default_config_file_if_missing};
 use ironclaw_reborn_webui_ingress::{
-    EnvBearerAuthenticator, RebornWebuiServeOptions, serve_webui_v2,
+    DeferredWebuiRouterHandle, EnvBearerAuthenticator, RebornWebuiServeError,
+    RebornWebuiServeOptions, deferred_webui_v2_startup_router, serve_webui_v2,
 };
 use secrecy::SecretString;
+use tokio_util::sync::CancellationToken;
 
 use crate::context::RebornCliContext;
 use crate::runtime::{RuntimeInputOptions, resolve_google_oauth_config_from_env};
@@ -352,6 +354,12 @@ impl ServeCommand {
             )
             .await?;
 
+            let startup_serve = if profile == RebornProfile::HostedSingleTenant {
+                Some(start_hosted_single_tenant_startup_listener(listen_addr).await?)
+            } else {
+                None
+            };
+
             let runtime = build_reborn_runtime(runtime_input)
                 .await
                 .context("failed to assemble Reborn runtime for `serve`")?;
@@ -499,24 +507,35 @@ impl ServeCommand {
                 .context("failed to compose v2 Router")?;
             let (router, public_route_drains) = webui_app.into_parts();
 
-            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-            tokio::spawn(async move {
-                if tokio::signal::ctrl_c().await.is_ok() {
-                    tracing::info!(
-                        target = "ironclaw::reborn::cli::serve",
-                        "ctrl-c received; signalling WebChat v2 graceful shutdown",
-                    );
-                    let _ = shutdown_tx.send(());
-                }
-            });
+            let serve_result = if let Some(startup_serve) = startup_serve {
+                startup_serve
+                    .ready_handle
+                    .publish_ready_router(router)
+                    .context("failed to publish ready WebChat v2 router")?;
+                startup_serve
+                    .serve_task
+                    .await
+                    .context("hosted single-tenant startup WebChat v2 serve task failed to join")?
+            } else {
+                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+                tokio::spawn(async move {
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        tracing::info!(
+                            target = "ironclaw::reborn::cli::serve",
+                            "ctrl-c received; signalling WebChat v2 graceful shutdown",
+                        );
+                        let _ = shutdown_tx.send(());
+                    }
+                });
 
-            let serve_result = serve_webui_v2(RebornWebuiServeOptions {
-                addr: listen_addr,
-                router,
-                shutdown: shutdown_rx,
-                bound_addr_tx: None,
-            })
-            .await;
+                serve_webui_v2(RebornWebuiServeOptions {
+                    addr: listen_addr,
+                    router,
+                    shutdown: shutdown_rx,
+                    bound_addr_tx: None,
+                })
+                .await
+            };
 
             // Always drain public route mounts before shutting down the
             // Reborn runtime. Protocol webhooks such as Slack can ACK a
@@ -535,6 +554,68 @@ impl ServeCommand {
 
         Ok(())
     }
+}
+
+struct StartupServe {
+    ready_handle: DeferredWebuiRouterHandle,
+    serve_task: tokio::task::JoinHandle<Result<(), RebornWebuiServeError>>,
+}
+
+async fn start_hosted_single_tenant_startup_listener(
+    listen_addr: SocketAddr,
+) -> anyhow::Result<StartupServe> {
+    let (router, ready_handle) = deferred_webui_v2_startup_router();
+    let shutdown = CancellationToken::new();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    let shutdown_signal = shutdown.clone();
+    tokio::spawn(async move {
+        shutdown_signal.cancelled().await;
+        let _ = shutdown_tx.send(());
+    });
+
+    let ctrl_c_shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!(
+                target = "ironclaw::reborn::cli::serve",
+                "ctrl-c received; signalling WebChat v2 graceful shutdown",
+            );
+            ctrl_c_shutdown.cancel();
+        }
+    });
+
+    let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
+    let serve_task = tokio::spawn(async move {
+        serve_webui_v2(RebornWebuiServeOptions {
+            addr: listen_addr,
+            router,
+            shutdown: shutdown_rx,
+            bound_addr_tx: Some(bound_tx),
+        })
+        .await
+    });
+
+    match bound_rx.await {
+        Ok(bound) => {
+            tracing::info!(
+                target = "ironclaw::reborn::cli::serve",
+                %bound,
+                "hosted single-tenant WebChat v2 startup listener is serving healthchecks before runtime assembly"
+            );
+        }
+        Err(_) => {
+            let serve_result = serve_task
+                .await
+                .context("hosted single-tenant startup WebChat v2 serve task failed to join")?;
+            serve_result.context("hosted single-tenant startup WebChat v2 serve loop failed")?;
+            anyhow::bail!("hosted single-tenant startup listener exited before binding");
+        }
+    }
+
+    Ok(StartupServe {
+        ready_handle,
+        serve_task,
+    })
 }
 
 fn reject_non_loopback_privileged_local_runtime(
