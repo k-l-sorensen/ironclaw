@@ -136,7 +136,6 @@ use ironclaw_turns::{
 };
 use ironclaw_wasm::{WitToolHost, WitToolRuntimeConfig};
 use serde_json::json;
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -183,7 +182,7 @@ pub struct RebornBinaryE2EHarness {
     milestone_sink: Arc<ironclaw_turns::run_profile::InMemoryLoopHostMilestoneSink>,
     worker: Arc<TurnRunnerWorker>,
     cancel: CancellationToken,
-    worker_tasks: Vec<JoinHandle<()>>,
+    worker_tasks: Vec<std::thread::JoinHandle<()>>,
     _turn_root: Arc<tempfile::TempDir>,
     _wake_sender: TurnRunnerWakeSender,
 }
@@ -1060,19 +1059,37 @@ impl RebornBinaryE2EHarness {
         if !self.worker_tasks.is_empty() {
             return;
         }
-        for _ in 0..count.max(1) {
+        for index in 0..count.max(1) {
             let worker = Arc::clone(&self.worker);
             let cancel = self.cancel.clone();
-            self.worker_tasks.push(tokio::spawn(async move {
-                worker.run(cancel).await;
-            }));
+            // Run the turn-runner worker on a dedicated 8 MB-stack thread rather
+            // than a default `tokio::spawn` task. The agent loop executes a deep
+            // async dispatch chain (turn runner -> planned driver -> canonical
+            // executor -> capability stage -> host dispatch -> first-party tool)
+            // whose single capability-dispatch poll consumes ~1.9 MB of stack in
+            // debug builds — enough to overflow the default 2 MB thread the
+            // `#[tokio::test]` runtime uses. This mirrors the 8 MB worker stack
+            // configured for the production `serve` runtime, and matches the
+            // existing `stack_size` idiom used elsewhere in the codebase.
+            let handle = std::thread::Builder::new()
+                .name(format!("qa-turn-runner-{index}"))
+                .stack_size(8 * 1024 * 1024)
+                .spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .expect("build turn-runner worker runtime");
+                    runtime.block_on(worker.run(cancel));
+                })
+                .expect("spawn turn-runner worker thread");
+            self.worker_tasks.push(handle);
         }
     }
 
     pub async fn shutdown(&mut self) {
         self.cancel.cancel();
         for task in self.worker_tasks.drain(..) {
-            let _ = task.await;
+            let _ = task.join();
         }
     }
 
