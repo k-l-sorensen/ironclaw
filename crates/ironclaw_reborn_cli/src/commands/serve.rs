@@ -27,7 +27,6 @@ use ironclaw_reborn_webui_ingress::{
     RebornWebuiServeOptions, deferred_webui_v2_startup_router, serve_webui_v2,
 };
 use secrecy::SecretString;
-use tokio_util::sync::CancellationToken;
 
 use crate::context::RebornCliContext;
 use crate::runtime::{RuntimeInputOptions, resolve_google_oauth_config_from_env};
@@ -517,21 +516,10 @@ impl ServeCommand {
                     .await
                     .context("hosted single-tenant startup WebChat v2 serve task failed to join")?
             } else {
-                let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-                tokio::spawn(async move {
-                    if tokio::signal::ctrl_c().await.is_ok() {
-                        tracing::info!(
-                            target = "ironclaw::reborn::cli::serve",
-                            "ctrl-c received; signalling WebChat v2 graceful shutdown",
-                        );
-                        let _ = shutdown_tx.send(());
-                    }
-                });
-
                 serve_webui_v2(RebornWebuiServeOptions {
                     addr: listen_addr,
                     router,
-                    shutdown: shutdown_rx,
+                    shutdown: webui_ctrl_c_shutdown(),
                     bound_addr_tx: None,
                 })
                 .await
@@ -565,31 +553,12 @@ async fn start_hosted_single_tenant_startup_listener(
     listen_addr: SocketAddr,
 ) -> anyhow::Result<StartupServe> {
     let (router, ready_handle) = deferred_webui_v2_startup_router();
-    let shutdown = CancellationToken::new();
-    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-    let shutdown_signal = shutdown.clone();
-    tokio::spawn(async move {
-        shutdown_signal.cancelled().await;
-        let _ = shutdown_tx.send(());
-    });
-
-    let ctrl_c_shutdown = shutdown.clone();
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            tracing::info!(
-                target = "ironclaw::reborn::cli::serve",
-                "ctrl-c received; signalling WebChat v2 graceful shutdown",
-            );
-            ctrl_c_shutdown.cancel();
-        }
-    });
-
     let (bound_tx, bound_rx) = tokio::sync::oneshot::channel();
     let serve_task = tokio::spawn(async move {
         serve_webui_v2(RebornWebuiServeOptions {
             addr: listen_addr,
             router,
-            shutdown: shutdown_rx,
+            shutdown: webui_ctrl_c_shutdown(),
             bound_addr_tx: Some(bound_tx),
         })
         .await
@@ -616,6 +585,20 @@ async fn start_hosted_single_tenant_startup_listener(
         ready_handle,
         serve_task,
     })
+}
+
+fn webui_ctrl_c_shutdown() -> tokio::sync::oneshot::Receiver<()> {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!(
+                target = "ironclaw::reborn::cli::serve",
+                "ctrl-c received; signalling WebChat v2 graceful shutdown",
+            );
+            let _ = shutdown_tx.send(());
+        }
+    });
+    shutdown_rx
 }
 
 fn reject_non_loopback_privileged_local_runtime(
