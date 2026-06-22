@@ -207,6 +207,7 @@ the current branch.
 | `IRONCLAW_REBORN_PROFILE` | Boot profile selector. Supported values: `local-dev`, `local-dev-yolo`, `production`, `migration-dry-run`. |
 | `IRONCLAW_REBORN_POSTGRES_URL` | Production PostgreSQL storage URL when `[storage].backend = "postgres"` and `[storage].url_env` names this variable. Keep it out of `config.toml`; remote providers must use TLS. |
 | `IRONCLAW_REBORN_POSTGRES_POOL_MAX_SIZE` | Optional override for the Reborn PostgreSQL client pool size. Use this when a managed provider enforces a small session-pool cap. |
+| `IRONCLAW_FILESYSTEM_POSTGRES_MIGRATION_CONNECT_MAX_WAIT_SECS` | Optional startup wait window for Postgres filesystem migration connection retries. Defaults to 300 seconds. |
 | `IRONCLAW_REBORN_SECRET_MASTER_KEY` | Production Reborn secret master key when `[storage].secret_master_key_env` names this variable. Keep it independent from the database URL and out of `config.toml`. |
 | `IRONCLAW_REBORN_LOG` | Tracing filter for the Reborn binary, for example `debug,ironclaw_reborn=trace`. |
 

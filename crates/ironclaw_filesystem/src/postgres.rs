@@ -25,9 +25,14 @@ pub struct PostgresRootFilesystem {
 }
 
 #[cfg(feature = "postgres")]
-const POSTGRES_MIGRATION_CONNECT_ATTEMPTS: u32 = 8;
+const POSTGRES_MIGRATION_CONNECT_MAX_WAIT_ENV: &str =
+    "IRONCLAW_FILESYSTEM_POSTGRES_MIGRATION_CONNECT_MAX_WAIT_SECS";
 #[cfg(feature = "postgres")]
-const POSTGRES_MIGRATION_CONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const POSTGRES_MIGRATION_CONNECT_DEFAULT_MAX_WAIT: Duration = Duration::from_secs(300);
+#[cfg(feature = "postgres")]
+const POSTGRES_MIGRATION_CONNECT_INITIAL_BACKOFF: Duration = Duration::from_millis(250);
+#[cfg(feature = "postgres")]
+const POSTGRES_MIGRATION_CONNECT_MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 #[cfg(feature = "postgres")]
 impl PostgresRootFilesystem {
@@ -46,32 +51,31 @@ impl PostgresRootFilesystem {
     async fn migration_client_with_retry(
         &self,
     ) -> Result<deadpool_postgres::Object, FilesystemError> {
-        let mut last_error = None;
-        for attempt in 0..POSTGRES_MIGRATION_CONNECT_ATTEMPTS {
+        let max_wait = postgres_migration_connect_max_wait()?;
+        let started_at = tokio::time::Instant::now();
+        let mut attempt = 0u32;
+        loop {
+            attempt = attempt.saturating_add(1);
             match self.client().await {
                 Ok(client) => return Ok(client),
                 Err(error) => {
-                    last_error = Some(error);
-                    if attempt + 1 < POSTGRES_MIGRATION_CONNECT_ATTEMPTS {
-                        let delay = postgres_migration_connect_backoff(attempt);
-                        tracing::debug!(
-                            attempt = attempt + 1,
-                            max_attempts = POSTGRES_MIGRATION_CONNECT_ATTEMPTS,
-                            retry_after_ms = delay.as_millis(),
-                            "postgres root filesystem migration connect failed; retrying"
-                        );
-                        tokio::time::sleep(delay).await;
+                    let elapsed = started_at.elapsed();
+                    if elapsed >= max_wait {
+                        return Err(error);
                     }
+                    let remaining = max_wait - elapsed;
+                    let delay = postgres_migration_connect_backoff(attempt - 1).min(remaining);
+                    tracing::debug!(
+                        attempt,
+                        max_wait_ms = max_wait.as_millis(),
+                        elapsed_ms = elapsed.as_millis(),
+                        retry_after_ms = delay.as_millis(),
+                        "postgres root filesystem migration connect failed; retrying"
+                    );
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
-
-        Err(last_error.unwrap_or_else(|| FilesystemError::BackendInfrastructure {
-            operation: FilesystemOperation::Connect,
-            reason: format!(
-                "failed to create PostgreSQL filesystem connection after {POSTGRES_MIGRATION_CONNECT_ATTEMPTS} attempts"
-            ),
-        }))
     }
 
     async fn client(&self) -> Result<deadpool_postgres::Object, FilesystemError> {
@@ -94,7 +98,40 @@ impl PostgresRootFilesystem {
 
 #[cfg(feature = "postgres")]
 fn postgres_migration_connect_backoff(attempt: u32) -> Duration {
-    POSTGRES_MIGRATION_CONNECT_INITIAL_BACKOFF * 2u32.pow(attempt)
+    POSTGRES_MIGRATION_CONNECT_INITIAL_BACKOFF
+        .saturating_mul(2u32.saturating_pow(attempt.min(16)))
+        .min(POSTGRES_MIGRATION_CONNECT_MAX_BACKOFF)
+}
+
+#[cfg(feature = "postgres")]
+fn postgres_migration_connect_max_wait() -> Result<Duration, FilesystemError> {
+    match std::env::var(POSTGRES_MIGRATION_CONNECT_MAX_WAIT_ENV) {
+        Ok(raw) => {
+            let seconds =
+                raw.trim()
+                    .parse::<u64>()
+                    .map_err(|_| FilesystemError::BackendInfrastructure {
+                        operation: FilesystemOperation::Connect,
+                        reason: format!(
+                            "{POSTGRES_MIGRATION_CONNECT_MAX_WAIT_ENV} must be a positive integer"
+                        ),
+                    })?;
+            if seconds == 0 {
+                return Err(FilesystemError::BackendInfrastructure {
+                    operation: FilesystemOperation::Connect,
+                    reason: format!(
+                        "{POSTGRES_MIGRATION_CONNECT_MAX_WAIT_ENV} must be greater than 0"
+                    ),
+                });
+            }
+            Ok(Duration::from_secs(seconds))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(POSTGRES_MIGRATION_CONNECT_DEFAULT_MAX_WAIT),
+        Err(std::env::VarError::NotUnicode(_)) => Err(FilesystemError::BackendInfrastructure {
+            operation: FilesystemOperation::Connect,
+            reason: format!("{POSTGRES_MIGRATION_CONNECT_MAX_WAIT_ENV} must be valid Unicode"),
+        }),
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -1491,3 +1528,20 @@ const POSTGRES_ROOT_FILESYSTEM_SCHEMA: &str = concat!(
     "\n",
     include_str!("../../../migrations/V31__root_filesystem_path_collation.sql"),
 );
+
+#[cfg(all(test, feature = "postgres"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_migration_connect_backoff_is_capped() {
+        assert_eq!(
+            postgres_migration_connect_backoff(0),
+            POSTGRES_MIGRATION_CONNECT_INITIAL_BACKOFF
+        );
+        assert_eq!(
+            postgres_migration_connect_backoff(20),
+            POSTGRES_MIGRATION_CONNECT_MAX_BACKOFF
+        );
+    }
+}
