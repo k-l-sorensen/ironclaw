@@ -58,6 +58,7 @@ use crate::{
 const MODEL_CREDITS_EXHAUSTED_SUMMARY: &str = "model provider account is out of credits";
 const PROVIDER_TOOL_ARGUMENTS_OMITTED_MARKER: &str =
     "arguments omitted because they exceeded the host provider-tool limit";
+const CONTEXT_SHADOW_TARGET: &str = "ironclaw::reborn::context_shadow";
 
 /// Fail-closed routing policy from resolved Reborn model profile ids to the
 /// host-selected provider/model envelope.
@@ -826,6 +827,15 @@ where
                 "reborn model gateway resolved provider tool definitions"
             );
         }
+        if tracing::enabled!(target: CONTEXT_SHADOW_TARGET, tracing::Level::DEBUG) {
+            let est_tool_schema_tokens = estimate_tool_schema_tokens(&tool_definitions);
+            debug!(
+                target: CONTEXT_SHADOW_TARGET,
+                tool_definition_count = tool_definitions.len(),
+                est_tool_schema_tokens,
+                "reborn tool surface shadow measurement"
+            );
+        }
         if !tool_definitions.is_empty() {
             let mut recovery_tool_names = Vec::with_capacity(tool_definitions.len());
             let llm_tool_definitions = tool_definitions
@@ -973,6 +983,17 @@ fn provider_tool_definition_to_llm(definition: ProviderToolDefinition) -> ToolDe
         description: definition.description,
         parameters: definition.parameters,
     }
+}
+
+fn estimate_tool_schema_tokens(definitions: &[ProviderToolDefinition]) -> u32 {
+    definitions.iter().fold(0_u32, |total, definition| {
+        let schema = serde_json::json!({
+            "name": definition.name.as_str(),
+            "description": definition.description.as_str(),
+            "parameters": &definition.parameters,
+        });
+        total.saturating_add(crate::context_shadow::estimate_tokens(&schema.to_string()))
+    })
 }
 
 #[tracing::instrument(

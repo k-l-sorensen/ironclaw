@@ -17,6 +17,8 @@
 //! the boundary tests are designed to prevent.
 
 pub mod app_loop_family;
+#[cfg(any(feature = "root-llm-provider", test))]
+mod context_shadow;
 pub mod driver_registry;
 pub mod failure_categories;
 pub mod hook_gate_refs;
