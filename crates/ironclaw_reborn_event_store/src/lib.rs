@@ -52,7 +52,7 @@ mod filesystem_store;
 pub use filesystem_store::{FilesystemDurableAuditLog, FilesystemDurableEventLog};
 
 #[cfg(feature = "postgres")]
-pub const DEFAULT_POSTGRES_POOL_MAX_SIZE: usize = 4;
+pub const DEFAULT_POSTGRES_POOL_MAX_SIZE: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PostgresPoolTlsOptions {

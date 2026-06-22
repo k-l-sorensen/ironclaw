@@ -149,9 +149,9 @@ may name the PostgreSQL URL variable, but must not contain the raw URL:
 backend = "postgres"
 url_env = "IRONCLAW_REBORN_POSTGRES_URL"
 secret_master_key_env = "IRONCLAW_REBORN_SECRET_MASTER_KEY"
-# Optional; defaults to 4. Keep below the PostgreSQL server or managed
+# Optional; defaults to 2. Keep below the PostgreSQL server or managed
 # session-pool cap after reserving capacity for restarts and operator sessions.
-pool_max_size = 4
+pool_max_size = 2
 
 [policy]
 deployment_mode = "hosted_multi_tenant"
@@ -206,6 +206,7 @@ the current branch.
 | `IRONCLAW_REBORN_HOME` | Absolute Reborn state root. Defaults to `$HOME/.ironclaw/reborn`. The resolver rejects unsafe paths and v1 state-root aliases such as `$HOME/.ironclaw`. |
 | `IRONCLAW_REBORN_PROFILE` | Boot profile selector. Supported values: `local-dev`, `local-dev-yolo`, `production`, `migration-dry-run`. |
 | `IRONCLAW_REBORN_POSTGRES_URL` | Production PostgreSQL storage URL when `[storage].backend = "postgres"` and `[storage].url_env` names this variable. Keep it out of `config.toml`; remote providers must use TLS. |
+| `IRONCLAW_REBORN_POSTGRES_POOL_MAX_SIZE` | Optional override for the Reborn PostgreSQL client pool size. Use this when a managed provider enforces a small session-pool cap. |
 | `IRONCLAW_REBORN_SECRET_MASTER_KEY` | Production Reborn secret master key when `[storage].secret_master_key_env` names this variable. Keep it independent from the database URL and out of `config.toml`. |
 | `IRONCLAW_REBORN_LOG` | Tracing filter for the Reborn binary, for example `debug,ironclaw_reborn=trace`. |
 

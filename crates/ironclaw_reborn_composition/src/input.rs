@@ -39,6 +39,8 @@ const DEFAULT_REBORN_POSTGRES_URL_ENV: &str = "IRONCLAW_REBORN_POSTGRES_URL";
 #[cfg(feature = "postgres")]
 const DEFAULT_REBORN_SECRET_MASTER_KEY_ENV: &str = "IRONCLAW_REBORN_SECRET_MASTER_KEY";
 #[cfg(feature = "postgres")]
+const REBORN_POSTGRES_POOL_MAX_SIZE_ENV: &str = "IRONCLAW_REBORN_POSTGRES_POOL_MAX_SIZE";
+#[cfg(feature = "postgres")]
 const DATABASE_SSLMODE_ENV: &str = "DATABASE_SSLMODE";
 #[cfg(feature = "postgres")]
 const ALLOW_REMOTE_POSTGRES_CLEAR_TEXT_ENV: &str =
@@ -751,9 +753,14 @@ fn resolve_postgres_storage_from_config_and_env(
         "Reborn secret master key",
         "storage.secret_master_key_env",
     )?;
-    let pool_max_size = storage
-        .pool_max_size
-        .unwrap_or(ironclaw_reborn_event_store::DEFAULT_POSTGRES_POOL_MAX_SIZE);
+    let (pool_max_size, pool_max_size_source) =
+        resolve_postgres_pool_max_size(storage.pool_max_size)?;
+    tracing::debug!(
+        %profile,
+        pool_max_size,
+        pool_max_size_source,
+        "resolved Reborn PostgreSQL pool size"
+    );
     let tls_options = postgres_pool_tls_options_from_env()?;
     let pool = ironclaw_reborn_event_store::open_postgres_pool_with_tls_options(
         database_url.clone(),
@@ -815,6 +822,40 @@ fn resolve_production_runtime_policy(
              default_profile={default_profile}: {error}"
         ),
     })
+}
+
+#[cfg(feature = "postgres")]
+fn resolve_postgres_pool_max_size(
+    configured: Option<usize>,
+) -> Result<(usize, &'static str), RebornBuildError> {
+    match std::env::var(REBORN_POSTGRES_POOL_MAX_SIZE_ENV) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            let parsed = trimmed
+                .parse::<usize>()
+                .map_err(|_| RebornBuildError::InvalidConfig {
+                    reason: format!(
+                        "{REBORN_POSTGRES_POOL_MAX_SIZE_ENV} must be a positive integer"
+                    ),
+                })?;
+            if parsed == 0 {
+                return Err(RebornBuildError::InvalidConfig {
+                    reason: format!("{REBORN_POSTGRES_POOL_MAX_SIZE_ENV} must be greater than 0"),
+                });
+            }
+            Ok((parsed, "env"))
+        }
+        Err(std::env::VarError::NotPresent) => Ok(configured.map_or(
+            (
+                ironclaw_reborn_event_store::DEFAULT_POSTGRES_POOL_MAX_SIZE,
+                "default",
+            ),
+            |value| (value, "config"),
+        )),
+        Err(std::env::VarError::NotUnicode(_)) => Err(RebornBuildError::InvalidConfig {
+            reason: format!("{REBORN_POSTGRES_POOL_MAX_SIZE_ENV} must be valid Unicode"),
+        }),
+    }
 }
 
 #[cfg(feature = "postgres")]

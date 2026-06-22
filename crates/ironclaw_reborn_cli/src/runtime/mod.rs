@@ -1438,6 +1438,7 @@ secret_master_key_env = "IRONCLAW_REBORN_SECRET_MASTER_KEY"
         );
         let secret_master_key =
             EnvGuard::set("IRONCLAW_REBORN_SECRET_MASTER_KEY", "test-master-key");
+        let pool_max_size = EnvGuard::set("IRONCLAW_REBORN_POSTGRES_POOL_MAX_SIZE", "1");
         let (_temp, config) = boot_config_with_config_toml(
             "hosted-single-tenant",
             r#"
@@ -1459,6 +1460,47 @@ secret_master_key_env = "IRONCLAW_REBORN_SECRET_MASTER_KEY"
         );
         assert_eq!(policy.requested_profile.as_str(), "local_dev");
         assert!(!services.grants_trusted_laptop_access());
+        drop(pool_max_size);
+        drop(secret_master_key);
+        drop(postgres_url);
+        drop(database_sslmode);
+        drop(allow_cleartext);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[test]
+    fn build_runtime_input_rejects_invalid_postgres_pool_max_size_override() {
+        let _lock = lock_trigger_env();
+        let (_enabled, _interval) = clear_trigger_poller_env();
+        let (database_sslmode, allow_cleartext) = clear_reborn_postgres_tls_env();
+        let postgres_url = EnvGuard::set(
+            "IRONCLAW_REBORN_POSTGRES_URL",
+            "postgres://event_user:RAW_PASSWORD_SENTINEL_3162@db.example.com/events?sslmode=require",
+        );
+        let secret_master_key =
+            EnvGuard::set("IRONCLAW_REBORN_SECRET_MASTER_KEY", "test-master-key");
+        let pool_max_size = EnvGuard::set("IRONCLAW_REBORN_POSTGRES_POOL_MAX_SIZE", "0");
+        let (_temp, config) = boot_config_with_config_toml(
+            "hosted-single-tenant",
+            r#"
+[storage]
+backend = "postgres"
+url_env = "IRONCLAW_REBORN_POSTGRES_URL"
+secret_master_key_env = "IRONCLAW_REBORN_SECRET_MASTER_KEY"
+"#,
+        );
+
+        let err = match build_runtime_input(&config, RuntimeInputCaller::Serve) {
+            Ok(_) => panic!("zero pool override must fail"),
+            Err(error) => error,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("IRONCLAW_REBORN_POSTGRES_POOL_MAX_SIZE"),
+            "error must identify pool override env var: {err:#}"
+        );
+        drop(pool_max_size);
         drop(secret_master_key);
         drop(postgres_url);
         drop(database_sslmode);

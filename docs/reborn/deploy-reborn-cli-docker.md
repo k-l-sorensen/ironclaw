@@ -94,6 +94,10 @@ IRONCLAW_REBORN_WEBUI_USER_ID=reborn-cli
 NEARAI_API_KEY=<nearai-api-key>
 ```
 
+For managed Postgres providers with a small session-pool cap, set
+`IRONCLAW_REBORN_POSTGRES_POOL_MAX_SIZE=1` or `2` rather than relying on the
+provider to queue excess sessions.
+
 `ironclaw-reborn serve` exits before binding the HTTP listener if the WebUI
 token/user variables are missing. The bundled config selects NearAI as the
 default LLM provider, so set `NEARAI_API_KEY` unless a custom mounted config

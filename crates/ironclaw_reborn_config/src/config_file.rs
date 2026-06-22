@@ -216,7 +216,7 @@ pub struct StorageSection {
     pub url_env: Option<String>,
     /// Environment variable name containing the Reborn secret master key.
     pub secret_master_key_env: Option<String>,
-    /// PostgreSQL connection pool size for production storage. Defaults to 4.
+    /// PostgreSQL connection pool size for production storage. Defaults to 2.
     pub pool_max_size: Option<usize>,
 }
 
