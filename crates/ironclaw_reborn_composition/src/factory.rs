@@ -47,8 +47,8 @@ use ironclaw_host_api::runtime_policy::{
     EffectiveRuntimePolicy, FilesystemBackendKind, ProcessBackendKind, SecretMode,
 };
 use ironclaw_host_api::{
-    EffectKind, ExtensionId, HostPath, MountPermissions, MountView, PackageId, ResourceScope,
-    RuntimeHttpEgress, UserId, VirtualPath,
+    EffectKind, ExtensionId, HostPath, InvocationId, MountPermissions, MountView, PackageId,
+    ResourceScope, RuntimeHttpEgress, UserId, VirtualPath,
 };
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 use ironclaw_host_api::{HostApiError, MountAlias, MountGrant};
@@ -791,6 +791,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         local_runtime_identity,
         ..
     } = input;
+    let local_runtime_identity_for_nearai_mcp = local_runtime_identity.clone();
     let (root, workspace_root, host_home_root, storage_backend_input, secret_master_key) =
         match storage {
             RebornStorageInput::LocalDev { .. }
@@ -971,10 +972,9 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         Arc::clone(&filesystem),
         runtime_workspace_mounts.clone(),
     ));
-    let nearai_mcp_resource_scope = nearai_mcp_bootstrap_resource_scope(
-        profile,
-        local_runtime_identity.as_ref(),
-        &owner_user_id,
+    let nearai_mcp_owner_scope = local_dev_nearai_mcp_owner_scope(
+        owner_user_id.clone(),
+        local_runtime_identity_for_nearai_mcp.as_ref(),
     )?;
     let mut store_graph = build_local_dev_store_graph(RebornLocalDevStoreGraphInput {
         filesystem: Arc::clone(&filesystem),
@@ -1203,7 +1203,7 @@ async fn build_local_runtime(input: RebornBuildInput) -> Result<RebornServices, 
         nearai_mcp_bootstrap_config,
         &product_auth,
         &extension_management,
-        nearai_mcp_resource_scope,
+        nearai_mcp_owner_scope,
     )
     .await?;
     nearai_mcp_bootstrap_outcome.log_completion();
@@ -1459,35 +1459,20 @@ fn local_dev_extension_lifecycle_surface_context(
     })
 }
 
-fn nearai_mcp_bootstrap_resource_scope(
-    profile: RebornCompositionProfile,
+fn local_dev_nearai_mcp_owner_scope(
+    owner_user_id: UserId,
     local_runtime_identity: Option<&RebornLocalRuntimeIdentity>,
-    owner_user_id: &UserId,
 ) -> Result<ResourceScope, RebornBuildError> {
-    if profile != RebornCompositionProfile::HostedSingleTenant {
-        return ResourceScope::local_default(
-            owner_user_id.clone(),
-            ironclaw_host_api::InvocationId::new(),
-        )
-        .map_err(|error| RebornBuildError::InvalidConfig {
-            reason: format!("NEAR AI MCP auto-enable scope could not be built: {error}"),
-        });
-    }
-
-    let Some(local_runtime_identity) = local_runtime_identity else {
-        return Err(RebornBuildError::InvalidConfig {
-            reason: "hosted-single-tenant NEAR AI MCP bootstrap requires runtime identity"
-                .to_string(),
-        });
-    };
+    let context =
+        local_dev_extension_lifecycle_surface_context(owner_user_id, local_runtime_identity)?;
     Ok(ResourceScope {
-        tenant_id: local_runtime_identity.tenant_id.clone(),
-        user_id: owner_user_id.clone(),
-        agent_id: Some(local_runtime_identity.agent_id.clone()),
-        project_id: None,
+        tenant_id: context.tenant_id,
+        user_id: context.user_id,
+        agent_id: context.agent_id,
+        project_id: context.project_id,
         mission_id: None,
         thread_id: None,
-        invocation_id: ironclaw_host_api::InvocationId::new(),
+        invocation_id: InvocationId::new(),
     })
 }
 
@@ -3910,7 +3895,6 @@ mod tests {
             source: ironclaw_triggers::TriggerSourceKind::Schedule,
             schedule: ironclaw_triggers::TriggerSchedule::cron("* * * * *")
                 .expect("valid cron expression"),
-            completion_policy: ironclaw_triggers::TriggerCompletionPolicy::Recurring,
             prompt: "pairing test prompt".to_string(),
             state: ironclaw_triggers::TriggerState::Scheduled,
             next_run_at: chrono::Utc::now(),
@@ -4820,12 +4804,8 @@ mod tests {
             agent_id: ironclaw_host_api::AgentId::new("hosted-nearai-agent").expect("agent"),
         };
 
-        let scope = nearai_mcp_bootstrap_resource_scope(
-            RebornCompositionProfile::HostedSingleTenant,
-            Some(&identity),
-            &owner,
-        )
-        .expect("hosted NEAR AI bootstrap scope");
+        let scope = local_dev_nearai_mcp_owner_scope(owner.clone(), Some(&identity))
+            .expect("hosted NEAR AI bootstrap scope");
 
         assert_eq!(scope.tenant_id, identity.tenant_id);
         assert_eq!(scope.user_id, owner);
@@ -4889,7 +4869,8 @@ mod tests {
         assert_eq!(search.runtime_credentials[0].audience.port, Some(9443));
 
         let auth_scope = AuthProductScope::new(
-            ResourceScope::local_default(UserId::new(owner).unwrap(), InvocationId::new()).unwrap(),
+            local_dev_nearai_mcp_owner_scope(UserId::new(owner).unwrap(), None)
+                .expect("NEAR AI MCP owner scope"),
             AuthSurface::Api,
         );
         let accounts = services
@@ -4914,7 +4895,8 @@ mod tests {
         let root = dir.path().join("local-dev");
         let owner = "local-dev-nearai-mcp-idempotent-owner";
         let auth_scope = AuthProductScope::new(
-            ResourceScope::local_default(UserId::new(owner).unwrap(), InvocationId::new()).unwrap(),
+            local_dev_nearai_mcp_owner_scope(UserId::new(owner).unwrap(), None)
+                .expect("NEAR AI MCP owner scope"),
             AuthSurface::Api,
         );
 
@@ -4987,10 +4969,6 @@ mod tests {
     async fn local_dev_nearai_mcp_bootstrap_reinstalls_discovered_reused_credential() {
         let dir = tempfile::tempdir().expect("tempdir");
         let owner = "local-dev-nearai-mcp-discovered-owner";
-        let auth_scope = AuthProductScope::new(
-            ResourceScope::local_default(UserId::new(owner).unwrap(), InvocationId::new()).unwrap(),
-            AuthSurface::Api,
-        );
         let nearai_ref =
             LifecyclePackageRef::new(LifecyclePackageKind::Extension, "nearai").expect("valid ref");
 
@@ -5022,7 +5000,8 @@ mod tests {
             ),
             services.product_auth.as_ref().expect("product auth"),
             extension_management,
-            auth_scope.resource.clone(),
+            local_dev_nearai_mcp_owner_scope(UserId::new(owner).unwrap(), None)
+                .expect("NEAR AI MCP owner scope"),
         )
         .await
         .expect("bootstrap should reinstall discovered extension");
