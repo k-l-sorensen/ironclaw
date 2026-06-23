@@ -337,14 +337,17 @@ export IRONCLAW_REBORN_HOME="$PWD/.reborn-home"
 export OPENAI_API_KEY="sk-..." # or the required env var for your configured provider
 export IRONCLAW_REBORN_WEBUI_TOKEN="$(openssl rand -hex 32)"
 export IRONCLAW_REBORN_WEBUI_USER_ID="reborn-cli"
+export IRONCLAW_REBORN_SLACK_ENABLED="true"
 export IRONCLAW_REBORN_SLACK_SIGNING_SECRET="..."
 export IRONCLAW_REBORN_SLACK_BOT_TOKEN="xoxb-..."
 
 cargo run -q -p ironclaw_reborn_cli --features slack-v2-host-beta --bin ironclaw-reborn -- serve
 ```
 
-Slack env vars alone do not enable Slack. Add a `[slack]` section to
-`config.toml`:
+Slack signing-secret and bot-token env vars alone do not enable Slack. Set
+`IRONCLAW_REBORN_SLACK_ENABLED=true`, or add `enabled = true` to the `[slack]`
+section in `config.toml`. The remaining Slack installation metadata still lives
+in `[slack]`:
 
 ```toml
 [slack]
@@ -362,7 +365,7 @@ Required Slack settings and env vars:
 
 | Name | Purpose |
 | --- | --- |
-| `[slack].enabled = true` | Mounts the Slack route during `serve`. |
+| `[slack].enabled = true` or `IRONCLAW_REBORN_SLACK_ENABLED=true` | Mounts the Slack route during `serve`; the env var overrides the TOML gate and `0`/`false` acts as a kill switch. |
 | `[slack].installation_id` | Stable local installation id. |
 | `[slack].team_id` | Slack workspace/team id. |
 | `[slack].api_app_id` | Slack app id. |

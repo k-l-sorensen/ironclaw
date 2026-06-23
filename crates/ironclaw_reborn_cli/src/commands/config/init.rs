@@ -220,6 +220,7 @@ api_key_env = "OPENAI_API_KEY"
 # [slack]
 # # Host-beta Slack Events API route for `ironclaw-reborn serve`.
 # # Requires a binary built with `--features slack-v2-host-beta`.
+# # Can also be overridden by IRONCLAW_REBORN_SLACK_ENABLED.
 # enabled = false
 # installation_id = "install-alpha"
 # team_id = "T123"

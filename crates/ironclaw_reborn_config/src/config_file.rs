@@ -294,15 +294,17 @@ pub struct WebuiSection {
 
 /// Slack Events API host-beta configuration.
 ///
-/// `enabled = true` is required before the standalone Reborn listener mounts
-/// `/webhooks/slack/events`; the route is never enabled by ambient Slack
-/// environment variables alone. Signing secret and bot token values stay
-/// env-only: `signing_secret_env` and `bot_token_env` are variable names.
+/// `enabled = true` or `IRONCLAW_REBORN_SLACK_ENABLED=true` is required before
+/// the standalone Reborn listener mounts `/webhooks/slack/events`. The env var
+/// overrides only this enablement gate; host installation IDs still come from
+/// this section. Signing secret and bot token values stay env-only:
+/// `signing_secret_env` and `bot_token_env` are variable names.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SlackSection {
     /// Explicit host-beta enablement gate. Omitted/false means the Slack route
-    /// is not mounted by `ironclaw-reborn serve`.
+    /// is not mounted by `ironclaw-reborn serve` unless
+    /// `IRONCLAW_REBORN_SLACK_ENABLED` overrides it.
     pub enabled: Option<bool>,
     /// Adapter installation id for this Slack workspace/app installation.
     pub installation_id: Option<String>,
