@@ -255,11 +255,11 @@ test("SlackSetupPanel defines field guidance for Slack credentials", () => {
   const { context } = setupContext(state);
   const help = context.globalThis.__testExports.FIELD_HELP;
 
-  assert.equal(help.installationId.title, "Choose a local install ID");
+  assert.match(help.installationId.body, /Local IronClaw name/);
   assert.equal(help.installationId.example, "Example: local-slack");
-  assert.equal(help.teamId.title, "Slack workspace ID");
+  assert.match(help.teamId.body, /workspace\/team ID/);
   assert.equal(help.teamId.example, "Example: T0123456789");
-  assert.equal(help.appId.title, "Slack app ID");
+  assert.match(help.appId.body, /App Credentials/);
   assert.equal(help.appId.example, "Example: A0123456789");
   assert.match(help.botToken.body, /Bot User OAuth Token/);
   assert.match(help.signingSecret.body, /Signing Secret/);

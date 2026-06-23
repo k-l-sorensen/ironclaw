@@ -1,6 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button } from "../design-system/button.js";
-import { Icon } from "../design-system/icons.js";
 import { React, html } from "../lib/html.js";
 import { getSlackSetup, saveSlackSetup, slackSetupError } from "../lib/slack-setup-api.js";
 import { SlackChannelPicker } from "./slack-channel-picker.js";
@@ -8,45 +7,31 @@ import { SlackChannelPicker } from "./slack-channel-picker.js";
 const QUERY_KEY = ["slack-setup"];
 const FIELD_HELP = {
   installationId: {
-    title: "Choose a local install ID",
-    body:
-      "IronClaw uses this stable name to key Slack routes and pairings. It is not issued by Slack; keep it unchanged after setup.",
+    body: "Local IronClaw name for this Slack install. Choose one and keep it stable.",
     example: "Example: local-slack",
   },
   teamId: {
-    title: "Slack workspace ID",
-    body:
-      "The team/workspace ID for the Slack workspace that installed the app. Slack event payloads include this as team_id.",
+    body: "Slack workspace/team ID from the workspace that installed the app.",
     example: "Example: T0123456789",
   },
   appId: {
-    title: "Slack app ID",
-    body:
-      "Open the app on api.slack.com/apps, then Basic Information. Use the App ID from App Credentials.",
+    body: "Slack app Basic Information > App Credentials.",
     example: "Example: A0123456789",
   },
   botUser: {
-    title: "Optional Reborn user",
-    body:
-      "Leave blank to use the current WebUI operator. Set this only when this Slack install should always run as a specific Reborn user.",
+    body: "Optional Reborn user. Blank uses the current WebUI operator.",
     example: "Example: user:operator",
   },
   sharedSubject: {
-    title: "Optional shared subject",
-    body:
-      "Used for shared channel turns when no team agent is selected. Leave blank for normal local testing.",
+    body: "Optional default team agent for shared channel turns. Usually blank.",
     example: "Example: user:slack-shared",
   },
   botToken: {
-    title: "Slack bot token",
-    body:
-      "After installing the Slack app, open OAuth & Permissions and copy the Bot User OAuth Token.",
+    body: "Slack app OAuth & Permissions > Bot User OAuth Token.",
     example: "Example: xoxb-...",
   },
   signingSecret: {
-    title: "Slack signing secret",
-    body:
-      "Open the Slack app Basic Information page and copy the Signing Secret from App Credentials.",
+    body: "Slack app Basic Information > App Credentials > Signing Secret.",
     example: "",
   },
 };
@@ -220,7 +205,7 @@ function emptyForm() {
 function textInput(label, value, onChange, placeholder = "", help = null) {
   return html`
     <label className="min-w-0">
-      <${FieldLabel} label=${label} help=${help} />
+      <span className="mb-1 block text-[11px] text-iron-500">${label}</span>
       <input
         type="text"
         value=${value}
@@ -228,6 +213,7 @@ function textInput(label, value, onChange, placeholder = "", help = null) {
         placeholder=${placeholder}
         className="h-9 w-full min-w-0 rounded-md border border-white/12 bg-white/[0.04] px-3 font-mono text-sm text-iron-100 outline-none placeholder:text-iron-700 focus:border-signal/45"
       />
+      <${FieldHint} help=${help} />
     </label>
   `;
 }
@@ -235,7 +221,7 @@ function textInput(label, value, onChange, placeholder = "", help = null) {
 function secretInput(label, value, onChange, configured, help = null) {
   return html`
     <label className="min-w-0">
-      <${FieldLabel} label=${label} help=${help} />
+      <span className="mb-1 block text-[11px] text-iron-500">${label}</span>
       <input
         type="password"
         value=${value}
@@ -243,44 +229,19 @@ function secretInput(label, value, onChange, configured, help = null) {
         placeholder=${configured ? "Configured; leave blank to keep" : ""}
         className="h-9 w-full min-w-0 rounded-md border border-white/12 bg-white/[0.04] px-3 text-sm text-iron-100 outline-none placeholder:text-iron-700 focus:border-signal/45"
       />
+      <${FieldHint} help=${help} />
     </label>
   `;
 }
 
-function FieldLabel({ label, help }) {
+function FieldHint({ help }) {
+  if (!help) return null;
   return html`
-    <span className="mb-1 flex min-w-0 items-center gap-1.5 text-[11px] text-iron-500">
-      <span className="truncate">${label}</span>
-      ${help && html`<${FieldHelp} help=${help} />`}
-    </span>
-  `;
-}
-
-function FieldHelp({ help }) {
-  const accessibleText = [help.title, help.body, help.example].filter(Boolean).join(". ");
-  return html`
-    <span className="group/help relative inline-flex shrink-0">
-      <button
-        type="button"
-        aria-label=${accessibleText}
-        className="grid h-4 w-4 place-items-center rounded-full text-iron-500 outline-none hover:text-signal focus-visible:text-signal focus-visible:ring-1 focus-visible:ring-signal/50"
-      >
-        <${Icon} name="info" className="h-3.5 w-3.5" strokeWidth=${1.8} />
-      </button>
-      <span
-        role="tooltip"
-        className="pointer-events-none absolute left-0 top-5 z-30 hidden w-[min(18rem,calc(100vw-3rem))] rounded-lg border border-white/10 bg-iron-900 p-3 text-left shadow-xl shadow-black/30 group-hover/help:block group-focus-within/help:block"
-      >
-        <span className="block font-mono text-[10px] uppercase tracking-[0.12em] text-signal">
-          ${help.title}
-        </span>
-        <span className="mt-1 block text-xs leading-5 text-iron-300">${help.body}</span>
-        ${help.example &&
-        html`<span className="mt-2 block font-mono text-[11px] text-iron-200">
-          ${help.example}
-        </span>`}
-      </span>
-    </span>
+    <p className="mt-1.5 min-h-8 text-[11px] leading-4 text-iron-400">
+      <span className="block">${help.body}</span>
+      ${help.example &&
+      html`<span className="mt-0.5 block font-mono text-iron-300">${help.example}</span>`}
+    </p>
   `;
 }
 
