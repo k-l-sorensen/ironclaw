@@ -52,10 +52,8 @@ impl RequiredMemoryProfileId {
     }
 
     pub fn capability_profile_id(&self) -> CapabilityProfileId {
-        // Safety: these literals are fixed required-profile contract IDs and
-        // are covered by the integration tests for the public constructors.
         CapabilityProfileId::new(self.as_str())
-            .expect("hardcoded required memory profile id must validate")
+            .expect("required memory profile id must validate") // safety: fixed contract id, validated by integration tests
     }
 
     pub const fn as_str(&self) -> &'static str {
@@ -108,11 +106,9 @@ impl MemoryProfileBindingTarget {
     }
 
     fn literal(value: &'static str) -> Self {
-        // Safety: these literals are host-owned sentinel/default IDs and are
-        // covered by integration tests that exercise the public constructors.
         Self {
             extension_id: ExtensionId::new(value)
-                .expect("hardcoded memory binding extension id must validate"),
+                .expect("memory binding extension id must validate"), // safety: host-owned sentinel id, validated by integration tests
         }
     }
 }
