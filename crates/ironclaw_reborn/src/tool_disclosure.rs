@@ -199,6 +199,25 @@ fn is_core_tool_definition(definition: &ProviderToolDefinition) -> bool {
         .any(|core_name| definition_matches_core_name(definition, core_name))
 }
 
+pub(crate) fn definition_matches_provider_name(
+    definition: &ProviderToolDefinition,
+    provider_name: &str,
+) -> bool {
+    if definition.name == provider_name {
+        return true;
+    }
+    if let Some(builtin_name) = provider_name
+        .strip_prefix("builtin__")
+        .or_else(|| provider_name.strip_prefix("builtin."))
+    {
+        return definition_matches_core_name(definition, builtin_name);
+    }
+    let capability_id = definition.capability_id.as_str();
+    capability_id
+        .strip_prefix("builtin.")
+        .is_some_and(|name| name == provider_name)
+}
+
 fn definition_matches_core_name(definition: &ProviderToolDefinition, core_name: &str) -> bool {
     if definition.name == core_name {
         return true;

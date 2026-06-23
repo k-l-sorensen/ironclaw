@@ -24,8 +24,8 @@ use tracing::debug;
 
 use crate::tool_disclosure::{
     ActiveSet, CapabilityCatalog, DisclosureCaps, PromotedSet, TOOL_CALL_NAME, TOOL_DESCRIBE_NAME,
-    TOOL_SEARCH_NAME, bridge_tool_definitions, canonicalize_json, is_bridge_capability_id,
-    is_bridge_name, select_active_set, tool_search_rank,
+    TOOL_SEARCH_NAME, bridge_tool_definitions, canonicalize_json, definition_matches_provider_name,
+    is_bridge_capability_id, is_bridge_name, select_active_set, tool_search_rank,
 };
 
 const DISCLOSURE_INPUT_PREFIX: &str = "input:tool-disclosure:";
@@ -91,6 +91,12 @@ struct BridgeInvocation {
     arguments: Value,
 }
 
+#[derive(Debug, Clone)]
+struct ResolvedToolTarget {
+    definition: ProviderToolDefinition,
+    target_call: ProviderToolCall,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct PromotionScopeKey {
     tenant_id: TenantId,
@@ -150,12 +156,15 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
         tool_call: &ProviderToolCall,
     ) -> Result<ProviderToolCallCapabilityIds, AgentLoopHostError> {
         if !is_bridge_name(&tool_call.name) {
-            if let Some(definition) = self.direct_deferred_target(tool_call)? {
+            if let Some(target) = self.direct_deferred_target(tool_call)? {
                 debug!(
                     tool_name = tool_call.name.as_str(),
-                    capability_id = definition.capability_id.as_str(),
+                    capability_id = target.definition.capability_id.as_str(),
                     "reborn tool disclosure resolving direct deferred provider tool call"
                 );
+                return Ok(ProviderToolCallCapabilityIds::single(
+                    target.definition.capability_id,
+                ));
             }
             return self.inner.provider_tool_call_capability_ids(tool_call);
         }
@@ -163,8 +172,8 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
             && let Some(target) = self.allowed_tool_call_target(tool_call)?
         {
             return Ok(ProviderToolCallCapabilityIds {
-                provider_capability_id: target.capability_id.clone(),
-                effective_capability_ids: vec![target.capability_id],
+                provider_capability_id: target.definition.capability_id.clone(),
+                effective_capability_ids: vec![target.definition.capability_id],
             });
         }
         let Some(definition) = bridge_tool_definitions()
@@ -183,12 +192,13 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
         tool_call: &ProviderToolCall,
     ) -> Result<(), AgentLoopHostError> {
         if !is_bridge_name(&tool_call.name) {
-            if let Some(definition) = self.direct_deferred_target(tool_call)? {
+            if let Some(target) = self.direct_deferred_target(tool_call)? {
                 debug!(
                     tool_name = tool_call.name.as_str(),
-                    capability_id = definition.capability_id.as_str(),
+                    capability_id = target.definition.capability_id.as_str(),
                     "reborn tool disclosure validating direct deferred provider tool call"
                 );
+                return self.inner.validate_provider_tool_call(&target.target_call);
             }
             return self.inner.validate_provider_tool_call(tool_call);
         }
@@ -199,9 +209,9 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
             return Ok(());
         }
         if tool_call.name == TOOL_CALL_NAME
-            && let Some(target_call) = self.synthetic_target_call(tool_call)?
+            && let Some(target) = self.allowed_tool_call_target(tool_call)?
         {
-            return self.inner.validate_provider_tool_call(&target_call);
+            return self.inner.validate_provider_tool_call(&target.target_call);
         }
         Ok(())
     }
@@ -211,13 +221,17 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
         tool_call: ProviderToolCall,
     ) -> Result<CapabilityCallCandidate, AgentLoopHostError> {
         if !is_bridge_name(&tool_call.name) {
-            if let Some(definition) = self.direct_deferred_target(&tool_call)? {
+            if let Some(target) = self.direct_deferred_target(&tool_call)? {
                 debug!(
                     tool_name = tool_call.name.as_str(),
-                    capability_id = definition.capability_id.as_str(),
+                    capability_id = target.definition.capability_id.as_str(),
                     "reborn tool disclosure registering direct deferred provider tool call"
                 );
-                let candidate = self.inner.register_provider_tool_call(tool_call).await?;
+                let mut candidate = self
+                    .inner
+                    .register_provider_tool_call(target.target_call)
+                    .await?;
+                candidate.provider_replay = Some(provider_replay_for(&tool_call));
                 self.record_promotable_input(
                     candidate.input_ref.as_str(),
                     candidate.capability_id.clone(),
@@ -227,9 +241,12 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
             return self.inner.register_provider_tool_call(tool_call).await;
         }
         if tool_call.name == TOOL_CALL_NAME
-            && let Some(target_call) = self.synthetic_target_call(&tool_call)?
+            && let Some(target) = self.allowed_tool_call_target(&tool_call)?
         {
-            let mut candidate = self.inner.register_provider_tool_call(target_call).await?;
+            let mut candidate = self
+                .inner
+                .register_provider_tool_call(target.target_call)
+                .await?;
             candidate.provider_replay = Some(provider_replay_for(&tool_call));
             self.record_promotable_input(
                 candidate.input_ref.as_str(),
@@ -575,57 +592,62 @@ impl ToolDisclosureCapabilityPort {
         }))
     }
 
-    fn synthetic_target_call(
+    fn target_call(
         &self,
         tool_call: &ProviderToolCall,
-    ) -> Result<Option<ProviderToolCall>, AgentLoopHostError> {
-        let Some(target) = self.allowed_tool_call_target(tool_call)? else {
-            return Ok(None);
-        };
-        let arguments = tool_call
-            .arguments
-            .get("arguments")
-            .cloned()
-            .unwrap_or_else(|| json!({}));
+        target: &ProviderToolDefinition,
+        arguments: Value,
+    ) -> ProviderToolCall {
         let digest_input = provider_call_digest_input(&tool_call.id, &target.name, &arguments);
         let target_id = ironclaw_host_api::sha256_digest_token(digest_input.as_bytes());
-        Ok(Some(ProviderToolCall {
+        ProviderToolCall {
             provider_id: tool_call.provider_id.clone(),
             provider_model_id: tool_call.provider_model_id.clone(),
             turn_id: tool_call.turn_id.clone(),
             id: format!("{}:{target_id}", tool_call.id),
-            name: target.name,
+            name: target.name.clone(),
             arguments,
             response_reasoning: tool_call.response_reasoning.clone(),
             reasoning: tool_call.reasoning.clone(),
             signature: tool_call.signature.clone(),
-        }))
+        }
     }
 
     fn allowed_tool_call_target(
         &self,
         tool_call: &ProviderToolCall,
-    ) -> Result<Option<ProviderToolDefinition>, AgentLoopHostError> {
+    ) -> Result<Option<ResolvedToolTarget>, AgentLoopHostError> {
         let Some(name) = tool_call.arguments.get("name").and_then(Value::as_str) else {
             return Ok(None);
         };
         if is_bridge_name(name) {
             return Ok(None);
         }
+        let arguments = tool_call
+            .arguments
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
         let guard = self.turn_state()?;
         let Some(state) = guard.as_ref() else {
             return Ok(None);
         };
-        let Some(definition) = state.catalog.definition_by_name(name).cloned() else {
+        let Some(definition) = self.catalog_target(state, name) else {
             return Ok(None);
         };
         let active = state
             .active
             .definitions
             .iter()
-            .any(|candidate| candidate.name == name);
-        if active || state.disclosed_names.contains(name) {
-            Ok(Some(definition))
+            .any(|candidate| candidate.capability_id == definition.capability_id);
+        let disclosed = state.disclosed_names.contains(name)
+            || state.disclosed_names.contains(&definition.name);
+        if active || disclosed {
+            let target_call = self.target_call(tool_call, &definition, arguments);
+            Ok(Some(ResolvedToolTarget {
+                definition,
+                target_call,
+            }))
         } else {
             Ok(None)
         }
@@ -634,7 +656,7 @@ impl ToolDisclosureCapabilityPort {
     fn direct_deferred_target(
         &self,
         tool_call: &ProviderToolCall,
-    ) -> Result<Option<ProviderToolDefinition>, AgentLoopHostError> {
+    ) -> Result<Option<ResolvedToolTarget>, AgentLoopHostError> {
         if is_bridge_name(&tool_call.name) {
             return Ok(None);
         }
@@ -642,7 +664,7 @@ impl ToolDisclosureCapabilityPort {
         let Some(state) = guard.as_ref() else {
             return Ok(None);
         };
-        let Some(definition) = state.catalog.definition_by_name(&tool_call.name).cloned() else {
+        let Some(definition) = self.catalog_target(state, &tool_call.name) else {
             return Ok(None);
         };
         let active = state
@@ -653,8 +675,29 @@ impl ToolDisclosureCapabilityPort {
         if active {
             Ok(None)
         } else {
-            Ok(Some(definition))
+            let target_call = self.target_call(tool_call, &definition, tool_call.arguments.clone());
+            Ok(Some(ResolvedToolTarget {
+                definition,
+                target_call,
+            }))
         }
+    }
+
+    fn catalog_target(
+        &self,
+        state: &ToolDisclosureTurnState,
+        provider_name: &str,
+    ) -> Option<ProviderToolDefinition> {
+        state
+            .catalog
+            .definition_by_name(provider_name)
+            .or_else(|| {
+                state
+                    .catalog
+                    .definitions()
+                    .find(|definition| definition_matches_provider_name(definition, provider_name))
+            })
+            .cloned()
     }
 }
 
@@ -737,10 +780,38 @@ mod tests {
             Ok(self.definitions.clone())
         }
 
+        fn provider_tool_call_capability_ids(
+            &self,
+            tool_call: &ProviderToolCall,
+        ) -> Result<ProviderToolCallCapabilityIds, AgentLoopHostError> {
+            let definition = self
+                .definitions
+                .iter()
+                .find(|definition| definition.name == tool_call.name)
+                .ok_or_else(|| {
+                    AgentLoopHostError::new(
+                        AgentLoopHostErrorKind::InvalidInvocation,
+                        "provider tool call is outside the visible capability surface",
+                    )
+                })?;
+            Ok(ProviderToolCallCapabilityIds::single(
+                definition.capability_id.clone(),
+            ))
+        }
+
+        fn validate_provider_tool_call(
+            &self,
+            tool_call: &ProviderToolCall,
+        ) -> Result<(), AgentLoopHostError> {
+            self.provider_tool_call_capability_ids(tool_call)
+                .map(|_| ())
+        }
+
         async fn register_provider_tool_call(
             &self,
             tool_call: ProviderToolCall,
         ) -> Result<CapabilityCallCandidate, AgentLoopHostError> {
+            self.validate_provider_tool_call(&tool_call)?;
             self.registered_calls
                 .lock()
                 .expect("registered calls lock")
@@ -1139,6 +1210,129 @@ mod tests {
                 .iter()
                 .any(|definition| definition.name == "hidden_tool"),
             "successful direct deferred call should promote the target on the next turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_provider_encoded_builtin_dispatches_and_promotes() {
+        let definitions = vec![
+            provider_definition("fixture.read_file", "read_file", "Read a file"),
+            provider_definition(
+                "builtin.extension_install",
+                "extension_install",
+                "Install an extension",
+            ),
+            provider_definition("fixture.extra_1", "extra_tool_1", "Extra operation"),
+            provider_definition("fixture.extra_2", "extra_tool_2", "Extra operation"),
+            provider_definition("fixture.extra_3", "extra_tool_3", "Extra operation"),
+            provider_definition("fixture.extra_4", "extra_tool_4", "Extra operation"),
+        ];
+        let inner = Arc::new(SpyPort {
+            definitions,
+            surface_version: CapabilitySurfaceVersion::new("surface:test")
+                .expect("valid surface version"),
+            registered_calls: Mutex::new(Vec::new()),
+            invocations: Mutex::new(Vec::new()),
+        });
+        let promoted_by_scope = Arc::new(Mutex::new(HashMap::new()));
+        let first_run_context = run_context(TurnId::new()).await;
+        let port = disclosure_port(
+            Arc::clone(&inner) as Arc<dyn LoopCapabilityPort>,
+            first_run_context,
+            Arc::clone(&promoted_by_scope),
+        );
+
+        port.visible_capabilities(VisibleCapabilityRequest)
+            .await
+            .expect("visible surface");
+        let advertised = port.tool_definitions().expect("tool definitions");
+        assert!(
+            !advertised
+                .iter()
+                .any(|definition| definition.name == "extension_install"),
+            "extension_install starts deferred"
+        );
+
+        let direct_call = provider_call("builtin__extension_install", json!({"path": "demo"}));
+        let capability_ids = port
+            .provider_tool_call_capability_ids(&direct_call)
+            .expect("provider-encoded direct deferred call resolves");
+        assert_eq!(
+            capability_ids.provider_capability_id.as_str(),
+            "builtin.extension_install"
+        );
+        assert_eq!(
+            capability_ids
+                .effective_capability_ids
+                .iter()
+                .map(CapabilityId::as_str)
+                .collect::<Vec<_>>(),
+            vec!["builtin.extension_install"]
+        );
+        port.validate_provider_tool_call(&direct_call)
+            .expect("provider-encoded direct deferred call validates against resolved target");
+        let target = port
+            .register_provider_tool_call(direct_call)
+            .await
+            .expect("provider-encoded direct deferred call registers as target");
+        assert_eq!(target.capability_id.as_str(), "builtin.extension_install");
+        assert_eq!(
+            target
+                .provider_replay
+                .as_ref()
+                .expect("provider replay")
+                .provider_tool_name,
+            "builtin__extension_install"
+        );
+        let outcome = port
+            .invoke_capability(CapabilityInvocation {
+                surface_version: target.surface_version,
+                capability_id: target.capability_id,
+                input_ref: target.input_ref,
+                approval_resume: None,
+                auth_resume: None,
+            })
+            .await
+            .expect("target invokes");
+        assert!(matches!(outcome, CapabilityOutcome::Completed(_)));
+        assert_eq!(
+            inner
+                .registered_calls
+                .lock()
+                .expect("registered calls lock")
+                .last()
+                .expect("target call")
+                .name,
+            "extension_install",
+            "inner registration must receive the catalog target name"
+        );
+        assert_eq!(
+            inner
+                .invocations
+                .lock()
+                .expect("invocations lock")
+                .last()
+                .expect("target invocation")
+                .capability_id
+                .as_str(),
+            "builtin.extension_install"
+        );
+
+        let next_turn = disclosure_port(
+            inner as Arc<dyn LoopCapabilityPort>,
+            run_context(TurnId::new()).await,
+            promoted_by_scope,
+        );
+        next_turn
+            .visible_capabilities(VisibleCapabilityRequest)
+            .await
+            .expect("next visible surface");
+        let next_advertised = next_turn.tool_definitions().expect("next tool definitions");
+        assert!(
+            next_advertised
+                .iter()
+                .any(|definition| definition.name == "extension_install"),
+            "successful provider-encoded direct deferred call should promote the target next turn"
         );
     }
 
