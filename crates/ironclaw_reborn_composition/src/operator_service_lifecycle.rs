@@ -6,7 +6,7 @@
 //! input can select an action, not a command line.
 
 use std::borrow::Cow;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use async_trait::async_trait;
 use ironclaw_host_api::{TenantId, UserId};
@@ -81,32 +83,28 @@ struct SystemCommandRunner;
 
 impl ServiceCommandRunner for SystemCommandRunner {
     fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, ServiceCommandError> {
-        let mut child = Command::new(program)
+        let mut stdout_file = tempfile::tempfile().map_err(ServiceCommandError::Output)?;
+        let child_stdout = stdout_file
+            .try_clone()
+            .map_err(ServiceCommandError::Output)?;
+        let mut command = Command::new(program);
+        command
             .args(args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(ServiceCommandError::Start)?;
-        let mut stdout = child.stdout.take().ok_or_else(|| {
-            ServiceCommandError::Output(std::io::Error::other(
-                "service manager stdout pipe was not available",
-            ))
-        })?;
-        let stdout_reader = std::thread::spawn(move || {
-            let mut output = Vec::new();
-            stdout.read_to_end(&mut output).map(|_| output)
-        });
+            .stdout(Stdio::from(child_stdout))
+            .stderr(Stdio::null());
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn().map_err(ServiceCommandError::Start)?;
         let started = Instant::now();
         loop {
             match child.try_wait().map_err(ServiceCommandError::Status)? {
                 Some(status) => {
-                    let stdout = stdout_reader
-                        .join()
-                        .map_err(|_| {
-                            ServiceCommandError::Output(std::io::Error::other(
-                                "service manager stdout reader panicked",
-                            ))
-                        })?
+                    let mut stdout = Vec::new();
+                    stdout_file
+                        .seek(SeekFrom::Start(0))
+                        .map_err(ServiceCommandError::Output)?;
+                    stdout_file
+                        .read_to_end(&mut stdout)
                         .map_err(ServiceCommandError::Output)?;
                     return Ok(CommandOutput {
                         success: status.success(),
@@ -114,17 +112,40 @@ impl ServiceCommandRunner for SystemCommandRunner {
                     });
                 }
                 None if started.elapsed() >= SERVICE_COMMAND_TIMEOUT => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    if stdout_reader.is_finished() {
-                        let _ = stdout_reader.join();
-                    }
+                    terminate_service_command(&mut child);
                     return Err(ServiceCommandError::Timeout);
                 }
                 None => std::thread::sleep(Duration::from_millis(25)),
             }
         }
     }
+}
+
+fn terminate_service_command(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        let pgid = child.id();
+        let kill_result = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pgid}"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !matches!(kill_result, Ok(status) if status.success()) {
+            tracing::debug!(
+                ?kill_result,
+                "service manager command process group kill failed"
+            );
+            let _ = child.kill();
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+
+    let _ = child.wait();
 }
 
 fn write_service_file(path: &Path, contents: &str) -> std::io::Result<()> {
