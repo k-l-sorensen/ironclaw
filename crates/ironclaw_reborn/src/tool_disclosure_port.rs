@@ -667,9 +667,28 @@ impl ToolDisclosureCapabilityPort {
         }
         let guard = self.turn_state()?;
         let Some(state) = guard.as_ref() else {
+            debug!(
+                tool_name = tool_call.name.as_str(),
+                "reborn tool disclosure direct-deferred miss: no turn state"
+            );
             return Ok(None);
         };
         let Some(definition) = self.catalog_target(state, &tool_call.name) else {
+            // DIAGNOSTIC (temporary): the model called a non-bridge tool that the
+            // catalog could not resolve by name. Log enough to see whether it's a
+            // name-form mismatch vs. genuinely absent from the catalog.
+            let sample: Vec<&str> = state
+                .catalog
+                .definitions()
+                .map(|definition| definition.name.as_str())
+                .filter(|name| name.contains("extension") || name.contains("install"))
+                .collect();
+            debug!(
+                tool_name = tool_call.name.as_str(),
+                catalog_len = state.catalog.len(),
+                extension_like_names = ?sample,
+                "reborn tool disclosure direct-deferred miss: not found in catalog by name"
+            );
             return Ok(None);
         };
         let active = state
@@ -678,6 +697,10 @@ impl ToolDisclosureCapabilityPort {
             .iter()
             .any(|candidate| candidate.name == tool_call.name);
         if active {
+            debug!(
+                tool_name = tool_call.name.as_str(),
+                "reborn tool disclosure direct-deferred miss: tool is already advertised"
+            );
             Ok(None)
         } else {
             let target_call = self.target_call(tool_call, &definition, tool_call.arguments.clone());
