@@ -6,6 +6,76 @@ import { useT } from "../../../lib/i18n.js";
 import { useTools } from "../hooks/useTools.js";
 import { matchesSearch } from "../lib/settings-search.js";
 
+const AUTO_APPROVE_KEY = "agent.auto_approve_tools";
+
+function SavedIndicator({ visible }) {
+  const t = useT();
+  if (!visible) return null;
+  return html`
+    <span className="font-mono text-[11px] text-[var(--v2-accent-text)]" role="status">
+      ${t("tools.saved")}
+    </span>
+  `;
+}
+
+function Switch({ checked, disabled = false, label, onChange }) {
+  return html`
+    <button
+      type="button"
+      role="switch"
+      aria-checked=${checked}
+      aria-label=${label}
+      disabled=${disabled}
+      onClick=${() => !disabled && onChange(!checked)}
+      className=${[
+        "relative inline-flex h-7 w-12 shrink-0 items-center rounded-full border transition",
+        disabled ? "cursor-not-allowed opacity-60" : "cursor-pointer",
+        checked
+          ? "border-[color-mix(in_srgb,var(--v2-accent)_45%,transparent)] bg-[color-mix(in_srgb,var(--v2-accent)_22%,transparent)]"
+          : "border-[var(--v2-panel-border)] bg-[var(--v2-surface-soft)]",
+      ].join(" ")}
+    >
+      <span
+        className=${[
+          "pointer-events-none inline-block h-5 w-5 rounded-full transition",
+          checked
+            ? "translate-x-5 bg-[var(--v2-accent-text)]"
+            : "translate-x-1 bg-[var(--v2-text-muted)]",
+        ].join(" ")}
+      />
+    </button>
+  `;
+}
+
+function AutoApproveCard({ settings, onSave, savedKeys, isLoading }) {
+  const t = useT();
+  const label = t("settings.field.autoApproveEligibleTools");
+  const checked =
+    settings?.[AUTO_APPROVE_KEY] === true || settings?.[AUTO_APPROVE_KEY] === "true";
+
+  return html`
+    <${Card} padding="md" className="flex items-center justify-between gap-6">
+      <div className="min-w-0">
+        <h3 className="text-sm font-semibold text-[var(--v2-text-strong)]">
+          ${label}
+        </h3>
+        <p className="mt-1 text-sm text-[var(--v2-text-muted)]">
+          ${t("settings.field.autoApproveEligibleToolsDesc")}
+        </p>
+      </div>
+      <div className="flex shrink-0 items-center gap-3">
+        <${SavedIndicator} visible=${savedKeys?.[AUTO_APPROVE_KEY]} />
+        <${Switch}
+          checked=${checked}
+          disabled=${isLoading}
+          label=${label}
+          onChange=${(value) => onSave(AUTO_APPROVE_KEY, value)}
+        />
+      </div>
+    <//>
+  `;
+}
+
 function ToolRow({ tool, onPermissionChange, isSaved }) {
   const t = useT();
   const permissionStates = [
@@ -92,36 +162,58 @@ function ToolRow({ tool, onPermissionChange, isSaved }) {
   `;
 }
 
-export function ToolsTab({ searchQuery = "" }) {
+export function ToolsTab({
+  settings = {},
+  onSave = () => {},
+  savedKeys = {},
+  isLoading = false,
+  searchQuery = "",
+}) {
   const t = useT();
   const { tools, query, setPermission, savedTools } = useTools();
 
   if (query.isLoading) {
     return html`
-      <${Card} padding="md">
-        <div className="mb-4 h-3 w-28 animate-pulse rounded bg-[var(--v2-surface-muted)]" />
-        ${[1, 2, 3, 4, 5].map(
-          (i) => html`
-            <div
-              key=${i}
-              className="flex items-center justify-between border-t border-[var(--v2-panel-border)] py-3.5 first:border-0"
-            >
-              <div className="h-4 w-36 animate-pulse rounded bg-[var(--v2-surface-muted)]" />
-              <div className="h-8 w-28 animate-pulse rounded bg-[var(--v2-surface-muted)]" />
-            </div>
-          `
-        )}
-      <//>
+      <div className="space-y-4">
+        <${AutoApproveCard}
+          settings=${settings}
+          onSave=${onSave}
+          savedKeys=${savedKeys}
+          isLoading=${isLoading}
+        />
+        <${Card} padding="md">
+          <div className="mb-4 h-3 w-28 animate-pulse rounded bg-[var(--v2-surface-muted)]" />
+          ${[1, 2, 3, 4, 5].map(
+            (i) => html`
+              <div
+                key=${i}
+                className="flex items-center justify-between border-t border-[var(--v2-panel-border)] py-3.5 first:border-0"
+              >
+                <div className="h-4 w-36 animate-pulse rounded bg-[var(--v2-surface-muted)]" />
+                <div className="h-8 w-28 animate-pulse rounded bg-[var(--v2-surface-muted)]" />
+              </div>
+            `
+          )}
+        <//>
+      </div>
     `;
   }
 
   if (query.error) {
     return html`
-      <${Card} padding="md">
-        <p className="text-sm text-[var(--v2-danger-text)]">
-          ${t("tools.failedLoad", { message: query.error.message })}
-        </p>
-      <//>
+      <div className="space-y-4">
+        <${AutoApproveCard}
+          settings=${settings}
+          onSave=${onSave}
+          savedKeys=${savedKeys}
+          isLoading=${isLoading}
+        />
+        <${Card} padding="md">
+          <p className="text-sm text-[var(--v2-danger-text)]">
+            ${t("tools.failedLoad", { message: query.error.message })}
+          </p>
+        <//>
+      </div>
     `;
   }
 
@@ -138,6 +230,13 @@ export function ToolsTab({ searchQuery = "" }) {
 
   return html`
     <div className="space-y-4">
+      <${AutoApproveCard}
+        settings=${settings}
+        onSave=${onSave}
+        savedKeys=${savedKeys}
+        isLoading=${isLoading}
+      />
+
       ${searchQuery &&
       html`
         <div className="flex justify-end">

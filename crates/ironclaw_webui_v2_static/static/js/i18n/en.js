@@ -378,7 +378,7 @@ registerPack("en", {
   "settings.field.planningDesc": "Enable multi-step planning before execution",
   "settings.field.autoApproveEligibleTools": "Always allow eligible tools",
   "settings.field.autoApproveEligibleToolsDesc":
-    "Automatically run tools that allow persistent approval; explicit approval gates still ask.",
+    "Automatically run eligible tools. Per-tool “Ask each time” overrides and hard-floor approval gates still ask.",
   "settings.field.timezone": "Timezone",
   "settings.field.timezoneDesc": "IANA timezone for scheduled work",
   "settings.field.sessionIdleTimeout": "Session idle timeout",
