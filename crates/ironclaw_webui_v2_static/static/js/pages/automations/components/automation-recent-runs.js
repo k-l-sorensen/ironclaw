@@ -24,6 +24,7 @@ export function RunDots({ runs = [] }) {
     return html`<span className="text-xs text-iron-400">${t("automations.table.noRuns")}</span>`;
   }
   const overflow = runs.length - visibleRuns.length;
+  const overflowLabel = `+${Math.min(overflow, 999)}`;
 
   return html`
     <div
@@ -48,7 +49,7 @@ export function RunDots({ runs = [] }) {
         className="ml-0.5 font-mono text-[11px] text-iron-400"
         title=${t("automations.runs.showingOf", { shown: visibleRuns.length, total: runs.length })}
       >
-        +${overflow}
+        ${overflowLabel}
       </span>`}
     </div>
   `;
