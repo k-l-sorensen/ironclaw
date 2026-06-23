@@ -5,6 +5,7 @@
 //! fixed `ironclaw-reborn` unit/label and fixed command argv shapes; browser
 //! input can select an action, not a command line.
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -50,41 +51,57 @@ impl ServicePlatform {
 #[derive(Debug, Clone)]
 struct CommandOutput {
     success: bool,
-    stdout: String,
+    stdout: Vec<u8>,
+}
+
+impl CommandOutput {
+    fn stdout_text(&self) -> Cow<'_, str> {
+        String::from_utf8_lossy(&self.stdout)
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ServiceCommandError {
+    #[error("service manager command could not be started: {0}")]
+    Start(std::io::Error),
+    #[error("service manager command status could not be read: {0}")]
+    Status(std::io::Error),
+    #[error("service manager command output could not be read: {0}")]
+    Output(std::io::Error),
+    #[error("service manager command timed out")]
+    Timeout,
 }
 
 trait ServiceCommandRunner: Send + Sync {
-    fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, String>;
+    fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, ServiceCommandError>;
 }
 
 #[derive(Debug, Default)]
 struct SystemCommandRunner;
 
 impl ServiceCommandRunner for SystemCommandRunner {
-    fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+    fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, ServiceCommandError> {
         let mut child = Command::new(program)
             .args(args)
             .stdout(std::process::Stdio::piped())
             .spawn()
-            .map_err(|error| format!("service manager command could not be started: {error}"))?;
+            .map_err(ServiceCommandError::Start)?;
         let started = Instant::now();
         loop {
-            match child.try_wait().map_err(|error| {
-                format!("service manager command status could not be read: {error}")
-            })? {
+            match child.try_wait().map_err(ServiceCommandError::Status)? {
                 Some(_) => {
-                    let output = child.wait_with_output().map_err(|error| {
-                        format!("service manager command output could not be read: {error}")
-                    })?;
+                    let output = child
+                        .wait_with_output()
+                        .map_err(ServiceCommandError::Output)?;
                     return Ok(CommandOutput {
                         success: output.status.success(),
-                        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                        stdout: output.stdout,
                     });
                 }
                 None if started.elapsed() >= SERVICE_COMMAND_TIMEOUT => {
                     let _ = child.kill();
                     let _ = child.wait();
-                    return Err("service manager command timed out".to_string());
+                    return Err(ServiceCommandError::Timeout);
                 }
                 None => std::thread::sleep(Duration::from_millis(25)),
             }
@@ -455,19 +472,21 @@ impl RebornLocalServiceLifecycle {
                     .runner
                     .run("systemctl", &["--user", "is-active", SYSTEMD_UNIT]);
                 match output {
-                    Ok(output) if output.success && output.stdout.trim() == "active" => {
+                    Ok(output) if output.success && output.stdout_text().trim() == "active" => {
                         Self::status_response(
                             RebornServiceLifecycleState::Running,
                             "local Reborn service is running",
                         )
                     }
-                    Ok(output) if matches!(output.stdout.trim(), "inactive" | "deactivating") => {
+                    Ok(output)
+                        if matches!(output.stdout_text().trim(), "inactive" | "deactivating") =>
+                    {
                         Self::status_response(
                             RebornServiceLifecycleState::Stopped,
                             "local Reborn service is stopped",
                         )
                     }
-                    Ok(output) if output.stdout.trim() == "failed" => Self::status_response(
+                    Ok(output) if output.stdout_text().trim() == "failed" => Self::status_response(
                         RebornServiceLifecycleState::Failed,
                         "local Reborn service is failed",
                     ),
@@ -484,7 +503,7 @@ impl RebornLocalServiceLifecycle {
             ServicePlatform::Macos => {
                 let output = self.runner.run("launchctl", &["list"]);
                 match output {
-                    Ok(output) if launchd_status_is_running(&output.stdout) => {
+                    Ok(output) if launchd_status_is_running(output.stdout_text().as_ref()) => {
                         Self::status_response(
                             RebornServiceLifecycleState::Running,
                             "local Reborn service is running",
@@ -531,7 +550,14 @@ impl RebornLocalServiceLifecycle {
                 message: success_message.to_string(),
                 remediation: None,
             },
-            Ok(_) | Err(_) => Self::failed_response(action, "local service manager command failed"),
+            Ok(_) => Self::failed_response(action, "local service manager command failed"),
+            Err(ServiceCommandError::Timeout) => {
+                Self::failed_response(action, "local service manager command timed out")
+            }
+            Err(error) => {
+                tracing::debug!(%error, "service manager command failed");
+                Self::failed_response(action, "local service manager command failed")
+            }
         }
     }
 
@@ -730,6 +756,7 @@ mod tests {
         calls: Mutex<Vec<(String, Vec<String>)>>,
         status_stdout: Mutex<String>,
         fail_command: Mutex<Option<(String, Vec<String>)>>,
+        timeout_command: Mutex<Option<(String, Vec<String>)>>,
     }
 
     impl RecordingRunner {
@@ -738,11 +765,19 @@ mod tests {
                 calls: Mutex::default(),
                 status_stdout: Mutex::new(status_stdout.to_string()),
                 fail_command: Mutex::new(None),
+                timeout_command: Mutex::new(None),
             }
         }
 
         fn fail_command(&self, program: &str, args: &[&str]) {
             *self.fail_command.lock().expect("lock") = Some((
+                program.to_string(),
+                args.iter().map(|arg| (*arg).to_string()).collect(),
+            ));
+        }
+
+        fn timeout_command(&self, program: &str, args: &[&str]) {
+            *self.timeout_command.lock().expect("lock") = Some((
                 program.to_string(),
                 args.iter().map(|arg| (*arg).to_string()).collect(),
             ));
@@ -754,7 +789,7 @@ mod tests {
     }
 
     impl ServiceCommandRunner for RecordingRunner {
-        fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, String> {
+        fn run(&self, program: &str, args: &[&str]) -> Result<CommandOutput, ServiceCommandError> {
             self.calls.lock().expect("lock").push((
                 program.to_string(),
                 args.iter().map(|arg| (*arg).to_string()).collect(),
@@ -774,16 +809,25 @@ mod tests {
             {
                 return Ok(CommandOutput {
                     success: false,
-                    stdout: String::new(),
+                    stdout: Vec::new(),
                 });
+            }
+            if self
+                .timeout_command
+                .lock()
+                .expect("lock")
+                .as_ref()
+                .is_some_and(|timeout_command| timeout_command == &command)
+            {
+                return Err(ServiceCommandError::Timeout);
             }
             let reports_status = (program == "systemctl"
                 && args.ends_with(&["is-active", SYSTEMD_UNIT]))
                 || (program == "launchctl" && args == ["list"]);
             let stdout = if reports_status {
-                self.status_stdout.lock().expect("lock").clone()
+                self.status_stdout.lock().expect("lock").as_bytes().to_vec()
             } else {
-                String::new()
+                Vec::new()
             };
             Ok(CommandOutput {
                 success: true,
@@ -990,6 +1034,27 @@ mod tests {
 
         assert_eq!(response.state, RebornServiceLifecycleState::Failed);
         assert!(response.remediation.is_some());
+    }
+
+    #[tokio::test]
+    async fn linux_start_timeout_returns_timeout_failed_state() {
+        let temp = TempDir::new().expect("tempdir");
+        let runner = Arc::new(RecordingRunner::new("inactive"));
+        runner.timeout_command("systemctl", &["--user", "start", SYSTEMD_UNIT]);
+        let service = linux_service(&temp, runner);
+
+        let response = service
+            .control_service(
+                test_caller(),
+                RebornServiceLifecycleRequest {
+                    action: RebornServiceLifecycleAction::Start,
+                },
+            )
+            .await
+            .expect("start response");
+
+        assert_eq!(response.state, RebornServiceLifecycleState::Failed);
+        assert_eq!(response.message, "local service manager command timed out");
     }
 
     #[tokio::test]
