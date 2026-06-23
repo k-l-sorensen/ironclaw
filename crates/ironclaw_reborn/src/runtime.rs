@@ -104,11 +104,21 @@ pub enum ToolDisclosureMode {
 
 impl ToolDisclosureMode {
     pub fn from_env() -> Self {
-        match std::env::var(REBORN_TOOL_DISCLOSURE_ENV) {
-            Ok(value) if value.eq_ignore_ascii_case("bridged") => Self::Bridged,
-            Ok(value) if value.eq_ignore_ascii_case("off") || value.trim().is_empty() => Self::Off,
-            Ok(_) => Self::Off,
-            Err(_) => Self::Off,
+        Self::from_raw(std::env::var(REBORN_TOOL_DISCLOSURE_ENV).ok().as_deref())
+    }
+
+    /// TEMPORARY (revert before GA — tracked in the context-management plan):
+    /// tool disclosure defaults **on** when `REBORN_TOOL_DISCLOSURE` is unset,
+    /// so the remote benchmark — which cannot set env vars — exercises the
+    /// bridged path. Explicit `REBORN_TOOL_DISCLOSURE=off` is the escape hatch
+    /// and still disables it. To restore default-off, change the catch-all arm
+    /// back to `Self::Off`.
+    fn from_raw(raw: Option<&str>) -> Self {
+        match raw {
+            Some(value) if value.eq_ignore_ascii_case("off") => Self::Off,
+            Some(value) if value.eq_ignore_ascii_case("bridged") => Self::Bridged,
+            // unset / empty / unrecognized -> temporarily ON for benchmarking.
+            _ => Self::Bridged,
         }
     }
 
@@ -762,25 +772,27 @@ mod tests {
     };
 
     #[test]
-    fn tool_disclosure_mode_defaults_off_and_gates_decorator() {
+    fn tool_disclosure_mode_temporarily_defaults_on_with_off_escape_hatch() {
         use super::ToolDisclosureMode;
-        // Flag-off invariant: the default mode must be Off and must NOT report
-        // bridged, because the gateway only attaches the disclosure decorator
-        // when `is_bridged()` is true (`if parts.config.tool_disclosure
-        // .is_bridged()`). Off => no decorator => byte-identical request path.
-        assert_eq!(ToolDisclosureMode::default(), ToolDisclosureMode::Off);
+        // TEMPORARY benchmark window: unset / empty / unrecognized resolve to
+        // Bridged so the remote benchmark (which cannot set env vars) exercises
+        // disclosure; explicit `off` is the escape hatch. `is_bridged()` is what
+        // gates whether the gateway attaches the decorator.
         assert!(
-            !ToolDisclosureMode::default().is_bridged(),
-            "default disclosure mode must not wire the decorator"
+            ToolDisclosureMode::from_raw(None).is_bridged(),
+            "unset must temporarily default ON for the remote benchmark"
         );
+        assert!(ToolDisclosureMode::from_raw(Some("")).is_bridged());
+        assert!(ToolDisclosureMode::from_raw(Some("garbage")).is_bridged());
+        assert!(ToolDisclosureMode::from_raw(Some("bridged")).is_bridged());
         assert!(
-            !ToolDisclosureMode::Off.is_bridged(),
-            "Off must not wire the decorator"
+            !ToolDisclosureMode::from_raw(Some("off")).is_bridged(),
+            "explicit REBORN_TOOL_DISCLOSURE=off must still disable disclosure"
         );
-        assert!(
-            ToolDisclosureMode::Bridged.is_bridged(),
-            "Bridged is the only mode that wires the decorator"
-        );
+        assert!(!ToolDisclosureMode::from_raw(Some("OFF")).is_bridged());
+        // Per-variant gating is unchanged.
+        assert!(!ToolDisclosureMode::Off.is_bridged());
+        assert!(ToolDisclosureMode::Bridged.is_bridged());
     }
 
     async fn test_run_context() -> LoopRunContext {
