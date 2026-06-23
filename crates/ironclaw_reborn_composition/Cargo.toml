@@ -64,7 +64,6 @@ openai-compat-beta = [
     "ironclaw_product_workflow_storage/libsql",
     "ironclaw_reborn_openai_compat_storage/libsql",
     "ironclaw_product_adapters/host-auth-mint",
-    "ironclaw_reborn_http_kit/openai-compat-beta",
 ]
 libsql = [
     "dep:libsql",

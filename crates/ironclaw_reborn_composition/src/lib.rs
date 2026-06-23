@@ -218,7 +218,9 @@ pub use nearai_mcp::{
     NearAiMcpBootstrapConfig, NearAiMcpBootstrapConfigError, nearai_mcp_bootstrap_config_from_env,
 };
 #[cfg(feature = "openai-compat-beta")]
-pub use openai_compat_serve::build_openai_compat_route_mount;
+pub use openai_compat_serve::{
+    build_openai_compat_route_mount, openai_compat_protected_route_mount,
+};
 pub use operator_logs::{OperatorLogLayer, capture_tracing_log, operator_log_buffer};
 pub use product_live_adapters::{
     ProductLiveCapabilityAuthorityResolver, ProductLiveCapabilityIo, ProductLiveModelRouteSettings,

@@ -12,20 +12,12 @@ publish = false
 
 [features]
 default = []
-openai-compat-beta = [
-    "dep:ironclaw_reborn_openai_compat",
-    "ironclaw_reborn_openai_compat/openai-compat-beta",
-    "dep:ironclaw_product_adapters",
-    "ironclaw_product_adapters/host-auth-mint",
-]
 
 [dependencies]
 async-trait = "0.1"
 axum = "0.8"
 ironclaw_host_api = { path = "../ironclaw_host_api" }
-ironclaw_product_adapters = { path = "../ironclaw_product_adapters", optional = true }
 ironclaw_product_workflow = { path = "../ironclaw_product_workflow" }
-ironclaw_reborn_openai_compat = { path = "../ironclaw_reborn_openai_compat", optional = true }
 ironclaw_webui_v2 = { path = "../ironclaw_webui_v2", features = ["webui-v2-beta"] }
 ironclaw_webui_v2_static = { path = "../ironclaw_webui_v2_static", features = ["webui-v2-beta"] }
 lru = "0.16"

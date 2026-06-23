@@ -9,6 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use axum::{
+    Router,
+    extract::Request,
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
+};
 use ironclaw_attachments::InboundAttachment;
 use ironclaw_filesystem::{RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{
@@ -19,24 +25,24 @@ use ironclaw_product_adapters::{
     AdapterInstallationId, ProductAdapterError, ProductAdapterId, ProductInboundAck,
     ProductInboundEnvelope, ProductOutboundEnvelope, ProductOutboundPayload, ProductProjectionItem,
     ProductProjectionState, ProductWorkflow, ProjectionCursor, ProjectionReadRequest,
-    ProjectionStream, ProjectionSubscriptionRequest,
+    ProjectionStream, ProjectionSubscriptionRequest, mark_bearer_token_verified_for_tenant,
 };
 use ironclaw_product_workflow::{
     DefaultInboundTurnService, DefaultProductWorkflow, InboundAttachmentLander,
     ProductActorUserResolutionRequest, ProductActorUserResolver, ProductConversationBindingService,
     ProductInstallationKey, ProductInstallationScope, ProductWorkflowError,
-    StaticProductInstallationResolver,
+    StaticProductInstallationResolver, WebUiAuthenticatedCaller,
 };
 use ironclaw_product_workflow_storage::RebornFilesystemIdempotencyLedger;
 use ironclaw_reborn_openai_compat::{
     OPENAI_COMPAT_ACTOR_KIND, OPENAI_COMPAT_ADAPTER_ID, OPENAI_COMPAT_INSTALLATION_ID,
     OpenAiChatCompletionProjection, OpenAiChatCompletionProjectionReader,
     OpenAiChatCompletionProjectionRequest, OpenAiChatCompletionsWorkflow,
-    OpenAiChatProjectionStreamRequest, OpenAiCompatErrorKind, OpenAiCompatHttpError,
-    OpenAiCompatInboundAttachmentSubmit, OpenAiCompatProjectionStreamer, OpenAiCompatRefStore,
-    OpenAiCompatResourceBinding, OpenAiCompatRouterState, OpenAiResponseErrorObject,
-    OpenAiResponseId, OpenAiResponseObject, OpenAiResponseOutputItem,
-    OpenAiResponseOutputItemStatus, OpenAiResponseProjection,
+    OpenAiChatProjectionStreamRequest, OpenAiCompatActorScope, OpenAiCompatAuthenticatedCaller,
+    OpenAiCompatErrorKind, OpenAiCompatHttpError, OpenAiCompatInboundAttachmentSubmit,
+    OpenAiCompatProjectionStreamer, OpenAiCompatRefStore, OpenAiCompatResourceBinding,
+    OpenAiCompatRouterState, OpenAiResponseErrorObject, OpenAiResponseId, OpenAiResponseObject,
+    OpenAiResponseOutputItem, OpenAiResponseOutputItemStatus, OpenAiResponseProjection,
     OpenAiResponseProjectionStreamRequest, OpenAiResponseReadRequest, OpenAiResponseStatus,
     OpenAiResponseWaitRequest, OpenAiResponsesMessageRole, OpenAiResponsesProjectionReader,
     OpenAiResponsesWorkflow, openai_compat_router_with_state, openai_compat_routes,
@@ -179,13 +185,45 @@ pub async fn build_openai_compat_route_mount(
         OpenAiResponsesWorkflow::new(product_workflow, ref_store, responses_projection_reader)
             .with_projection_streamer(projection_streamer),
     );
-    Ok(ProtectedRouteMount::new(
+    Ok(openai_compat_protected_route_mount(
         openai_compat_router_with_state(
             OpenAiCompatRouterState::with_chat_completions(chat_workflow)
                 .with_responses_workflow(responses_workflow),
         ),
-        openai_compat_routes(),
     ))
+}
+
+pub fn openai_compat_protected_route_mount(router: Router) -> ProtectedRouteMount {
+    ProtectedRouteMount::new(
+        router.route_layer(middleware::from_fn(stamp_openai_compat_caller)),
+        openai_compat_routes(),
+    )
+}
+
+async fn stamp_openai_compat_caller(mut request: Request, next: Next) -> Response {
+    let Some(webui_caller) = request
+        .extensions()
+        .get::<WebUiAuthenticatedCaller>()
+        .cloned()
+    else {
+        return next.run(request).await;
+    };
+    let scope = OpenAiCompatActorScope::new(
+        webui_caller.tenant_id.clone(),
+        webui_caller.user_id.clone(),
+        webui_caller.agent_id.clone(),
+        webui_caller.project_id.clone(),
+    );
+    let auth_evidence = mark_bearer_token_verified_for_tenant(
+        webui_caller.user_id.as_str(),
+        webui_caller.tenant_id.clone(),
+    );
+    let caller = match OpenAiCompatAuthenticatedCaller::new(scope, auth_evidence) {
+        Ok(caller) => caller,
+        Err(error) => return error.into_response(),
+    };
+    request.extensions_mut().insert(caller);
+    next.run(request).await
 }
 
 /// Bridges the route crate's [`OpenAiCompatInboundAttachmentSubmit`] door to the

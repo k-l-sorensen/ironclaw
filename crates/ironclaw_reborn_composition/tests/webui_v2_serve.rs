@@ -159,7 +159,7 @@ mod openai_compat_mount_tests {
         ConversationBindingService, DefaultInboundTurnService, DefaultProductWorkflow,
         FakeIdempotencyLedger, ProductWorkflowError, ResolveBindingRequest, ResolvedBinding,
     };
-    use ironclaw_reborn_composition::ProtectedRouteMount;
+    use ironclaw_reborn_composition::openai_compat_protected_route_mount;
     use ironclaw_reborn_openai_compat::{
         InMemoryOpenAiCompatRefStore, OpenAiChatCompletionProjection,
         OpenAiChatCompletionProjectionReader, OpenAiChatCompletionProjectionRequest,
@@ -167,7 +167,7 @@ mod openai_compat_mount_tests {
         OpenAiResponseObject, OpenAiResponseOutputItem, OpenAiResponseOutputItemStatus,
         OpenAiResponseProjection, OpenAiResponseReadRequest, OpenAiResponseStatus,
         OpenAiResponseWaitRequest, OpenAiResponsesMessageRole, OpenAiResponsesProjectionReader,
-        OpenAiResponsesWorkflow, openai_compat_router_with_state, openai_compat_routes,
+        OpenAiResponsesWorkflow, openai_compat_router_with_state,
     };
     use ironclaw_threads::InMemorySessionThreadService;
     use ironclaw_turns::runner::{ClaimRunRequest, CompleteRunRequest, TurnRunTransitionPort};
@@ -191,10 +191,9 @@ mod openai_compat_mount_tests {
                 "hello through composition",
             )),
         ));
-        let mount = ProtectedRouteMount::new(
-            openai_compat_router_with_state(OpenAiCompatRouterState::with_chat_completions(chat)),
-            openai_compat_routes(),
-        );
+        let mount = openai_compat_protected_route_mount(openai_compat_router_with_state(
+            OpenAiCompatRouterState::with_chat_completions(chat),
+        ));
         let bundle = RebornWebuiBundle {
             api: Arc::new(StubServices::default()),
             product_auth: None,
@@ -262,10 +261,9 @@ mod openai_compat_mount_tests {
             )
             .with_wait_timeout(Duration::from_millis(1)),
         );
-        let mount = ProtectedRouteMount::new(
-            openai_compat_router_with_state(OpenAiCompatRouterState::with_chat_completions(chat)),
-            openai_compat_routes(),
-        );
+        let mount = openai_compat_protected_route_mount(openai_compat_router_with_state(
+            OpenAiCompatRouterState::with_chat_completions(chat),
+        ));
         let bundle = RebornWebuiBundle {
             api: Arc::new(StubServices::default()),
             product_auth: None,
@@ -346,10 +344,9 @@ mod openai_compat_mount_tests {
                 "hello through responses",
             )),
         ));
-        let mount = ProtectedRouteMount::new(
-            openai_compat_router_with_state(OpenAiCompatRouterState::with_responses(responses)),
-            openai_compat_routes(),
-        );
+        let mount = openai_compat_protected_route_mount(openai_compat_router_with_state(
+            OpenAiCompatRouterState::with_responses(responses),
+        ));
         let bundle = RebornWebuiBundle {
             api: Arc::new(StubServices::default()),
             product_auth: None,
