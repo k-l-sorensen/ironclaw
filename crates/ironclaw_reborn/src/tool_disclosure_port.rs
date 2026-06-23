@@ -133,6 +133,13 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
         tool_call: &ProviderToolCall,
     ) -> Result<ProviderToolCallCapabilityIds, AgentLoopHostError> {
         if !is_bridge_name(&tool_call.name) {
+            if let Some(definition) = self.direct_deferred_target(tool_call)? {
+                debug!(
+                    tool_name = tool_call.name.as_str(),
+                    capability_id = definition.capability_id.as_str(),
+                    "reborn tool disclosure resolving direct deferred provider tool call"
+                );
+            }
             return self.inner.provider_tool_call_capability_ids(tool_call);
         }
         if tool_call.name == TOOL_CALL_NAME
@@ -159,6 +166,13 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
         tool_call: &ProviderToolCall,
     ) -> Result<(), AgentLoopHostError> {
         if !is_bridge_name(&tool_call.name) {
+            if let Some(definition) = self.direct_deferred_target(tool_call)? {
+                debug!(
+                    tool_name = tool_call.name.as_str(),
+                    capability_id = definition.capability_id.as_str(),
+                    "reborn tool disclosure validating direct deferred provider tool call"
+                );
+            }
             return self.inner.validate_provider_tool_call(tool_call);
         }
         if matches!(
@@ -180,6 +194,19 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
         tool_call: ProviderToolCall,
     ) -> Result<CapabilityCallCandidate, AgentLoopHostError> {
         if !is_bridge_name(&tool_call.name) {
+            if let Some(definition) = self.direct_deferred_target(&tool_call)? {
+                debug!(
+                    tool_name = tool_call.name.as_str(),
+                    capability_id = definition.capability_id.as_str(),
+                    "reborn tool disclosure registering direct deferred provider tool call"
+                );
+                let candidate = self.inner.register_provider_tool_call(tool_call).await?;
+                self.record_promotable_input(
+                    candidate.input_ref.as_str(),
+                    candidate.capability_id.clone(),
+                )?;
+                return Ok(candidate);
+            }
             return self.inner.register_provider_tool_call(tool_call).await;
         }
         if tool_call.name == TOOL_CALL_NAME
@@ -187,15 +214,10 @@ impl LoopCapabilityPort for ToolDisclosureCapabilityPort {
         {
             let mut candidate = self.inner.register_provider_tool_call(target_call).await?;
             candidate.provider_replay = Some(provider_replay_for(&tool_call));
-            self.tool_call_target_inputs
-                .lock()
-                .map_err(|e| {
-                    invalid_invocation(format!("tool_call target store lock is poisoned: {e}"))
-                })?
-                .insert(
-                    candidate.input_ref.as_str().to_string(),
-                    candidate.capability_id.clone(),
-                );
+            self.record_promotable_input(
+                candidate.input_ref.as_str(),
+                candidate.capability_id.clone(),
+            )?;
             return Ok(candidate);
         }
         self.register_bridge_call(tool_call)
@@ -348,6 +370,18 @@ impl ToolDisclosureCapabilityPort {
             )
         })?;
         guard.entry(key).or_default().push(name);
+        Ok(())
+    }
+
+    fn record_promotable_input(
+        &self,
+        input_ref: &str,
+        capability_id: CapabilityId,
+    ) -> Result<(), AgentLoopHostError> {
+        self.tool_call_target_inputs
+            .lock()
+            .map_err(|e| invalid_invocation(format!("tool target store lock is poisoned: {e}")))?
+            .insert(input_ref.to_string(), capability_id);
         Ok(())
     }
 
@@ -579,6 +613,32 @@ impl ToolDisclosureCapabilityPort {
             Ok(None)
         }
     }
+
+    fn direct_deferred_target(
+        &self,
+        tool_call: &ProviderToolCall,
+    ) -> Result<Option<ProviderToolDefinition>, AgentLoopHostError> {
+        if is_bridge_name(&tool_call.name) {
+            return Ok(None);
+        }
+        let guard = self.turn_state()?;
+        let Some(state) = guard.as_ref() else {
+            return Ok(None);
+        };
+        let Some(definition) = state.catalog.definition_by_name(&tool_call.name).cloned() else {
+            return Ok(None);
+        };
+        let active = state
+            .active
+            .definitions
+            .iter()
+            .any(|candidate| candidate.name == tool_call.name);
+        if active {
+            Ok(None)
+        } else {
+            Ok(Some(definition))
+        }
+    }
 }
 
 trait CatalogLookupByCapability {
@@ -759,7 +819,7 @@ mod tests {
     #[tokio::test]
     async fn search_discloses_tool_call_dispatches_target_and_promotes_next_turn() {
         let definitions = vec![
-            provider_definition("fixture.file_read", "file_read", "Read a file"),
+            provider_definition("fixture.read_file", "read_file", "Read a file"),
             provider_definition(
                 "fixture.hidden",
                 "hidden_tool",
@@ -800,8 +860,8 @@ mod tests {
             surface
                 .descriptors
                 .iter()
-                .find(|descriptor| descriptor.safe_name == "file_read")
-                .expect("file_read descriptor")
+                .find(|descriptor| descriptor.safe_name == "read_file")
+                .expect("read_file descriptor")
                 .concurrency_hint,
             ConcurrencyHint::SafeForParallel,
             "visible surface must preserve inner descriptor metadata"
@@ -952,13 +1012,127 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_deferred_catalog_tool_dispatches_target_and_promotes_next_turn() {
+        let definitions = vec![
+            provider_definition("fixture.read_file", "read_file", "Read a file"),
+            provider_definition(
+                "fixture.hidden",
+                "hidden_tool",
+                "Hidden workspace operation",
+            ),
+            provider_definition("fixture.extra_1", "extra_tool_1", "Extra operation"),
+            provider_definition("fixture.extra_2", "extra_tool_2", "Extra operation"),
+            provider_definition("fixture.extra_3", "extra_tool_3", "Extra operation"),
+            provider_definition("fixture.extra_4", "extra_tool_4", "Extra operation"),
+        ];
+        let inner = Arc::new(SpyPort {
+            definitions,
+            surface_version: CapabilitySurfaceVersion::new("surface:test")
+                .expect("valid surface version"),
+            registered_calls: Mutex::new(Vec::new()),
+            invocations: Mutex::new(Vec::new()),
+        });
+        let promoted_by_scope = Arc::new(Mutex::new(HashMap::new()));
+        let first_run_context = run_context(TurnId::new()).await;
+        let port = disclosure_port(
+            Arc::clone(&inner) as Arc<dyn LoopCapabilityPort>,
+            first_run_context,
+            Arc::clone(&promoted_by_scope),
+        );
+
+        port.visible_capabilities(VisibleCapabilityRequest)
+            .await
+            .expect("visible surface");
+        let advertised = port.tool_definitions().expect("tool definitions");
+        assert!(
+            !advertised
+                .iter()
+                .any(|definition| definition.name == "hidden_tool"),
+            "hidden_tool starts deferred"
+        );
+
+        let direct_call = provider_call("hidden_tool", json!({"path": "demo"}));
+        let capability_ids = port
+            .provider_tool_call_capability_ids(&direct_call)
+            .expect("direct deferred call resolves through inner");
+        assert_eq!(
+            capability_ids.provider_capability_id.as_str(),
+            "fixture.hidden"
+        );
+        port.validate_provider_tool_call(&direct_call)
+            .expect("direct deferred call validates through inner");
+        let target = port
+            .register_provider_tool_call(direct_call)
+            .await
+            .expect("direct deferred call registers as target");
+        assert_eq!(target.capability_id.as_str(), "fixture.hidden");
+        assert_eq!(
+            target
+                .provider_replay
+                .as_ref()
+                .expect("provider replay")
+                .provider_tool_name,
+            "hidden_tool"
+        );
+        let outcome = port
+            .invoke_capability(CapabilityInvocation {
+                surface_version: target.surface_version,
+                capability_id: target.capability_id,
+                input_ref: target.input_ref,
+                approval_resume: None,
+                auth_resume: None,
+            })
+            .await
+            .expect("target invokes");
+        assert!(matches!(outcome, CapabilityOutcome::Completed(_)));
+        assert_eq!(
+            inner
+                .registered_calls
+                .lock()
+                .expect("registered calls lock")
+                .last()
+                .expect("target call")
+                .name,
+            "hidden_tool"
+        );
+        assert_eq!(
+            inner
+                .invocations
+                .lock()
+                .expect("invocations lock")
+                .last()
+                .expect("target invocation")
+                .capability_id
+                .as_str(),
+            "fixture.hidden"
+        );
+
+        let next_turn = disclosure_port(
+            inner as Arc<dyn LoopCapabilityPort>,
+            run_context(TurnId::new()).await,
+            promoted_by_scope,
+        );
+        next_turn
+            .visible_capabilities(VisibleCapabilityRequest)
+            .await
+            .expect("next visible surface");
+        let next_advertised = next_turn.tool_definitions().expect("next tool definitions");
+        assert!(
+            next_advertised
+                .iter()
+                .any(|definition| definition.name == "hidden_tool"),
+            "successful direct deferred call should promote the target on the next turn"
+        );
+    }
+
+    #[tokio::test]
     async fn tool_call_targeting_a_bridge_is_rejected_without_dispatch() {
         // Recursion guard: tool_call(name = a bridge) must NOT re-enter the
         // bridge or dispatch anything — it is a model-recoverable failure.
         let inner = Arc::new(SpyPort {
             definitions: vec![provider_definition(
-                "fixture.file_read",
-                "file_read",
+                "fixture.read_file",
+                "read_file",
                 "Read a file",
             )],
             surface_version: CapabilitySurfaceVersion::new("surface:test")
@@ -1032,8 +1206,8 @@ mod tests {
         // model-recoverable failure and must not dispatch to the inner port.
         let inner = Arc::new(SpyPort {
             definitions: vec![provider_definition(
-                "fixture.file_read",
-                "file_read",
+                "fixture.read_file",
+                "read_file",
                 "Read a file",
             )],
             surface_version: CapabilitySurfaceVersion::new("surface:test")
@@ -1105,7 +1279,7 @@ mod tests {
     async fn promotions_are_scoped_by_full_turn_scope_not_thread_only() {
         let inner = Arc::new(SpyPort {
             definitions: vec![
-                provider_definition("fixture.file_read", "file_read", "Read a file"),
+                provider_definition("fixture.read_file", "read_file", "Read a file"),
                 provider_definition(
                     "fixture.hidden",
                     "hidden_tool",
@@ -1210,8 +1384,8 @@ mod tests {
     async fn tool_search_rejects_missing_non_string_or_blank_query() {
         let inner = Arc::new(SpyPort {
             definitions: vec![provider_definition(
-                "fixture.file_read",
-                "file_read",
+                "fixture.read_file",
+                "read_file",
                 "Read a file",
             )],
             surface_version: CapabilitySurfaceVersion::new("surface:test")

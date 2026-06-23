@@ -1038,16 +1038,6 @@ async fn tool_response_to_host(
             .into_iter()
             .map(|definition| definition.name)
             .collect::<HashSet<_>>();
-        if response
-            .tool_calls
-            .iter()
-            .any(|tool_call| !advertised_tool_names.contains(&tool_call.name))
-        {
-            return Err(HostManagedModelError::safe(
-                HostManagedModelErrorKind::InvalidOutput,
-                "model returned a tool call outside the advertised capability surface",
-            ));
-        }
         let mut candidates = Vec::with_capacity(response.tool_calls.len());
         let provider_turn_id = provider_turn_id(provider_turn_scope, &response.tool_calls);
         let provider_calls = response
@@ -1062,6 +1052,16 @@ async fn tool_response_to_host(
                 )
             })
             .collect::<Vec<_>>();
+        if !provider_calls_are_advertised_or_resolvable(
+            &advertised_tool_names,
+            capabilities.as_ref(),
+            &provider_calls,
+        ) {
+            return Err(HostManagedModelError::safe(
+                HostManagedModelErrorKind::InvalidOutput,
+                "model returned a tool call outside the advertised capability surface",
+            ));
+        }
         for provider_call in &provider_calls {
             capabilities
                 .validate_provider_tool_call(provider_call)
@@ -1128,6 +1128,36 @@ async fn tool_response_to_host(
             "model response did not complete cleanly",
         )),
     }
+}
+
+fn provider_calls_are_advertised_or_resolvable(
+    advertised_tool_names: &HashSet<String>,
+    capabilities: &dyn ironclaw_turns::run_profile::LoopCapabilityPort,
+    provider_calls: &[ProviderToolCall],
+) -> bool {
+    for provider_call in provider_calls {
+        if advertised_tool_names.contains(&provider_call.name) {
+            continue;
+        }
+        match capabilities.provider_tool_call_capability_ids(provider_call) {
+            Ok(ids) => {
+                debug!(
+                    tool_name = provider_call.name.as_str(),
+                    provider_capability_id = ids.provider_capability_id.as_str(),
+                    "reborn model gateway accepted resolvable unadvertised provider tool call"
+                );
+            }
+            Err(error) => {
+                debug!(
+                    tool_name = provider_call.name.as_str(),
+                    safe_summary = error.safe_summary.as_str(),
+                    "reborn model gateway rejected unresolved unadvertised provider tool call"
+                );
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn provider_tool_call_from_llm(

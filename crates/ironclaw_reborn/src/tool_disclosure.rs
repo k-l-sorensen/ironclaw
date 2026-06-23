@@ -11,8 +11,12 @@ use ironclaw_turns::run_profile::{
 };
 use serde_json::{Map, Value, json};
 
-/// Candidate core names from the design doc. Exact membership is
-/// telemetry-tunable and may become profile-specific as production traces land.
+/// Canonical core tool names from the progressive-disclosure policy.
+///
+/// Builtin provider names may be encoded from capability ids by the host
+/// runtime (for example `builtin.read_file` can be exposed as
+/// `builtin__read_file`). Core matching also checks the canonical builtin
+/// suffix so this list stays stable across provider-name encoding changes.
 pub(crate) const CORE_TOOL_NAMES: &[&str] = &[
     "tool_search",
     "tool_describe",
@@ -21,9 +25,16 @@ pub(crate) const CORE_TOOL_NAMES: &[&str] = &[
     "memory_search",
     "memory_read",
     "memory_write",
-    "skill_search",
-    "file_read",
+    "skill_list",
+    "read_file",
     "list_dir",
+    "http",
+    "extension_search",
+    "extension_install",
+    "extension_activate",
+    "extension_remove",
+    "web_search",
+    "web_fetch",
 ];
 
 const BRIDGE_CAPABILITY_PREFIX: &str = "ironclaw";
@@ -89,7 +100,7 @@ impl CapabilityCatalog {
                 let search_blob =
                     format!("{} {}", definition.name, definition.description).to_lowercase();
                 let search_terms = search_terms(&search_blob);
-                let tier = if CORE_TOOL_NAMES.contains(&definition.name.as_str())
+                let tier = if is_core_tool_definition(definition)
                     || pinned_names.contains(definition.name.as_str())
                 {
                     ToolTier::Core
@@ -171,6 +182,29 @@ impl CapabilityCatalog {
         descriptors.sort_by(|left, right| left.capability_id.cmp(&right.capability_id));
         descriptors
     }
+}
+
+fn is_core_tool_definition(definition: &ProviderToolDefinition) -> bool {
+    CORE_TOOL_NAMES
+        .iter()
+        .any(|core_name| definition_matches_core_name(definition, core_name))
+}
+
+fn definition_matches_core_name(definition: &ProviderToolDefinition, core_name: &str) -> bool {
+    if definition.name == core_name {
+        return true;
+    }
+    let capability_id = definition.capability_id.as_str();
+    if capability_id
+        .strip_prefix("builtin.")
+        .is_some_and(|name| name == core_name)
+    {
+        return true;
+    }
+    matches!(
+        (capability_id, core_name),
+        ("web-access.search", "web_search") | ("web-access.get_content", "web_fetch")
+    ) || capability_id.ends_with(&format!(".{core_name}"))
 }
 
 impl PromotedSet {
@@ -617,11 +651,91 @@ mod tests {
     use super::*;
 
     #[test]
+    fn core_builtin_names_are_backed_by_known_capability_ids() {
+        let known_builtin_core_names = [
+            (
+                "memory_search",
+                ironclaw_host_runtime::MEMORY_SEARCH_CAPABILITY_ID,
+            ),
+            (
+                "memory_read",
+                ironclaw_host_runtime::MEMORY_READ_CAPABILITY_ID,
+            ),
+            (
+                "memory_write",
+                ironclaw_host_runtime::MEMORY_WRITE_CAPABILITY_ID,
+            ),
+            (
+                "skill_list",
+                ironclaw_host_runtime::SKILL_LIST_CAPABILITY_ID,
+            ),
+            ("read_file", ironclaw_host_runtime::READ_FILE_CAPABILITY_ID),
+            ("list_dir", ironclaw_host_runtime::LIST_DIR_CAPABILITY_ID),
+            ("http", ironclaw_host_runtime::HTTP_CAPABILITY_ID),
+            ("extension_search", "builtin.extension_search"),
+            ("extension_install", "builtin.extension_install"),
+            ("extension_activate", "builtin.extension_activate"),
+            ("extension_remove", "builtin.extension_remove"),
+        ];
+        let synthetic_or_extension_core_names = [
+            TOOL_SEARCH_NAME,
+            TOOL_DESCRIBE_NAME,
+            TOOL_CALL_NAME,
+            "result_read",
+            "web_search",
+            "web_fetch",
+        ];
+
+        for (name, capability_id) in known_builtin_core_names {
+            assert!(
+                CORE_TOOL_NAMES.contains(&name),
+                "known builtin core tool {name} is missing from CORE_TOOL_NAMES"
+            );
+            assert_eq!(
+                capability_id.strip_prefix("builtin."),
+                Some(name),
+                "builtin core tool {name} must map to builtin.{name}"
+            );
+        }
+        for name in CORE_TOOL_NAMES {
+            if synthetic_or_extension_core_names.contains(name) {
+                continue;
+            }
+            assert!(
+                known_builtin_core_names
+                    .iter()
+                    .any(|(known_name, _)| known_name == name),
+                "core tool {name} is neither a known builtin nor an intentional synthetic/extension entry"
+            );
+        }
+    }
+
+    #[test]
+    fn catalog_marks_provider_encoded_builtin_names_core_by_capability_id() {
+        let definitions = vec![ProviderToolDefinition {
+            capability_id: CapabilityId::new(ironclaw_host_runtime::READ_FILE_CAPABILITY_ID)
+                .expect("valid capability id"),
+            name: "builtin__read_file".to_string(),
+            description: "Read files from the workspace.".to_string(),
+            parameters: medium_schema(0),
+        }];
+
+        let catalog = CapabilityCatalog::new(&definitions, &[]);
+
+        assert_eq!(
+            catalog
+                .entry_by_name("builtin__read_file")
+                .map(|entry| entry.tier),
+            Some(ToolTier::Core)
+        );
+    }
+
+    #[test]
     fn catalog_sorts_entries_and_marks_core_and_pins() {
         let definitions = vec![
             fixture_tool("zeta_tool", "Zeta tool", small_no_arg_schema()),
             fixture_tool(
-                "file_read",
+                "read_file",
                 "Read files from the workspace.",
                 medium_schema(0),
             ),
@@ -636,9 +750,9 @@ mod tests {
             .iter()
             .map(|entry| entry.definition.name.as_str())
             .collect();
-        assert_eq!(names, vec!["alpha_tool", "file_read", "zeta_tool"]);
+        assert_eq!(names, vec!["alpha_tool", "read_file", "zeta_tool"]);
         assert_eq!(
-            catalog.entry_by_name("file_read").map(|entry| entry.tier),
+            catalog.entry_by_name("read_file").map(|entry| entry.tier),
             Some(ToolTier::Core)
         );
         assert_eq!(
@@ -660,7 +774,7 @@ mod tests {
                 small_no_arg_schema(),
             ),
             fixture_tool(
-                "file_read",
+                "read_file",
                 "Read files from the workspace.",
                 medium_schema(0),
             ),
@@ -705,7 +819,7 @@ mod tests {
                 parameters: small_no_arg_schema(),
             },
             fixture_tool(
-                "file_read",
+                "read_file",
                 "Read files from the workspace.",
                 medium_schema(0),
             ),
@@ -719,7 +833,7 @@ mod tests {
                 .definitions()
                 .map(|definition| definition.name.as_str())
                 .collect::<Vec<_>>(),
-            vec!["file_read"]
+            vec!["read_file"]
         );
     }
 
@@ -810,7 +924,7 @@ mod tests {
         let definitions = vec![
             fixture_tool("zzz_promoted", "Promoted", medium_schema(1)),
             fixture_tool(
-                "file_read",
+                "read_file",
                 "Read files from the workspace.",
                 medium_schema(2),
             ),
@@ -830,12 +944,12 @@ mod tests {
         let mut promoted = PromotedSet::default();
         promoted.push("zzz_promoted");
         promoted.push("aaa_promoted");
-        promoted.push("file_read");
+        promoted.push("read_file");
         let bridge_tokens = bridge_tool_definitions_with_tokens()
             .fold(0_u32, |total, (_definition, est_schema_tokens)| {
                 total.saturating_add(est_schema_tokens)
             });
-        let active_budget = ["file_read", "memory_search", "zzz_promoted", "aaa_promoted"]
+        let active_budget = ["read_file", "memory_search", "zzz_promoted", "aaa_promoted"]
             .into_iter()
             .filter_map(|name| catalog.entry_by_name(name))
             .fold(bridge_tokens, |total, entry| {
@@ -861,8 +975,8 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "file_read",
                 "memory_search",
+                "read_file",
                 "tool_search",
                 "tool_describe",
                 "tool_call",
@@ -875,7 +989,7 @@ mod tests {
     #[test]
     fn select_active_set_caps_promoted_suffix_without_dropping_core_or_bridges() {
         let mut definitions = vec![fixture_tool(
-            "file_read",
+            "read_file",
             "Read files from the workspace.",
             medium_schema(0),
         )];
@@ -909,7 +1023,7 @@ mod tests {
             .collect();
         assert!(by_count.deferred);
         assert!(by_count.definitions.len() <= base_count + 1);
-        assert!(by_count_names.contains(&"file_read"));
+        assert!(by_count_names.contains(&"read_file"));
         assert!(by_count_names.contains(&TOOL_SEARCH_NAME));
         assert!(by_count_names.contains(&TOOL_DESCRIBE_NAME));
         assert!(by_count_names.contains(&TOOL_CALL_NAME));
@@ -923,8 +1037,8 @@ mod tests {
         let token_threshold = bridge_tokens
             .saturating_add(
                 catalog
-                    .entry_by_name("file_read")
-                    .expect("file_read entry")
+                    .entry_by_name("read_file")
+                    .expect("read_file entry")
                     .est_schema_tokens,
             )
             .saturating_add(
@@ -954,7 +1068,7 @@ mod tests {
         assert!(by_tokens.deferred);
         assert!(by_tokens.definitions.len() <= 32);
         assert!(by_tokens.advertised_tokens <= token_threshold);
-        assert!(by_token_names.contains(&"file_read"));
+        assert!(by_token_names.contains(&"read_file"));
         assert!(by_token_names.contains(&TOOL_SEARCH_NAME));
         assert!(by_token_names.contains(&TOOL_DESCRIBE_NAME));
         assert!(by_token_names.contains(&TOOL_CALL_NAME));
@@ -971,7 +1085,7 @@ mod tests {
                 medium_schema(1),
             ),
             fixture_tool(
-                "file_read",
+                "read_file",
                 "Read a workspace file by path.",
                 medium_schema(2),
             ),
@@ -987,7 +1101,7 @@ mod tests {
             tool_search_rank(&catalog, "search issue", 2),
             vec!["github_issue_search"]
         );
-        assert_eq!(tool_search_rank(&catalog, "read", 2), vec!["file_read"]);
+        assert_eq!(tool_search_rank(&catalog, "read", 2), vec!["read_file"]);
     }
 
     #[test]
@@ -1053,8 +1167,8 @@ mod tests {
             "memory_search",
             "memory_read",
             "memory_write",
-            "skill_search",
-            "file_read",
+            "skill_list",
+            "read_file",
             "list_dir",
         ];
         let mut definitions: Vec<ProviderToolDefinition> = core_names
