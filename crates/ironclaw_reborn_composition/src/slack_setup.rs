@@ -11,7 +11,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ironclaw_common::hashing::sha256_hex;
-use ironclaw_host_api::{AgentId, ProjectId, ResourceScope, SecretHandle, TenantId, UserId};
+use ironclaw_host_api::{
+    AgentId, InvocationId, ProjectId, ResourceScope, SecretHandle, TenantId, UserId,
+};
 use ironclaw_product_adapters::AdapterInstallationId;
 use ironclaw_secrets::{SecretMaterial, SecretStore, SecretStoreError};
 use secrecy::{ExposeSecret, SecretString};
@@ -368,7 +370,15 @@ impl SlackSetupService {
     }
 
     fn secret_scope(&self) -> ResourceScope {
-        ResourceScope::system()
+        ResourceScope {
+            tenant_id: self.tenant_id.clone(),
+            user_id: self.operator_user_id.clone(),
+            agent_id: Some(self.agent_id.clone()),
+            project_id: self.project_id.clone(),
+            mission_id: None,
+            thread_id: None,
+            invocation_id: InvocationId::new(),
+        }
     }
 }
 
@@ -475,7 +485,6 @@ fn map_secret_error(error: SecretStoreError) -> SlackSetupError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ironclaw_host_api::InvocationId;
     use ironclaw_secrets::InMemorySecretStore;
 
     #[derive(Debug, Default)]
@@ -501,7 +510,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_stores_slack_credentials_in_system_scope_only() {
+    async fn save_stores_slack_credentials_in_operator_scope_only() {
         let secret_store = Arc::new(InMemorySecretStore::new());
         let service = SlackSetupService::new(
             TenantId::new("tenant:test").expect("tenant"),
@@ -561,14 +570,14 @@ mod tests {
                 .metadata(&operator_runtime_scope, &setup.bot_token_handle)
                 .await
                 .expect("operator metadata")
-                .is_none()
+                .is_some()
         );
         assert!(
             secret_store
                 .metadata(&ResourceScope::system(), &setup.bot_token_handle)
                 .await
                 .expect("system metadata")
-                .is_some()
+                .is_none()
         );
 
         let bot_token = service.bot_token(&setup).await.expect("bot token");
@@ -576,7 +585,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn save_namespaces_system_scope_slack_credentials_by_tenant() {
+    async fn save_namespaces_operator_scope_slack_credentials_by_tenant() {
         let secret_store = Arc::new(InMemorySecretStore::new());
         let service_a = SlackSetupService::new(
             TenantId::new("tenant:a").expect("tenant"),

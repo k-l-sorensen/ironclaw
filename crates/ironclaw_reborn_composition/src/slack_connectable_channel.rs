@@ -319,6 +319,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slack_mounts_hide_channel_admin_action_from_cross_tenant_operator_user() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let runtime = build_reborn_runtime(
+            RebornRuntimeInput::from_services(
+                RebornBuildInput::local_dev("slack-webui-owner", root.path().join("local-dev"))
+                    .with_runtime_policy(local_dev_runtime_policy().expect("local policy")),
+            )
+            .with_identity(RebornRuntimeIdentity {
+                tenant_id: "slack-webui-tenant".to_string(),
+                agent_id: "slack-webui-agent".to_string(),
+                source_binding_id: "slack-webui-source".to_string(),
+                reply_target_binding_id: "slack-webui-reply".to_string(),
+            })
+            .with_model_gateway_override(Arc::new(StaticGateway)),
+        )
+        .await
+        .expect("runtime builds");
+        let bundle = build_webui_services_with_slack_connectable_channel(
+            &runtime,
+            None,
+            SlackConnectableChannelVisibility::PersonalPairingAndAdminChannelManagement,
+        )
+        .expect("webui bundle");
+        let caller = WebUiAuthenticatedCaller::new(
+            TenantId::new("tenant:other").expect("tenant"),
+            UserId::new(SLACK_OPERATOR_USER).expect("user"),
+            Some(AgentId::new("slack-webui-agent").expect("agent")),
+            None,
+        );
+
+        let response = bundle
+            .api
+            .list_connectable_channels(caller)
+            .await
+            .expect("connectable channels");
+
+        assert_eq!(response.channels.len(), 1);
+        assert_eq!(
+            response.channels[0].strategy,
+            RebornChannelConnectStrategy::InboundProofCode
+        );
+
+        runtime.shutdown().await.expect("runtime shutdown");
+    }
+
+    #[tokio::test]
     async fn slack_mounts_without_operator_action_advertise_personal_pairing_only() {
         let root = tempfile::tempdir().expect("tempdir");
         let runtime = build_reborn_runtime(

@@ -659,8 +659,10 @@ pub fn webui_v2_app_with_lifecycle(
     }
     #[cfg(feature = "slack-v2-host-beta")]
     if let Some(mount) = &slack_channel_routes_mount {
-        operator_descriptors.extend(mount.descriptors.iter().cloned());
-        descriptors.extend(mount.descriptors.iter().cloned());
+        if mount_operator_routes {
+            operator_descriptors.extend(mount.descriptors.iter().cloned());
+            descriptors.extend(mount.descriptors.iter().cloned());
+        }
     }
     for mount in &public_mounts {
         descriptors.extend(mount.descriptors.iter().cloned());
@@ -719,7 +721,9 @@ pub fn webui_v2_app_with_lifecycle(
     }
     #[cfg(feature = "slack-v2-host-beta")]
     if let Some(mount) = slack_channel_routes_mount {
-        protected_inner = protected_inner.merge(mount.protected);
+        if mount_operator_routes {
+            protected_inner = protected_inner.merge(mount.protected);
+        }
     }
     for mount in public_mounts {
         public_inner = Some(match public_inner {

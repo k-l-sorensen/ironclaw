@@ -1112,6 +1112,21 @@ mod tests {
         }
     }
 
+    struct NonOperatorTokenAuthenticator;
+
+    #[async_trait]
+    impl WebuiAuthenticator for NonOperatorTokenAuthenticator {
+        async fn authenticate(&self, token: &str) -> Option<WebuiAuthentication> {
+            if token == "operator-token" {
+                Some(WebuiAuthentication::operator(
+                    UserId::new(USER).expect("user"),
+                ))
+            } else {
+                None
+            }
+        }
+    }
+
     #[derive(Debug)]
     struct NonAdvancingCursorRouteStore;
 
@@ -1986,6 +2001,48 @@ mod tests {
             .await
             .expect("route responds");
         assert_eq!(response.status(), StatusCode::OK);
+
+        runtime.shutdown().await.expect("runtime shuts down");
+    }
+
+    #[tokio::test]
+    async fn slack_channel_routes_not_mounted_for_non_operator_config_authenticator() {
+        let (runtime, _root) = runtime().await;
+        let mounts = build_slack_host_beta_mounts(&runtime, config_without_channel_routes())
+            .expect("mounts");
+        let bundle = build_webui_services_with_slack_host_beta_mounts(
+            &runtime,
+            None,
+            Some(&mounts),
+            SlackOperatorRouteVisibility::Hidden,
+        )
+        .expect("webui bundle");
+        let app = webui_v2_app(
+            bundle,
+            WebuiServeConfig::new(
+                TenantId::new(TENANT).expect("tenant"),
+                Arc::new(NonOperatorTokenAuthenticator),
+                Vec::new(),
+            )
+            .with_default_agent_id(AgentId::new(AGENT).expect("agent"))
+            .with_default_project_id(ProjectId::new(PROJECT).expect("project"))
+            .with_slack_channel_routes(mounts.channel_routes),
+        )
+        .expect("webui app");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(WEBUI_V2_CHANNELS_SLACK_ROUTES_PATH)
+                    .header("authorization", "Bearer operator-token")
+                    .body(Body::empty())
+                    .expect("request builds"),
+            )
+            .await
+            .expect("route responds");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
 
         runtime.shutdown().await.expect("runtime shuts down");
     }

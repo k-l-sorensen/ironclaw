@@ -299,9 +299,10 @@ fn ensure_selected_subject_user(
     if ensure_allowed_subject_user(context, subject_user_id).is_ok() {
         return Ok(());
     }
-    if current_subjects_by_channel
-        .get(channel_id)
-        .is_some_and(|current_subject_user_id| current_subject_user_id == subject_user_id)
+    if context.preserve_existing_subjects
+        && current_subjects_by_channel
+            .get(channel_id)
+            .is_some_and(|current_subject_user_id| current_subject_user_id == subject_user_id)
     {
         return Ok(());
     }

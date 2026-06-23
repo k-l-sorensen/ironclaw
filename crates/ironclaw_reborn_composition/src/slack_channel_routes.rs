@@ -569,6 +569,7 @@ impl SlackChannelRouteAdminRouteConfig {
                 allowed_subject_user_ids: allowed_subject_user_ids.clone(),
                 routable_team_subjects: routable_team_subjects.clone(),
                 channel_subject_assigner: channel_subject_assigner.clone(),
+                preserve_existing_subjects: true,
             }),
             SlackChannelRouteAdminScope::Dynamic {
                 tenant_id,
@@ -651,6 +652,7 @@ struct SlackChannelRouteAdminContext {
     allowed_subject_user_ids: HashSet<UserId>,
     routable_team_subjects: Vec<subjects::SlackRoutableTeamSubject>,
     channel_subject_assigner: SlackChannelSubjectAssigner,
+    preserve_existing_subjects: bool,
 }
 
 impl SlackChannelRouteAdminContext {
@@ -686,6 +688,7 @@ impl SlackChannelRouteAdminContext {
                 installation_id,
                 team_id,
             ),
+            preserve_existing_subjects: false,
         })
     }
 }

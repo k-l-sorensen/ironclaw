@@ -50,7 +50,7 @@ pub(super) fn descriptors() -> Vec<IngressRouteDescriptor> {
     ]
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SlackSetupSaveRequest {
     installation_id: String,

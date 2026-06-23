@@ -352,7 +352,7 @@ impl DynamicSlackInstallationResolver {
             .setup_service
             .current_setup()
             .await
-            .map_err(|_| SlackIngressError::InstallationNotFound)?
+            .map_err(map_setup_error_to_ingress_not_found("read Slack setup"))?
             .ok_or(SlackIngressError::InstallationNotFound)?;
         let revision = setup.revision;
         if let Some(resolver) = self.live_resolver_for_revision(revision).await {
@@ -393,8 +393,12 @@ impl DynamicSlackInstallationResolver {
     ) -> Result<StaticSlackInstallationResolver, SlackIngressError> {
         let config = slack_host_beta_config_from_setup(&self.setup_service, setup)
             .await
-            .map_err(|_| SlackIngressError::InstallationNotFound)?
-            .map_err(|_| SlackIngressError::InstallationNotFound)?;
+            .map_err(map_setup_error_to_ingress_not_found(
+                "resolve Slack setup secrets",
+            ))?
+            .map_err(map_build_error_to_ingress_not_found(
+                "build Slack setup config",
+            ))?;
         let identity_lookup: Arc<dyn crate::slack_actor_identity::RebornUserIdentityLookup> =
             self.state.clone();
         let actor_user_resolver = Arc::new(SlackHostBetaActorUserResolver::new(
@@ -421,7 +425,9 @@ impl DynamicSlackInstallationResolver {
             actor_user_resolver,
             Some(subject_route_resolver),
         )
-        .map_err(|_| SlackIngressError::InstallationNotFound)?;
+        .map_err(map_build_error_to_ingress_not_found(
+            "build Slack installation resolver",
+        ))?;
         Ok(StaticSlackInstallationResolver::new([record]))
     }
 
@@ -692,17 +698,18 @@ impl SlackDynamicOutboundTargetProvider {
     async fn configured_provider(
         &self,
     ) -> Result<Option<SlackHostBetaOutboundTargetProvider>, RebornServicesError> {
-        let Some(setup) = self
-            .setup_service
-            .current_setup()
-            .await
-            .map_err(|_| slack_dynamic_target_unavailable())?
+        let Some(setup) = self.setup_service.current_setup().await.map_err(
+            map_setup_error_to_dynamic_target_unavailable("read Slack setup for outbound targets"),
+        )?
         else {
             return Ok(None);
         };
-        let installation_id = setup
-            .installation_id()
-            .map_err(|_| slack_dynamic_target_unavailable())?;
+        let installation_id =
+            setup
+                .installation_id()
+                .map_err(map_setup_error_to_dynamic_target_unavailable(
+                    "parse Slack setup installation id for outbound targets",
+                ))?;
         let team_id = setup.team_id();
         Ok(Some(SlackHostBetaOutboundTargetProvider::new(
             SlackOutboundTargetProviderConfig {
@@ -806,9 +813,41 @@ async fn slack_host_beta_config_from_setup(
     }))
 }
 
+fn map_setup_error_to_ingress_not_found(
+    context: &'static str,
+) -> impl FnOnce(crate::slack_setup::SlackSetupError) -> SlackIngressError {
+    move |error| {
+        tracing::debug!(%error, context, "Slack setup unavailable for dynamic ingress");
+        SlackIngressError::InstallationNotFound
+    }
+}
+
+fn map_build_error_to_ingress_not_found(
+    context: &'static str,
+) -> impl FnOnce(SlackHostBetaBuildError) -> SlackIngressError {
+    move |error| {
+        tracing::debug!(%error, context, "Slack setup config unavailable for dynamic ingress");
+        SlackIngressError::InstallationNotFound
+    }
+}
+
+fn map_setup_error_to_dynamic_target_unavailable(
+    context: &'static str,
+) -> impl FnOnce(crate::slack_setup::SlackSetupError) -> RebornServicesError {
+    move |error| {
+        tracing::debug!(
+            %error,
+            context,
+            "Slack setup unavailable for dynamic outbound targets"
+        );
+        slack_dynamic_target_unavailable()
+    }
+}
+
 fn map_setup_error_to_egress(
     error: crate::slack_setup::SlackSetupError,
 ) -> ProtocolHttpEgressError {
+    tracing::debug!(%error, "Slack setup unavailable for dynamic Slack egress");
     ProtocolHttpEgressError::PolicyDenied {
         reason: RedactedString::new(error.to_string()),
     }

@@ -30,6 +30,12 @@ pub(crate) fn resolve_slack_config_for_serve(
     let Some(section) = section else {
         return Ok(None);
     };
+    if has_legacy_slack_setup(section) && section.enabled != Some(true) {
+        anyhow::bail!(
+            "[slack].enabled must be true when legacy Slack setup fields are present in {}",
+            config_path.display()
+        );
+    }
     if section.enabled != Some(true) {
         return Ok(None);
     }
@@ -176,11 +182,11 @@ fn required_env_secret(
     env_var: &str,
     config_path: &Path,
 ) -> anyhow::Result<String> {
-    let value = env::var(env_var).map_err(|_| {
+    let value = env::var(env_var).map_err(|error| {
         anyhow!(
             "{env_var} must be set to the Slack {label} for legacy Slack setup. \
-             Override the variable name via [slack].{field} in {}.",
-            config_path.display()
+             Override the variable name via [slack].{field} in {}: {error}",
+            config_path.display(),
         )
     })?;
     if value.is_empty() {
@@ -241,6 +247,28 @@ mod tests {
         .expect("disabled Slack should not require runtime setup fields");
 
         assert!(resolved.is_none());
+    }
+
+    #[cfg(feature = "slack-v2-host-beta")]
+    #[test]
+    fn slack_host_beta_runtime_config_rejects_legacy_fields_when_disabled() {
+        let section = ironclaw_reborn_config::SlackSection {
+            enabled: Some(false),
+            installation_id: Some("install-alpha".to_string()),
+            ..Default::default()
+        };
+
+        let err = resolve_slack_config_for_serve(
+            Some(&section),
+            &tenant_id("tenant"),
+            &agent_id("agent"),
+            None,
+            &user_id("web-user"),
+            std::path::Path::new("/tmp/reborn-config.toml"),
+        )
+        .expect_err("legacy Slack fields require enabled Slack");
+
+        assert!(err.to_string().contains("[slack].enabled must be true"));
     }
 
     #[cfg(feature = "slack-v2-host-beta")]

@@ -788,13 +788,16 @@ impl RebornConfigFile {
                     shared_subject_user_id,
                 )?;
             }
-            for route in &slack.channel_routes {
+            for (index, route) in slack.channel_routes.iter().enumerate() {
                 if let Some(channel_id) = &route.channel_id {
-                    check(Cow::Borrowed("slack.channel_routes.channel_id"), channel_id)?;
+                    check_non_empty_trimmed(
+                        Cow::Owned(format!("slack.channel_routes[{index}].channel_id")),
+                        channel_id,
+                    )?;
                 }
                 if let Some(subject_user_id) = &route.subject_user_id {
-                    check(
-                        Cow::Borrowed("slack.channel_routes.subject_user_id"),
+                    check_non_empty_trimmed(
+                        Cow::Owned(format!("slack.channel_routes[{index}].subject_user_id")),
                         subject_user_id,
                     )?;
                 }
@@ -1607,6 +1610,21 @@ signing_secret_env = "sk-proj-1234567890abcdef1234567890"
             .expect_err("legacy Slack env name must not accept raw secrets");
         assert!(
             err.to_string().contains("slack.signing_secret_env"),
+            "error should identify legacy Slack field: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_inline_secret_in_legacy_slack_bot_token_env_name() {
+        let toml = r#"
+[slack]
+enabled = true
+bot_token_env = "sk-proj-1234567890abcdef1234567890"
+"#;
+        let err = RebornConfigFile::parse_text(toml, &attributed())
+            .expect_err("legacy Slack bot token env name must not accept raw secrets");
+        assert!(
+            err.to_string().contains("slack.bot_token_env"),
             "error should identify legacy Slack field: {err}"
         );
     }
