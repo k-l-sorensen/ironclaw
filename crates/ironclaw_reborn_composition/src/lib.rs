@@ -33,6 +33,8 @@ mod budget;
 mod budget_events;
 mod bundled_skills;
 mod communication_context;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+mod credential_refresh_worker;
 mod default_system_prompt;
 mod error;
 mod extension_activation_credentials;
@@ -65,6 +67,7 @@ mod local_runtime_profile;
 mod manual_token_flow;
 mod mcp;
 mod mcp_discovery;
+mod mount_filesystem_reader;
 #[cfg(all(feature = "root-llm-provider", feature = "webui-v2-beta"))]
 mod nearai_login_serve;
 mod nearai_mcp;
@@ -81,6 +84,8 @@ mod outbound_delivery_capability_surface;
 mod outbound_preferences;
 mod product_auth_durable;
 mod product_auth_providers;
+#[cfg(any(feature = "libsql", feature = "postgres"))]
+mod product_auth_refresh_lock;
 mod product_auth_runtime_credentials;
 #[cfg(feature = "webui-v2-beta")]
 mod product_auth_serve;
@@ -89,9 +94,11 @@ mod product_live_adapters;
 mod production_runtime_policy;
 mod profile;
 mod profile_approval_authorization;
+mod project_filesystem_reader;
+mod project_service;
 mod projection;
 mod trajectory_observer;
-pub use auth_prompt::{AuthChallengeProvider, AuthChallengeView};
+pub use auth_prompt::{AuthChallengeProvider, AuthChallengeView, BlockedAuthFlowCanceller};
 #[cfg(feature = "slack-v2-host-beta")]
 mod delivered_gate_routing;
 #[cfg(feature = "root-llm-provider")]
@@ -104,6 +111,7 @@ mod readiness;
 mod runtime;
 mod runtime_input;
 mod runtime_profile_approval_policy;
+mod skill_learning;
 mod skill_listing;
 #[cfg(feature = "slack-v2-host-beta")]
 mod slack_actor_identity;
@@ -188,8 +196,9 @@ pub use input::{OAuthClientConfig, RebornBuildInput, RebornRuntimeProcessBinding
 pub use ironclaw_auth::GoogleOAuthRouteConfig;
 pub use ironclaw_product_workflow::{
     LifecycleExtensionSource, LifecycleExtensionSummary, LifecyclePhase, LifecycleProductPayload,
-    LifecycleProductResponse,
+    LifecycleProductResponse, LifecycleSearchExtensionSummary,
 };
+pub use ironclaw_reborn::runtime::DEFAULT_TURN_RUNNER_WORKER_COUNT;
 #[cfg(any(feature = "libsql", feature = "postgres"))]
 pub use ironclaw_runtime_policy::{
     ResolveRequest as RuntimePolicyResolveRequest, resolve as resolve_runtime_policy,
@@ -210,9 +219,9 @@ pub use llm_config_service::{LlmReloadTrigger, RebornLlmConfigService};
 #[cfg(feature = "root-llm-provider")]
 pub use llm_key_store::{LlmKeyStore, LlmKeyStoreError};
 pub use local_runtime_profile::{
-    RebornLocalRuntimeProfileError, RebornLocalRuntimeProfileOptions, local_dev_runtime_policy,
-    local_dev_yolo_runtime_policy, local_runtime_build_input,
-    local_runtime_build_input_with_options,
+    RebornLocalRuntimeProfileError, RebornLocalRuntimeProfileOptions,
+    hosted_single_tenant_runtime_policy, local_dev_runtime_policy, local_dev_yolo_runtime_policy,
+    local_runtime_build_input, local_runtime_build_input_with_options,
 };
 pub use nearai_mcp::{
     NearAiMcpBootstrapConfig, NearAiMcpBootstrapConfigError, nearai_mcp_bootstrap_config_from_env,
@@ -252,9 +261,10 @@ pub use runtime::{
     RebornSkillExecutionResult, RebornSkillSourceKind, build_reborn_runtime,
 };
 pub use runtime_input::{
-    DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL, DEFAULT_TURN_RUNNER_POLL_INTERVAL, PollSettings,
-    RebornRuntimeIdentity, RebornRuntimeInput, TriggerFireAccessCheck, TriggerFireAccessChecker,
-    TriggerFireAccessDecision, TriggerFireAccessError, TriggerPollerSettings, TurnRunnerSettings,
+    CredentialRefreshSettings, DEFAULT_TURN_RUNNER_HEARTBEAT_INTERVAL,
+    DEFAULT_TURN_RUNNER_POLL_INTERVAL, PollSettings, RebornRuntimeIdentity, RebornRuntimeInput,
+    TriggerFireAccessCheck, TriggerFireAccessChecker, TriggerFireAccessDecision,
+    TriggerFireAccessError, TriggerPollerSettings, TurnRunnerSettings,
 };
 #[cfg(feature = "root-llm-provider")]
 pub use runtime_input::{RebornProviderFactory, ResolvedRebornLlm};
@@ -1240,6 +1250,7 @@ mod two_tenant_isolation_tests {
                 scope_a.clone(),
                 handle.clone(),
                 SecretMaterial::from("alice-secret".to_string()),
+                None,
             )
             .await
             .unwrap();
@@ -1248,6 +1259,7 @@ mod two_tenant_isolation_tests {
                 scope_b.clone(),
                 handle.clone(),
                 SecretMaterial::from("bob-secret".to_string()),
+                None,
             )
             .await
             .unwrap();
