@@ -678,12 +678,11 @@ impl ironclaw_turns::run_profile::LoopCapabilityPort for MockHost {
         activity_id: ironclaw_turns::CapabilityActivityId,
     ) -> Result<CapabilityCallCandidate, AgentLoopHostError> {
         let mut candidate = self.register_provider_tool_call(tool_call).await?;
-        candidate.activity_id = self
+        candidate.activity_id = (*self
             .provider_registration_activity_remap
             .lock()
-            .expect("lock")
-            .clone()
-            .unwrap_or(activity_id);
+            .expect("lock"))
+        .unwrap_or(activity_id);
         Ok(candidate)
     }
 
