@@ -950,7 +950,7 @@ mod tests {
             }
             let reports_status = (program == "systemctl"
                 && args.ends_with(&["is-active", SYSTEMD_UNIT]))
-                || (program == "launchctl" && args == &["list"]);
+                || (program == "launchctl" && args == ["list"]);
             let stdout = if reports_status {
                 self.status_stdout.lock().expect("lock").as_bytes().to_vec()
             } else {
