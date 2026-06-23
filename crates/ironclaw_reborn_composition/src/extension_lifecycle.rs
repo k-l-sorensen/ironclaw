@@ -13,9 +13,9 @@ use ironclaw_host_api::{
     sha256_digest_token,
 };
 use ironclaw_product_workflow::{
-    LifecycleInstalledExtensionSummary, LifecyclePackageKind, LifecyclePackageRef, LifecyclePhase,
-    LifecycleProductPayload, LifecycleProductResponse, LifecycleSearchExtensionSummary,
-    ProductWorkflowError,
+    LifecycleExtensionSummary, LifecycleInstalledExtensionSummary, LifecyclePackageKind,
+    LifecyclePackageRef, LifecyclePhase, LifecycleProductPayload, LifecycleProductResponse,
+    LifecycleSearchExtensionSummary, ProductWorkflowError,
 };
 use tokio::sync::Mutex;
 
@@ -186,14 +186,21 @@ impl RebornLocalExtensionManagementPort {
             summaries.push(self.search_summary(extension, credential_gate).await?);
         }
         let count = summaries.len();
-        Ok(response_with_payload(
+        let mut response = response_with_payload(
             None,
             LifecyclePhase::Discovered,
             LifecycleProductPayload::ExtensionSearch {
                 extensions: summaries,
                 count,
             },
-        ))
+        );
+        if extension_search_has_ready_result(response.payload.as_ref()) {
+            response.message = Some(
+                "Search found installed extension results that are already configured or active. Treat those results as ready for this connection request; do not ask the user for credentials unless a later tool call reports auth_required."
+                    .to_string(),
+            );
+        }
+        Ok(response)
     }
 
     pub(crate) async fn list_installed(
@@ -304,6 +311,7 @@ impl RebornLocalExtensionManagementPort {
         credential_gate: Option<&RuntimeExtensionActivationCredentialGate>,
     ) -> Result<LifecycleSearchExtensionSummary, ProductWorkflowError> {
         let mut summary = extension.summary();
+        suppress_search_credential_onboarding(&mut summary);
         let Some(installation) = self.search_installation(&extension.package.id).await? else {
             return Ok(LifecycleSearchExtensionSummary {
                 summary,
@@ -311,10 +319,6 @@ impl RebornLocalExtensionManagementPort {
             });
         };
         let phase = search_installation_phase(extension, &installation, credential_gate).await?;
-        if search_setup_is_complete(phase) {
-            summary.credential_requirements.clear();
-            summary.onboarding = None;
-        }
         Ok(LifecycleSearchExtensionSummary {
             summary,
             installation_phase: Some(phase),
@@ -555,14 +559,19 @@ impl RebornLocalExtensionManagementPort {
 
         let visible_capability_ids = package_visible_capability_ids(&active_package);
 
-        Ok(response_with_payload(
+        let mut response = response_with_payload(
             Some(package_ref),
             LifecyclePhase::Active,
             LifecycleProductPayload::ExtensionActivate {
                 activated: true,
                 visible_capability_ids,
             },
-        ))
+        );
+        response.message = Some(
+            "Extension activation succeeded and its tools are now available. No additional authorization or configuration is needed, including for write-capable tools, unless a later tool call reports auth_required. Do not ask the user for a token, OAuth, authorization, or configuration after activated=true."
+                .to_string(),
+        );
+        Ok(response)
     }
 
     pub(crate) async fn package_requires_hosted_mcp_discovery(
@@ -1204,14 +1213,22 @@ async fn search_credentials_configured(
         .is_empty())
 }
 
-fn search_setup_is_complete(phase: LifecyclePhase) -> bool {
-    matches!(
-        phase,
-        LifecyclePhase::Configured
-            | LifecyclePhase::Activating
-            | LifecyclePhase::Active
-            | LifecyclePhase::Disabled
-    )
+fn suppress_search_credential_onboarding(summary: &mut LifecycleExtensionSummary) {
+    summary.credential_requirements.clear();
+    summary.onboarding = None;
+}
+
+fn extension_search_has_ready_result(payload: Option<&LifecycleProductPayload>) -> bool {
+    let Some(LifecycleProductPayload::ExtensionSearch { extensions, .. }) = payload else {
+        return false;
+    };
+    extensions.iter().any(|extension| {
+        matches!(
+            extension.installation_phase,
+            Some(LifecyclePhase::Configured | LifecyclePhase::Active)
+        ) && extension.summary.credential_requirements.is_empty()
+            && extension.summary.onboarding.is_none()
+    })
 }
 
 fn map_search_credential_stage_error(
