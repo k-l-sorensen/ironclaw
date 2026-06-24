@@ -1,6 +1,8 @@
 # Mistral Reasoning — Implementation Plan
 
-**Status:** Implemented — offline gate green and live acceptance PASSED · **Date:** 2026-06-24 · **Scope:** v1 (non-Reborn)
+**Status:** v1 Implemented — offline gate green and live acceptance PASSED · Reborn
+follow-up (WU8–WU10) **scoped, unstarted** · **Date:** 2026-06-24 · **Scope:** v1
+(shipped) + Reborn
 
 > Companion to the design doc
 > [`2026-06-24-mistral-reasoning-provider-architecture.md`](2026-06-24-mistral-reasoning-provider-architecture.md)
@@ -160,6 +162,87 @@ Audited; all items confirmed (built against the converged decisions, no drift).
       `IRONCLAW_LIVE_TEST=1 LLM_BACKEND=mistral MISTRAL_API_KEY=... cargo test --features libsql --test e2e_live_mistral_reasoning -- --ignored --nocapture`.
 - [x] commit as `feat(llm): …` (separate from the planning commit) — landed.
 
+## Reborn follow-up (WU8–WU10) — scoped, unstarted
+
+Scope: the `ironclaw-reborn` binary only. Architecture/decisions (R1–R3) and the
+"already present in Reborn" inventory live in the `-architecture` doc's **"Reborn
+architecture (follow-up)"** section — cite, don't restate. Engine v2 is
+permanently out of scope (Reborn replaces it). All three WUs land as one
+`feat(llm)`/`feat(reborn)` commit, separate from docs.
+
+Why this is small: in Reborn the custom Mistral provider is already reachable
+(`build_static_provider_chain` → registry dispatch), the reasoning round-trip
+already exists (`model_gateway.rs`), and reasoning is already persisted
+(`ironclaw_turns` / `ironclaw_threads`). Only *enable*, *redact*, and *expose in
+UI* are missing.
+
+### WU8 — Enable reasoning via the provider catalog (R1) ☐
+- [ ] Add `#[serde(default)] reasoning_effort: Option<MistralReasoningEffort>` to
+      `ProviderDefinition` (`crates/ironclaw_llm/src/registry.rs`); `#[serde(default)]`
+      keeps all other entries valid. Reuse the existing enum (no bool/string).
+- [ ] Built-in `providers.json` (repo root): add `"reasoning_effort": "high"` to
+      the `mistral` entry.
+- [ ] `resolution.rs::resolve_provider_definition`: at the
+      `RegistryProviderConfig::generic(...)` builder, set
+      `config.mistral_reasoning = provider.reasoning_effort`. This is the single
+      point feeding both the Reborn catalog path
+      (`llm_catalog::resolve_against_registry` → `build_llm_config_from_resolved_provider`)
+      and v1 selection/onboarding.
+- [ ] Verify precedence: the v1 primary-chain `apply_registry_provider_env` path
+      stays authoritative (catalog = default, env = override); an explicit
+      `MISTRAL_REASONING=off` must still win and not be re-defaulted to `High`.
+- **Acceptance:** caller-level test driving `resolve_against_registry` /
+      `resolve_provider_config_from_selection` for built-in `mistral` →
+      `mistral_reasoning == Some(High)`; a `mistral-large` case still omits the
+      param (model-gate); `ProviderDefinition` round-trip test that the embedded
+      `providers.json` parses the field and other entries (no field) still
+      deserialize.
+
+### WU9 — Leak-scan reasoning on the Reborn path (R2) ☐
+- [ ] In `crates/ironclaw_reborn/src/model_gateway.rs`, route `response.reasoning`
+      through `LeakDetector::redact_all` (added to `ironclaw_safety` in WU5)
+      **before** it lands on `HostManagedModelResponse`, so the redacted form is
+      what is persisted + replayed. Fail-soft (redact, never block). Covers all
+      reasoning-emitting providers on that gateway, not just Mistral.
+- **Acceptance:** test in `crates/ironclaw_reborn/tests/llm_gateway.rs` — a planted
+      secret in a provider `reasoning` value is redacted on the returned
+      `HostManagedModelResponse`. (Note: the store's `validate_optional_provider_text`
+      is shape validation, not secret scanning — WU9 is still required.)
+
+### WU10 — Surface the toggle in the Reborn WebUI v2 LLM settings (R3) ☐
+Extends the **existing** LLM-provider-config feature with one per-provider field
+(no new endpoint). The overlay is itself a `ProviderDefinition`, so the UI edits
+the same `reasoning_effort` field WU8 adds.
+- [ ] Port DTOs (`crates/ironclaw_product_workflow/src/reborn_services/llm_config.rs`):
+      add `reasoning_effort` to `UpsertLlmProviderRequest` (`#[serde(default)]`) and
+      `LlmProviderView` (`#[serde(skip_serializing_if = "Option::is_none")]`). No
+      trait/facade change.
+- [ ] Composition (`crates/ironclaw_reborn_composition/src/llm_config_service.rs`):
+      thread the field through `upsert_provider` → `build_overlay_definition`
+      (builtin-clone + custom paths) and read it back in `build_snapshot`. Add it
+      to `RebornProviderMetadata` and populate in `provider_admin.rs::provider_info`.
+- [ ] HTTP: no route change (16 KiB upsert cap). Confirm
+      `crates/ironclaw_webui_v2/tests/webui_v2_descriptors_contract.rs` still
+      passes unchanged.
+- [ ] Frontend (`crates/ironclaw_webui_v2_static/static/js/pages/settings/`):
+      `useProviderDialogForm.js` init `reasoning`, a Mistral-adapter-gated select
+      in `provider-dialog.js`, and add `reasoning_effort` to the save payload in
+      `useLlmProviders.js`. `node --check` the three JS files.
+- **Acceptance:** caller-level round-trip in the `llm_config_service.rs` test
+      module — `upsert_provider` with `reasoning_effort: Some(High)` persists it in
+      the overlay and `snapshot()` reads it back on `LlmProviderView` (test through
+      the service, not just the DTO).
+- **Per-crate gate (don't wait for the whole graph):**
+      `cargo build -p ironclaw_product_workflow --all-features`;
+      `cargo build -p ironclaw_webui_v2 --features webui-v2-beta`;
+      `cargo build -p ironclaw_reborn_composition --features "root-llm-provider webui-v2-beta libsql"`;
+      `cargo build -p ironclaw_reborn_cli`.
+
+### Reborn live acceptance (optional smoke) ☐
+- [ ] `ironclaw-reborn serve` with `mistral`: multi-turn exchange returns a clean
+      reply, no `ApiResponse` parse error, no turn-2 HTTP 400. Adapt the approach
+      from `tests/e2e_live_mistral_reasoning.rs` to the Reborn binary.
+
 ## Open code-level questions (from the review, carry forward)
 - [x] **RESOLVED — no remap needed.** `BadGateway` and `EmptyResponse` are both
       classified transient: `retry.rs::is_retryable` (lines 45–57) and
@@ -179,3 +262,4 @@ Audited; all items confirmed (built against the converged decisions, no drift).
 - 2026-06-24 — Live acceptance run against the real API: receive path works on small/medium/large, no `ApiResponse` parse error; thinking trace and answer surfaced separately. Acceptance script rebuilt to log the full interaction across 5 cases; a trace-detection ANSI bug (false FAIL) was found and fixed. WU7 remaining: clean final acceptance run + multi-turn check + `feat(llm)` commit.
 - 2026-06-24 — Implementation committed as the `feat(llm): …` commit, separate from the planning `docs(llm): …` commit. WU7 remaining: clean final live-acceptance run + multi-turn check.
 - 2026-06-24 — Test alignment: the bespoke bash acceptance harness was replaced by the Live-tier Rust test `tests/e2e_live_mistral_reasoning.rs` (`#[ignore]` + `LiveTestHarness`, skips cleanly without `IRONCLAW_LIVE_TEST`); `MISTRAL_API_KEY` added to the harness `SECRET_TO_ENV` map. **WU7 closed:** both live tests PASSED against the real API (round-trip: clean reply, no parse error; multi-turn: turn 2 OK), on the v1 path (`engine_v2=false`). Offline matrix remains the primary deterministic net.
+- 2026-06-24 — Reborn follow-up scoped (WU8–WU10, unstarted). Investigation found Reborn already has the provider reachable, the reasoning round-trip (`model_gateway.rs`), and reasoning persistence (`ironclaw_turns`/`ironclaw_threads`); the only gaps are enabling the catalog field (WU8), the leak-scan on the Reborn path (WU9), and the WebUI toggle (WU10). Engine v2 ruled permanently out of scope (Reborn replaces it). Decisions R1–R3 recorded in the `-architecture` doc's "Reborn architecture (follow-up)" section. Docs-only this pass; no code.

@@ -1,6 +1,7 @@
 # Mistral Reasoning — Provider Architecture (C4 Level 3)
 
-**Status:** Approved architecture · **Date:** 2026-06-24 · **Scope:** v1 (non-Reborn)
+**Status:** Approved architecture · **Date:** 2026-06-24 · **Scope:** v1 (shipped)
++ Reborn follow-up (scoped, unstarted — see "Reborn architecture (follow-up)" below)
 
 > This is an **architecture-level** design (C4 model, component level). It does
 > not specify line-level code; the code-level plan lives in the companion impl
@@ -226,7 +227,12 @@ is reused unchanged.
 
 - `rig-core` version bump (orthogonal; doesn't solve this).
 - `prompt_mode` knob (risks layering Mistral's own system prompt over IronClaw's).
-- Reborn / engine v2 — this is the v1 path only.
+- **Engine v2** (`crates/ironclaw_engine/`) — permanently out of scope. Reborn is
+  intended to replace both v1 and engine v2, so engine v2's reasoning plumbing
+  (which drops `reasoning` at the `LlmBridgeAdapter` and has no field on
+  `LlmOutput`/`LlmResponse`/`ThreadMessage`) is deliberately not pursued.
+- **Reborn** was originally out of scope for the v1 design but is now a scoped
+  follow-up — see "Reborn architecture (follow-up)" below.
 - Streaming reasoning surfacing in the TUI (round-trip + final answer is the goal;
   live thinking display is a possible follow-up, not required).
 
@@ -306,3 +312,77 @@ implementation must honor, not resolvable in a design doc).
 **What this leaves for the code-level pass:** F10–F12 are constraints that can only
 be verified against real code, plus the mechanical implementation of every
 "settled" item. No open architecture-level questions remain.
+
+## Reborn architecture (follow-up)
+
+**Status:** Scoped, **unstarted**. **Date:** 2026-06-24. **Scope:** Reborn stack
+only (`ironclaw-reborn` binary); engine v2 deliberately excluded (see Out of
+scope). The code-level work units live in the impl doc (WU8–WU10).
+
+The everything-above design targeted v1. Reborn (`crates/ironclaw_reborn/` and
+the `ironclaw_reborn_*` family, separate `ironclaw-reborn` binary) is a distinct
+execution stack with its own loop and model gateway. Because Reborn is intended
+to replace both v1 and engine v2, Mistral reasoning must work there too. An
+investigation found Reborn is **much closer to working than engine v2** — most of
+the machinery is already present; only two small gaps and one UI surface remain.
+
+### Reused — already present in Reborn (do NOT rebuild)
+
+| Concern | Where it already works in Reborn |
+|---|---|
+| Custom Mistral provider reachable | `ironclaw_llm::build_static_provider_chain` → `build_provider_chain_components_with_options` → registry dispatch (`lib.rs` `ProviderProtocol::Mistral => create_mistral_from_registry(...)`). The v1 provider, shared `providers.json`, and overlay migration all apply unchanged. |
+| Reasoning round-trip (capture + replay) | `crates/ironclaw_reborn/src/model_gateway.rs` captures `response.reasoning` (`assistant_reply_with_reasoning`, `capability_calls_with_reasoning`, `response_reasoning` on tool-call refs) and replays it via `ChatMessage::…with_reasoning(...)` in `convert_messages` / `provider_tool_roundtrip_messages`. Satisfies Mistral's multi-turn ThinkChunk-replay requirement (else turn-2 HTTP 400). |
+| Reasoning persistence | The store already carries it: `response_reasoning` + `reasoning` on `crates/ironclaw_turns/src/run_profile/host.rs` and `crates/ironclaw_threads/src/tool_result_reference.rs` (validated, 4096-char cap). No persistence work needed. |
+| Typed effort enum, model-gating, `LeakDetector::redact_all` | All landed in the v1 work (`MistralReasoningEffort`, `supports_mistral_reasoning`, `redact_all`). |
+
+### Gaps (the only Reborn-specific work)
+
+1. **Reasoning is never enabled on the Reborn config path.** Reborn resolves LLM
+   config via `llm_catalog::resolve_against_registry` →
+   `ironclaw_llm::build_llm_config_from_resolved_provider` (`resolution.rs`),
+   which assigns the resolved `RegistryProviderConfig` straight through and does
+   **not** call `apply_registry_provider_env`. The v1 default-on logic lives only
+   in `apply_registry_provider_env` (the env path). So
+   `RegistryProviderConfig.mistral_reasoning` stays at its `::generic` default of
+   `Option::None` → `reasoning_effort` is omitted → no reasoning, ever. **This is
+   why Mistral reasoning silently does nothing in Reborn today.**
+2. **Reborn bypasses the v1 reasoning leak-scan.** The v1 redaction lives in the
+   crate `Reasoning` engine (`reasoning.rs::respond_with_tools`), which Reborn
+   does not use; `model_gateway.rs` captures `response.reasoning` raw.
+
+### Decisions (Reborn follow-up)
+
+- **R1 — Toggle is a Reborn-native catalog field, not an env var.** Per the user,
+  add `reasoning_effort: Option<MistralReasoningEffort>` to `ProviderDefinition`
+  (`registry.rs`), default `"high"` on the built-in `mistral` entry in
+  `providers.json`, and apply it in `resolution.rs::resolve_provider_definition`
+  at the `RegistryProviderConfig::generic(...)` builder. This single injection
+  point feeds both the Reborn catalog path and the v1 selection/onboarding path;
+  the provider's `supports_mistral_reasoning` model-gate still auto-omits the
+  param for non-small/medium models. The v1 primary-chain env path
+  (`apply_registry_provider_env`) is unchanged and must remain authoritative
+  there (catalog = default, env = override) — verify no double-apply flips an
+  explicit `MISTRAL_REASONING=off`.
+- **R2 — Leak-scan at the Reborn chokepoint.** Route `response.reasoning` through
+  `LeakDetector::redact_all` in `model_gateway.rs` before it lands on
+  `HostManagedModelResponse` (so the redacted form is persisted + replayed).
+  Fail-soft. Also covers other reasoning-emitting providers on that gateway.
+- **R3 — Surface the toggle in the Reborn WebUI v2 LLM settings.** Per the user,
+  expose it as one more per-provider field on the **existing** LLM-provider-config
+  feature (no new endpoint). The crucial enabler: the WebUI per-provider overlay
+  is itself a `ProviderDefinition` persisted to
+  `$IRONCLAW_REBORN_HOME/providers.json` (via `ProviderRepo::upsert_async` /
+  `build_overlay_definition`), so the UI edits the *same* `reasoning_effort` field
+  R1 adds — one field, one storage shape, one resolution path. Add it to the port
+  DTOs (`UpsertLlmProviderRequest` / `LlmProviderView` in
+  `ironclaw_product_workflow`), thread it through
+  `llm_config_service.rs` (`upsert_provider` / `build_overlay_definition` /
+  `build_snapshot`) and `RebornProviderMetadata` (`provider_admin.rs`), and add a
+  Mistral-adapter-gated select in the `settings` frontend
+  (`useProviderDialogForm.js`, `provider-dialog.js`, `useLlmProviders.js`).
+  Backend stays generic; the value is ignored for non-Mistral providers.
+
+### Out of scope (Reborn follow-up)
+
+- **Engine v2** — see the top-level Out of scope; not pursued.
+- Streaming reasoning in the Reborn WebUI (round-trip + final answer is the goal).
