@@ -40,7 +40,7 @@ Keep planning/docs and implementation in **separate** commits.
 
 ## Active local changes
 
-### Mistral reasoning — ARCHITECTURE DONE, build pending — 2026-06-24
+### Mistral reasoning — IMPLEMENTATION WRITTEN, acceptance pending — 2026-06-24
 
 We want to use Mistral (largest EU provider) to its fullest, which mandates
 `reasoning_effort=high`. We are building this **properly** as a first-class path.
@@ -70,17 +70,17 @@ We want to use Mistral (largest EU provider) to its fullest, which mandates
 - `docs/mistral-reasoning.md` — knowledge doc (above).
 - `scripts/test-mistral-reasoning.sh` — raw Mistral API test (PASS: confirms the
   field is honored).
-- `scripts/test-mistral-reasoning-ironclaw.sh` — live end-to-end test via
-  `ironclaw -m` (currently FAIL: proves the receive-path blocker; will become the
-  acceptance test once the real fix lands).
+- `scripts/test-mistral-reasoning-ironclaw.sh` — live end-to-end acceptance test
+  via `ironclaw -m`, rebuilt to log the full interaction (request
+  `reasoning_effort`, parsed thinking trace, answer) across both reasoning models,
+  a non-reasoning model, and the off toggle.
 
 #### Status
 
 - **Exploratory code REVERTED.** The earlier minimal `reasoning_effort` injection
   (config enum/field, env read, `RigAdapter::with_additional_params`, gating
   helper) was rolled back — it could not work end-to-end and modeled the param
-  wrong. Working tree is clean of it; only the docs, the two scripts, and the
-  `CLAUDE.md` fork pointer remain.
+  wrong, and was discarded before the proper build (below) was written.
 - **Architecture DONE (2026-06-24).** Build-vs-upgrade gating decision resolved
   (build custom provider — `rig-core` 0.39 still can't parse the array response).
   Approved C4 L3 design recorded in
@@ -89,13 +89,29 @@ We want to use Mistral (largest EU provider) to its fullest, which mandates
   (`docs(llm): add Mistral reasoning provider architecture + research`) carries
   the architecture doc, `docs/mistral-reasoning.md`, this file, and
   `scripts/test-mistral-reasoning.sh`. Docs/research only — no implementation.
-- **Implementation IN PROGRESS (uncommitted).** Working tree carries the build
-  (`crates/ironclaw_llm/src/mistral.rs` + edits to `lib.rs`, `registry.rs`,
-  `config.rs`, `reasoning_models.rs`, `vision_models.rs`, `providers.json`,
-  `src/config/llm.rs`, etc.). This must land as a **separate `feat(llm): …`
-  commit** (Conventional Commits + `Co-Authored-By: Claude …` trailer), distinct
-  from the docs commit above — do not fold it into the planning commit.
-- **Next:** finish the implementation per the architecture doc, run the quality
-  gate (`cargo fmt` / `clippy` / `test`), then commit it as `feat(llm): …`.
+- **Implementation WRITTEN (uncommitted) — NOT yet declared done.** Working tree
+  carries the full build: new `crates/ironclaw_llm/src/mistral.rs`
+  (`MistralProvider` owning the request/response JSON — untagged String-or-array
+  content model, `reasoning_effort` gated via
+  `reasoning_models::supports_mistral_reasoning`, ThinkChunk multi-turn replay,
+  vision patterns via `vision_models`, Decision-6 error mapping) plus edits to
+  `lib.rs` (factory dispatch), `registry.rs` (`ProviderProtocol::Mistral` +
+  overlay migration), `config.rs` (`MistralReasoningEffort`), `src/config/llm.rs`
+  and `resolution.rs` (`MISTRAL_REASONING` env → typed
+  `Option<MistralReasoningEffort>`), `providers.json` (`protocol: mistral`,
+  default `mistral-medium-latest`), a reasoning leak-scan in the shared
+  `Reasoning` engine (`LeakDetector::redact_all`, covering
+  DeepSeek/Gemini/OpenRouter too), and docs (`llm-providers.md`, `.env.example`).
+  Must land as a **separate `feat(llm): …` commit** (Conventional Commits +
+  `Co-Authored-By: Claude …` trailer), distinct from the planning commit
+  `74b63b0dc` — do not fold it in.
+- **Verified so far:** offline matrix C1–C12 + U1/U2/G1 pass; `cargo fmt`,
+  `cargo clippy --all-features`, and `cargo test` are green. The rebuilt live
+  acceptance script ran against the real API and the receive path worked on
+  small/medium/large with no `ApiResponse` parse error — but its reasoning-trace
+  detection needed an ANSI fix, so a clean final acceptance run is still pending.
+- **Next (before declaring done):** re-run the ANSI-tolerant live acceptance
+  script (`scripts/test-mistral-reasoning-ironclaw.sh`) for a clean PASS, commit
+  the build as `feat(llm): …`, then mark the feature implemented.
 
 <!-- Add new local changes above this line, newest first. -->

@@ -590,6 +590,7 @@ fn resolve_custom_provider(
         refresh_token: None,
         auth_path: None,
         cache_retention: CacheRetention::default(),
+        mistral_reasoning: None,
         unsupported_params: Vec::new(),
     })
 }
@@ -802,6 +803,31 @@ fn resolve_registry_provider(
         CacheRetention::default()
     };
 
+    // Resolve Mistral `reasoning_effort` from env (default: on/high).
+    //
+    // Three wire states are carried as `Option<MistralReasoningEffort>`:
+    //   - `MISTRAL_REASONING=high|on|true|1` (or unset) → `Some(High)` → "high"
+    //   - `MISTRAL_REASONING=off|none|false|0`          → `None`       → omit
+    // The provider further gates `Some(_)` on model capability before sending,
+    // so the toggle is safe even when a non-reasoning model is selected. "off"
+    // maps to `Option::None` (omit) rather than `Some(None)` so the wire body
+    // omits the param entirely, matching the architecture's C2 contract.
+    let mistral_reasoning: Option<MistralReasoningEffort> = if canonical_id == "mistral" {
+        match optional_env("MISTRAL_REASONING")? {
+            None => Some(MistralReasoningEffort::High),
+            Some(raw) => match raw.parse::<MistralReasoningEffort>() {
+                Ok(MistralReasoningEffort::High) => Some(MistralReasoningEffort::High),
+                Ok(MistralReasoningEffort::None) => None,
+                Err(e) => {
+                    tracing::warn!("Invalid MISTRAL_REASONING ({raw}): {e}; defaulting to high");
+                    Some(MistralReasoningEffort::High)
+                }
+            },
+        }
+    } else {
+        None
+    };
+
     Ok(RegistryProviderConfig {
         protocol,
         provider_id: canonical_id.to_string(),
@@ -814,6 +840,7 @@ fn resolve_registry_provider(
         refresh_token: codex_refresh_token,
         auth_path: codex_auth_path,
         cache_retention,
+        mistral_reasoning,
         unsupported_params,
     })
 }
@@ -1311,6 +1338,74 @@ mod tests {
             std::env::remove_var("LLM_BACKEND");
             std::env::remove_var("OPENAI_API_KEY");
         }
+    }
+
+    /// Drives the env→config boundary for Mistral reasoning through the public
+    /// `resolve()` caller (test-through-the-caller): asserts the
+    /// `MISTRAL_REASONING` env value maps to the right
+    /// `Option<MistralReasoningEffort>` on the resolved `RegistryProviderConfig`.
+    fn resolve_mistral_reasoning(value: Option<&str>) -> Option<MistralReasoningEffort> {
+        let _guard = lock_env();
+        clear_openai_compatible_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_BACKEND", "mistral");
+            std::env::set_var("MISTRAL_API_KEY", TEST_API_KEY);
+            match value {
+                Some(v) => std::env::set_var("MISTRAL_REASONING", v),
+                None => std::env::remove_var("MISTRAL_REASONING"),
+            }
+        }
+
+        let settings = Settings::default();
+        let cfg = crate::config::llm::resolve(&settings).expect("resolve should succeed");
+        let provider = cfg.provider.expect("mistral should have provider config");
+        assert_eq!(provider.protocol, ProviderProtocol::Mistral);
+        assert_eq!(provider.provider_id, "mistral");
+        let reasoning = provider.mistral_reasoning;
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("MISTRAL_API_KEY");
+            std::env::remove_var("MISTRAL_REASONING");
+        }
+        reasoning
+    }
+
+    #[test]
+    fn mistral_reasoning_defaults_to_high_when_unset() {
+        assert_eq!(
+            resolve_mistral_reasoning(None),
+            Some(MistralReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn mistral_reasoning_high_resolves_to_some_high() {
+        assert_eq!(
+            resolve_mistral_reasoning(Some("high")),
+            Some(MistralReasoningEffort::High)
+        );
+        assert_eq!(
+            resolve_mistral_reasoning(Some("on")),
+            Some(MistralReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn mistral_reasoning_off_resolves_to_none_omit() {
+        // "off" omits the wire param entirely → Option::None (not Some(None)).
+        assert_eq!(resolve_mistral_reasoning(Some("off")), None);
+        assert_eq!(resolve_mistral_reasoning(Some("none")), None);
+    }
+
+    #[test]
+    fn mistral_reasoning_invalid_warns_and_defaults_to_high() {
+        assert_eq!(
+            resolve_mistral_reasoning(Some("medium")),
+            Some(MistralReasoningEffort::High)
+        );
     }
 
     #[test]

@@ -293,6 +293,38 @@ impl LeakDetector {
             .unwrap_or_else(|| content.to_string()))
     }
 
+    /// Redact every detected secret in `content`, regardless of its action.
+    ///
+    /// Unlike [`Self::scan_and_clean`] (which *errors* on a `Block`-action
+    /// match) and [`Self::scan`] (whose `redacted_content` covers only
+    /// `Redact`-action matches), this masks **all** matches — `Block`, `Redact`,
+    /// and `Warn` — and never fails. It is the right tool for a surface that
+    /// must be stored and replayed with secrets removed but must not abort the
+    /// operation, e.g. an LLM reasoning trace that is persisted and fed back
+    /// into the next request.
+    ///
+    /// Returns `None` when the content is clean (no matches at all), so callers
+    /// can keep the original allocation.
+    pub fn redact_all(&self, content: &str) -> Option<String> {
+        let result = self.scan(content);
+        if result.matches.is_empty() {
+            return None;
+        }
+        // Merge overlapping match ranges (the same secret can match more than
+        // one pattern) so `apply_redactions` never slices a partial range.
+        let mut ranges: Vec<Range<usize>> =
+            result.matches.iter().map(|m| m.location.clone()).collect();
+        ranges.sort_by_key(|r| r.start);
+        let mut merged: Vec<Range<usize>> = Vec::with_capacity(ranges.len());
+        for range in ranges {
+            match merged.last_mut() {
+                Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+                _ => merged.push(range),
+            }
+        }
+        Some(apply_redactions(content, &merged))
+    }
+
     /// Scan an outbound HTTP request for potential secret leakage.
     ///
     /// This MUST be called before executing any HTTP request from WASM
@@ -635,6 +667,34 @@ mod tests {
         let result = detector.scan(content);
         assert!(result.is_clean());
         assert!(!result.should_block);
+    }
+
+    #[test]
+    fn redact_all_returns_none_for_clean_content() {
+        let detector = LeakDetector::new();
+        assert!(
+            detector
+                .redact_all("just some reasoning, nothing secret")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn redact_all_masks_secrets_without_failing() {
+        // A bearer token in a reasoning trace must be redacted (not blocked /
+        // erroring) so the trace can still be stored and replayed.
+        let detector = LeakDetector::new();
+        let token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9_longtokenvalue";
+        let trace = format!("I will call the API with Bearer {token} to fetch data");
+
+        let redacted = detector
+            .redact_all(&trace)
+            .expect("a secret was present, so content must be redacted");
+        assert!(redacted.contains("[REDACTED]"), "got: {redacted}");
+        assert!(
+            !redacted.contains(token),
+            "redacted reasoning leaked the token: {redacted}"
+        );
     }
 
     #[test]

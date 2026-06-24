@@ -31,6 +31,11 @@ const VISION_PATTERNS: &[&str] = &[
     "qwen-vl",
     "qwen2-vl",
     "pixtral",
+    // Mistral small/medium are multimodal (vision-capable). Without these
+    // patterns, switching the default to `mistral-medium-latest` would
+    // mis-classify it as text-only and silently drop image attachments.
+    "mistral-small",
+    "mistral-medium",
 ];
 
 /// Check if a model name indicates vision capabilities.
@@ -111,11 +116,24 @@ mod tests {
         assert!(is_vision_model("pixtral-12b"));
     }
 
+    /// Mistral small/medium are multimodal and must classify as vision so the
+    /// provider forwards image attachments instead of dropping them (U2). The
+    /// existing `pixtral` entry must keep working too.
+    #[test]
+    fn detects_mistral_vision_models() {
+        assert!(is_vision_model("mistral-small-latest"));
+        assert!(is_vision_model("mistral-medium-latest"));
+        assert!(is_vision_model("Mistral-Medium-3-5"));
+        assert!(is_vision_model("pixtral-12b"));
+    }
+
     #[test]
     fn rejects_non_vision_models() {
         assert!(!is_vision_model("gpt-3.5-turbo"));
         assert!(!is_vision_model("llama-3.1-70b"));
+        // mistral-large / mistral-7b are not in the vision allowlist.
         assert!(!is_vision_model("mistral-7b"));
+        assert!(!is_vision_model("mistral-large-latest"));
     }
 
     #[test]

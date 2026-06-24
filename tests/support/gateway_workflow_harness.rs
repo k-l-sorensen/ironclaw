@@ -149,6 +149,7 @@ impl GatewayWorkflowHarness {
             refresh_token: None,
             auth_path: None,
             cache_retention: Default::default(),
+            mistral_reasoning: None,
             unsupported_params: Vec::new(),
         });
 

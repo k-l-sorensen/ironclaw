@@ -127,6 +127,21 @@ pub fn supports_anthropic_enabled_thinking(model: &str) -> bool {
         .any(|p| lower.contains(p))
 }
 
+/// Mistral models that accept the `reasoning_effort` request parameter.
+///
+/// Reasoning rides on the general `mistral-small` / `mistral-medium` models
+/// (the dedicated Magistral reasoning models are deprecated). `mistral-large`,
+/// `mistral-7b`, `mistral-tiny`, `mistral-nemo`, embedding models, and the
+/// NEAR AI `auto` alias do **not** support it — sending `reasoning_effort` to
+/// them risks a 400, so the provider omits the param for any unmatched model.
+const MISTRAL_REASONING_PATTERNS: &[&str] = &["mistral-small", "mistral-medium"];
+
+/// Returns `true` when *model* accepts Mistral's `reasoning_effort` parameter.
+pub fn supports_mistral_reasoning(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    MISTRAL_REASONING_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +245,32 @@ mod tests {
         assert!(!has_native_thinking("glm-4-air"));
         assert!(!has_native_thinking("glm-4v"));
         assert!(!has_native_thinking("step-3-mini"));
+    }
+
+    // ── supports_mistral_reasoning tests (U1) ──
+
+    #[test]
+    fn mistral_small_and_medium_support_reasoning() {
+        assert!(supports_mistral_reasoning("mistral-small-latest"));
+        assert!(supports_mistral_reasoning("mistral-medium-latest"));
+        assert!(supports_mistral_reasoning("mistral-medium-3-5"));
+    }
+
+    #[test]
+    fn mistral_reasoning_is_case_insensitive() {
+        assert!(supports_mistral_reasoning("Mistral-Medium-Latest"));
+        assert!(supports_mistral_reasoning("MISTRAL-SMALL-LATEST"));
+    }
+
+    #[test]
+    fn mistral_large_and_others_do_not_support_reasoning() {
+        assert!(!supports_mistral_reasoning("mistral-large-latest"));
+        assert!(!supports_mistral_reasoning("mistral-7b"));
+        assert!(!supports_mistral_reasoning("mistral-tiny"));
+        assert!(!supports_mistral_reasoning("mistral-nemo"));
+        assert!(!supports_mistral_reasoning("open-mistral-7b"));
+        // NEAR AI alias and empty/unknown names fall through to "unsupported".
+        assert!(!supports_mistral_reasoning("auto"));
+        assert!(!supports_mistral_reasoning(""));
     }
 }

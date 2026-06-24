@@ -63,8 +63,8 @@ use rust_decimal::Decimal;
 
 use crate::error::LlmError;
 use crate::provider::{
-    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCompletionRequest,
-    ToolCompletionResponse,
+    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCall,
+    ToolCompletionRequest, ToolCompletionResponse,
 };
 
 // ── Session test constants ──────────────────────────────────────────────
@@ -107,6 +107,12 @@ pub struct StubLlm {
     /// Optional fault injector for fine-grained failure control.
     /// When set, takes precedence over the `should_fail` / `error_kind` fields.
     fault_injector: Option<Arc<fault_injection::FaultInjector>>,
+    /// Provider-emitted reasoning trace returned on the response (e.g. to
+    /// exercise the reasoning round-trip / leak-scan path). Default `None`.
+    response_reasoning: Option<String>,
+    /// Tool calls returned from `complete_with_tools`. Default empty (plain
+    /// text response).
+    tool_calls: Vec<ToolCall>,
 }
 
 impl StubLlm {
@@ -119,6 +125,8 @@ impl StubLlm {
             should_fail: AtomicBool::new(false),
             error_kind: StubErrorKind::Transient,
             fault_injector: None,
+            response_reasoning: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -131,6 +139,8 @@ impl StubLlm {
             should_fail: AtomicBool::new(true),
             error_kind: StubErrorKind::Transient,
             fault_injector: None,
+            response_reasoning: None,
+            tool_calls: Vec::new(),
         }
     }
 
@@ -143,12 +153,27 @@ impl StubLlm {
             should_fail: AtomicBool::new(true),
             error_kind: StubErrorKind::NonTransient,
             fault_injector: None,
+            response_reasoning: None,
+            tool_calls: Vec::new(),
         }
     }
 
     /// Set the model name.
     pub fn with_model_name(mut self, name: impl Into<String>) -> Self {
         self.model_name = name.into();
+        self
+    }
+
+    /// Set the provider-emitted reasoning trace returned on responses.
+    pub fn with_response_reasoning(mut self, reasoning: impl Into<String>) -> Self {
+        self.response_reasoning = Some(reasoning.into());
+        self
+    }
+
+    /// Add a tool call to the `complete_with_tools` response (so the stub
+    /// exercises the tool-call branch of the reasoning engine).
+    pub fn with_tool_call(mut self, tool_call: ToolCall) -> Self {
+        self.tool_calls.push(tool_call);
         self
     }
 
@@ -230,7 +255,7 @@ impl LlmProvider for StubLlm {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
-            reasoning: None,
+            reasoning: self.response_reasoning.clone(),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -246,13 +271,13 @@ impl LlmProvider for StubLlm {
         }
         Ok(ToolCompletionResponse {
             content: Some(self.response.clone()),
-            tool_calls: Vec::new(),
+            tool_calls: self.tool_calls.clone(),
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: None,
+            reasoning: self.response_reasoning.clone(),
         })
     }
 }

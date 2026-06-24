@@ -25,7 +25,7 @@ ironclaw onboard --provider-only
 | OpenAI                | `openai`            | `OPENAI_API_KEY`       | GPT models                      |
 | Google Gemini         | `gemini_oauth`      | OAuth (browser)        | Gemini models; function calling |
 | io.net                | `ionet`             | `IONET_API_KEY`        | Intelligence API                |
-| Mistral               | `mistral`           | `MISTRAL_API_KEY`      | Mistral models                  |
+| Mistral               | `mistral`           | `MISTRAL_API_KEY`      | Reasoning on by default (small/medium) |
 | Yandex AI Studio      | `yandex`            | `YANDEX_API_KEY`       | YandexGPT models                |
 | MiniMax               | `minimax`           | `MINIMAX_API_KEY`      | MiniMax-M2.7 models             |
 | Cloudflare Workers AI | `cloudflare`        | `CLOUDFLARE_API_KEY`   | Access to Workers AI            |
@@ -176,6 +176,39 @@ To use the China mainland endpoint, set:
 ```env
 MINIMAX_BASE_URL=https://api.minimaxi.com/v1
 ```
+
+---
+
+## Mistral
+
+[Mistral](https://console.mistral.ai/api-keys) — the largest EU model
+provider — is a first-class backend with full `reasoning_effort` support.
+
+```env
+LLM_BACKEND=mistral
+MISTRAL_API_KEY=...
+MISTRAL_MODEL=mistral-medium-latest   # default
+```
+
+### Reasoning
+
+`mistral-small` and `mistral-medium` produce a full thinking trace when
+`reasoning_effort=high`. IronClaw runs reasoning **on by default** for those
+models: the thinking trace is parsed out, surfaced as the response's reasoning
+field, and replayed to Mistral on the next turn (required to avoid degraded
+multi-turn performance). `mistral-large` is not reasoning-capable, so the
+parameter is automatically omitted for it.
+
+Toggle with `MISTRAL_REASONING`:
+
+```env
+MISTRAL_REASONING=high   # high | on | true | 1  → full reasoning (default)
+MISTRAL_REASONING=off    # off | none | false | 0 → no reasoning trace
+```
+
+The toggle is read at startup only. The default model is `mistral-medium-latest`
+so reasoning engages out of the box; `mistral-small`/`mistral-medium` are also
+vision-capable, so image attachments are forwarded.
 
 ---
 

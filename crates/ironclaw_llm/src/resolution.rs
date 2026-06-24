@@ -11,8 +11,8 @@ use secrecy::SecretString;
 
 use crate::auth::{self, CredentialSource};
 use crate::config::{
-    BedrockConfig, CacheRetention, GeminiOauthConfig, LlmConfig, NearAiConfig, OAUTH_PLACEHOLDER,
-    OpenAiCodexConfig, RegistryProviderConfig,
+    BedrockConfig, CacheRetention, GeminiOauthConfig, LlmConfig, MistralReasoningEffort,
+    NearAiConfig, OAUTH_PLACEHOLDER, OpenAiCodexConfig, RegistryProviderConfig,
 };
 use crate::error::{LlmConfigError, LlmError};
 use crate::registry::{ProviderDefinition, ProviderProtocol, ProviderRegistry};
@@ -223,7 +223,8 @@ pub fn build_llm_config_from_resolved_provider(
             | ProviderProtocol::GithubCopilot
             | ProviderProtocol::DeepSeek
             | ProviderProtocol::Gemini
-            | ProviderProtocol::OpenRouter => {
+            | ProviderProtocol::OpenRouter
+            | ProviderProtocol::Mistral => {
                 return Err(LlmError::RequestFailed {
                     provider: dedicated.provider_id,
                     reason: "registry provider protocol resolved as dedicated config".to_string(),
@@ -414,6 +415,27 @@ fn apply_registry_provider_env(config: &mut RegistryProviderConfig) -> Result<()
                 config.api_key = Some(SecretString::from(OAUTH_PLACEHOLDER.to_string()));
             }
         }
+    }
+
+    // Mistral `reasoning_effort` toggle (default on/high). "off" maps to
+    // `Option::None` (omit the param), distinct from `Some(None)` per the wire
+    // contract; the provider further gates `Some(_)` on model capability. This
+    // operator path is fail-closed: an invalid value is an error, not a warning.
+    if config.protocol == ProviderProtocol::Mistral {
+        config.mistral_reasoning = match nonempty_env("MISTRAL_REASONING") {
+            None => Some(MistralReasoningEffort::High),
+            Some(value) => {
+                match value.parse::<MistralReasoningEffort>().map_err(|reason| {
+                    LlmError::RequestFailed {
+                        provider: config.provider_id.clone(),
+                        reason: format!("invalid MISTRAL_REASONING: {reason}"),
+                    }
+                })? {
+                    MistralReasoningEffort::High => Some(MistralReasoningEffort::High),
+                    MistralReasoningEffort::None => None,
+                }
+            }
+        };
     }
     Ok(())
 }

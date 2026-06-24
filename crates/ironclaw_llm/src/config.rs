@@ -65,6 +65,61 @@ impl std::fmt::Display for CacheRetention {
     }
 }
 
+/// Mistral `reasoning_effort` control.
+///
+/// Mistral's reasoning is a two-state toggle (`"high"` / `"none"`), *not* the
+/// OpenAI low/medium/high scale. `High` emits the full thinking trace as an
+/// array-shaped response; `None` sends an explicit `"none"`.
+///
+/// Three wire behaviors are expressed as `Option<MistralReasoningEffort>` on
+/// [`RegistryProviderConfig`]:
+/// - `Option::None` — **omit** the param entirely (model-gated off, or an
+///   unsupported model). This is distinct from `Some(None)`.
+/// - `Some(High)` — send `reasoning_effort: "high"`.
+/// - `Some(None)` — send explicit `reasoning_effort: "none"`.
+///
+/// The variant is named `None` to mirror the wire value (the explicit `"none"`
+/// Mistral accepts); use [`MistralReasoningEffort::wire_value`] to render it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MistralReasoningEffort {
+    /// Full thinking trace (`reasoning_effort: "high"`). The default.
+    #[default]
+    High,
+    /// No thinking trace (explicit `reasoning_effort: "none"`).
+    None,
+}
+
+impl MistralReasoningEffort {
+    /// The exact string Mistral's API expects on the wire.
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            Self::High => "high",
+            Self::None => "none",
+        }
+    }
+}
+
+impl std::str::FromStr for MistralReasoningEffort {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_lowercase().as_str() {
+            "high" | "on" | "true" | "1" => Ok(Self::High),
+            "off" | "none" | "false" | "0" => Ok(Self::None),
+            _ => Err(format!(
+                "invalid mistral reasoning '{}', expected one of: high, none, on, off, true, false, 1, 0",
+                s
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for MistralReasoningEffort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.wire_value())
+    }
+}
+
 /// Resolved configuration for a registry-based provider.
 ///
 /// This single struct replaces what used to be five separate config types
@@ -98,6 +153,13 @@ pub struct RegistryProviderConfig {
     pub auth_path: Option<PathBuf>,
     /// Prompt cache retention (Anthropic-specific).
     pub cache_retention: CacheRetention,
+    /// Mistral `reasoning_effort` control (Mistral-specific).
+    ///
+    /// `None` omits the param (default for non-Mistral providers, or when
+    /// the selected model is not reasoning-capable). `Some(_)` is set at the
+    /// env boundary for the Mistral provider; the provider further gates it on
+    /// model capability before sending. See [`MistralReasoningEffort`].
+    pub mistral_reasoning: Option<MistralReasoningEffort>,
     /// Parameter names that this provider does not support (e.g., `["temperature"]`).
     /// Supported keys: `"temperature"`, `"max_tokens"`, `"stop_sequences"`.
     /// Listed parameters are stripped from requests before sending to avoid 400 errors.
@@ -126,6 +188,7 @@ impl RegistryProviderConfig {
             refresh_token: None,
             auth_path: None,
             cache_retention: CacheRetention::None,
+            mistral_reasoning: None,
             unsupported_params: Vec::new(),
         }
     }

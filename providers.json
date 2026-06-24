@@ -421,13 +421,13 @@
       "mistral_ai",
       "mistralai"
     ],
-    "protocol": "open_ai_completions",
+    "protocol": "mistral",
     "default_base_url": "https://api.mistral.ai/v1",
     "api_key_env": "MISTRAL_API_KEY",
     "api_key_required": true,
     "model_env": "MISTRAL_MODEL",
-    "default_model": "mistral-large-latest",
-    "description": "Mistral AI API",
+    "default_model": "mistral-medium-latest",
+    "description": "Mistral AI API (reasoning_effort on by default for small/medium)",
     "setup": {
       "kind": "api_key",
       "secret_name": "llm_mistral_api_key",
