@@ -1072,6 +1072,7 @@ async fn hydrate_llm_secrets_into_env() {
         ("llm_nearai_api_key", "NEARAI_API_KEY"),
         ("llm_anthropic_api_key", "ANTHROPIC_API_KEY"),
         ("llm_openai_api_key", "OPENAI_API_KEY"),
+        ("llm_mistral_api_key", "MISTRAL_API_KEY"),
     ];
 
     // If all target env vars are already set, skip the DB work entirely.
