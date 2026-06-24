@@ -86,7 +86,7 @@ is reused unchanged.
 └───────────────────────────────────────────────────────────┘
         │ returns Arc<dyn LlmProvider>
         ▼
-[ build_provider_chain() ]  → Retry → SmartRouting → Failover → CircuitBreaker → Cache → Recording   (UNCHANGED)
+[ build_provider_chain() ]  → Retry → SmartRouting → Failover → CircuitBreaker → Cached → Swappable → Recording   (UNCHANGED)
         ▼
 [ agent loop / Reasoning engine ]  (UNCHANGED)
    round-trips ChatMessage.reasoning via existing .with_reasoning(...) channel
