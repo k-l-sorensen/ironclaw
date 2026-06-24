@@ -29,14 +29,11 @@
 #   • a genuine reasoning task  — a logic-deduction puzzle (not calc/count)
 #   • the original arithmetic prompt, reworded
 #
-# Usage:
-#   ./scripts/test-mistral-reasoning-ironclaw.sh
-#   MISTRAL_API_KEY=... ./scripts/test-mistral-reasoning-ironclaw.sh   # skip 1Password
+# Usage (MISTRAL_API_KEY must be set in the environment):
+#   MISTRAL_API_KEY=... ./scripts/test-mistral-reasoning-ironclaw.sh
 #
 # Do NOT use `set -e` — we want every test to run and a summary at the end.
 set -uo pipefail
-
-OP_REF="***REDACTED***"
 
 SMALL="mistral-small-latest"
 MEDIUM="mistral-medium-latest"
@@ -66,12 +63,7 @@ FAIL_RE='did not match any variant|JsonError|Invalid response from mistral|Empty
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
-if [ -z "${MISTRAL_API_KEY:-}" ]; then
-  command -v op >/dev/null || { echo "error: 'op' not found and MISTRAL_API_KEY unset" >&2; exit 1; }
-  echo "Reading MISTRAL_API_KEY from 1Password ($OP_REF)..."
-  MISTRAL_API_KEY="$(op read "$OP_REF")"
-fi
-[ -n "${MISTRAL_API_KEY:-}" ] || { echo "error: empty API key" >&2; exit 1; }
+[ -n "${MISTRAL_API_KEY:-}" ] || { echo "error: MISTRAL_API_KEY is not set in the environment" >&2; exit 1; }
 export MISTRAL_API_KEY
 
 STAMP="$(date +%Y%m%d-%H%M%S)"

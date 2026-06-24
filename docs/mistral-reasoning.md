@@ -116,8 +116,8 @@ the dedicated rig client is also a dead end at 0.30.
   - Note: requires `DATABASE_BACKEND=libsql` (+ a throwaway `LIBSQL_PATH`) so
     config resolution doesn't demand a Postgres `DATABASE_URL`; `--no-db` alone
     is not enough.
-- Both scripts pull the key from 1Password:
-  `***REDACTED***`.
+- Both scripts read `MISTRAL_API_KEY` from the environment; set/export it before
+  running (sourced from your own secret manager). No vault reference is committed.
 
 ## 3a. FIRST STEP before any build — resolve build-vs-upgrade
 

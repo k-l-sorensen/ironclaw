@@ -3,7 +3,7 @@
 # Live smoke test for Mistral reasoning_effort — LOCAL FORK helper.
 # (See CLAUDE-local.md → "Mistral reasoning fix".)
 #
-# Pulls MISTRAL_API_KEY from 1Password and sends the SAME reasoning prompt to
+# Reads MISTRAL_API_KEY from the environment and sends the SAME reasoning prompt to
 # the Mistral API twice — once WITH reasoning_effort (the field this fork
 # injects) and once WITHOUT — then compares them. Reasoning shows up as a large
 # jump in completion tokens and, usually, a <think> trace in the content.
@@ -12,25 +12,23 @@
 # wiring (gating + flattening the field into the request) is covered by unit
 # tests: `cargo test -p ironclaw_llm mistral`.
 #
-# Usage:
-#   ./scripts/test-mistral-reasoning.sh
-#   MISTRAL_MODEL=mistral-small-latest MISTRAL_REASONING_EFFORT=low ./scripts/test-mistral-reasoning.sh
+# Usage (MISTRAL_API_KEY must be set in the environment):
+#   MISTRAL_API_KEY=... ./scripts/test-mistral-reasoning.sh
+#   MISTRAL_API_KEY=... MISTRAL_MODEL=mistral-small-latest MISTRAL_REASONING_EFFORT=low ./scripts/test-mistral-reasoning.sh
 #
 set -euo pipefail
 
-OP_REF="***REDACTED***"
 MODEL="${MISTRAL_MODEL:-mistral-medium-latest}"
 EFFORT="${MISTRAL_REASONING_EFFORT:-high}"
 ENDPOINT="https://api.mistral.ai/v1/chat/completions"
 PROMPT='John is one of 4 children. The first sister is 4 years old. Next year, the second sister will be twice as old as the first sister. The third sister is two years older than the second sister. The third sister is half the age of her older brother. How old is John?'
 
-for bin in op jq curl; do
+for bin in jq curl; do
   command -v "$bin" >/dev/null || { echo "error: '$bin' not found in PATH" >&2; exit 1; }
 done
 
-echo "Reading MISTRAL_API_KEY from 1Password ($OP_REF)..."
-API_KEY="$(op read "$OP_REF")"
-[ -n "$API_KEY" ] || { echo "error: empty API key" >&2; exit 1; }
+API_KEY="${MISTRAL_API_KEY:-}"
+[ -n "$API_KEY" ] || { echo "error: MISTRAL_API_KEY is not set in the environment" >&2; exit 1; }
 
 # Send one chat-completion request. $1 = full JSON body. Echoes the raw response.
 call() {

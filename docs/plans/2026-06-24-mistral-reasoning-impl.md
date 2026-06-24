@@ -1,6 +1,6 @@
 # Mistral Reasoning — Implementation Plan
 
-**Status:** Implementation written — offline gate green; live acceptance + `feat(llm)` commit pending · **Date:** 2026-06-24 · **Scope:** v1 (non-Reborn)
+**Status:** Implementation committed (`feat(llm)` landed) — offline gate green; live acceptance pending · **Date:** 2026-06-24 · **Scope:** v1 (non-Reborn)
 
 > Companion to the design doc
 > [`2026-06-24-mistral-reasoning-provider-architecture.md`](2026-06-24-mistral-reasoning-provider-architecture.md)
@@ -11,28 +11,27 @@
 >
 > The work-unit breakdown is complete and the per-file detail is filled in.
 > Boxes checked `[x]` are done and verified by the offline test matrix + gate;
-> boxes left `[ ]` are genuinely outstanding (final live acceptance run + the
-> commit). Keep this live until the feature is declared implemented.
+> boxes left `[ ]` are genuinely outstanding (the final live acceptance run).
+> Keep this live until the feature is declared implemented.
 
 ## Current state (read first)
 
 - The architecture is **approved and review-converged** (no open
   architecture-level items; see the design doc's "Rule-compliance review
   findings"). Implemented to the decisions as written.
-- **The build is written and uncommitted in the working tree.** It was authored
-  in one pass against the post-review architecture doc (D1–D10 + F1–F12 already
-  folded in), so there was no pre-review drift to undo — WU0 below is a
-  confirmation audit, and every item holds.
+- **The build is committed** as the `feat(llm): …` commit, kept **separate** from
+  the planning `docs(llm): …` commit per `CLAUDE-local.md`. It was authored in one
+  pass against the post-review architecture doc (D1–D10 + F1–F12 already folded
+  in), so there was no pre-review drift to undo — WU0 below is a confirmation
+  audit, and every item holds.
 - **Offline verified:** the full matrix (C1–C12, U1/U2, G1) passes; `cargo fmt`,
   `cargo clippy --all --benches --tests --examples --all-features` (zero
   warnings), and `cargo test` are green.
 - **Not yet declared done:** the live acceptance script ran against the real API
   and the receive path worked (no `ApiResponse` parse error) on small/medium/large,
   but its reasoning-trace detection needed an ANSI fix, so a clean final
-  acceptance run — and the `feat(llm): …` commit — are still outstanding.
-- The planning docs are already committed (`docs(llm): …`, `74b63b0dc`). The
-  implementation must land as a **separate `feat(llm): …` commit** (Conventional
-  Commits + `Co-Authored-By: Claude …` trailer) — see `CLAUDE-local.md`.
+  acceptance run is still outstanding (see WU7). Fork-level status lives in
+  `CLAUDE-local.md`.
 
 ## Goal
 
@@ -151,7 +150,7 @@ Audited; all items confirmed (built against the converged decisions, no drift).
       bug (false FAIL) was then fixed. **Re-run for a clean PASS verdict.**
 - [ ] multi-turn live: confirm no HTTP 400 on turn 2 (the single-message runs so
       far resolved in one turn — `replay` not yet observed live).
-- [ ] commit as `feat(llm): …` (separate from the planning commit).
+- [x] commit as `feat(llm): …` (separate from the planning commit) — landed.
 
 ## Open code-level questions (from the review, carry forward)
 - [x] **RESOLVED — no remap needed.** `BadGateway` and `EmptyResponse` are both
@@ -170,3 +169,4 @@ Audited; all items confirmed (built against the converged decisions, no drift).
 - 2026-06-24 — Open code-level question resolved: `BadGateway` + `EmptyResponse` confirmed transient (`retry.rs:45-57`, `circuit_breaker.rs:231-238`); no 5xx remap.
 - 2026-06-24 — WU5 leak-scan landed in the crate `Reasoning` engine (shared v1 chokepoint) via new `LeakDetector::redact_all`; covers DeepSeek/Gemini/OpenRouter too.
 - 2026-06-24 — Live acceptance run against the real API: receive path works on small/medium/large, no `ApiResponse` parse error; thinking trace and answer surfaced separately. Acceptance script rebuilt to log the full interaction across 5 cases; a trace-detection ANSI bug (false FAIL) was found and fixed. WU7 remaining: clean final acceptance run + multi-turn check + `feat(llm)` commit.
+- 2026-06-24 — Implementation committed as the `feat(llm): …` commit, separate from the planning `docs(llm): …` commit. WU7 remaining: clean final live-acceptance run + multi-turn check.

@@ -3,13 +3,13 @@
 **Status:** Approved architecture · **Date:** 2026-06-24 · **Scope:** v1 (non-Reborn)
 
 > This is an **architecture-level** design (C4 model, component level). It does
-> not specify line-level code. A code-level implementation plan and the build
-> itself are deliberately deferred to a later pass (see the fork workflow in
-> `CLAUDE-local.md`).
+> not specify line-level code; the code-level plan lives in the companion impl
+> doc and the build is committed (the `feat(llm): …` commit).
 >
-> Companion docs: `docs/mistral-reasoning.md` (the API/blocker research this
-> builds on), `CLAUDE-local.md` (fork status). This document supersedes the
-> "design implications" sketch in `docs/mistral-reasoning.md` §4.
+> Companion docs: `2026-06-24-mistral-reasoning-impl.md` (the code-level plan +
+> live status), `docs/mistral-reasoning.md` (the API/blocker research this builds
+> on), `CLAUDE-local.md` (fork status). This document supersedes the "design
+> implications" sketch in `docs/mistral-reasoning.md` §4.
 
 ## Context
 
