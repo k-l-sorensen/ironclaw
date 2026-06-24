@@ -109,13 +109,13 @@ the dedicated rig client is also a dead end at 0.30.
   `reasoning_effort`. **PASS**: `reasoning_effort=high` returns
   `content` as an array containing a `thinking` part; without it, `content` is a
   string. Confirms Mistral honors the field.
-- `scripts/test-mistral-reasoning-ironclaw.sh` — drives the real agent via
-  `ironclaw -m` (single-message mode) with the Mistral backend + reasoning on.
-  **FAIL**: `JsonError: did not match any variant of untagged enum ApiResponse`.
-  Confirms IronClaw's receive path cannot parse it.
-  - Note: requires `DATABASE_BACKEND=libsql` (+ a throwaway `LIBSQL_PATH`) so
-    config resolution doesn't demand a Postgres `DATABASE_URL`; `--no-db` alone
-    is not enough.
+- Driving the real agent against the Mistral backend with reasoning on
+  originally **FAILED** with `JsonError: did not match any variant of untagged
+  enum ApiResponse`, confirming IronClaw's receive path could not parse the
+  array-shaped response (the bug this work fixes). That end-to-end check now
+  lives as the Live-tier test `tests/e2e_live_mistral_reasoning.rs` (run with
+  `IRONCLAW_LIVE_TEST=1 LLM_BACKEND=mistral`), which must PASS post-fix; it
+  superseded the earlier `scripts/test-mistral-reasoning-ironclaw.sh` bash harness.
 - Both scripts read `MISTRAL_API_KEY` from the environment; set/export it before
   running (sourced from your own secret manager). No vault reference is committed.
 
@@ -134,8 +134,8 @@ How to check: review `rig-core` releases > 0.30 on crates.io / its repo
 changelog and `providers/mistral/completion.rs` in the newer version; look for
 array-`content` deserialization and removal of the
 `"Reasoning ... not ... supported on Mistral via Rig"` `panic!`s. Validate any
-candidate version with `scripts/test-mistral-reasoning-ironclaw.sh` (the
-acceptance test) before adopting.
+candidate version with the live acceptance test
+`tests/e2e_live_mistral_reasoning.rs` before adopting.
 
 ## 4. Implications for the design (inputs to the plan)
 

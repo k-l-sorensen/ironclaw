@@ -45,7 +45,7 @@ Conventional-Commit subject instead.
 
 ## Active local changes
 
-### Mistral reasoning — implemented (`feat(llm)` landed), live acceptance pending — 2026-06-24
+### Mistral reasoning — implemented (`feat(llm)` landed), live acceptance PASSED — 2026-06-24
 
 We want to use Mistral (largest EU provider) to its fullest, which mandates
 `reasoning_effort=high`. We built this **properly** as a first-class path: a
@@ -67,10 +67,14 @@ custom `ProviderProtocol::Mistral` that owns all Mistral traffic.
 
 - `scripts/test-mistral-reasoning.sh` — raw Mistral API test (PASS: confirms the
   field is honored).
-- `scripts/test-mistral-reasoning-ironclaw.sh` — live end-to-end acceptance test
-  via `ironclaw -m`, logging the full interaction (request `reasoning_effort`,
-  parsed thinking trace, answer) across both reasoning models, a non-reasoning
-  model, and the off toggle.
+- `tests/e2e_live_mistral_reasoning.rs` — Live-tier acceptance test that drives the
+  real agent loop against the Mistral API and asserts a clean reasoning round-trip
+  (non-empty reply, no parse-error signature) plus a multi-turn thinking replay. It
+  replaced the bespoke bash harness so the live coverage follows the repo's standard
+  `#[ignore]` + `LiveTestHarness` convention; the deterministic regression net stays
+  the offline matrix in `crates/ironclaw_llm/src/mistral_tests.rs`. Run with:
+  `IRONCLAW_LIVE_TEST=1 LLM_BACKEND=mistral MISTRAL_API_KEY=... cargo test --features
+  libsql --test e2e_live_mistral_reasoning -- --ignored`.
 
 #### Status
 
@@ -82,9 +86,11 @@ custom `ProviderProtocol::Mistral` that owns all Mistral traffic.
   kept **separate** from the planning commit per the Conventional-Commits
   convention above. Offline matrix C1–C12 + U1/U2/G1 pass; `cargo fmt`,
   `cargo clippy --all-features`, and `cargo test` are green.
-- **Not yet declared done.** The live acceptance script ran against the real API
-  and the receive path worked on small/medium/large with no `ApiResponse` parse
-  error, but a clean final acceptance run (post-ANSI-fix) and a multi-turn replay
-  check are still pending. See the impl doc's **WU7** for the remaining steps.
+- **Done.** The bash acceptance harness was replaced by the Live-tier Rust test
+  `tests/e2e_live_mistral_reasoning.rs`, which **PASSED against the real API** on the
+  v1 path: the reasoning round-trip returns a clean reply with no `ApiResponse` parse
+  error, and the multi-turn case confirms the thinking-chunk replay does not 400 on
+  turn 2. Offline matrix C1–C12 + U1/U2/G1 remain the primary deterministic net. See
+  the impl doc's **WU7** (closed).
 
 <!-- Add new local changes above this line, newest first. -->

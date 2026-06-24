@@ -261,12 +261,20 @@ call-site tests are mandatory.
 
 **Live smoke tests (`-- --ignored`, need `MISTRAL_API_KEY`):**
 
-1. **Acceptance (the locked artifact):** `scripts/test-mistral-reasoning-ironclaw.sh`
-   — real agent via `ironclaw -m`, Mistral + reasoning on. Currently **FAILS**
-   (`JsonError … ApiResponse`); must **PASS** after the change. Needs
-   `DATABASE_BACKEND=libsql` + throwaway `LIBSQL_PATH`.
+These follow the repo's standard Live tier (`#[ignore]` Rust tests on
+`LiveTestHarness`), not a bespoke script — see `tests/support/LIVE_TESTING.md`.
+
+1. **Acceptance:** `tests/e2e_live_mistral_reasoning.rs::mistral_reasoning_round_trips`
+   — drives the real agent loop with Mistral + reasoning on; asserts a non-empty
+   reply with no `ApiResponse`/parse-failure signature (the original bug). The
+   harness resolves config from env, so select Mistral via
+   `LLM_BACKEND=mistral`; it builds with `with_no_trace_recording()` so the default
+   `cargo test` matrix skips it cleanly. (Replaces the former
+   `scripts/test-mistral-reasoning-ironclaw.sh` bash harness.)
 2. **Raw-API control:** `scripts/test-mistral-reasoning.sh` already PASSes.
-3. **Multi-turn live:** ≥2-turn exchange, reasoning on; no HTTP 400 on turn 2.
+3. **Multi-turn live:** `tests/e2e_live_mistral_reasoning.rs::mistral_reasoning_multi_turn_replays`
+   — ≥2-turn exchange, reasoning on; asserts turn 2 succeeds (no HTTP 400 when the
+   parsed thinking chunk is replayed).
 
 **Gate:** `cargo fmt`, `cargo clippy --all --benches --tests --examples --all-features`
 (zero warnings), `cargo test`.
