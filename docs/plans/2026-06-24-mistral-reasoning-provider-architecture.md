@@ -8,9 +8,9 @@
 > doc and the build is committed (the `feat(llm): …` commit).
 >
 > Companion docs: `2026-06-24-mistral-reasoning-impl.md` (the code-level plan +
-> live status), `docs/mistral-reasoning.md` (the API/blocker research this builds
+> live status), `docs/providers/mistral-reasoning.md` (the API/blocker research this builds
 > on), `CLAUDE-local.md` (fork status). This document supersedes the "design
-> implications" sketch in `docs/mistral-reasoning.md` §4.
+> implications" sketch in `docs/providers/mistral-reasoning.md` §4.
 
 ## Context
 
@@ -24,11 +24,11 @@ path **cannot consume Mistral's reasoning response**: with `reasoning_effort=hig
 `message.content` becomes an array of typed chunks
 (`[{type:"thinking",…},{type:"text",…}]`) instead of a string, and the agent
 loop fails every turn (`JsonError: did not match any variant of untagged enum
-ApiResponse`). Full request/response details are in `docs/mistral-reasoning.md`.
+ApiResponse`). Full request/response details are in `docs/providers/mistral-reasoning.md`.
 
 ### Gating decision — RESOLVED: build, don't upgrade
 
-The first required step was build-vs-upgrade (`docs/mistral-reasoning.md` §3a):
+The first required step was build-vs-upgrade (`docs/providers/mistral-reasoning.md` §3a):
 does a newer `rig-core` parse Mistral reasoning natively? **Verified against the
 latest `rig-core` (0.39.0, Jun 2026): no.**
 

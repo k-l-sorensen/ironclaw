@@ -46,19 +46,28 @@ The shape of `message.content` is dictated by `reasoning_effort`:
 | `"high"` | **array of chunks** (see below) |
 | `"none"` / omitted | **plain string** |
 
-When `"high"`, `message.content` is a list of typed chunks:
+When `"high"`, `message.content` is a list of typed chunks. **The thinking is a
+separate chunk from the message** — they are distinct entries in the `content`
+array, not a single string with the reasoning inlined:
 
 ```jsonc
 "content": [
   { "type": "thinking",
-    "thinking": [ { "type": "text", "text": "... reasoning trace ..." } ] },
+    "thinking": [
+      { "type": "text", "text": "... first reasoning step ..." },
+      { "type": "text", "text": "... later reasoning step ..." }
+    ] },
   { "type": "text", "text": "... final answer ..." }
 ]
 ```
 
 - `ThinkChunk` — `type: "thinking"`; its `thinking` field is itself a **list of
-  `TextChunk`**.
-- `TextChunk` — `type: "text"`; the final answer.
+  `TextChunk`** (one or more text fragments making up that turn's reasoning
+  trace). Treat it as a list, not a single string — a turn's thinking can span
+  several `TextChunk` entries.
+- `TextChunk` — `type: "text"`; when it appears at the top level of `content` it
+  is the final answer (the message). The same `TextChunk` type is reused *inside*
+  a `ThinkChunk`'s `thinking` list for the reasoning fragments.
 - (Other chunk types exist in the same union: `reference`, `file`, `audio`.)
 
 There is **no option to get the reasoning as inline `<think>…</think>` tags
@@ -69,9 +78,16 @@ that would mean `reasoning_effort=none`, i.e. no reasoning.
 ### Multi-turn requirement
 
 The docs are explicit: to avoid degraded performance, **replay the full
-assistant message including the `ThinkChunk`** back into history on subsequent
-turns. So a correct integration must both (a) parse the array out and (b) be
-able to send the thinking content back in.
+assistant message back into history on subsequent turns — both the `ThinkChunk`
+*and* the final `TextChunk` (the message), in the same array shape they were
+received.** Do not strip the `ThinkChunk` before replaying; the model relies on
+the reasoning trace to stay coherent across turns. It is not enough to replay
+only the final message text, nor only the thinking — the whole `content` array
+(thinking chunk + message chunk) must be sent back.
+
+So a correct integration must both (a) parse the array out (separating the
+thinking from the message) and (b) reconstruct and send that full array —
+thinking chunk *and* message chunk — back in on the next turn.
 
 ## 2. Why it does not work in IronClaw today (`rig-core 0.30`)
 

@@ -59,7 +59,7 @@ custom `ProviderProtocol::Mistral` that owns all Mistral traffic.
   does **not** fix it. (`reasoning_effort` is `high`/`none`, boolean-ish — **not**
   the OpenAI `low`/`medium`/`high` scale.)
 - **Detail lives in the plan docs — do not restate here:**
-  - [`docs/mistral-reasoning.md`](docs/mistral-reasoning.md) — API findings, request/response format, the blocker.
+  - [`docs/providers/mistral-reasoning.md`](docs/providers/mistral-reasoning.md) — API findings, request/response format, the blocker.
   - [`docs/plans/2026-06-24-mistral-reasoning-provider-architecture.md`](docs/plans/2026-06-24-mistral-reasoning-provider-architecture.md) — approved C4 L3 design (decisions D1–D10, findings F1–F12).
   - [`docs/plans/2026-06-24-mistral-reasoning-impl.md`](docs/plans/2026-06-24-mistral-reasoning-impl.md) — work-unit breakdown and the outstanding live-acceptance steps.
 
