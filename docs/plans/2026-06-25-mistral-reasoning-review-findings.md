@@ -34,7 +34,7 @@ the CTR-1 cross-turn layer, not blockers on the core provider.
 
 - **Severity:** Medium
 - **Category:** Correctness / consistency
-- **Status:** ☐ open
+- **Status:** ☑ fixed
 
 ### Locations
 - `crates/ironclaw_llm/src/resolution.rs:424-439` (`apply_registry_provider_env`) — **fail-closed**.
@@ -256,4 +256,10 @@ one Mistral most needs). `log()`/comment any truncation so it is not silent
 > Conventional-Commit subject, not its SHA (carry commits re-hash on rebase —
 > see `CLAUDE-local.md`).
 
-- _(none yet)_
+- 2026-06-25 — **F1 fixed** in `fix(llm): unify MISTRAL_REASONING invalid-input
+  handling across both resolution paths`. Extracted shared
+  `resolve_mistral_reasoning_from_env` helper in `ironclaw_llm` (fail-open: warn
+  + default to `High`); both `apply_registry_provider_env` (was fail-closed) and
+  the v1 `resolve_registry_provider` now call it. Added caller-level regression
+  test `mistral_reasoning_invalid_warns_and_defaults_to_high_on_registry_path`
+  driving `apply_registry_provider_env`. Gating keys left untouched (F2 scope).

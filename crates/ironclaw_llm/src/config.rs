@@ -120,6 +120,36 @@ impl std::fmt::Display for MistralReasoningEffort {
     }
 }
 
+/// Resolve the Mistral `reasoning_effort` toggle from a raw env value.
+///
+/// Shared by both resolution paths (the v1 env-boundary resolver in
+/// `src/config/llm.rs` and the catalog/Reborn `apply_registry_provider_env`)
+/// so invalid input is handled identically. Policy is **fail-open**:
+///   - `None` (unset)            → `Some(High)` (the default-on contract)
+///   - `"high"`/`"on"`/`"1"`/…   → `Some(High)`
+///   - `"off"`/`"none"`/`"0"`/…  → `None` (omit the wire param)
+///   - anything else             → warn + `Some(High)`
+///
+/// "off" maps to `Option::None` (omit) rather than `Some(None)` so the wire
+/// body omits the param entirely, per the architecture's C2 contract. The
+/// provider further gates `Some(_)` on model capability before sending.
+///
+/// The crate stays env-agnostic: callers read the env var at their own
+/// boundary and pass the raw `Option<String>` in.
+pub fn resolve_mistral_reasoning_from_env(raw: Option<String>) -> Option<MistralReasoningEffort> {
+    match raw {
+        None => Some(MistralReasoningEffort::High),
+        Some(raw) => match raw.parse::<MistralReasoningEffort>() {
+            Ok(MistralReasoningEffort::High) => Some(MistralReasoningEffort::High),
+            Ok(MistralReasoningEffort::None) => None,
+            Err(e) => {
+                tracing::warn!("Invalid MISTRAL_REASONING ({raw}): {e}; defaulting to high");
+                Some(MistralReasoningEffort::High)
+            }
+        },
+    }
+}
+
 /// Resolved configuration for a registry-based provider.
 ///
 /// This single struct replaces what used to be five separate config types

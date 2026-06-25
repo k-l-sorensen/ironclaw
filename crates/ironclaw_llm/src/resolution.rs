@@ -11,8 +11,8 @@ use secrecy::SecretString;
 
 use crate::auth::{self, CredentialSource};
 use crate::config::{
-    BedrockConfig, CacheRetention, GeminiOauthConfig, LlmConfig, MistralReasoningEffort,
-    NearAiConfig, OAUTH_PLACEHOLDER, OpenAiCodexConfig, RegistryProviderConfig,
+    BedrockConfig, CacheRetention, GeminiOauthConfig, LlmConfig, NearAiConfig, OAUTH_PLACEHOLDER,
+    OpenAiCodexConfig, RegistryProviderConfig, resolve_mistral_reasoning_from_env,
 };
 use crate::error::{LlmConfigError, LlmError};
 use crate::registry::{ProviderDefinition, ProviderProtocol, ProviderRegistry};
@@ -417,25 +417,12 @@ fn apply_registry_provider_env(config: &mut RegistryProviderConfig) -> Result<()
         }
     }
 
-    // Mistral `reasoning_effort` toggle (default on/high). "off" maps to
-    // `Option::None` (omit the param), distinct from `Some(None)` per the wire
-    // contract; the provider further gates `Some(_)` on model capability. This
-    // operator path is fail-closed: an invalid value is an error, not a warning.
+    // Mistral `reasoning_effort` toggle (default on/high). Invalid values are
+    // handled fail-open (warn + default to high) identically to the v1 path via
+    // the shared `resolve_mistral_reasoning_from_env`.
     if config.protocol == ProviderProtocol::Mistral {
-        config.mistral_reasoning = match nonempty_env("MISTRAL_REASONING") {
-            None => Some(MistralReasoningEffort::High),
-            Some(value) => {
-                match value.parse::<MistralReasoningEffort>().map_err(|reason| {
-                    LlmError::RequestFailed {
-                        provider: config.provider_id.clone(),
-                        reason: format!("invalid MISTRAL_REASONING: {reason}"),
-                    }
-                })? {
-                    MistralReasoningEffort::High => Some(MistralReasoningEffort::High),
-                    MistralReasoningEffort::None => None,
-                }
-            }
-        };
+        config.mistral_reasoning =
+            resolve_mistral_reasoning_from_env(nonempty_env("MISTRAL_REASONING"));
     }
     Ok(())
 }
@@ -881,6 +868,31 @@ mod tests {
 
         assert!(!config.smart_routing_cascade);
         assert!(config.response_cache_enabled);
+    }
+
+    /// F1 regression: the catalog/Reborn path must handle an invalid
+    /// `MISTRAL_REASONING` fail-open (warn + default to high), identically to
+    /// the v1 env-boundary path — not hard-fail resolution. Drives the caller
+    /// (`apply_registry_provider_env`), not the helper in isolation.
+    #[test]
+    fn mistral_reasoning_invalid_warns_and_defaults_to_high_on_registry_path() {
+        let _env_lock = ironclaw_common::env_helpers::lock_env();
+        let env = EnvGuard::clear(&["MISTRAL_REASONING"]);
+        env.set("MISTRAL_REASONING", "hgih"); // typo → must fail-open, not error
+
+        let mut config = RegistryProviderConfig::generic(
+            ProviderProtocol::Mistral,
+            "mistral",
+            None,
+            "https://api.mistral.ai/v1",
+            "mistral-large-latest",
+        );
+        apply_registry_provider_env(&mut config)
+            .expect("invalid MISTRAL_REASONING must warn and default, not error");
+        assert_eq!(
+            config.mistral_reasoning,
+            Some(crate::config::MistralReasoningEffort::High)
+        );
     }
 
     #[test]

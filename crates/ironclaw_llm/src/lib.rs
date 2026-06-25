@@ -66,7 +66,7 @@ pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerProvider};
 pub use config::{
     BedrockConfig, CacheRetention, GeminiOauthConfig, LlmBackendKind, LlmConfig,
     MistralReasoningEffort, NearAiConfig, OAUTH_PLACEHOLDER, OpenAiCodexConfig,
-    RegistryProviderConfig,
+    RegistryProviderConfig, resolve_mistral_reasoning_from_env,
 };
 pub use error::{LlmConfigError, LlmError};
 pub use failover::{CooldownConfig, FailoverProvider};

@@ -813,17 +813,7 @@ fn resolve_registry_provider(
     // maps to `Option::None` (omit) rather than `Some(None)` so the wire body
     // omits the param entirely, matching the architecture's C2 contract.
     let mistral_reasoning: Option<MistralReasoningEffort> = if canonical_id == "mistral" {
-        match optional_env("MISTRAL_REASONING")? {
-            None => Some(MistralReasoningEffort::High),
-            Some(raw) => match raw.parse::<MistralReasoningEffort>() {
-                Ok(MistralReasoningEffort::High) => Some(MistralReasoningEffort::High),
-                Ok(MistralReasoningEffort::None) => None,
-                Err(e) => {
-                    tracing::warn!("Invalid MISTRAL_REASONING ({raw}): {e}; defaulting to high");
-                    Some(MistralReasoningEffort::High)
-                }
-            },
-        }
+        ironclaw_llm::resolve_mistral_reasoning_from_env(optional_env("MISTRAL_REASONING")?)
     } else {
         None
     };
