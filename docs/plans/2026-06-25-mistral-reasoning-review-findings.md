@@ -90,7 +90,7 @@ is preferred instead, update that test accordingly.
 
 - **Severity:** Medium
 - **Category:** Correctness
-- **Status:** ☐ open
+- **Status:** ☑ fixed
 
 ### Locations
 - `src/config/llm.rs:809` — gate is `if canonical_id == "mistral"`.
@@ -263,3 +263,11 @@ one Mistral most needs). `log()`/comment any truncation so it is not silent
   the v1 `resolve_registry_provider` now call it. Added caller-level regression
   test `mistral_reasoning_invalid_warns_and_defaults_to_high_on_registry_path`
   driving `apply_registry_provider_env`. Gating keys left untouched (F2 scope).
+- 2026-06-25 — **F2 fixed** in `fix(llm): gate v1 Mistral reasoning on protocol,
+  not id string`. Changed the v1 `resolve_registry_provider` gate from
+  `canonical_id == "mistral"` to `protocol == ProviderProtocol::Mistral`, so a
+  Mistral-protocol provider under a non-`"mistral"` id (custom overlay, rename,
+  alias) is no longer silently left reasoning-off — matching the protocol-keyed
+  `apply_registry_provider_env`, factory dispatch, and overlay migration. Added
+  caller-level regression test `mistral_reasoning_gates_on_protocol_not_id_string`
+  driving `resolve_registry_provider` with a custom-id Mistral `ProviderDefinition`.
