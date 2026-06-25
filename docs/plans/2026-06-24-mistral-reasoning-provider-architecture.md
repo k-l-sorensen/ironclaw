@@ -386,3 +386,96 @@ the machinery is already present; only two small gaps and one UI surface remain.
 
 - **Engine v2** — see the top-level Out of scope; not pursued.
 - Streaming reasoning in the Reborn WebUI (round-trip + final answer is the goal).
+
+## CTR-1 — Cross-turn reasoning replay defect (found post-ship, 2026-06-25)
+
+**Status:** Open defect · **architecture pass needed** (run this before the impl
+pass). **Scope:** v1 agent loop's turn persistence + context rebuild; verify the
+Reborn path too. The implementation work units live in the companion impl doc's
+**"CTR-1 — Cross-turn reasoning replay"** section.
+
+### The defect
+
+Mistral's reasoning docs
+([docs.mistral.ai/en/studio-api/conversations/reasoning](https://docs.mistral.ai/en/studio-api/conversations/reasoning))
+are emphatic: on every subsequent turn you must **append the full assistant message —
+including its `ThinkChunk` — back into history**, and must **not** rebuild the message
+from the answer text alone, or multi-turn quality degrades. Mistral's own Python SDK
+example states it inline:
+
+```python
+for user_text in ["What is 17 * 23?", "Now multiply that by 3."]:
+    messages.append(UserMessage(content=user_text))
+    response = client.chat.complete(
+        model="mistral-medium-3-5", messages=messages, reasoning_effort="high",
+    )
+    assistant_message = response.choices[0].message
+    # ... extract TextChunk for display only ...
+
+    # IMPORTANT: append the full assistant message to history.
+    # This preserves ThinkChunk so the model can see its own
+    # reasoning trace in subsequent turns.
+    # Do NOT rebuild the message with only the answer text.
+    messages.append(assistant_message)
+```
+
+The v1 implementation honours this **only within a single agentic turn's tool loop**
+and **drops it on every new user turn** (and after DB hydration). This doc's
+"Reused — do NOT rebuild" claim (the `ChatMessage.reasoning` round-trip "satisfies
+Mistral's multi-turn requirement … with no agent-loop change") holds **within one
+turn's tool loop** but is **false across user turns** — the agent loop *does* need a
+change after all.
+
+### Where it works vs. breaks
+
+| Path | Site | Replays ThinkChunk? |
+|---|---|---|
+| Provider serialization | `crates/ironclaw_llm/src/mistral.rs:515` (`chat_message_to_wire`) | ✅ yes (test C8) |
+| Within-turn tool loop | `src/agent/dispatcher.rs:863`; `src/worker/job.rs:1770`; `src/worker/container.rs:549` (push `.with_reasoning(...)` onto `reason_ctx.messages`) | ✅ yes |
+| **New user-turn context build** | `src/agent/session.rs:587` (`ChatMessage::assistant(response)`) and `:562` (`assistant_with_tool_calls(None, …)`) — no `.with_reasoning(...)` | ❌ **dropped** |
+| **DB hydration** | `src/agent/thread_ops.rs:3047` / `:3098` (`rebuild_chat_messages_from_db`) — no `.with_reasoning(...)` | ❌ **dropped** |
+
+`Thread::messages()` (`src/agent/session.rs:518-591`) is the builder that seeds every
+new turn's context (confirmed at `thread_ops.rs:750`), so the `:562`/`:587` omissions
+are the live break.
+
+Root cause beneath the rebuild sites: the `Turn` struct (`src/agent/session.rs:716`)
+has **no field for the raw reasoning trace**. It stores `response` and `narrative`
+(the cleaned, channel-facing narrative — *not* the ThinkChunk). The trace is never
+persisted, so `Thread::messages()` has nothing to re-attach even if it tried, and it
+cannot survive a restart — which also conflicts with CLAUDE.md's "LLM data is never
+deleted."
+
+### Where this must be handled (architecture)
+
+1. **Persist the reasoning trace as first-class turn data**, not a transient
+   `reason_ctx` value: add a reasoning field to `Turn` (`session.rs`) and to the
+   persisted message row (`crate::history::ConversationMessage` + DB schema, **both
+   PostgreSQL and libSQL** per the dual-backend rule). Store the **leak-scanned** copy
+   — the `LeakDetector` redaction already runs on the round-trip path at
+   `crates/ironclaw_llm/src/reasoning.rs:841`; confirm the persisted copy is the
+   redacted one (Decision 7's pre-persistence requirement).
+2. **Re-attach on context assembly through a single gateway.** `Thread::messages()`
+   (`session.rs:518-591`) and its hydration twin `rebuild_chat_messages_from_db()`
+   (`thread_ops.rs:3039`) are the two converging "rebuild assistant history" sites;
+   both must `.with_reasoning(...)` the reconstructed assistant message. Treat them as
+   one gateway — do not add a third copy (cf. `architecture.md` smell #4).
+3. **Confirm the cross-provider contract is inert elsewhere.** Re-attaching
+   `ChatMessage.reasoning` is replayed to every provider, but only `mistral.rs`
+   re-serializes it into wire content; DeepSeek/Gemini/OpenRouter already round-trip a
+   `reasoning` field. Verify no regression for them when the field is now also present
+   on rebuilt history (it should be inert on their request side).
+4. **Verify the Reborn path** carries this across turns too. `model_gateway.rs`
+   already captures/replays reasoning within its loop (this doc's Reborn inventory),
+   but the same cross-turn + persistence question applies there.
+
+### Verification gap to close
+
+The live `mistral_reasoning_multi_turn_replays` test
+(`tests/e2e_live_mistral_reasoning.rs:176`) passes **without proving replay**: it only
+asserts turn-2 is non-empty and free of failure markers, and its `REASONING_PROMPT`
+uses no tools, so the within-turn replay branch never fires. Dropping the ThinkChunk
+yields a valid plain-string assistant message Mistral accepts (no 400), so the test is
+green on the degraded path. CTR-1 must add a **request-body assertion** (mock server or
+trace capture) that the turn-2 request actually contains a `thinking` chunk for the
+prior assistant message — "no 400" is not evidence of replay.

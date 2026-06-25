@@ -243,6 +243,63 @@ the same `reasoning_effort` field WU8 adds.
       reply, no `ApiResponse` parse error, no turn-2 HTTP 400. Adapt the approach
       from `tests/e2e_live_mistral_reasoning.rs` to the Reborn binary.
 
+## CTR-1 — Cross-turn reasoning replay (found post-ship, unstarted)
+
+**Status:** Open defect, **unstarted**. **Found:** 2026-06-25 by post-ship validation
+of the shipped v1 path. Architecture and where-to-handle live in the `-architecture`
+doc's **"CTR-1 — Cross-turn reasoning replay defect"** section — cite, don't restate.
+**Run the architecture pass first, then this implementation pass.**
+
+Scope: the v1 agent loop's turn persistence + context rebuild, plus a Reborn check.
+Engine v2 remains permanently out of scope.
+
+### The one-line problem
+
+Mistral requires replaying the full assistant message **including its `ThinkChunk`**
+on every subsequent turn — and explicitly **not** rebuilding it from the answer text
+alone (docs: <https://docs.mistral.ai/en/studio-api/conversations/reasoning>; the SDK
+example's `messages.append(assistant_message)` with its "Do NOT rebuild the message
+with only the answer text" comment is quoted in the architecture doc). v1 does this
+**within a single tool loop** (`dispatcher.rs:863` et al.) but **drops it on every new
+user turn and after DB hydration**, because the reasoning trace is never stored on
+`Turn` and never re-attached in `Thread::messages()`. The shipped feature therefore
+does **not** meet the multi-turn requirement it was built for.
+
+### WU-CTR1 — Persist the reasoning trace on the turn ☐
+- [ ] Add a reasoning field to `Turn` (`src/agent/session.rs:716`) and persist it on
+      the assistant message row (`crate::history::ConversationMessage` + migrations for
+      **both** PostgreSQL and libSQL). Store the leak-scanned copy (redaction already
+      runs at `crates/ironclaw_llm/src/reasoning.rs:841` on the round-trip path).
+- [ ] Populate it from `RespondResult` on **both** the text and tool-call paths.
+- **Acceptance:** dual-backend persistence round-trip test (write turn with reasoning →
+      reload → field intact on both backends).
+
+### WU-CTR2 — Re-attach on context rebuild ☐
+- [ ] `Thread::messages()` (`src/agent/session.rs:562` and `:587`): `.with_reasoning(...)`
+      on the reconstructed assistant message.
+- [ ] `rebuild_chat_messages_from_db()` (`src/agent/thread_ops.rs:3047`, `:3098`): same.
+- [ ] Confirm inert for non-Mistral providers (only `mistral.rs` reads
+      `ChatMessage.reasoning` into wire content).
+- **Acceptance:** caller-level tests (per `testing.md`) driving `Thread::messages()`
+      and `rebuild_chat_messages_from_db()` assert the rebuilt assistant `ChatMessage`
+      carries `reasoning`.
+
+### WU-CTR3 — Real multi-turn assertion ☐
+- [ ] Strengthen `tests/e2e_live_mistral_reasoning.rs:176` (or add an offline
+      mock-server test) to assert the **turn-2 request body** contains a `thinking`
+      chunk for the prior assistant message — not just "non-empty, no 400". Use a
+      tool-bearing or genuinely two-distinct-turn prompt so the cross-turn (not
+      within-loop) path is exercised.
+
+### WU-CTR4 — Reborn cross-turn check ☐
+- [ ] Verify `crates/ironclaw_reborn/src/model_gateway.rs` carries reasoning **across
+      turns** (not just within its loop) and persists it
+      (`ironclaw_turns`/`ironclaw_threads`). Fold into WU8–WU10 if it overlaps.
+
+**Gate:** `cargo fmt` · `cargo clippy --all --benches --tests --examples --all-features`
+(zero warnings) · `cargo test` (+ `--features integration` for the dual-backend
+persistence test). Land as one `fix(llm)`/`fix(agent)` commit, separate from docs.
+
 ## Open code-level questions (from the review, carry forward)
 - [x] **RESOLVED — no remap needed.** `BadGateway` and `EmptyResponse` are both
       classified transient: `retry.rs::is_retryable` (lines 45–57) and
@@ -262,4 +319,11 @@ the same `reasoning_effort` field WU8 adds.
 - 2026-06-24 — Live acceptance run against the real API: receive path works on small/medium/large, no `ApiResponse` parse error; thinking trace and answer surfaced separately. Acceptance script rebuilt to log the full interaction across 5 cases; a trace-detection ANSI bug (false FAIL) was found and fixed. WU7 remaining: clean final acceptance run + multi-turn check + `feat(llm)` commit.
 - 2026-06-24 — Implementation committed as the `feat(llm): …` commit, separate from the planning `docs(llm): …` commit. WU7 remaining: clean final live-acceptance run + multi-turn check.
 - 2026-06-24 — Test alignment: the bespoke bash acceptance harness was replaced by the Live-tier Rust test `tests/e2e_live_mistral_reasoning.rs` (`#[ignore]` + `LiveTestHarness`, skips cleanly without `IRONCLAW_LIVE_TEST`); `MISTRAL_API_KEY` added to the harness `SECRET_TO_ENV` map. **WU7 closed:** both live tests PASSED against the real API (round-trip: clean reply, no parse error; multi-turn: turn 2 OK), on the v1 path (`engine_v2=false`). Offline matrix remains the primary deterministic net.
+- 2026-06-25 — **CTR-1 found:** post-ship validation showed the ThinkChunk is replayed
+  only within a single turn's tool loop (`dispatcher.rs:863`) and dropped on every new
+  user turn + after DB hydration — `Turn` never stores the trace and `Thread::messages()`
+  / `rebuild_chat_messages_from_db()` rebuild assistant messages without `.with_reasoning(...)`.
+  The live multi-turn test is green on the degraded (no-ThinkChunk) path, so it gave false
+  confidence. Logged as CTR-1 (architecture section + WU-CTR1–4) for a fresh architecture
+  pass then implementation pass. Docs-only this change; no code.
 - 2026-06-24 — Reborn follow-up scoped (WU8–WU10, unstarted). Investigation found Reborn already has the provider reachable, the reasoning round-trip (`model_gateway.rs`), and reasoning persistence (`ironclaw_turns`/`ironclaw_threads`); the only gaps are enabling the catalog field (WU8), the leak-scan on the Reborn path (WU9), and the WebUI toggle (WU10). Engine v2 ruled permanently out of scope (Reborn replaces it). Decisions R1–R3 recorded in the `-architecture` doc's "Reborn architecture (follow-up)" section. Docs-only this pass; no code.
