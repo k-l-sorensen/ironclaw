@@ -86,11 +86,20 @@ custom `ProviderProtocol::Mistral` that owns all Mistral traffic.
   kept **separate** from the planning commit per the Conventional-Commits
   convention above. Offline matrix C1–C12 + U1/U2/G1 pass; `cargo fmt`,
   `cargo clippy --all-features`, and `cargo test` are green.
-- **Done.** The bash acceptance harness was replaced by the Live-tier Rust test
-  `tests/e2e_live_mistral_reasoning.rs`, which **PASSED against the real API** on the
-  v1 path: the reasoning round-trip returns a clean reply with no `ApiResponse` parse
-  error, and the multi-turn case confirms the thinking-chunk replay does not 400 on
-  turn 2. Offline matrix C1–C12 + U1/U2/G1 remain the primary deterministic net. See
+- **Done (v1 provider).** The bash acceptance harness was replaced by the Live-tier
+  Rust test `tests/e2e_live_mistral_reasoning.rs`, which **PASSED against the real API**
+  on the v1 path: the reasoning round-trip returns a clean reply with no `ApiResponse`
+  parse error, and the multi-turn case confirms the thinking-chunk replay does not 400
+  on turn 2. Offline matrix C1–C12 + U1/U2/G1 remain the primary deterministic net. See
   the impl doc's **WU7** (closed).
+- **CTR-1 cross-turn replay — v1 fixed (2026-06-25).** Post-ship validation found the
+  ThinkChunk was replayed only *within* a turn's tool loop and dropped on every new user
+  turn + after DB hydration (the live multi-turn test was green on the degraded path).
+  WU-CTR1–3 landed: `Turn`/`ConversationMessage` carry a leak-scanned `reasoning` field
+  (dual-backend column, PG `V31`/libSQL `v26`), captured from `RespondResult` and
+  re-attached at both context-rebuild gateways. Offline tests CTR-C1–C5 pass; gate green.
+  **WU-CTR4** confirmed Reborn has the *same* drop for plain assistant messages
+  (`model_gateway.rs::convert_messages`) — deferred to the Reborn follow-up (WU8–WU10)
+  as it is a multi-crate Reborn change. See the impl doc's **CTR-1** section.
 
 <!-- Add new local changes above this line, newest first. -->

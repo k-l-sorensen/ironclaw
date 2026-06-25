@@ -176,6 +176,18 @@ already exists (`model_gateway.rs`), and reasoning is already persisted
 (`ironclaw_turns` / `ironclaw_threads`). Only *enable*, *redact*, and *expose in
 UI* are missing.
 
+> **Correction (WU-CTR4, 2026-06-25):** the "reasoning round-trip already
+> exists / is already persisted" claim above holds only **within a single
+> turn's tool loop** (tool-call reasoning rides
+> `ProviderToolCallReferenceEnvelope.response_reasoning`). It is **false across
+> user turns** for a *plain assistant message*: `model_gateway.rs::convert_messages`
+> rebuilds it as `ChatMessage::assistant(content)` with no `.with_reasoning(...)`,
+> and there is **no `reasoning` field** on `ThreadMessageRecord` /
+> `ContextMessage` / `HostManagedModelMessage` to read back. Closing this is the
+> Reborn analogue of v1's CTR-1 fix and belongs in this follow-up (add the field
+> to the thread/loop-support records, persist the leak-scanned trace, and
+> re-attach it in `convert_messages`). It overlaps WU9's redaction work.
+
 ### WU8 — Enable reasoning via the provider catalog (R1) ☐
 - [ ] Add `#[serde(default)] reasoning_effort: Option<MistralReasoningEffort>` to
       `ProviderDefinition` (`crates/ironclaw_llm/src/registry.rs`); `#[serde(default)]`
@@ -243,12 +255,13 @@ the same `reasoning_effort` field WU8 adds.
       reply, no `ApiResponse` parse error, no turn-2 HTTP 400. Adapt the approach
       from `tests/e2e_live_mistral_reasoning.rs` to the Reborn binary.
 
-## CTR-1 — Cross-turn reasoning replay (found post-ship, unstarted)
+## CTR-1 — Cross-turn reasoning replay (found post-ship)
 
-**Status:** Open defect, **unstarted**. **Found:** 2026-06-25 by post-ship validation
-of the shipped v1 path. Architecture and where-to-handle live in the `-architecture`
-doc's **"CTR-1 — Cross-turn reasoning replay defect"** section — cite, don't restate.
-**Run the architecture pass first, then this implementation pass.**
+**Status:** v1 fix **implemented** (WU-CTR1–3 landed, offline gate green); WU-CTR4
+verification **done — confirmed a Reborn gap**, deferred to the Reborn follow-up.
+**Found:** 2026-06-25 by post-ship validation of the shipped v1 path. **v1 fix:**
+2026-06-25. Architecture and where-to-handle live in the `-architecture` doc's
+**"CTR-1 — Cross-turn reasoning replay defect"** section — cite, don't restate.
 
 Scope: the v1 agent loop's turn persistence + context rebuild, plus a Reborn check.
 Engine v2 remains permanently out of scope.
@@ -265,50 +278,69 @@ user turn and after DB hydration**, because the reasoning trace is never stored 
 `Turn` and never re-attached in `Thread::messages()`. The shipped feature therefore
 does **not** meet the multi-turn requirement it was built for.
 
-### WU-CTR1 — Persist the reasoning trace on the turn ☐
-- [ ] Add a reasoning field to `Turn` (`src/agent/session.rs:716`) and persist it on
-      the assistant message row (`ConversationMessage` in
-      `crates/ironclaw_reborn_traces/src/conversation_message.rs` + a `reasoning TEXT`
-      column on **both** backends — PG `V31`, libSQL incremental `v26` + idempotent
-      marker). Thread the field through `Store::add_conversation_message`
-      (`src/history/store.rs` + `src/db/postgres.rs` + `src/db/libsql/conversations.rs`),
-      which has no reasoning param today. Store the leak-scanned copy (redaction already
-      runs at `crates/ironclaw_llm/src/reasoning.rs:841`). See **CTR-D1/D6**.
-- [ ] Populate it from `RespondResult` on **both** paths. Note **CTR-D5**:
-      `RespondResult::Text(String)` carries no reasoning today (only `ToolCalls` does) —
-      extend the `Text` variant with `reasoning: Option<String>` so pure-text turns
-      persist their trace.
-- **Acceptance:** dual-backend persistence round-trip test (write turn with reasoning →
-      reload → field intact on both backends).
+### WU-CTR1 — Persist the reasoning trace on the turn ☑
+- [x] Added `reasoning: Option<String>` to `Turn` (`src/agent/session.rs`) and persist
+      it on the assistant **and** tool_calls rows. `ConversationMessage`
+      (`crates/ironclaw_reborn_traces/src/conversation_message.rs`) gained `reasoning`;
+      `reasoning TEXT` column added on **both** backends — PG `V31`
+      (`migrations/V31__conversation_messages_reasoning.sql` + `checksums.lock`), libSQL
+      base SCHEMA + incremental `v26` + idempotent marker. Threaded a new sibling trait
+      method `add_conversation_message_with_reasoning` through `ConversationStore`
+      (`src/db/mod.rs`), `Store` (`src/history/store.rs`), `postgres.rs`,
+      `libsql/conversations.rs` (write + read), and the test mock — chosen over a
+      signature change to avoid churning ~58 call sites. Stores the leak-scanned copy
+      (redaction at `reasoning.rs`'s `redact_reasoning`). See **CTR-D1/D6**.
+- [x] Populated from `RespondResult` on **both** paths. Per **CTR-D5**, extended
+      `RespondResult::Text` → `Text { text, reasoning }`; the no-tools branch now
+      leak-scans its reasoning too. ChatDelegate captures it onto the turn in
+      `execute_tool_calls` (tool path) and `handle_text_response` (text path; trait
+      signature gained a `reasoning` param, other delegates ignore it).
+- **Acceptance:** **CTR-C1** libSQL dual-backend round-trip
+      (`db::libsql::conversations::tests::test_conversation_message_reasoning_round_trips`,
+      runs under `cargo test`). The PG half shares the same trait + `Store` SQL; a
+      PG-only `--features integration` test needs a live database not available in this
+      environment.
 
-### WU-CTR2 — Re-attach on context rebuild ☐
-- [ ] `Thread::messages()` (`src/agent/session.rs:562` and `:587`): `.with_reasoning(...)`
-      on the reconstructed assistant message.
-- [ ] `rebuild_chat_messages_from_db()` (`src/agent/thread_ops.rs:3047`, `:3098`): same.
-- [ ] Confirm no regression for non-Mistral providers. Per **CTR-D4** the re-attach is
-      **load-bearing, not inert**: `rig_adapter.rs:406–462` reads `ChatMessage.reasoning`
-      and DeepSeek/Gemini/OpenRouter require the echo (HTTP 400 if dropped). CTR-1 closes
-      the same cross-turn drop for them; only `mistral.rs` re-serializes into nested wire
-      content. Verify providers that ignore the field (OpenAI/Anthropic) are unaffected.
-- **Acceptance:** caller-level tests (per `testing.md`) driving `Thread::messages()`
-      and `rebuild_chat_messages_from_db()` assert the rebuilt assistant `ChatMessage`
-      carries `reasoning`.
+### WU-CTR2 — Re-attach on context rebuild ☑
+- [x] `Thread::messages()` (`src/agent/session.rs`): `.with_reasoning(turn.reasoning…)`
+      on both the `assistant_with_tool_calls` and the final `assistant` message.
+- [x] `rebuild_chat_messages_from_db()` (`src/agent/thread_ops.rs`): same on both the
+      assistant and tool_calls rebuild sites.
+- [x] No-regression for non-Mistral providers confirmed via the existing `rig_adapter`
+      round-trip (the field is load-bearing per **CTR-D4**); providers that ignore it
+      (OpenAI/Anthropic) are unaffected.
+- **Acceptance:** **CTR-C2/C3/C4** caller-level tests —
+      `session::tests::test_messages_reattaches_reasoning_{text,tool}_turn` and
+      `thread_ops::tests::test_rebuild_chat_messages_reattaches_reasoning`.
 
-### WU-CTR3 — Real multi-turn assertion ☐
-- [ ] Strengthen `tests/e2e_live_mistral_reasoning.rs:176` (or add an offline
-      mock-server test) to assert the **turn-2 request body** contains a `thinking`
-      chunk for the prior assistant message — not just "non-empty, no 400". Use a
-      tool-bearing or genuinely two-distinct-turn prompt so the cross-turn (not
-      within-loop) path is exercised.
+### WU-CTR3 — Real multi-turn assertion ☑
+- [x] Added offline **CTR-C5** test
+      `mistral::tests::ctr_c5_turn_two_request_replays_prior_think_chunk`: builds a
+      turn-2 history (prior assistant message carrying reasoning) and asserts the
+      serialized request body contains a `thinking` chunk for that prior message — not
+      just "no 400". Complements the existing C8 wire test and the CTR-C2/C3 rebuild
+      tests.
 
-### WU-CTR4 — Reborn cross-turn check ☐
-- [ ] Verify `crates/ironclaw_reborn/src/model_gateway.rs` carries reasoning **across
-      turns** (not just within its loop) and persists it
-      (`ironclaw_turns`/`ironclaw_threads`). Fold into WU8–WU10 if it overlaps.
+### WU-CTR4 — Reborn cross-turn check ☑ (verified — **gap confirmed, deferred**)
+- [x] Verified `crates/ironclaw_reborn/src/model_gateway.rs`. **Finding:** Reborn has
+      the **same** cross-turn drop for plain assistant messages. Tool-call reasoning
+      *is* replayed (`provider_tool_roundtrip_messages` → `.with_reasoning(...)` off
+      `ProviderToolCallReferenceEnvelope.response_reasoning`), but a plain assistant
+      message is rebuilt at `model_gateway.rs` `convert_messages` as
+      `ChatMessage::assistant(content)` with **no** `.with_reasoning(...)`, and no
+      `reasoning` field exists on `ThreadMessageRecord` / `ContextMessage` /
+      `HostManagedModelMessage` to read back. Closing it is a multi-crate Reborn change
+      (`ironclaw_threads` contract, `ironclaw_loop_support`, `ironclaw_reborn`) that
+      **overlaps WU8–WU10**, so per this WU's own "fold into WU8–WU10 if it overlaps"
+      guidance it is **deferred to the Reborn follow-up**, not landed in this v1 pass.
+      Engine v2 stays out of scope.
 
-**Gate:** `cargo fmt` · `cargo clippy --all --benches --tests --examples --all-features`
-(zero warnings) · `cargo test` (+ `--features integration` for the dual-backend
-persistence test). Land as one `fix(llm)`/`fix(agent)` commit, separate from docs.
+**Gate (v1 pass):** `cargo fmt` clean · `cargo clippy --all --benches --tests --examples
+--all-features` **zero warnings** · changed-module tests green (`agent::` 517,
+`ironclaw_llm` 901, libSQL conversations 11, history/worker/hooks). Full `cargo test`
+also surfaces pre-existing `channels::wasm::wrapper` failures that are an environment
+issue (the wasm target std is unavailable here), unrelated to CTR-1. Lands as one
+`fix(agent)`/`fix(llm)` commit, separate from docs.
 
 ## Open code-level questions (from the review, carry forward)
 - [x] **RESOLVED — no remap needed.** `BadGateway` and `EmptyResponse` are both
@@ -337,3 +369,20 @@ persistence test). Land as one `fix(llm)`/`fix(agent)` commit, separate from doc
   confidence. Logged as CTR-1 (architecture section + WU-CTR1–4) for a fresh architecture
   pass then implementation pass. Docs-only this change; no code.
 - 2026-06-24 — Reborn follow-up scoped (WU8–WU10, unstarted). Investigation found Reborn already has the provider reachable, the reasoning round-trip (`model_gateway.rs`), and reasoning persistence (`ironclaw_turns`/`ironclaw_threads`); the only gaps are enabling the catalog field (WU8), the leak-scan on the Reborn path (WU9), and the WebUI toggle (WU10). Engine v2 ruled permanently out of scope (Reborn replaces it). Decisions R1–R3 recorded in the `-architecture` doc's "Reborn architecture (follow-up)" section. Docs-only this pass; no code.
+- 2026-06-25 — **CTR-1 v1 fix implemented (WU-CTR1–3).** `Turn`/`ConversationMessage`
+  gained a leak-scanned `reasoning` field, persisted via a new
+  `add_conversation_message_with_reasoning` trait method on both backends (PG `V31`,
+  libSQL `v26`), captured from `RespondResult` (incl. extending `Text` per CTR-D5), and
+  re-attached at both context-rebuild gateways (`Thread::messages()` +
+  `rebuild_chat_messages_from_db()`). Offline tests CTR-C1 (libSQL round-trip),
+  CTR-C2/C3/C4 (rebuild caller-level), CTR-C5 (turn-2 wire replays the ThinkChunk) pass.
+  `cargo fmt`/`clippy --all-features` clean; changed-module suites green. Per the user,
+  the shared `ConversationMessage` field forced compile-only `reasoning: None` in a few
+  Reborn construction sites (Option A) — no Reborn behavior changed. Code only.
+- 2026-06-25 — **WU-CTR4 verified — Reborn has the same cross-turn drop, deferred.**
+  `model_gateway.rs::convert_messages` rebuilds a prior plain assistant message as
+  `ChatMessage::assistant(content)` with no `.with_reasoning(...)`, and no `reasoning`
+  field exists on `ThreadMessageRecord`/`ContextMessage`/`HostManagedModelMessage` to
+  read back (tool-call reasoning *is* replayed via `ProviderToolCallReferenceEnvelope`).
+  Closing it is a multi-crate Reborn change overlapping WU8–WU10, so it is folded into
+  the Reborn follow-up rather than landed in this v1 pass.
