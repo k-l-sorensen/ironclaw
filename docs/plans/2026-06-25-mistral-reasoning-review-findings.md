@@ -183,7 +183,7 @@ failure, before relying on Mistral multi-turn tool use.
 
 - **Severity:** Low
 - **Category:** Coverage / scope confirmation
-- **Status:** ☐ open
+- **Status:** ☑ fixed
 
 ### Locations
 - `src/bridge/router.rs:5217`, `:5473`, `:6003` (`add_conversation_message(cid, "assistant", …)`)
@@ -288,3 +288,12 @@ one Mistral most needs). `log()`/comment any truncation so it is not silent
   asserts the two rows carry their respective traces (would fail under the old
   single-slot last-write-wins). Chose unit/round-trip coverage over a live API
   test (the structural fix satisfies F3's preferred acceptance branch).
+- 2026-06-25 — **F4 fixed** in `docs(llm): scope CTR-1 cross-turn replay to v1
+  agent loop (F4)`. No code change: confirmed `ENGINE_V2` defaults to `false`
+  (`src/config/agent.rs:159`), so the Mistral deployment runs the v1 agent loop
+  and the engine-v2 → v1-DB persistence sites in `src/bridge/router.rs` are not
+  exercised. Added a **Scope: v1 agent loop only** note to the CTR-1 bullet in
+  `CLAUDE-local.md` stating the replay applies to v1 only, that under engine v2
+  the `assistant`/`tool_calls` rows hydrate `reasoning = NULL` (inert — the
+  pre-CTR-1 behavior, not a regression), and that enabling engine v2 or migrating
+  to Reborn requires the WU-CTR4 / Reborn follow-up (WU8–WU10).

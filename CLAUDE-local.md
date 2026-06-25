@@ -101,5 +101,13 @@ custom `ProviderProtocol::Mistral` that owns all Mistral traffic.
   **WU-CTR4** confirmed Reborn has the *same* drop for plain assistant messages
   (`model_gateway.rs::convert_messages`) — deferred to the Reborn follow-up (WU8–WU10)
   as it is a multi-crate Reborn change. See the impl doc's **CTR-1** section.
+  **Scope: v1 agent loop only.** The replay applies to the default v1 loop
+  (`ENGINE_V2` unset/false — the Mistral deployment runs v1). Under engine v2, the
+  `src/bridge/router.rs` sites that persist `assistant`/`tool_calls` rows into the
+  v1 `conversation_messages` table write **no** reasoning, so
+  `rebuild_chat_messages_from_db` hydrates `reasoning = NULL` and the replay is
+  inert (the pre-CTR-1 behavior — not a regression). Enabling engine v2 or
+  migrating to Reborn requires the **WU-CTR4** / Reborn follow-up (WU8–WU10) to
+  carry reasoning through that path.
 
 <!-- Add new local changes above this line, newest first. -->
