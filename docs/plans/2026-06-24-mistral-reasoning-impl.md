@@ -267,10 +267,17 @@ does **not** meet the multi-turn requirement it was built for.
 
 ### WU-CTR1 — Persist the reasoning trace on the turn ☐
 - [ ] Add a reasoning field to `Turn` (`src/agent/session.rs:716`) and persist it on
-      the assistant message row (`crate::history::ConversationMessage` + migrations for
-      **both** PostgreSQL and libSQL). Store the leak-scanned copy (redaction already
-      runs at `crates/ironclaw_llm/src/reasoning.rs:841` on the round-trip path).
-- [ ] Populate it from `RespondResult` on **both** the text and tool-call paths.
+      the assistant message row (`ConversationMessage` in
+      `crates/ironclaw_reborn_traces/src/conversation_message.rs` + a `reasoning TEXT`
+      column on **both** backends — PG `V31`, libSQL incremental `v26` + idempotent
+      marker). Thread the field through `Store::add_conversation_message`
+      (`src/history/store.rs` + `src/db/postgres.rs` + `src/db/libsql/conversations.rs`),
+      which has no reasoning param today. Store the leak-scanned copy (redaction already
+      runs at `crates/ironclaw_llm/src/reasoning.rs:841`). See **CTR-D1/D6**.
+- [ ] Populate it from `RespondResult` on **both** paths. Note **CTR-D5**:
+      `RespondResult::Text(String)` carries no reasoning today (only `ToolCalls` does) —
+      extend the `Text` variant with `reasoning: Option<String>` so pure-text turns
+      persist their trace.
 - **Acceptance:** dual-backend persistence round-trip test (write turn with reasoning →
       reload → field intact on both backends).
 
@@ -278,8 +285,11 @@ does **not** meet the multi-turn requirement it was built for.
 - [ ] `Thread::messages()` (`src/agent/session.rs:562` and `:587`): `.with_reasoning(...)`
       on the reconstructed assistant message.
 - [ ] `rebuild_chat_messages_from_db()` (`src/agent/thread_ops.rs:3047`, `:3098`): same.
-- [ ] Confirm inert for non-Mistral providers (only `mistral.rs` reads
-      `ChatMessage.reasoning` into wire content).
+- [ ] Confirm no regression for non-Mistral providers. Per **CTR-D4** the re-attach is
+      **load-bearing, not inert**: `rig_adapter.rs:406–462` reads `ChatMessage.reasoning`
+      and DeepSeek/Gemini/OpenRouter require the echo (HTTP 400 if dropped). CTR-1 closes
+      the same cross-turn drop for them; only `mistral.rs` re-serializes into nested wire
+      content. Verify providers that ignore the field (OpenAI/Anthropic) are unaffected.
 - **Acceptance:** caller-level tests (per `testing.md`) driving `Thread::messages()`
       and `rebuild_chat_messages_from_db()` assert the rebuilt assistant `ChatMessage`
       carries `reasoning`.

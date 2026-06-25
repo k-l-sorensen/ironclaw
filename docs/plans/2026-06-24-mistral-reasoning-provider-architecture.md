@@ -446,28 +446,136 @@ persisted, so `Thread::messages()` has nothing to re-attach even if it tried, an
 cannot survive a restart — which also conflicts with CLAUDE.md's "LLM data is never
 deleted."
 
-### Where this must be handled (architecture)
+### Target architecture (C4 L3 — components)
 
-1. **Persist the reasoning trace as first-class turn data**, not a transient
-   `reason_ctx` value: add a reasoning field to `Turn` (`session.rs`) and to the
-   persisted message row (`crate::history::ConversationMessage` + DB schema, **both
-   PostgreSQL and libSQL** per the dual-backend rule). Store the **leak-scanned** copy
-   — the `LeakDetector` redaction already runs on the round-trip path at
-   `crates/ironclaw_llm/src/reasoning.rs:841`; confirm the persisted copy is the
-   redacted one (Decision 7's pre-persistence requirement).
-2. **Re-attach on context assembly through a single gateway.** `Thread::messages()`
-   (`session.rs:518-591`) and its hydration twin `rebuild_chat_messages_from_db()`
-   (`thread_ops.rs:3039`) are the two converging "rebuild assistant history" sites;
-   both must `.with_reasoning(...)` the reconstructed assistant message. Treat them as
-   one gateway — do not add a third copy (cf. `architecture.md` smell #4).
-3. **Confirm the cross-provider contract is inert elsewhere.** Re-attaching
-   `ChatMessage.reasoning` is replayed to every provider, but only `mistral.rs`
-   re-serializes it into wire content; DeepSeek/Gemini/OpenRouter already round-trip a
-   `reasoning` field. Verify no regression for them when the field is now also present
-   on rebuilt history (it should be inert on their request side).
-4. **Verify the Reborn path** carries this across turns too. `model_gateway.rs`
-   already captures/replays reasoning within its loop (this doc's Reborn inventory),
-   but the same cross-turn + persistence question applies there.
+CTR-1 adds **no new component**. It threads a reasoning value that is already
+captured and redacted through two stages that currently drop it — **turn
+persistence** and **context rebuild** — by giving `Turn` and the persisted message
+record a first-class field and re-attaching it at the single context-build
+gateway. The provider serialization, the redaction chokepoint, and the
+`ChatMessage.reasoning` channel are all reused unchanged.
+
+```
+[ provider response ]  CompletionResponse.reasoning            (UNCHANGED capture)
+        │  redacted once at reasoning.rs:841 (LeakDetector — REUSED)
+        ▼
+[ RespondResult ]  ToolCalls{reasoning}  +  (NEW) reasoning on the Text path (CTR-D5)
+        │
+        ▼
+[ Turn ]  src/agent/session.rs:716  — NEW reasoning: Option<String>   (first-class
+        │                              turn data, not transient reason_ctx)
+        │  persist (flat, redacted) on the assistant / tool_calls row
+        ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  Dual-backend persistence  (NEW column, both backends — CTR-D1/D6) │
+│   conversation_messages.reasoning TEXT   (PG V31 · libSQL incr v26)│
+│   ConversationMessage.reasoning: Option<String>                    │
+│   Store::add_conversation_message(… , reasoning)  write + read     │
+└───────────────────────────────────────────────────────────────────┘
+        │  hydrate
+        ▼
+[ SINGLE context-build gateway ]                       (NEW .with_reasoning — CTR-D2)
+  • Thread::messages()             session.rs:562 / :587
+  • rebuild_chat_messages_from_db  thread_ops.rs:3047 / :3098
+        │  ChatMessage.reasoning (flat Option<String>)             (REUSED channel)
+        ▼
+[ provider serialize ]  mistral.rs:515 re-wraps flat → nested ThinkChunk (UNCHANGED)
+  DeepSeek/Gemini/OpenRouter read it via rig_adapter.rs:406–462   (REQUIRED, not inert)
+```
+
+### Components touched
+
+| Component | File | Change |
+|---|---|---|
+| `Turn` struct | `src/agent/session.rs:716` | Add `reasoning: Option<String>` — first-class turn data (today it has only `response` + `narrative`; `narrative` is the cleaned channel-facing text, **not** the ThinkChunk). |
+| `RespondResult` | `crates/ironclaw_llm/src/reasoning.rs:444` | The `Text` variant carries **no** reasoning today; give it a reasoning channel so pure-text turns persist their trace (CTR-D5). |
+| `ConversationMessage` | `crates/ironclaw_reborn_traces/src/conversation_message.rs` | Add `reasoning: Option<String>` (today: `id/role/content/created_at`). Mirrors Reborn's typed field (CTR-D1). |
+| Persist write | `src/agent/thread_ops.rs` (`persist_assistant_response ~1246`, `persist_tool_calls ~1490`) | Write the redacted flat trace onto the `assistant` / `tool_calls` row. A turn is persisted as **three** rows, so this rides the existing write path. |
+| Store / DB trait | `src/history/store.rs` + `src/db/postgres.rs` + `src/db/libsql/conversations.rs` | `add_conversation_message(conv, role, content)` has no reasoning param today — thread it through (param or sibling method) on **both** backends, write + read. |
+| Schema (PostgreSQL) | `migrations/V31__conversation_messages_reasoning.sql` | `ALTER TABLE conversation_messages ADD COLUMN reasoning TEXT;` (verify next free version vs `origin/staging`). |
+| Schema (libSQL) | `src/db/libsql_migrations.rs` | Incremental `v26` `ADD COLUMN reasoning TEXT` + `IDEMPOTENT_ADD_COLUMN_MIGRATIONS` marker `(26,"conversation_messages","reasoning")` (the `source_channel`/V15 precedent). |
+| Context-build gateway | `src/agent/session.rs:562/:587` **and** `src/agent/thread_ops.rs:3047/:3098` | `.with_reasoning(...)` the rebuilt assistant message at **both** sites; treat as one gateway — no third copy (`architecture.md` smell #4). |
+| Reborn parity | `crates/ironclaw_reborn/src/model_gateway.rs`, `ironclaw_turns`, `ironclaw_threads` | Verify cross-turn (not just within-loop) carry + persistence; keep the field shape identical (CTR-D7). |
+
+### Reused — do NOT rebuild
+
+- **Redaction chokepoint** — `reasoning.rs:841` `redact_reasoning(...)` already runs
+  `LeakDetector::redact_all` on every within-turn response. The persisted copy
+  **must be the already-redacted one** (Decision 7's pre-persistence rule); do not
+  add a second scan.
+- **Flat `Option<String>` channel** — `ChatMessage.reasoning` + `.with_reasoning(...)`
+  and `mistral.rs`'s flat↔nested conversion are unchanged. CTR-1 persists/replays
+  the same flat shape DeepSeek/Gemini/OpenRouter already round-trip.
+- **Dual-backend column-add pattern** — follow the `source_channel` precedent
+  (`V15` + libSQL idempotent marker); `TEXT → TEXT`, no type negotiation.
+
+### Key architectural decisions
+
+- **CTR-D1 — First-class typed field, dual-backend (chosen to match Reborn).**
+  Persist a typed `reasoning: Option<String>` on the message record + a
+  `reasoning TEXT` column on both backends. This shape was selected **to match
+  Reborn as closely as possible**: Reborn already carries reasoning as dedicated
+  typed `response_reasoning` / `reasoning` fields on its records
+  (`crates/ironclaw_threads/src/tool_result_reference.rs`,
+  `crates/ironclaw_turns/src/run_profile/host.rs`, validated 4096-char cap) — a
+  typed field, **not** a key embedded in a free-form content blob. Since Reborn is
+  intended to replace v1, keeping the same field shape means WU-CTR4 becomes a
+  parity check, not a reconciliation. **Rejected:** JSON-embed in `content` (the
+  `narrative` precedent) — it diverges from Reborn, leaves reasoning
+  non-queryable, and would force the plain `assistant` row into a JSON envelope it
+  is not today. ADD only, never drop ("LLM data is never deleted").
+- **CTR-D2 — Single re-attachment gateway.** `Thread::messages()` and its
+  hydration twin `rebuild_chat_messages_from_db()` are the two converging "rebuild
+  assistant history" sites; both `.with_reasoning(...)` the reconstructed assistant
+  message. Treat them as one gateway — no third copy (`architecture.md` smell #4).
+- **CTR-D3 — Persist the redacted, normalized flat string.** Mistral reasoning is
+  **nested** on the wire — `content = [ThinkChunk{type:"thinking",
+  thinking:[TextChunk,…]}, TextChunk{type:"text"}]`, unlike DeepSeek's flat
+  top-level `reasoning_content`. The cross-provider channel
+  (`ChatMessage.reasoning` and the new persisted field) is a **flat
+  `Option<String>`**; `mistral.rs` is the **sole owner** of both directions
+  (`extract_content` joins `thinking[]` → String; `chat_message_to_wire:515`
+  re-wraps String → nested array). CTR-1 persists the **flat normalized string**,
+  never the raw nested JSON. The flatten concatenates the `thinking[]` segmentation
+  (lossless for the text, normalizes chunk boundaries) — an explicit, accepted
+  boundary.
+- **CTR-D4 — Cross-provider replay is load-bearing, and CTR-1's fix is generic.**
+  (Corrects the earlier "inert on their request side" claim.) `rig_adapter.rs:406–462`
+  **reads** `msg.reasoning` and forwards it to rig-core as `AssistantContent::Reasoning`;
+  DeepSeek/Gemini/OpenRouter **require** the echo (HTTP 400 if dropped — #3201/#3225).
+  Re-attaching reasoning on rebuilt history is therefore **required, not inert**, and
+  CTR-1 closes the *same* latent cross-turn drop for those providers via the shared
+  `ChatMessage.reasoning` channel — it is **not Mistral-specific**. Providers that
+  ignore the field (OpenAI/Anthropic via rig-core) are unaffected; verify no regression.
+- **CTR-D5 — Capture text-turn reasoning.** `RespondResult::Text(String)` has no
+  reasoning field — only `ToolCalls { …, reasoning }` does. A pure-text turn (the
+  most common shape, no tools) therefore has nowhere to read the trace from.
+  Specify the channel: **recommend extending `Text` to carry
+  `reasoning: Option<String>`**, mirroring `ToolCalls`, so the redaction at
+  `reasoning.rs:841` and the persist path apply uniformly.
+- **CTR-D6 — Migration discipline (dual-backend rule).** Number the PostgreSQL
+  migration after the highest version on `origin/staging`; add the libSQL
+  incremental + idempotent marker; check all three feature combos (`cargo check`,
+  `--no-default-features --features libsql`, `--all-features`). See `src/db/CLAUDE.md`.
+- **CTR-D7 — Reborn parity is a check, not a rebuild.** Keep the v1 persisted field
+  shape identical to Reborn's typed field so the Reborn cross-turn verification
+  (WU-CTR4) confirms carry/persistence rather than reconciling two shapes.
+
+### Verification matrix (CTR-C1…CTR-C8)
+
+Offline-first, mirroring the main section's matrix. The live test is a smoke
+layer, not the primary net.
+
+| # | Driver | Assert |
+|---|---|---|
+| CTR-C1 | dual-backend persistence round-trip (`--features integration`) | write a turn with reasoning → reload → field intact on **PostgreSQL and libSQL**. |
+| CTR-C2 | caller-level `Thread::messages()` | rebuilt assistant `ChatMessage` carries `reasoning`. |
+| CTR-C3 | caller-level `rebuild_chat_messages_from_db()` | same, after DB hydration. |
+| CTR-C4 | pure-text turn (no tools) | text-turn reasoning is persisted and replayed (exercises CTR-D5). |
+| CTR-C5 | turn-2 request body (mock server / trace capture) | request contains a `thinking` chunk for the prior assistant message — "no 400" is **not** evidence of replay. |
+| CTR-C6 | non-Mistral providers (DeepSeek/Gemini) | reattached `reasoning` is forwarded (load-bearing, CTR-D4); agnostic providers unaffected. |
+| CTR-C7 | redaction (CTR-D3) | planted secret in a `thinking` chunk is redacted in the **persisted** row **and** the **replayed** prompt. |
+| CTR-C8 | Reborn cross-turn (CTR-D7) | `model_gateway.rs` carries + persists reasoning across user turns. |
 
 ### Verification gap to close
 
@@ -478,4 +586,5 @@ uses no tools, so the within-turn replay branch never fires. Dropping the ThinkC
 yields a valid plain-string assistant message Mistral accepts (no 400), so the test is
 green on the degraded path. CTR-1 must add a **request-body assertion** (mock server or
 trace capture) that the turn-2 request actually contains a `thinking` chunk for the
-prior assistant message — "no 400" is not evidence of replay.
+prior assistant message — "no 400" is not evidence of replay. This is **CTR-C5** in the
+verification matrix above.
