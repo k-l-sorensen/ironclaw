@@ -131,7 +131,7 @@ env-agnostic rule — so pass the raw `Option<String>` in and return
 
 - **Severity:** Medium
 - **Category:** Correctness / unvalidated contract
-- **Status:** ☐ open
+- **Status:** ☑ fixed
 
 ### Locations
 - `src/agent/session.rs:558` and `:589` (`Thread::messages()`).
@@ -221,7 +221,7 @@ revisit, alongside the already-scoped Reborn WU-CTR4).
 
 - **Severity:** Low
 - **Category:** Cost / resource bounding
-- **Status:** ☐ open
+- **Status:** ☐ Will not fix
 
 ### Locations
 - `src/agent/session.rs:589` (and the tool-call branch at `:558`), plus the
@@ -271,3 +271,20 @@ one Mistral most needs). `log()`/comment any truncation so it is not silent
   `apply_registry_provider_env`, factory dispatch, and overlay migration. Added
   caller-level regression test `mistral_reasoning_gates_on_protocol_not_id_string`
   driving `resolve_registry_provider` with a custom-id Mistral `ProviderDefinition`.
+- 2026-06-25 — **F3 fixed** in `fix(agent): replay per-message reasoning so tool
+  and final ThinkChunks don't cross-stamp`. Implemented the preferred fix: added
+  a distinct `Turn::tool_call_reasoning` slot alongside `reasoning` (no DB
+  migration — each is persisted via the existing per-row `reasoning` column).
+  `execute_tool_calls` now captures the tool-call round's trace into
+  `tool_call_reasoning` while `handle_text_response` keeps the final answer's in
+  `reasoning`; `Thread::messages()` re-attaches each to its own message, and the
+  eight `process_user_input` persist sites route `tool_call_reasoning` to the
+  `tool_calls` row and `reasoning` to the `assistant` row.
+  `rebuild_chat_messages_from_db` already read each row's own trace, so the DB
+  hydration path needed no change. Updated `test_messages_reattaches_reasoning_tool_turn`
+  to assert distinct (no cross-stamping) and added the caller-level DB round-trip
+  `test_process_user_input_persists_distinct_tool_and_final_reasoning`, which
+  drives `process_user_input` with a sequenced tool-then-text reasoning LLM and
+  asserts the two rows carry their respective traces (would fail under the old
+  single-slot last-write-wins). Chose unit/round-trip coverage over a live API
+  test (the structural fix satisfies F3's preferred acceptance branch).

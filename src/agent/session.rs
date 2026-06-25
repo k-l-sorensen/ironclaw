@@ -559,11 +559,13 @@ impl Thread {
                     .collect();
 
                 // Assistant message declaring the tool calls (no text content).
-                // Re-attach the turn's reasoning trace so the provider sees its
-                // prior ThinkChunk on the next request (CTR-1).
+                // Re-attach the tool-call round's own reasoning trace (distinct
+                // from the final answer's) so the provider sees the ThinkChunk
+                // that actually preceded this tool call, not the final answer's
+                // (CTR-1 / F3).
                 messages.push(
                     ChatMessage::assistant_with_tool_calls(None, tool_calls)
-                        .with_reasoning(turn.reasoning.clone()),
+                        .with_reasoning(turn.tool_call_reasoning.clone()),
                 );
 
                 // Individual tool result messages, truncated to limit context size.
@@ -751,6 +753,14 @@ pub struct Turn {
     /// validate the chain (CTR-1). Persisted on the turn's assistant row.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Reasoning trace that preceded this turn's tool-call round (the ThinkChunk
+    /// emitted alongside the `tool_calls`), distinct from `reasoning` which is
+    /// the trace preceding the final text answer. Re-attached to the
+    /// `assistant_with_tool_calls` message and persisted on the `tool_calls`
+    /// row, so each assistant message replays its own ThinkChunk rather than
+    /// having one slot last-write-wins and cross-stamp both messages (CTR-1 / F3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_reasoning: Option<String>,
     /// Transient image content parts for multimodal LLM input.
     /// Not serialized — images are only needed for the current LLM call.
     /// The text description in `user_input` persists for compaction/context.
@@ -773,6 +783,7 @@ impl Turn {
             error: None,
             narrative: None,
             reasoning: None,
+            tool_call_reasoning: None,
             image_content_parts: Vec::new(),
         }
     }
@@ -1937,8 +1948,10 @@ mod tests {
         assert_eq!(messages[1].reasoning.as_deref(), Some("17 * 23 = 391"));
     }
 
-    /// CTR-C2: a tool-bearing turn replays its reasoning on both the
-    /// tool-call assistant message and the final assistant message.
+    /// CTR-C2 / F3: a tool-bearing turn replays the tool-call round's own
+    /// reasoning on the tool-call assistant message and the final answer's
+    /// reasoning on the final assistant message — each message carries its own
+    /// ThinkChunk, with no cross-stamping between the two slots.
     #[test]
     fn test_messages_reattaches_reasoning_tool_turn() {
         let mut thread = Thread::new(Uuid::new_v4(), None);
@@ -1950,24 +1963,29 @@ mod tests {
             Some("id_a".into()),
         );
         turn.record_tool_result_for("id_a", serde_json::json!("ok"));
-        turn.reasoning = Some("kick off the build, then report".to_string());
+        // Distinct traces: the thinking before the tool call vs. before the
+        // final answer. The single-slot bug (F3) replayed the final answer's
+        // trace onto both messages.
+        turn.tool_call_reasoning = Some("think before the tool".to_string());
+        turn.reasoning = Some("think before the answer".to_string());
         turn.conclude(TurnOutcome::Completed("Build is clean.".to_string()));
         thread.turns.push(turn);
 
         let messages = thread.messages();
         // user + assistant_with_tool_calls + tool_result + assistant
         assert_eq!(messages.len(), 4);
-        // tool-call assistant message
+        // tool-call assistant message carries the tool-call round's trace.
         assert!(messages[1].tool_calls.is_some());
         assert_eq!(
             messages[1].reasoning.as_deref(),
-            Some("kick off the build, then report")
+            Some("think before the tool")
         );
-        // final assistant message
+        // final assistant message carries the final answer's trace — not the
+        // tool-call trace.
         assert_eq!(messages[3].content, "Build is clean.");
         assert_eq!(
             messages[3].reasoning.as_deref(),
-            Some("kick off the build, then report")
+            Some("think before the answer")
         );
     }
 

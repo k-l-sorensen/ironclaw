@@ -950,11 +950,14 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 if turn.narrative.is_none() {
                     turn.narrative = narrative;
                 }
-                // Persist this round's reasoning trace on the turn (CTR-1). Only
-                // overwrite with a non-empty trace so a later round without
-                // reasoning doesn't clobber an earlier one.
+                // Persist this round's reasoning trace on the turn as the
+                // tool-call trace, distinct from the final answer's
+                // `turn.reasoning` so the two assistant messages don't share one
+                // last-write-wins slot (CTR-1 / F3). Only overwrite with a
+                // non-empty trace so a later round without reasoning doesn't
+                // clobber an earlier one.
                 if turn_reasoning.is_some() {
-                    turn.reasoning = turn_reasoning;
+                    turn.tool_call_reasoning = turn_reasoning;
                 }
                 for (tc, safe_args) in tool_calls.iter().zip(redacted_args) {
                     let sanitized_rationale = tc.reasoning.as_ref().map(|r| {
