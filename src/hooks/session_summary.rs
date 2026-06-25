@@ -247,6 +247,16 @@ mod tests {
             unimplemented!()
         }
 
+        async fn add_conversation_message_with_reasoning(
+            &self,
+            _conversation_id: Uuid,
+            _role: &str,
+            _content: &str,
+            _reasoning: Option<&str>,
+        ) -> Result<Uuid, crate::error::DatabaseError> {
+            unimplemented!()
+        }
+
         async fn add_conversation_message_if_empty(
             &self,
             _conversation_id: Uuid,
@@ -574,12 +584,14 @@ mod tests {
                     role: "user".into(),
                     content: "Hello".into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
                     role: "assistant".into(),
                     content: "Hi".into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
             ],
         });
@@ -623,18 +635,21 @@ mod tests {
                     role: "user".into(),
                     content: "Can you help me plan the project?".into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
                     role: "assistant".into(),
                     content: "Sure! Let me outline the key milestones.".into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
                     role: "user".into(),
                     content: "Focus on the backend first.".into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
@@ -642,6 +657,7 @@ mod tests {
                     content: "Got it. Backend priorities: API design, database schema, auth."
                         .into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
             ],
         });
@@ -708,24 +724,28 @@ mod tests {
                     role: "user".into(),
                     content: "First message".into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
                     role: "assistant".into(),
                     content: "Reply one".into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
                     role: "user".into(),
                     content: "Second message".into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
                     role: "assistant".into(),
                     content: "Reply two".into(),
                     created_at: Utc::now(),
+                    reasoning: None,
                 },
             ],
         });

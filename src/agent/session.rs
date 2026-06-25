@@ -558,8 +558,13 @@ impl Thread {
                     })
                     .collect();
 
-                // Assistant message declaring the tool calls (no text content)
-                messages.push(ChatMessage::assistant_with_tool_calls(None, tool_calls));
+                // Assistant message declaring the tool calls (no text content).
+                // Re-attach the turn's reasoning trace so the provider sees its
+                // prior ThinkChunk on the next request (CTR-1).
+                messages.push(
+                    ChatMessage::assistant_with_tool_calls(None, tool_calls)
+                        .with_reasoning(turn.reasoning.clone()),
+                );
 
                 // Individual tool result messages, truncated to limit context size.
                 for (call_id, tc) in tool_calls_with_ids {
@@ -584,7 +589,9 @@ impl Thread {
                 }
             }
             if let Some(ref response) = turn.response {
-                messages.push(ChatMessage::assistant(response));
+                // Re-attach the turn's reasoning trace (CTR-1) — see above.
+                messages
+                    .push(ChatMessage::assistant(response).with_reasoning(turn.reasoning.clone()));
             }
         }
         messages
@@ -737,6 +744,13 @@ pub struct Turn {
     /// Cleaned via `clean_response` and sanitized through `SafetyLayer` before storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narrative: Option<String>,
+    /// Provider-emitted reasoning trace (the raw ThinkChunk / `reasoning_content`)
+    /// for this turn, already leak-scanned. Distinct from `narrative` (the
+    /// cleaned, channel-facing text): this is the trace replayed verbatim into
+    /// the next request so Mistral sees its prior ThinkChunk and DeepSeek/Gemini
+    /// validate the chain (CTR-1). Persisted on the turn's assistant row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// Transient image content parts for multimodal LLM input.
     /// Not serialized — images are only needed for the current LLM call.
     /// The text description in `user_input` persists for compaction/context.
@@ -758,6 +772,7 @@ impl Turn {
             completed_at: None,
             error: None,
             narrative: None,
+            reasoning: None,
             image_content_parts: Vec::new(),
         }
     }
@@ -1901,6 +1916,58 @@ mod tests {
         assert_eq!(
             turn.tool_calls[1].result.as_ref().unwrap(),
             &serde_json::json!("result_b")
+        );
+    }
+
+    /// CTR-C4: a pure-text turn (no tools) replays its reasoning trace on the
+    /// rebuilt assistant message that seeds the next turn's context.
+    #[test]
+    fn test_messages_reattaches_reasoning_text_turn() {
+        let mut thread = Thread::new(Uuid::new_v4(), None);
+        let mut turn = Turn::new(0, "What is 17 * 23?");
+        turn.reasoning = Some("17 * 23 = 391".to_string());
+        turn.conclude(TurnOutcome::Completed("391".to_string()));
+        thread.turns.push(turn);
+
+        let messages = thread.messages();
+        // user + assistant
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, ironclaw_llm::Role::Assistant);
+        assert_eq!(messages[1].content, "391");
+        assert_eq!(messages[1].reasoning.as_deref(), Some("17 * 23 = 391"));
+    }
+
+    /// CTR-C2: a tool-bearing turn replays its reasoning on both the
+    /// tool-call assistant message and the final assistant message.
+    #[test]
+    fn test_messages_reattaches_reasoning_tool_turn() {
+        let mut thread = Thread::new(Uuid::new_v4(), None);
+        let mut turn = Turn::new(0, "Run the build");
+        turn.record_tool_call_with_reasoning(
+            "shell",
+            serde_json::json!({"cmd": "make"}),
+            None,
+            Some("id_a".into()),
+        );
+        turn.record_tool_result_for("id_a", serde_json::json!("ok"));
+        turn.reasoning = Some("kick off the build, then report".to_string());
+        turn.conclude(TurnOutcome::Completed("Build is clean.".to_string()));
+        thread.turns.push(turn);
+
+        let messages = thread.messages();
+        // user + assistant_with_tool_calls + tool_result + assistant
+        assert_eq!(messages.len(), 4);
+        // tool-call assistant message
+        assert!(messages[1].tool_calls.is_some());
+        assert_eq!(
+            messages[1].reasoning.as_deref(),
+            Some("kick off the build, then report")
+        );
+        // final assistant message
+        assert_eq!(messages[3].content, "Build is clean.");
+        assert_eq!(
+            messages[3].reasoning.as_deref(),
+            Some("kick off the build, then report")
         );
     }
 

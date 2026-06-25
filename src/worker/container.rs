@@ -449,6 +449,7 @@ impl LoopDelegate for ContainerDelegate {
         &self,
         text: &str,
         metadata: ResponseMetadata,
+        _reasoning: Option<String>,
         reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
         let action = {

@@ -827,8 +827,24 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         &self,
         text: &str,
         _metadata: ironclaw_llm::ResponseMetadata,
+        reasoning: Option<String>,
         _reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
+        // Record the (already leak-scanned) reasoning trace on the turn so it
+        // survives turn persistence and is replayed on the next user turn —
+        // Mistral requires the prior ThinkChunk, and DeepSeek/Gemini reject the
+        // follow-up without the echo (CTR-1, #3201/#3225). Only overwrite with a
+        // non-empty trace so a final answer without reasoning doesn't clobber an
+        // earlier tool-round trace.
+        if reasoning.is_some() {
+            let mut sess = self.session.lock().await;
+            if let Some(thread) = sess.threads.get_mut(&self.thread_id)
+                && let Some(turn) = thread.last_turn_mut()
+            {
+                turn.reasoning = reasoning;
+            }
+        }
+
         // Strip internal "[Called tool ...]" text that can leak when legacy
         // provider compatibility flattening converts tool_calls to plain text
         // and the LLM echoes it back.
@@ -855,6 +871,10 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 sanitized.content
             })
             .filter(|c| !c.trim().is_empty());
+
+        // Capture the reasoning trace for cross-turn persistence before it is
+        // moved into the within-turn context below (CTR-1).
+        let turn_reasoning = reasoning.clone();
 
         // Add the assistant message with tool_calls to context.
         // OpenAI protocol requires this before tool-result messages.
@@ -929,6 +949,12 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 // Set turn-level narrative.
                 if turn.narrative.is_none() {
                     turn.narrative = narrative;
+                }
+                // Persist this round's reasoning trace on the turn (CTR-1). Only
+                // overwrite with a non-empty trace so a later round without
+                // reasoning doesn't clobber an earlier one.
+                if turn_reasoning.is_some() {
+                    turn.reasoning = turn_reasoning;
                 }
                 for (tc, safe_args) in tool_calls.iter().zip(redacted_args) {
                     let sanitized_rationale = tc.reasoning.as_ref().map(|r| {
@@ -3244,7 +3270,7 @@ mod tests {
         ctx_forced.force_text = true;
         let output = reasoning.respond_with_tools(&ctx_forced).await.unwrap();
         assert!(
-            matches!(output.result, RespondResult::Text(_)),
+            matches!(output.result, RespondResult::Text { .. }),
             "With force_text, should get text response, got: {:?}",
             output.result
         );

@@ -674,7 +674,7 @@ Create alongside the .wasm file to grant capabilities:
                 })?;
 
             match result.result {
-                RespondResult::Text(response) => {
+                RespondResult::Text { text: response, .. } => {
                     reason_ctx.messages.push(ChatMessage::assistant(&response));
 
                     // If tools haven't been executed yet, we're stuck in planning mode

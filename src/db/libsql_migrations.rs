@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    reasoning TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation
@@ -1007,6 +1008,18 @@ WHERE key = 'wasm.default_fuel_limit'
   AND CAST(json_extract(value, '$') AS INTEGER) = 10000000;
 "#,
     ),
+    (
+        26,
+        "conversation_messages_reasoning",
+        // Persist the leak-scanned reasoning trace on each assistant/tool_calls
+        // message so it can be replayed into the LLM on the next user turn
+        // (Mistral ThinkChunk; DeepSeek/Gemini chain echo). Marked idempotent
+        // (see IDEMPOTENT_ADD_COLUMN_MIGRATIONS) because SQLite lacks
+        // ADD COLUMN IF NOT EXISTS. See CTR-1.
+        r#"
+ALTER TABLE conversation_messages ADD COLUMN reasoning TEXT;
+"#,
+    ),
 ];
 
 /// Migrations whose ADD COLUMN should be skipped when the column already
@@ -1017,6 +1030,7 @@ const IDEMPOTENT_ADD_COLUMN_MIGRATIONS: &[(i64, &str, &str)] = &[
     (18, "wasm_tools", "scope"),
     (18, "dynamic_tools", "scope"),
     (22, "agent_jobs", "restart_params"),
+    (26, "conversation_messages", "reasoning"),
 ];
 
 /// Check whether `table` already contains `column` via `pragma_table_info`.

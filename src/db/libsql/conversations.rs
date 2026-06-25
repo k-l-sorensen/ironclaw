@@ -48,12 +48,23 @@ impl ConversationStore for LibSqlBackend {
         role: &str,
         content: &str,
     ) -> Result<Uuid, DatabaseError> {
+        self.add_conversation_message_with_reasoning(conversation_id, role, content, None)
+            .await
+    }
+
+    async fn add_conversation_message_with_reasoning(
+        &self,
+        conversation_id: Uuid,
+        role: &str,
+        content: &str,
+        reasoning: Option<&str>,
+    ) -> Result<Uuid, DatabaseError> {
         let conn = self.connect().await?;
         let id = Uuid::new_v4();
         let now = fmt_ts(&Utc::now());
         conn.execute(
-                "INSERT INTO conversation_messages (id, conversation_id, role, content, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![id.to_string(), conversation_id.to_string(), role, content, now],
+                "INSERT INTO conversation_messages (id, conversation_id, role, content, created_at, reasoning) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id.to_string(), conversation_id.to_string(), role, content, now, opt_text(reasoning)],
             )
             .await
             .map_err(|e| DatabaseError::Query(e.to_string()))?;
@@ -530,7 +541,7 @@ impl ConversationStore for LibSqlBackend {
         let mut rows = if let Some(before_ts) = before {
             conn.query(
                 r#"
-                    SELECT id, role, content, created_at
+                    SELECT id, role, content, created_at, reasoning
                     FROM conversation_messages
                     WHERE conversation_id = ?1 AND created_at < ?2
                     ORDER BY created_at DESC, rowid DESC
@@ -542,7 +553,7 @@ impl ConversationStore for LibSqlBackend {
         } else {
             conn.query(
                 r#"
-                    SELECT id, role, content, created_at
+                    SELECT id, role, content, created_at, reasoning
                     FROM conversation_messages
                     WHERE conversation_id = ?1
                     ORDER BY created_at DESC, rowid DESC
@@ -565,6 +576,7 @@ impl ConversationStore for LibSqlBackend {
                 role: get_text(&row, 1),
                 content: get_text(&row, 2),
                 created_at: get_ts(&row, 3),
+                reasoning: get_opt_text(&row, 4),
             });
         }
 
@@ -623,7 +635,7 @@ impl ConversationStore for LibSqlBackend {
         let mut rows = conn
             .query(
                 r#"
-                SELECT id, role, content, created_at
+                SELECT id, role, content, created_at, reasoning
                 FROM conversation_messages
                 WHERE conversation_id = ?1
                 ORDER BY created_at ASC, rowid ASC
@@ -644,6 +656,7 @@ impl ConversationStore for LibSqlBackend {
                 role: get_text(&row, 1),
                 content: get_text(&row, 2),
                 created_at: get_ts(&row, 3),
+                reasoning: get_opt_text(&row, 4),
             });
         }
         Ok(messages)
@@ -696,6 +709,44 @@ impl ConversationStore for LibSqlBackend {
 mod tests {
     use super::*;
     use crate::db::Database;
+
+    /// CTR-C1 (libSQL half): a message persisted with a reasoning trace reloads
+    /// with the field intact; a message without one reloads as `None`.
+    #[tokio::test]
+    async fn test_conversation_message_reasoning_round_trips() {
+        // new_local (not new_memory): per-operation connections must share state.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test_reasoning_round_trip.db");
+        let backend = LibSqlBackend::new_local(&db_path).await.unwrap();
+        backend.run_migrations().await.unwrap();
+
+        let conv = backend
+            .create_conversation("cli", "test_user", None)
+            .await
+            .unwrap();
+
+        backend
+            .add_conversation_message_with_reasoning(
+                conv,
+                "assistant",
+                "391",
+                Some("17 * 23 = 391"),
+            )
+            .await
+            .unwrap();
+        // No-reasoning insert must round-trip as NULL/None.
+        backend
+            .add_conversation_message(conv, "user", "next question")
+            .await
+            .unwrap();
+
+        let messages = backend.list_conversation_messages(conv).await.unwrap();
+        assert_eq!(messages.len(), 2);
+        let assistant = messages.iter().find(|m| m.role == "assistant").unwrap();
+        assert_eq!(assistant.reasoning.as_deref(), Some("17 * 23 = 391"));
+        let user = messages.iter().find(|m| m.role == "user").unwrap();
+        assert_eq!(user.reasoning, None);
+    }
 
     #[tokio::test]
     async fn test_get_or_create_routine_conversation_is_idempotent() {

@@ -9798,6 +9798,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "Please inspect the build".to_string(),
                 created_at: now,
+                reasoning: None,
             },
             crate::ConversationMessage {
                 id: Uuid::new_v4(),
@@ -9811,12 +9812,14 @@ mod tests {
                 })
                 .to_string(),
                 created_at: now,
+                reasoning: None,
             },
             crate::ConversationMessage {
                 id: Uuid::new_v4(),
                 role: "assistant".to_string(),
                 content: "The build is clean.".to_string(),
                 created_at: now,
+                reasoning: None,
             },
         ];
 

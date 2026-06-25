@@ -419,6 +419,16 @@ pub trait ConversationStore: Send + Sync {
         role: &str,
         content: &str,
     ) -> Result<Uuid, DatabaseError>;
+    /// Add a message carrying an optional, already-redacted reasoning trace.
+    /// The trace is persisted so it can be replayed into the LLM on the next
+    /// user turn (CTR-1). Implementations must store `reasoning` on the row.
+    async fn add_conversation_message_with_reasoning(
+        &self,
+        conversation_id: Uuid,
+        role: &str,
+        content: &str,
+        reasoning: Option<&str>,
+    ) -> Result<Uuid, DatabaseError>;
     /// Insert a message only if the conversation has zero messages.
     /// Returns `Ok(true)` if the message was inserted, `Ok(false)` if skipped.
     async fn add_conversation_message_if_empty(

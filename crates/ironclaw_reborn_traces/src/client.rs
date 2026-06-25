@@ -417,6 +417,7 @@ mod tests {
             role: role.to_string(),
             content: content.into(),
             created_at: Utc::now(),
+            reasoning: None,
         }
     }
 

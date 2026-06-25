@@ -109,10 +109,15 @@ pub trait LoopDelegate: Send + Sync {
 
     /// Handle a text-only response from the LLM.
     /// Return `TextAction::Return` to exit the loop, `TextAction::Continue` to proceed.
+    ///
+    /// `reasoning` is the provider's leak-scanned reasoning trace for this
+    /// text turn (CTR-D5). Delegates that persist turns record it so it is
+    /// replayed on subsequent user turns; delegates that don't may ignore it.
     async fn handle_text_response(
         &self,
         text: &str,
         metadata: ResponseMetadata,
+        reasoning: Option<String>,
         reason_ctx: &mut ReasoningContext,
     ) -> TextAction;
 
@@ -242,7 +247,7 @@ pub async fn run_agentic_loop(
         let output = delegate.call_llm(reasoning, reason_ctx, iteration).await?;
 
         match &output.result {
-            RespondResult::Text(text) => {
+            RespondResult::Text { text, .. } => {
                 tracing::debug!(
                     iteration,
                     len = text.len(),
@@ -267,7 +272,7 @@ pub async fn run_agentic_loop(
         }
 
         match output.result {
-            RespondResult::Text(text) => {
+            RespondResult::Text { text, reasoning } => {
                 // Tool intent nudge: if the LLM says "let me search..." without
                 // actually calling a tool, inject a nudge message.
                 if config.enable_tool_intent_nudge
@@ -282,7 +287,12 @@ pub async fn run_agentic_loop(
                         "LLM expressed tool intent without calling a tool, nudging"
                     );
                     delegate.on_tool_intent_nudge(&text, reason_ctx).await;
-                    reason_ctx.messages.push(ChatMessage::assistant(&text));
+                    // Carry reasoning so the next request can echo it back —
+                    // required for DeepSeek/Gemini to validate the chain (#3201,
+                    // #3225), same as the tool-call replay path.
+                    reason_ctx
+                        .messages
+                        .push(ChatMessage::assistant(&text).with_reasoning(reasoning.clone()));
                     reason_ctx
                         .messages
                         .push(ChatMessage::user(ironclaw_llm::TOOL_INTENT_NUDGE));
@@ -299,7 +309,7 @@ pub async fn run_agentic_loop(
                 dup_tracker.reset();
 
                 match delegate
-                    .handle_text_response(&text, output.metadata, reason_ctx)
+                    .handle_text_response(&text, output.metadata, reasoning, reason_ctx)
                     .await
                 {
                     TextAction::Return(outcome) => return Ok(outcome),
@@ -425,7 +435,10 @@ mod tests {
 
     fn text_output(text: &str) -> RespondOutput {
         RespondOutput {
-            result: RespondResult::Text(text.to_string()),
+            result: RespondResult::Text {
+                text: text.to_string(),
+                reasoning: None,
+            },
             usage: zero_usage(),
             finish_reason: FinishReason::Stop,
             metadata: ResponseMetadata::default(),
@@ -526,6 +539,7 @@ mod tests {
             &self,
             text: &str,
             _metadata: ResponseMetadata,
+            _reasoning: Option<String>,
             _reason_ctx: &mut ReasoningContext,
         ) -> TextAction {
             TextAction::Return(LoopOutcome::Response(text.to_string()))
@@ -708,7 +722,10 @@ mod tests {
                 _: usize,
             ) -> Result<ironclaw_llm::RespondOutput, crate::error::Error> {
                 Ok(RespondOutput {
-                    result: RespondResult::Text("fallback".to_string()),
+                    result: RespondResult::Text {
+                        text: "fallback".to_string(),
+                        reasoning: None,
+                    },
                     usage: zero_usage(),
                     finish_reason: FinishReason::Stop,
                     metadata: ResponseMetadata {
@@ -721,6 +738,7 @@ mod tests {
                 &self,
                 _: &str,
                 metadata: ResponseMetadata,
+                _: Option<String>,
                 _: &mut ReasoningContext,
             ) -> TextAction {
                 assert_eq!(metadata.anomaly, Some(ResponseAnomaly::EmptyToolCompletion));
@@ -785,6 +803,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: ResponseMetadata,
+                _: Option<String>,
                 ctx: &mut ReasoningContext,
             ) -> TextAction {
                 ctx.messages.push(ChatMessage::assistant("still working"));
@@ -1251,6 +1270,7 @@ mod tests {
                 &self,
                 text: &str,
                 _: ResponseMetadata,
+                _: Option<String>,
                 ctx: &mut ReasoningContext,
             ) -> TextAction {
                 let count = self.text_response_count.fetch_add(1, Ordering::SeqCst);

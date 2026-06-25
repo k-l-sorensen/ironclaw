@@ -10,4 +10,9 @@ pub struct ConversationMessage {
     pub role: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
+    /// Provider-emitted reasoning trace for an assistant/tool_calls message,
+    /// already leak-scanned. Persisted so it can be replayed into the LLM on
+    /// the next user turn (CTR-1). `None` for user messages and for rows
+    /// written before the `reasoning` column existed.
+    pub reasoning: Option<String>,
 }

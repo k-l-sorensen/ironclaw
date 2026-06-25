@@ -290,6 +290,41 @@ fn c8_multi_turn_replays_think_chunk() {
     assert_eq!(chunks[1]["text"], "the answer");
 }
 
+/// CTR-C5: a turn-2 request body (the full prior history the agent loop replays)
+/// must carry a `thinking` chunk for the prior assistant message — "no HTTP 400"
+/// is not evidence of replay. This mirrors what `Thread::messages()` /
+/// `rebuild_chat_messages_from_db` produce after CTR-1: the prior assistant
+/// message carries its reasoning, which serializes to a ThinkChunk on turn 2.
+#[test]
+fn ctr_c5_turn_two_request_replays_prior_think_chunk() {
+    // History as rebuilt for the second user turn.
+    let history = vec![
+        ChatMessage::user("What is 17 * 23?"),
+        ChatMessage::assistant("391").with_reasoning(Some("17 * 23 = 391".to_string())),
+        ChatMessage::user("Now multiply that by 3."),
+    ];
+
+    let wire: Vec<_> = history
+        .into_iter()
+        .map(|m| serde_json::to_value(chat_message_to_wire(m, false)).unwrap())
+        .collect();
+
+    // The prior assistant message (index 1) must replay its ThinkChunk.
+    let prior_assistant = &wire[1]["content"];
+    assert!(
+        prior_assistant.is_array(),
+        "prior assistant content must be a chunk array on turn 2: {:?}",
+        wire[1]
+    );
+    let chunks = prior_assistant.as_array().unwrap();
+    assert!(
+        chunks
+            .iter()
+            .any(|c| c["type"] == "thinking" && c["thinking"][0]["text"] == "17 * 23 = 391"),
+        "turn-2 request is missing the prior ThinkChunk: {chunks:?}"
+    );
+}
+
 // ── C9: complete_with_tools carries both reasoning_effort and tool schema ────
 
 #[tokio::test]
