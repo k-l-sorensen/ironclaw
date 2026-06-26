@@ -35,7 +35,7 @@ findings are structural refinements, concentrated in the CTR-1 persistence layer
 
 - **Severity:** Medium
 - **Category:** Spaghetti growth / missing helper / type-contract
-- **Status:** ☐ open
+- **Status:** ☑ done
 
 ### Locations
 - `src/agent/thread_ops.rs` — 8 sites: the `tool_call_reasoning.clone()` lines at
@@ -241,4 +241,11 @@ the 1,500 soft line; its additions here are small and cohesive (two documented
 > Conventional-Commit subject, not its SHA (carry commits re-hash on rebase —
 > see `CLAUDE-local.md`).
 
-- _(none yet)_
+- 2026-06-26 — **Q1 done**: `refactor(agent): replace hand-destructured turn
+  snapshot tuple with named TurnPersistSnapshot`. Added
+  `TurnPersistSnapshot` + `Thread::last_turn_snapshot()` in
+  `src/agent/session.rs`; collapsed all 8 destructuring blocks in
+  `thread_ops.rs` to `let snapshot = thread.last_turn_snapshot();` with by-name
+  field access (−91 production lines, also satisfies Q3 for this PR). Two
+  regression tests added (empty-thread default; distinct reasoning slots). Pure
+  refactor — full agent unit suite (520 tests incl. CTR-1) green, zero clippy.
