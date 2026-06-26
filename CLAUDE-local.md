@@ -63,8 +63,13 @@ Conventional-Commit subject instead.
 - **Release targeting repointed to the fork (local-only):** upstream hardcodes
   `nearai/ironclaw` in release generation. We repointed it so fork releases are
   self-consistent: `Cargo.toml` `repository`/`homepage` → `k-l-sorensen/ironclaw`
-  (cargo-dist bakes this into the generated installers), and the WASM-manifest
-  download URLs in `.github/workflows/release.yml` → `${{ github.repository }}`
+  (cargo-dist bakes this into the generated installers), `wix/main.wxs`'s
+  `ARPHELPLINK` → `k-l-sorensen/ironclaw` (this is a **committed** generated file
+  the `msi` installer reads; it is NOT covered by `allow-dirty = ["ci"]`, so
+  cargo-dist's `dist host` plan step fails the build if it drifts from
+  `Cargo.toml` — it conflicts on rebase like the version line, and the first
+  `0.29.1-fork.1` tag attempt failed here before this was caught), and the
+  WASM-manifest download URLs in `.github/workflows/release.yml` → `${{ github.repository }}`
   (resolves to whoever runs the build — fork-safe and upstream-safe). `authors`
   and the license are deliberately left as NEAR AI. The `Cargo.toml` change
   conflicts on rebase like the version line; the `release.yml` change is
