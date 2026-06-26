@@ -1,3 +1,13 @@
+> **Fork notice.** This is a fork of [nearai/ironclaw](https://github.com/nearai/ironclaw).
+> It is identical to upstream except that it adds support for the Mistral LLM
+> provider with `reasoning_effort` (`high`). Tracks upstream as of `v0.29.1`
+> (commit `96a89039a`). All credit for the original work goes to the upstream
+> authors; the original license (MIT OR Apache-2.0) is retained unchanged.
+> Issues with the added Mistral support → [this fork's issues](https://github.com/k-l-sorensen/ironclaw/issues).
+> Core issues → [upstream](https://github.com/nearai/ironclaw/issues).
+
+---
+
 <p align="center">
   <img src="ironclaw.png?v=2" alt="IronClaw" width="200"/>
 </p>
