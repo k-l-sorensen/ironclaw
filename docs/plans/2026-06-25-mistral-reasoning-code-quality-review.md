@@ -162,7 +162,7 @@ actual behavior. Reserve a richer enum for if/when Mistral adds graded effort.
 
 - **Severity:** Low
 - **Category:** File size / decomposition
-- **Status:** ☐ open
+- **Status:** ☑ done
 
 ### Locations
 - `src/agent/thread_ops.rs` (5,725 lines).
@@ -261,3 +261,13 @@ the 1,500 soft line; its additions here are small and cohesive (two documented
   comment, and architecture Decision 3 to the two-state contract. No live-path
   behavior change (`high`/unset → `"high"`, `off`/`none` → omit). Resolver
   `off → omit` coverage retained in `src/config/llm.rs`.
+- 2026-06-26 — **Q3 done** (doc-only, no code change): satisfied by Q1.
+  Measured production-line delta in `src/agent/thread_ops.rs` vs `main` is
+  **−5** (`+64 / −69`, `#[cfg(test)]` excluded) — Q1's `TurnPersistSnapshot` /
+  `last_turn_snapshot()` shrank the production side while threading reasoning
+  through the persist sites. This meets Q3's first acceptance branch ("net
+  production-line delta ≤ 0 after Q1"), so per the OR-clause no
+  `// arch-exempt: large_file` note is required; the optional tracking note from
+  the Fix section is deliberately omitted. File remains 5,634 lines (test
+  additions `+230` are excluded by the criterion and the `architecture.md` rule,
+  which skips `#[cfg(test)]`). No production or test code changed for Q3.
