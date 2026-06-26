@@ -25,6 +25,7 @@ pub(crate) mod gemini_oauth;
 mod github_copilot;
 pub(crate) mod github_copilot_auth;
 pub mod host;
+pub mod mistral;
 pub mod nearai_chat;
 pub mod openai_codex_provider;
 pub(crate) mod openai_codex_session;
@@ -63,8 +64,9 @@ pub mod vision_models;
 
 pub use circuit_breaker::{CircuitBreakerConfig, CircuitBreakerProvider};
 pub use config::{
-    BedrockConfig, CacheRetention, GeminiOauthConfig, LlmBackendKind, LlmConfig, NearAiConfig,
-    OAUTH_PLACEHOLDER, OpenAiCodexConfig, RegistryProviderConfig,
+    BedrockConfig, CacheRetention, GeminiOauthConfig, LlmBackendKind, LlmConfig,
+    MistralReasoningEffort, NearAiConfig, OAUTH_PLACEHOLDER, OpenAiCodexConfig,
+    RegistryProviderConfig, resolve_mistral_reasoning_from_env,
 };
 pub use error::{LlmConfigError, LlmError};
 pub use failover::{CooldownConfig, FailoverProvider};
@@ -247,6 +249,7 @@ fn create_registry_provider_inner(
         ProviderProtocol::DeepSeek => create_deepseek_from_registry(config),
         ProviderProtocol::Gemini => create_gemini_from_registry(config),
         ProviderProtocol::OpenRouter => create_openrouter_from_registry(config),
+        ProviderProtocol::Mistral => create_mistral_from_registry(config, request_timeout_secs),
         ProviderProtocol::GithubCopilot => {
             let provider =
                 github_copilot::GithubCopilotProvider::new(config, request_timeout_secs)?;
@@ -634,6 +637,40 @@ fn create_deepseek_from_registry(
         RigAdapter::new(model, &config.model)
             .with_unsupported_params(config.unsupported_params.clone()),
     ))
+}
+
+/// Build a Mistral provider via IronClaw's dedicated `MistralProvider`.
+///
+/// Routing through this provider (rather than the generic OpenAI-compat path)
+/// is what makes `reasoning_effort=high` work: it owns the request/response
+/// JSON so it can parse Mistral's array-shaped reasoning response
+/// (`[{thinking},{text}]`) — which rig-core's OpenAI client (and rig 0.39's
+/// dedicated Mistral client, which still models content as `String`) cannot —
+/// and replay the prior `ThinkChunk` on the next turn. The `reasoning_effort`
+/// toggle rides on `RegistryProviderConfig::mistral_reasoning`, populated at the
+/// binary's env boundary.
+fn create_mistral_from_registry(
+    config: &RegistryProviderConfig,
+    request_timeout_secs: u64,
+) -> Result<Arc<dyn LlmProvider>, LlmError> {
+    let api_key = config.api_key.clone().ok_or_else(|| LlmError::AuthFailed {
+        provider: config.provider_id.clone(),
+    })?;
+
+    tracing::debug!(
+        provider = %config.provider_id,
+        model = %config.model,
+        reasoning = ?config.mistral_reasoning,
+        "Using Mistral provider (owns reasoning_effort array response + ThinkChunk replay)"
+    );
+
+    let provider = mistral::MistralProvider::new(
+        config.model.clone(),
+        api_key,
+        config.mistral_reasoning,
+        request_timeout_secs,
+    )?;
+    Ok(Arc::new(provider))
 }
 
 /// Build an OpenRouter provider via rig-core's dedicated OpenRouter client.

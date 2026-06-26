@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::agent::Agent;
-use crate::agent::session::{PendingApproval, PendingAuthPrompt, Session, ThreadState};
+use crate::agent::session::{PendingApproval, PendingAuthPrompt, Session, ThreadState, Turn};
 use crate::channels::{ChannelManager, IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
@@ -473,6 +473,16 @@ impl ChatDelegate<'_> {
             }
         }
     }
+
+    /// Run `f` against the active thread's last turn under the session lock,
+    /// collapsing the repeated `lock() → threads.get_mut() → last_turn_mut()`
+    /// block into one place. Returns `None` (and runs nothing) when the thread
+    /// or last turn is absent.
+    async fn with_last_turn<R>(&self, f: impl FnOnce(&mut Turn) -> R) -> Option<R> {
+        let mut sess = self.session.lock().await;
+        let turn = sess.threads.get_mut(&self.thread_id)?.last_turn_mut()?;
+        Some(f(turn))
+    }
 }
 
 #[async_trait]
@@ -827,8 +837,22 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         &self,
         text: &str,
         _metadata: ironclaw_llm::ResponseMetadata,
+        reasoning: Option<String>,
         _reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
+        // Record the (already leak-scanned) reasoning trace on the turn so it
+        // survives turn persistence and is replayed on the next user turn —
+        // Mistral requires the prior ThinkChunk, and DeepSeek/Gemini reject the
+        // follow-up without the echo (CTR-1, #3201/#3225). Only overwrite with a
+        // non-empty trace so a final answer without reasoning doesn't clobber an
+        // earlier tool-round trace.
+        if reasoning.is_some() {
+            self.with_last_turn(|turn| {
+                turn.reasoning = reasoning;
+            })
+            .await;
+        }
+
         // Strip internal "[Called tool ...]" text that can leak when legacy
         // provider compatibility flattening converts tool_calls to plain text
         // and the LLM echoes it back.
@@ -855,6 +879,10 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 sanitized.content
             })
             .filter(|c| !c.trim().is_empty());
+
+        // Capture the reasoning trace for cross-turn persistence before it is
+        // moved into the within-turn context below (CTR-1).
+        let turn_reasoning = reasoning.clone();
 
         // Add the assistant message with tool_calls to context.
         // OpenAI protocol requires this before tool-result messages.
@@ -922,13 +950,19 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 };
                 redacted_args.push(safe);
             }
-            let mut sess = self.session.lock().await;
-            if let Some(thread) = sess.threads.get_mut(&self.thread_id)
-                && let Some(turn) = thread.last_turn_mut()
-            {
+            self.with_last_turn(|turn| {
                 // Set turn-level narrative.
                 if turn.narrative.is_none() {
                     turn.narrative = narrative;
+                }
+                // Persist this round's reasoning trace on the turn as the
+                // tool-call trace, distinct from the final answer's
+                // `turn.reasoning` so the two assistant messages don't share one
+                // last-write-wins slot (CTR-1 / F3). Only overwrite with a
+                // non-empty trace so a later round without reasoning doesn't
+                // clobber an earlier one.
+                if turn_reasoning.is_some() {
+                    turn.tool_call_reasoning = turn_reasoning;
                 }
                 for (tc, safe_args) in tool_calls.iter().zip(redacted_args) {
                     let sanitized_rationale = tc.reasoning.as_ref().map(|r| {
@@ -944,7 +978,8 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         Some(tc.id.clone()),
                     );
                 }
-            }
+            })
+            .await;
         }
 
         // === Phase 1: Preflight (sequential) ===
@@ -1224,14 +1259,10 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         &tc.id,
                         &error_msg,
                     );
-                    {
-                        let mut sess = self.session.lock().await;
-                        if let Some(thread) = sess.threads.get_mut(&self.thread_id)
-                            && let Some(turn) = thread.last_turn_mut()
-                        {
-                            turn.record_tool_error_for(&tc.id, result_content.clone());
-                        }
-                    }
+                    self.with_last_turn(|turn| {
+                        turn.record_tool_error_for(&tc.id, result_content.clone());
+                    })
+                    .await;
                     reason_ctx.messages.push(tool_message);
                 }
                 PreflightOutcome::Runnable => {
@@ -1360,21 +1391,14 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         };
 
                     // Record sanitized result in thread (identity-based matching).
-                    {
-                        let mut sess = self.session.lock().await;
-                        if let Some(thread) = sess.threads.get_mut(&self.thread_id)
-                            && let Some(turn) = thread.last_turn_mut()
-                        {
-                            if is_tool_error {
-                                turn.record_tool_error_for(&tc.id, record_content.clone());
-                            } else {
-                                turn.record_tool_result_for(
-                                    &tc.id,
-                                    serde_json::json!(record_content),
-                                );
-                            }
+                    self.with_last_turn(|turn| {
+                        if is_tool_error {
+                            turn.record_tool_error_for(&tc.id, record_content.clone());
+                        } else {
+                            turn.record_tool_result_for(&tc.id, serde_json::json!(record_content));
                         }
-                    }
+                    })
+                    .await;
 
                     reason_ctx.messages.push(tool_message);
                 }
@@ -3244,7 +3268,7 @@ mod tests {
         ctx_forced.force_text = true;
         let output = reasoning.respond_with_tools(&ctx_forced).await.unwrap();
         assert!(
-            matches!(output.result, RespondResult::Text(_)),
+            matches!(output.result, RespondResult::Text { .. }),
             "With force_text, should get text response, got: {:?}",
             output.result
         );

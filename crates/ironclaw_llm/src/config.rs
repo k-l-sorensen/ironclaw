@@ -65,6 +65,69 @@ impl std::fmt::Display for CacheRetention {
     }
 }
 
+/// Mistral `reasoning_effort` control.
+///
+/// Mistral's reasoning is an on/off toggle, *not* the OpenAI low/medium/high
+/// scale. The only on-state Mistral exposes is `"high"`, which emits the full
+/// thinking trace as an array-shaped response; "off" is expressed by *omitting*
+/// the param rather than by an explicit value.
+///
+/// Two wire behaviors are expressed as `Option<MistralReasoningEffort>` on
+/// [`RegistryProviderConfig`]:
+/// - `Option::None` — **omit** the param entirely (off, or an unsupported model).
+/// - `Some(High)` — send `reasoning_effort: "high"`.
+///
+/// Kept as an enum (rather than a `bool`) so a richer graded scale can be added
+/// here if Mistral ever exposes one; [`MistralReasoningEffort::wire_value`]
+/// renders the on-state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MistralReasoningEffort {
+    /// Full thinking trace (`reasoning_effort: "high"`). The only state; the default.
+    #[default]
+    High,
+}
+
+impl MistralReasoningEffort {
+    /// The exact string Mistral's API expects on the wire.
+    pub fn wire_value(self) -> &'static str {
+        match self {
+            Self::High => "high",
+        }
+    }
+}
+
+/// Resolve the Mistral `reasoning_effort` toggle from a raw env value.
+///
+/// Shared by both resolution paths (the v1 env-boundary resolver in
+/// `src/config/llm.rs` and the catalog/Reborn `apply_registry_provider_env`)
+/// so invalid input is handled identically. Policy is **fail-open**:
+///   - `None` (unset)            → `Some(High)` (the default-on contract)
+///   - `"high"`/`"on"`/`"1"`/…   → `Some(High)`
+///   - `"off"`/`"none"`/`"0"`/…  → `None` (omit the wire param)
+///   - anything else             → warn + `Some(High)`
+///
+/// "off" maps to `Option::None` so the wire body omits the param entirely, per
+/// the architecture's C2 contract. The provider further gates `Some(_)` on model
+/// capability before sending.
+///
+/// The crate stays env-agnostic: callers read the env var at their own
+/// boundary and pass the raw `Option<String>` in.
+pub fn resolve_mistral_reasoning_from_env(raw: Option<String>) -> Option<MistralReasoningEffort> {
+    let Some(raw) = raw else {
+        return Some(MistralReasoningEffort::High);
+    };
+    match raw.trim().to_lowercase().as_str() {
+        "high" | "on" | "true" | "1" => Some(MistralReasoningEffort::High),
+        "off" | "none" | "false" | "0" => None,
+        _ => {
+            tracing::warn!(
+                "Invalid MISTRAL_REASONING ({raw}); expected one of: high, none, on, off, true, false, 1, 0; defaulting to high"
+            );
+            Some(MistralReasoningEffort::High)
+        }
+    }
+}
+
 /// Resolved configuration for a registry-based provider.
 ///
 /// This single struct replaces what used to be five separate config types
@@ -98,6 +161,13 @@ pub struct RegistryProviderConfig {
     pub auth_path: Option<PathBuf>,
     /// Prompt cache retention (Anthropic-specific).
     pub cache_retention: CacheRetention,
+    /// Mistral `reasoning_effort` control (Mistral-specific).
+    ///
+    /// `None` omits the param (default for non-Mistral providers, or when
+    /// the selected model is not reasoning-capable). `Some(_)` is set at the
+    /// env boundary for the Mistral provider; the provider further gates it on
+    /// model capability before sending. See [`MistralReasoningEffort`].
+    pub mistral_reasoning: Option<MistralReasoningEffort>,
     /// Parameter names that this provider does not support (e.g., `["temperature"]`).
     /// Supported keys: `"temperature"`, `"max_tokens"`, `"stop_sequences"`.
     /// Listed parameters are stripped from requests before sending to avoid 400 errors.
@@ -126,6 +196,7 @@ impl RegistryProviderConfig {
             refresh_token: None,
             auth_path: None,
             cache_retention: CacheRetention::None,
+            mistral_reasoning: None,
             unsupported_params: Vec::new(),
         }
     }

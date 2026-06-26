@@ -1298,7 +1298,10 @@ impl<'a> JobDelegate<'a> {
         tokio::time::sleep(wait).await;
 
         Ok(ironclaw_llm::RespondOutput {
-            result: RespondResult::Text(String::new()),
+            result: RespondResult::Text {
+                text: String::new(),
+                reasoning: None,
+            },
             usage: ironclaw_llm::TokenUsage::default(),
             finish_reason: ironclaw_llm::FinishReason::Stop,
             metadata: ResponseMetadata::default(),
@@ -1346,7 +1349,10 @@ impl<'a> JobDelegate<'a> {
         );
         self.mark_completed_or_warn(context).await;
         Some(ironclaw_llm::RespondOutput {
-            result: RespondResult::Text(String::new()),
+            result: RespondResult::Text {
+                text: String::new(),
+                reasoning: None,
+            },
             usage: ironclaw_llm::TokenUsage::default(),
             finish_reason: ironclaw_llm::FinishReason::Stop,
             metadata: ResponseMetadata::default(),
@@ -1590,6 +1596,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         &self,
         text: &str,
         metadata: ResponseMetadata,
+        _reasoning: Option<String>,
         reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
         let action = {
@@ -2561,6 +2568,7 @@ mod tests {
             .handle_text_response(
                 "Weekly review created in Notion and notification sent.",
                 ResponseMetadata::default(),
+                None,
                 &mut reason_ctx,
             )
             .await;

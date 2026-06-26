@@ -1098,6 +1098,7 @@ fn engine_history_entry_to_message(
         role: role.to_string(),
         content,
         created_at: timestamp,
+        reasoning: None,
     })
 }
 

@@ -43,6 +43,9 @@ pub(super) struct PersistToolCallsInput<'a> {
     pub tool_calls: &'a [crate::agent::session::TurnToolCall],
     pub narrative: Option<&'a str>,
     pub outcome: Option<serde_json::Value>,
+    /// Already-redacted reasoning trace for this turn, persisted on the
+    /// `tool_calls` row so it can be replayed after DB hydration (CTR-1).
+    pub reasoning: Option<&'a str>,
 }
 
 struct ProcessingLiveState<'a> {
@@ -873,11 +876,7 @@ impl Agent {
                 }
 
                 thread.conclude_turn(TurnOutcome::Completed(response.clone()));
-                let (turn_number, tool_calls, narrative) = thread
-                    .turns
-                    .last()
-                    .map(|t| (t.turn_number, t.tool_calls.clone(), t.narrative.clone()))
-                    .unwrap_or_default();
+                let snapshot = thread.last_turn_snapshot();
                 drop(sess);
 
                 // Persist tool calls then assistant response (user message already persisted at turn start)
@@ -885,10 +884,11 @@ impl Agent {
                     thread_id,
                     channel: &message.channel,
                     user_id: &message.user_id,
-                    turn_number,
-                    tool_calls: &tool_calls,
-                    narrative: narrative.as_deref(),
+                    turn_number: snapshot.turn_number,
+                    tool_calls: &snapshot.tool_calls,
+                    narrative: snapshot.narrative.as_deref(),
                     outcome: Some(trace_turn_outcome_success()),
+                    reasoning: snapshot.tool_call_reasoning.as_deref(),
                 })
                 .await;
                 self.persist_assistant_response(
@@ -896,6 +896,7 @@ impl Agent {
                     &message.channel,
                     &message.user_id,
                     &response,
+                    snapshot.reasoning.as_deref(),
                 )
                 .await;
 
@@ -975,20 +976,17 @@ impl Agent {
                 // Persist tool calls so history shows what happened, but
                 // skip persist_assistant_response — the auth card is the
                 // only user-facing signal.
-                let (turn_number, tool_calls, narrative) = thread
-                    .turns
-                    .last()
-                    .map(|t| (t.turn_number, t.tool_calls.clone(), t.narrative.clone()))
-                    .unwrap_or_default();
+                let snapshot = thread.last_turn_snapshot();
                 drop(sess);
                 self.persist_tool_calls(PersistToolCallsInput {
                     thread_id,
                     channel: &message.channel,
                     user_id: &message.user_id,
-                    turn_number,
-                    tool_calls: &tool_calls,
-                    narrative: narrative.as_deref(),
+                    turn_number: snapshot.turn_number,
+                    tool_calls: &snapshot.tool_calls,
+                    narrative: snapshot.narrative.as_deref(),
                     outcome: None,
+                    reasoning: snapshot.tool_call_reasoning.as_deref(),
                 })
                 .await;
                 self.send_turn_cost_status(&message.channel, &message.metadata, &turn_usage)
@@ -1000,19 +998,16 @@ impl Agent {
                     .await;
                 let error_message = error.to_string();
                 thread.conclude_turn(TurnOutcome::Failed(error_message.clone()));
-                let (turn_number, tool_calls, narrative) = thread
-                    .turns
-                    .last()
-                    .map(|t| (t.turn_number, t.tool_calls.clone(), t.narrative.clone()))
-                    .unwrap_or_default();
+                let snapshot = thread.last_turn_snapshot();
                 self.persist_tool_calls(PersistToolCallsInput {
                     thread_id,
                     channel: &message.channel,
                     user_id: &message.user_id,
-                    turn_number,
-                    tool_calls: &tool_calls,
-                    narrative: narrative.as_deref(),
+                    turn_number: snapshot.turn_number,
+                    tool_calls: &snapshot.tool_calls,
+                    narrative: snapshot.narrative.as_deref(),
                     outcome: Some(trace_turn_outcome_failure(&error_message)),
+                    reasoning: snapshot.tool_call_reasoning.as_deref(),
                 })
                 .await;
                 drop(sess);
@@ -1029,19 +1024,16 @@ impl Agent {
             Err(e) => {
                 let error_message = e.to_string();
                 thread.conclude_turn(TurnOutcome::Failed(error_message.clone()));
-                let (turn_number, tool_calls, narrative) = thread
-                    .turns
-                    .last()
-                    .map(|t| (t.turn_number, t.tool_calls.clone(), t.narrative.clone()))
-                    .unwrap_or_default();
+                let snapshot = thread.last_turn_snapshot();
                 self.persist_tool_calls(PersistToolCallsInput {
                     thread_id,
                     channel: &message.channel,
                     user_id: &message.user_id,
-                    turn_number,
-                    tool_calls: &tool_calls,
-                    narrative: narrative.as_deref(),
+                    turn_number: snapshot.turn_number,
+                    tool_calls: &snapshot.tool_calls,
+                    narrative: snapshot.narrative.as_deref(),
                     outcome: Some(trace_turn_outcome_failure(&error_message)),
+                    reasoning: snapshot.tool_call_reasoning.as_deref(),
                 })
                 .await;
                 drop(sess);
@@ -1249,6 +1241,7 @@ impl Agent {
         channel: &str,
         user_id: &str,
         response: &str,
+        reasoning: Option<&str>,
     ) {
         let store = match self.store() {
             Some(s) => Arc::clone(s),
@@ -1263,7 +1256,7 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "assistant", response)
+            .add_conversation_message_with_reasoning(thread_id, "assistant", response, reasoning)
             .await
         {
             tracing::warn!("Failed to persist assistant message: {}", e);
@@ -1496,6 +1489,7 @@ impl Agent {
             tool_calls,
             narrative,
             outcome,
+            reasoning,
         } = input;
 
         if tool_calls.is_empty() && outcome.is_none() {
@@ -1565,7 +1559,7 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message(thread_id, "tool_calls", &content)
+            .add_conversation_message_with_reasoning(thread_id, "tool_calls", &content, reasoning)
             .await
         {
             tracing::warn!("Failed to persist tool calls: {}", e);
@@ -2435,20 +2429,17 @@ impl Agent {
                     let (response, suggestions) =
                         crate::agent::dispatcher::extract_suggestions(&response);
                     thread.conclude_turn(TurnOutcome::Completed(response.clone()));
-                    let (turn_number, tool_calls, narrative) = thread
-                        .turns
-                        .last()
-                        .map(|t| (t.turn_number, t.tool_calls.clone(), t.narrative.clone()))
-                        .unwrap_or_default();
+                    let snapshot = thread.last_turn_snapshot();
                     // User message already persisted at turn start; save tool calls then assistant response
                     self.persist_tool_calls(PersistToolCallsInput {
                         thread_id,
                         channel: &message.channel,
                         user_id: &message.user_id,
-                        turn_number,
-                        tool_calls: &tool_calls,
-                        narrative: narrative.as_deref(),
+                        turn_number: snapshot.turn_number,
+                        tool_calls: &snapshot.tool_calls,
+                        narrative: snapshot.narrative.as_deref(),
                         outcome: Some(trace_turn_outcome_success()),
+                        reasoning: snapshot.tool_call_reasoning.as_deref(),
                     })
                     .await;
                     self.persist_assistant_response(
@@ -2456,6 +2447,7 @@ impl Agent {
                         &message.channel,
                         &message.user_id,
                         &response,
+                        snapshot.reasoning.as_deref(),
                     )
                     .await;
                     if !suggestions.is_empty() {
@@ -2523,19 +2515,16 @@ impl Agent {
                 Ok(AgenticLoopResult::AuthPending { turn_usage }) => {
                     // See the other AuthPending arm for the full rationale.
                     thread.conclude_turn(TurnOutcome::CompletedSilently);
-                    let (turn_number, tool_calls, narrative) = thread
-                        .turns
-                        .last()
-                        .map(|t| (t.turn_number, t.tool_calls.clone(), t.narrative.clone()))
-                        .unwrap_or_default();
+                    let snapshot = thread.last_turn_snapshot();
                     self.persist_tool_calls(PersistToolCallsInput {
                         thread_id,
                         channel: &message.channel,
                         user_id: &message.user_id,
-                        turn_number,
-                        tool_calls: &tool_calls,
-                        narrative: narrative.as_deref(),
+                        turn_number: snapshot.turn_number,
+                        tool_calls: &snapshot.tool_calls,
+                        narrative: snapshot.narrative.as_deref(),
                         outcome: None,
+                        reasoning: snapshot.tool_call_reasoning.as_deref(),
                     })
                     .await;
                     self.send_turn_cost_status(&message.channel, &message.metadata, &turn_usage)
@@ -2547,19 +2536,16 @@ impl Agent {
                         .await;
                     let error_message = error.to_string();
                     thread.conclude_turn(TurnOutcome::Failed(error_message.clone()));
-                    let (turn_number, tool_calls, narrative) = thread
-                        .turns
-                        .last()
-                        .map(|t| (t.turn_number, t.tool_calls.clone(), t.narrative.clone()))
-                        .unwrap_or_default();
+                    let snapshot = thread.last_turn_snapshot();
                     self.persist_tool_calls(PersistToolCallsInput {
                         thread_id,
                         channel: &message.channel,
                         user_id: &message.user_id,
-                        turn_number,
-                        tool_calls: &tool_calls,
-                        narrative: narrative.as_deref(),
+                        turn_number: snapshot.turn_number,
+                        tool_calls: &snapshot.tool_calls,
+                        narrative: snapshot.narrative.as_deref(),
                         outcome: Some(trace_turn_outcome_failure(&error_message)),
+                        reasoning: snapshot.tool_call_reasoning.as_deref(),
                     })
                     .await;
                     drop(sess);
@@ -2580,19 +2566,16 @@ impl Agent {
                 Err(e) => {
                     let error_message = e.to_string();
                     thread.conclude_turn(TurnOutcome::Failed(error_message.clone()));
-                    let (turn_number, tool_calls, narrative) = thread
-                        .turns
-                        .last()
-                        .map(|t| (t.turn_number, t.tool_calls.clone(), t.narrative.clone()))
-                        .unwrap_or_default();
+                    let snapshot = thread.last_turn_snapshot();
                     self.persist_tool_calls(PersistToolCallsInput {
                         thread_id,
                         channel: &message.channel,
                         user_id: &message.user_id,
-                        turn_number,
-                        tool_calls: &tool_calls,
-                        narrative: narrative.as_deref(),
+                        turn_number: snapshot.turn_number,
+                        tool_calls: &snapshot.tool_calls,
+                        narrative: snapshot.narrative.as_deref(),
                         outcome: Some(trace_turn_outcome_failure(&error_message)),
+                        reasoning: snapshot.tool_call_reasoning.as_deref(),
                     })
                     .await;
                     drop(sess);
@@ -2624,12 +2607,14 @@ impl Agent {
                     Some(thread) => {
                         thread.clear_pending_approval();
                         thread.conclude_turn(TurnOutcome::Completed(rejection.clone()));
+                        let turn_reasoning = thread.turns.last().and_then(|t| t.reasoning.clone());
                         // User message already persisted at turn start; save rejection response
                         self.persist_assistant_response(
                             thread_id,
                             &message.channel,
                             &message.user_id,
                             &rejection,
+                            turn_reasoning.as_deref(),
                         )
                         .await;
                     }
@@ -2674,12 +2659,14 @@ impl Agent {
                 Some(thread) => {
                     thread.enter_auth_mode(ext_name.clone());
                     thread.conclude_turn(TurnOutcome::Completed(instructions.clone()));
+                    let turn_reasoning = thread.turns.last().and_then(|t| t.reasoning.clone());
                     // User message already persisted at turn start; save auth instructions
                     self.persist_assistant_response(
                         thread_id,
                         &message.channel,
                         &message.user_id,
                         &instructions,
+                        turn_reasoning.as_deref(),
                     )
                     .await;
                 }
@@ -3044,7 +3031,11 @@ fn rebuild_chat_messages_from_db(
     for msg in db_messages {
         match msg.role.as_str() {
             "user" => result.push(ChatMessage::user(&msg.content)),
-            "assistant" => result.push(ChatMessage::assistant(&msg.content)),
+            "assistant" => result.push(
+                // Re-attach the persisted reasoning trace so it is replayed into
+                // the LLM on the next user turn after DB hydration (CTR-1).
+                ChatMessage::assistant(&msg.content).with_reasoning(msg.reasoning.clone()),
+            ),
             "tool_calls" => {
                 // Try to parse the enriched JSON and rebuild tool messages.
                 // Supports two formats:
@@ -3094,8 +3085,12 @@ fn rebuild_chat_messages_from_db(
 
                         // The assistant text for tool_calls is always None here;
                         // the final assistant response comes as a separate
-                        // "assistant" row after this tool_calls row.
-                        result.push(ChatMessage::assistant_with_tool_calls(None, tool_calls));
+                        // "assistant" row after this tool_calls row. Re-attach the
+                        // persisted reasoning trace for cross-turn replay (CTR-1).
+                        result.push(
+                            ChatMessage::assistant_with_tool_calls(None, tool_calls)
+                                .with_reasoning(msg.reasoning.clone()),
+                        );
 
                         // Emit tool_result messages for each call
                         for c in &calls {
@@ -3451,6 +3446,199 @@ mod tests {
                 Duration::from_millis(1),
             ))
         }
+    }
+
+    /// Emits a tool call (with one reasoning trace) on the first round, then a
+    /// final text answer (with a *different* reasoning trace) on the second.
+    /// Drives the F3 cross-turn replay path: the tool-call round and the final
+    /// answer carry distinct ThinkChunks that must land on distinct rows.
+    struct SequencedReasoningLlm {
+        calls: AtomicU32,
+    }
+
+    impl SequencedReasoningLlm {
+        const TOOL_TRACE: &'static str = "think before the tool";
+        const FINAL_TRACE: &'static str = "think before the answer";
+
+        fn new() -> Self {
+            Self {
+                calls: AtomicU32::new(0),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ironclaw_llm::LlmProvider for SequencedReasoningLlm {
+        fn model_name(&self) -> &str {
+            "sequenced-reasoning-mock"
+        }
+
+        fn cost_per_token(&self) -> (Decimal, Decimal) {
+            (Decimal::ZERO, Decimal::ZERO)
+        }
+
+        async fn complete(
+            &self,
+            _request: ironclaw_llm::CompletionRequest,
+        ) -> Result<ironclaw_llm::CompletionResponse, crate::error::LlmError> {
+            Ok(ironclaw_llm::CompletionResponse {
+                content: "unused".to_string(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: ironclaw_llm::FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning: None,
+            })
+        }
+
+        async fn complete_with_tools(
+            &self,
+            _request: ironclaw_llm::ToolCompletionRequest,
+        ) -> Result<ironclaw_llm::ToolCompletionResponse, crate::error::LlmError> {
+            let call = self.calls.fetch_add(1, Ordering::Relaxed);
+            if call == 0 {
+                return Ok(ironclaw_llm::ToolCompletionResponse {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call_probe_0".to_string(),
+                        name: "reasoning_probe".to_string(),
+                        arguments: serde_json::json!({}),
+                        reasoning: None,
+                        signature: None,
+                        arguments_parse_error: None,
+                    }],
+                    input_tokens: 0,
+                    output_tokens: 0,
+                    finish_reason: ironclaw_llm::FinishReason::ToolUse,
+                    cache_read_input_tokens: 0,
+                    cache_creation_input_tokens: 0,
+                    reasoning: Some(Self::TOOL_TRACE.to_string()),
+                });
+            }
+
+            Ok(ironclaw_llm::ToolCompletionResponse {
+                content: Some("final answer".to_string()),
+                tool_calls: Vec::new(),
+                input_tokens: 0,
+                output_tokens: 0,
+                finish_reason: ironclaw_llm::FinishReason::Stop,
+                cache_read_input_tokens: 0,
+                cache_creation_input_tokens: 0,
+                reasoning: Some(Self::FINAL_TRACE.to_string()),
+            })
+        }
+    }
+
+    struct ReasoningProbeTool;
+
+    #[async_trait::async_trait]
+    impl crate::tools::Tool for ReasoningProbeTool {
+        fn name(&self) -> &str {
+            "reasoning_probe"
+        }
+
+        fn description(&self) -> &str {
+            "No-op probe tool for reasoning replay tests"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+
+        async fn execute(
+            &self,
+            _params: serde_json::Value,
+            _ctx: &JobContext,
+        ) -> Result<crate::tools::ToolOutput, crate::tools::ToolError> {
+            Ok(crate::tools::ToolOutput::success(
+                serde_json::json!("ok"),
+                Duration::from_millis(1),
+            ))
+        }
+    }
+
+    /// F3 regression (caller-level, DB round-trip): a tool-using turn must
+    /// persist the tool-call round's reasoning on the `tool_calls` row and the
+    /// final answer's reasoning on the `assistant` row — two distinct traces,
+    /// not one slot last-write-wins cross-stamped onto both. Drives the real
+    /// `process_user_input` → persist → `rebuild_chat_messages_from_db` path.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_process_user_input_persists_distinct_tool_and_final_reasoning() {
+        use crate::agent::session::{Session, Thread};
+        use uuid::Uuid;
+
+        let (db, _temp_dir) = crate::testing::test_db().await;
+        let tools = Arc::new(ToolRegistry::new());
+        tools.register(Arc::new(ReasoningProbeTool)).await;
+        let llm: Arc<dyn ironclaw_llm::LlmProvider> = Arc::new(SequencedReasoningLlm::new());
+        let (mut agent, _statuses) = make_thread_ops_test_agent_with(llm, tools).await;
+        agent.deps.store = Some(Arc::clone(&db));
+
+        let session_id = Uuid::new_v4();
+        let thread_id = Uuid::new_v4();
+        let thread = Thread::with_id(thread_id, session_id, Some("test"));
+        let mut sess = Session::new("probe-user");
+        sess.threads.insert(thread_id, thread);
+        let session = Arc::new(TokioMutex::new(sess));
+        let message = IncomingMessage::new("test", "probe-user", "run the probe");
+
+        let result = agent
+            .process_user_input(
+                &message,
+                agent.tenant_ctx("probe-user").await,
+                Arc::clone(&session),
+                thread_id,
+                "run the probe",
+            )
+            .await
+            .expect("tool turn handled");
+        assert!(matches!(result, SubmissionResult::Response { .. }));
+
+        let messages = db
+            .list_conversation_messages(thread_id)
+            .await
+            .expect("list persisted messages");
+
+        // The tool_calls row carries the tool-call round's trace; the assistant
+        // row carries the final answer's trace. Under the F3 single-slot bug
+        // both rows would hold the final trace.
+        let tool_row = messages
+            .iter()
+            .find(|m| m.role == "tool_calls")
+            .expect("tool_calls row persisted");
+        let assistant_row = messages
+            .iter()
+            .find(|m| m.role == "assistant")
+            .expect("assistant row persisted");
+        assert_eq!(
+            tool_row.reasoning.as_deref(),
+            Some(SequencedReasoningLlm::TOOL_TRACE)
+        );
+        assert_eq!(
+            assistant_row.reasoning.as_deref(),
+            Some(SequencedReasoningLlm::FINAL_TRACE)
+        );
+
+        // And the rebuilt chat context re-attaches each row's own trace.
+        let rebuilt = rebuild_chat_messages_from_db(&messages);
+        let tool_msg = rebuilt
+            .iter()
+            .find(|m| m.tool_calls.is_some())
+            .expect("rebuilt tool-call message");
+        let final_msg = rebuilt
+            .iter()
+            .find(|m| m.content == "final answer")
+            .expect("rebuilt final assistant message");
+        assert_eq!(
+            tool_msg.reasoning.as_deref(),
+            Some(SequencedReasoningLlm::TOOL_TRACE)
+        );
+        assert_eq!(
+            final_msg.reasoning.as_deref(),
+            Some(SequencedReasoningLlm::FINAL_TRACE)
+        );
     }
 
     #[cfg(feature = "libsql")]
@@ -4402,6 +4590,42 @@ mod tests {
         assert_eq!(result[2].content, wrapped_error);
     }
 
+    /// CTR-C3: after DB hydration, the rebuilt assistant message carries the
+    /// persisted reasoning trace so it is replayed into the LLM next turn.
+    #[test]
+    fn test_rebuild_chat_messages_reattaches_reasoning() {
+        let mut assistant = make_db_msg("assistant", "The answer is 42.");
+        assistant.reasoning = Some("first multiply, then add".to_string());
+        let tool_json = serde_json::json!({
+            "calls": [{
+                "name": "shell",
+                "call_id": "call_0",
+                "result_preview": "ok"
+            }]
+        });
+        let mut tool_calls = make_db_msg("tool_calls", &tool_json.to_string());
+        tool_calls.reasoning = Some("I should run the check first".to_string());
+
+        let messages = vec![make_db_msg("user", "Compute it"), tool_calls, assistant];
+        let result = rebuild_chat_messages_from_db(&messages);
+
+        // user + assistant_with_tool_calls + tool_result + assistant
+        assert_eq!(result.len(), 4);
+        // tool-call assistant message carries its reasoning
+        assert_eq!(result[1].role, ironclaw_llm::Role::Assistant);
+        assert_eq!(
+            result[1].reasoning.as_deref(),
+            Some("I should run the check first")
+        );
+        // final assistant message carries its reasoning
+        assert_eq!(result[3].role, ironclaw_llm::Role::Assistant);
+        assert_eq!(result[3].content, "The answer is 42.");
+        assert_eq!(
+            result[3].reasoning.as_deref(),
+            Some("first multiply, then add")
+        );
+    }
+
     #[test]
     fn test_rebuild_chat_messages_legacy_tool_calls_skipped() {
         // Legacy format: no call_id field
@@ -4686,6 +4910,7 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
             created_at: chrono::Utc::now(),
+            reasoning: None,
         }
     }
 

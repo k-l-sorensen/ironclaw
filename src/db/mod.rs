@@ -413,11 +413,27 @@ pub trait ConversationStore: Send + Sync {
         thread_id: Option<&str>,
     ) -> Result<Uuid, DatabaseError>;
     async fn touch_conversation(&self, id: Uuid) -> Result<(), DatabaseError>;
+    /// Add a message with no reasoning trace. Defaults to delegating to
+    /// [`add_conversation_message_with_reasoning`] with `None` so the `None`
+    /// shim lives once on the trait rather than being hand-copied per backend.
     async fn add_conversation_message(
         &self,
         conversation_id: Uuid,
         role: &str,
         content: &str,
+    ) -> Result<Uuid, DatabaseError> {
+        self.add_conversation_message_with_reasoning(conversation_id, role, content, None)
+            .await
+    }
+    /// Add a message carrying an optional, already-redacted reasoning trace.
+    /// The trace is persisted so it can be replayed into the LLM on the next
+    /// user turn (CTR-1). Implementations must store `reasoning` on the row.
+    async fn add_conversation_message_with_reasoning(
+        &self,
+        conversation_id: Uuid,
+        role: &str,
+        content: &str,
+        reasoning: Option<&str>,
     ) -> Result<Uuid, DatabaseError>;
     /// Insert a message only if the conversation has zero messages.
     /// Returns `Ok(true)` if the message was inserted, `Ok(false)` if skipped.

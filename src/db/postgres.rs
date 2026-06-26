@@ -125,14 +125,15 @@ impl ConversationStore for PgBackend {
         self.store.touch_conversation(id).await
     }
 
-    async fn add_conversation_message(
+    async fn add_conversation_message_with_reasoning(
         &self,
         conversation_id: Uuid,
         role: &str,
         content: &str,
+        reasoning: Option<&str>,
     ) -> Result<Uuid, DatabaseError> {
         self.store
-            .add_conversation_message(conversation_id, role, content)
+            .add_conversation_message_with_reasoning(conversation_id, role, content, reasoning)
             .await
     }
 

@@ -395,6 +395,22 @@ impl Thread {
         self.turns.last_mut()
     }
 
+    /// Snapshot the last turn's persist-relevant fields (cloned). Returns the
+    /// `Default` (turn_number 0, empty/None) when the thread has no turns —
+    /// matching the prior `.unwrap_or_default()` behavior exactly.
+    pub(crate) fn last_turn_snapshot(&self) -> TurnPersistSnapshot {
+        self.turns
+            .last()
+            .map(|t| TurnPersistSnapshot {
+                turn_number: t.turn_number,
+                tool_calls: t.tool_calls.clone(),
+                narrative: t.narrative.clone(),
+                reasoning: t.reasoning.clone(),
+                tool_call_reasoning: t.tool_call_reasoning.clone(),
+            })
+            .unwrap_or_default()
+    }
+
     /// Queue a message for processing after the current turn completes.
     /// Returns `false` if the queue is at capacity ([`MAX_PENDING_MESSAGES`]).
     pub fn queue_message(&mut self, content: String) -> bool {
@@ -558,8 +574,15 @@ impl Thread {
                     })
                     .collect();
 
-                // Assistant message declaring the tool calls (no text content)
-                messages.push(ChatMessage::assistant_with_tool_calls(None, tool_calls));
+                // Assistant message declaring the tool calls (no text content).
+                // Re-attach the tool-call round's own reasoning trace (distinct
+                // from the final answer's) so the provider sees the ThinkChunk
+                // that actually preceded this tool call, not the final answer's
+                // (CTR-1 / F3).
+                messages.push(
+                    ChatMessage::assistant_with_tool_calls(None, tool_calls)
+                        .with_reasoning(turn.tool_call_reasoning.clone()),
+                );
 
                 // Individual tool result messages, truncated to limit context size.
                 for (call_id, tc) in tool_calls_with_ids {
@@ -584,7 +607,9 @@ impl Thread {
                 }
             }
             if let Some(ref response) = turn.response {
-                messages.push(ChatMessage::assistant(response));
+                // Re-attach the turn's reasoning trace (CTR-1) — see above.
+                messages
+                    .push(ChatMessage::assistant(response).with_reasoning(turn.reasoning.clone()));
             }
         }
         messages
@@ -737,11 +762,42 @@ pub struct Turn {
     /// Cleaned via `clean_response` and sanitized through `SafetyLayer` before storage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub narrative: Option<String>,
+    /// Provider-emitted reasoning trace (the raw ThinkChunk / `reasoning_content`)
+    /// for this turn, already leak-scanned. Distinct from `narrative` (the
+    /// cleaned, channel-facing text): this is the trace replayed verbatim into
+    /// the next request so Mistral sees its prior ThinkChunk and DeepSeek/Gemini
+    /// validate the chain (CTR-1). Persisted on the turn's assistant row.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Reasoning trace that preceded this turn's tool-call round (the ThinkChunk
+    /// emitted alongside the `tool_calls`), distinct from `reasoning` which is
+    /// the trace preceding the final text answer. Re-attached to the
+    /// `assistant_with_tool_calls` message and persisted on the `tool_calls`
+    /// row, so each assistant message replays its own ThinkChunk rather than
+    /// having one slot last-write-wins and cross-stamp both messages (CTR-1 / F3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_reasoning: Option<String>,
     /// Transient image content parts for multimodal LLM input.
     /// Not serialized — images are only needed for the current LLM call.
     /// The text description in `user_input` persists for compaction/context.
     #[serde(skip)]
     pub image_content_parts: Vec<ironclaw_llm::ContentPart>,
+}
+
+/// Owned, cloned snapshot of the fields the persistence layer reads off the
+/// most-recent turn. Replaces a positional tuple that was hand-destructured at
+/// 8 persist sites in `thread_ops.rs`; naming the fields makes the two adjacent
+/// `Option<String>` reasoning slots compiler-checked instead of swappable by
+/// position (Q1 / F3 — see `.claude/rules/types.md`).
+#[derive(Debug, Default, Clone)]
+pub(crate) struct TurnPersistSnapshot {
+    pub(crate) turn_number: usize,
+    pub(crate) tool_calls: Vec<TurnToolCall>,
+    pub(crate) narrative: Option<String>,
+    /// Final assistant answer's reasoning trace.
+    pub(crate) reasoning: Option<String>,
+    /// Tool-call round's reasoning trace.
+    pub(crate) tool_call_reasoning: Option<String>,
 }
 
 impl Turn {
@@ -758,6 +814,8 @@ impl Turn {
             completed_at: None,
             error: None,
             narrative: None,
+            reasoning: None,
+            tool_call_reasoning: None,
             image_content_parts: Vec::new(),
         }
     }
@@ -926,6 +984,39 @@ mod tests {
         thread.conclude_turn(TurnOutcome::Completed("Hi there!".into()));
         assert_eq!(thread.state, ThreadState::Idle);
         assert_eq!(thread.turns[0].response, Some("Hi there!".to_string()));
+    }
+
+    #[test]
+    fn test_last_turn_snapshot_empty_thread_is_default() {
+        let thread = Thread::new(Uuid::new_v4(), None);
+        let snapshot = thread.last_turn_snapshot();
+        assert_eq!(snapshot.turn_number, 0);
+        assert!(snapshot.tool_calls.is_empty());
+        assert_eq!(snapshot.narrative, None);
+        assert_eq!(snapshot.reasoning, None);
+        assert_eq!(snapshot.tool_call_reasoning, None);
+    }
+
+    #[test]
+    fn test_last_turn_snapshot_keeps_reasoning_slots_distinct() {
+        // Guards against the positional swap the named struct exists to prevent
+        // (Q1 / F3): the final-answer trace and the tool-call-round trace must
+        // land in their own fields, not get cross-stamped.
+        let mut thread = Thread::new(Uuid::new_v4(), None);
+        thread.start_turn("Hello");
+        let turn = thread.last_turn_mut().expect("turn exists");
+        turn.reasoning = Some("final-answer trace".to_string());
+        turn.tool_call_reasoning = Some("tool-call-round trace".to_string());
+        turn.narrative = Some("narrative text".to_string());
+
+        let snapshot = thread.last_turn_snapshot();
+        assert_eq!(snapshot.reasoning.as_deref(), Some("final-answer trace"));
+        assert_eq!(
+            snapshot.tool_call_reasoning.as_deref(),
+            Some("tool-call-round trace")
+        );
+        assert_eq!(snapshot.narrative.as_deref(), Some("narrative text"));
+        assert_eq!(snapshot.turn_number, thread.turns[0].turn_number);
     }
 
     #[test]
@@ -1901,6 +1992,65 @@ mod tests {
         assert_eq!(
             turn.tool_calls[1].result.as_ref().unwrap(),
             &serde_json::json!("result_b")
+        );
+    }
+
+    /// CTR-C4: a pure-text turn (no tools) replays its reasoning trace on the
+    /// rebuilt assistant message that seeds the next turn's context.
+    #[test]
+    fn test_messages_reattaches_reasoning_text_turn() {
+        let mut thread = Thread::new(Uuid::new_v4(), None);
+        let mut turn = Turn::new(0, "What is 17 * 23?");
+        turn.reasoning = Some("17 * 23 = 391".to_string());
+        turn.conclude(TurnOutcome::Completed("391".to_string()));
+        thread.turns.push(turn);
+
+        let messages = thread.messages();
+        // user + assistant
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].role, ironclaw_llm::Role::Assistant);
+        assert_eq!(messages[1].content, "391");
+        assert_eq!(messages[1].reasoning.as_deref(), Some("17 * 23 = 391"));
+    }
+
+    /// CTR-C2 / F3: a tool-bearing turn replays the tool-call round's own
+    /// reasoning on the tool-call assistant message and the final answer's
+    /// reasoning on the final assistant message — each message carries its own
+    /// ThinkChunk, with no cross-stamping between the two slots.
+    #[test]
+    fn test_messages_reattaches_reasoning_tool_turn() {
+        let mut thread = Thread::new(Uuid::new_v4(), None);
+        let mut turn = Turn::new(0, "Run the build");
+        turn.record_tool_call_with_reasoning(
+            "shell",
+            serde_json::json!({"cmd": "make"}),
+            None,
+            Some("id_a".into()),
+        );
+        turn.record_tool_result_for("id_a", serde_json::json!("ok"));
+        // Distinct traces: the thinking before the tool call vs. before the
+        // final answer. The single-slot bug (F3) replayed the final answer's
+        // trace onto both messages.
+        turn.tool_call_reasoning = Some("think before the tool".to_string());
+        turn.reasoning = Some("think before the answer".to_string());
+        turn.conclude(TurnOutcome::Completed("Build is clean.".to_string()));
+        thread.turns.push(turn);
+
+        let messages = thread.messages();
+        // user + assistant_with_tool_calls + tool_result + assistant
+        assert_eq!(messages.len(), 4);
+        // tool-call assistant message carries the tool-call round's trace.
+        assert!(messages[1].tool_calls.is_some());
+        assert_eq!(
+            messages[1].reasoning.as_deref(),
+            Some("think before the tool")
+        );
+        // final assistant message carries the final answer's trace — not the
+        // tool-call trace.
+        assert_eq!(messages[3].content, "Build is clean.");
+        assert_eq!(
+            messages[3].reasoning.as_deref(),
+            Some("think before the answer")
         );
     }
 

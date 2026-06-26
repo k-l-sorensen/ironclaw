@@ -84,6 +84,15 @@ pub enum ProviderProtocol {
     /// tool calling on every reasoning model OpenRouter exposes (Claude with
     /// thinking, OpenAI o-series, DeepSeek-R1, Gemini 2.5+, Qwen QwQ, …).
     OpenRouter,
+    /// Mistral AI API. Routes through IronClaw's dedicated Mistral provider
+    /// (`crate::mistral`), which owns the request/response JSON so it can
+    /// consume `reasoning_effort=high` responses — where `message.content`
+    /// becomes an array of typed chunks (`[{thinking},{text}]`) that rig-core's
+    /// OpenAI-compat client (and rig 0.39's dedicated Mistral client, which
+    /// still models content as `String`) cannot deserialize. The provider also
+    /// replays the prior `ThinkChunk` on the next turn, which Mistral requires
+    /// to avoid degraded multi-turn performance.
+    Mistral,
     /// AWS Bedrock native Converse API (via `aws-sdk-bedrockruntime`).
     /// Reads its config from [`crate::config::LlmConfig::bedrock`].
     /// Feature-gated behind `--features bedrock`.
@@ -473,6 +482,7 @@ impl ProviderRegistry {
             }
         }
 
+        migrate_mistral_overlay(&mut all);
         Ok(Self::new(all))
     }
 
@@ -536,6 +546,46 @@ impl ProviderRegistry {
 
 fn user_providers_path() -> Option<std::path::PathBuf> {
     Some(ironclaw_common::paths::ironclaw_base_dir().join("providers.json"))
+}
+
+/// Mistral identity strings (id or alias) a copied overlay block may carry.
+const MISTRAL_IDENTITY: &[&str] = &["mistral", "mistral_ai", "mistralai"];
+
+/// Rewrite any provider entry that pins Mistral to the legacy
+/// `open_ai_completions` protocol onto the dedicated [`ProviderProtocol::Mistral`].
+///
+/// Switching the built-in `providers.json` does not touch a user/operator
+/// overlay (`~/.ironclaw/providers.json`, `$IRONCLAW_REBORN_HOME/providers.json`)
+/// that copied the old Mistral block. Left alone, that overlay would silently
+/// keep the broken rig-core path (the OpenAI-compat client cannot deserialize
+/// the `reasoning_effort=high` array response). This is a **value migration**,
+/// not an enum rename — `open_ai_completions` remains a live protocol for every
+/// other provider, so we only rewrite entries whose id/alias is Mistral's.
+/// See `docs/plans/2026-06-24-mistral-reasoning-provider-architecture.md`
+/// (Decision 9).
+fn migrate_mistral_overlay(defs: &mut [ProviderDefinition]) {
+    for def in defs.iter_mut() {
+        if def.protocol != ProviderProtocol::OpenAiCompletions {
+            continue;
+        }
+        let is_mistral = MISTRAL_IDENTITY
+            .iter()
+            .any(|m| def.id.eq_ignore_ascii_case(m))
+            || def
+                .aliases
+                .iter()
+                .any(|a| MISTRAL_IDENTITY.iter().any(|m| a.eq_ignore_ascii_case(m)));
+        if is_mistral {
+            tracing::warn!(
+                id = %def.id,
+                "Rewriting overlay Mistral provider from open_ai_completions to the \
+                 dedicated `mistral` protocol — the OpenAI-compat path cannot parse \
+                 reasoning_effort=high responses. Update your providers.json overlay \
+                 to set \"protocol\": \"mistral\" to silence this warning."
+            );
+            def.protocol = ProviderProtocol::Mistral;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -644,6 +694,67 @@ mod tests {
             err.to_string().contains("unknown field `api_key`"),
             "unexpected parse error: {err}"
         );
+    }
+
+    /// C12: an overlay Mistral entry pinned to the legacy `open_ai_completions`
+    /// protocol must be rewritten to the dedicated `mistral` protocol on load,
+    /// not silently kept (which would preserve the broken rig path). Drives the
+    /// real `try_load_from_path` overlay loader, not the migration helper alone.
+    #[test]
+    fn overlay_mistral_open_ai_completions_is_migrated_to_mistral() {
+        use std::io::Write;
+
+        let overlay = r#"[
+            {
+                "id": "mistral",
+                "aliases": ["mistral_ai", "mistralai"],
+                "protocol": "open_ai_completions",
+                "default_base_url": "https://api.mistral.ai/v1",
+                "api_key_env": "MISTRAL_API_KEY",
+                "api_key_required": true,
+                "model_env": "MISTRAL_MODEL",
+                "default_model": "mistral-large-latest",
+                "description": "stale overlay copy"
+            }
+        ]"#;
+
+        let mut file = tempfile::NamedTempFile::new().expect("temp overlay file");
+        file.write_all(overlay.as_bytes()).expect("write overlay");
+
+        let registry =
+            ProviderRegistry::try_load_from_path(Some(file.path())).expect("overlay loads");
+        let mistral = registry.find("mistral").expect("mistral resolves");
+        assert_eq!(
+            mistral.protocol,
+            ProviderProtocol::Mistral,
+            "overlay pinned to open_ai_completions must be migrated to the \
+             dedicated mistral protocol, not silently kept"
+        );
+    }
+
+    /// The migration is Mistral-specific: a non-Mistral `open_ai_completions`
+    /// overlay entry must be left untouched (it is a value migration, not an
+    /// enum rename — `open_ai_completions` stays live for other providers).
+    #[test]
+    fn overlay_migration_leaves_other_openai_compat_providers_alone() {
+        let mut defs = vec![ProviderDefinition {
+            id: "groq".to_string(),
+            aliases: vec![],
+            protocol: ProviderProtocol::OpenAiCompletions,
+            default_base_url: Some("https://api.groq.com/openai/v1".to_string()),
+            base_url_env: None,
+            base_url_required: false,
+            api_key_env: Some("GROQ_API_KEY".to_string()),
+            api_key_required: true,
+            model_env: "GROQ_MODEL".to_string(),
+            default_model: "llama-3.3-70b-versatile".to_string(),
+            description: "Groq".to_string(),
+            extra_headers_env: None,
+            setup: None,
+            unsupported_params: vec![],
+        }];
+        migrate_mistral_overlay(&mut defs);
+        assert_eq!(defs[0].protocol, ProviderProtocol::OpenAiCompletions);
     }
 
     #[test]
@@ -844,6 +955,16 @@ mod tests {
              strips reasoning_details and tool-call signatures, breaking \
              every thinking-mode model OpenRouter exposes (Claude with \
              thinking, OpenAI o-series, DeepSeek-R1, Gemini 2.5+, Qwen QwQ)",
+        );
+
+        let mistral = by_id("mistral").expect("mistral entry must exist");
+        assert_eq!(
+            mistral.protocol,
+            ProviderProtocol::Mistral,
+            "mistral must use the dedicated Mistral protocol — OpenAiCompletions \
+             (via rig-core) cannot deserialize the reasoning_effort=high array \
+             response ([{{thinking}},{{text}}]) and fails every turn with \
+             `did not match any variant of untagged enum ApiResponse`",
         );
     }
 

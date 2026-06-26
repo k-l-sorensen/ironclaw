@@ -658,6 +658,7 @@ mod tests {
             role: role.to_string(),
             content: content.to_string(),
             created_at: chrono::Utc::now() + chrono::TimeDelta::milliseconds(offset_ms),
+            reasoning: None,
         }
     }
 

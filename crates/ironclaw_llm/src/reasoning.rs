@@ -14,6 +14,25 @@ use crate::{
     ToolCompletionRequest, ToolDefinition,
 };
 
+/// Shared leak detector for scanning model-emitted reasoning traces.
+///
+/// Built once (the default patterns compile a set of regexes) and reused for
+/// every reasoning scan, rather than reconstructing per call.
+static REASONING_LEAK_DETECTOR: LazyLock<ironclaw_safety::LeakDetector> =
+    LazyLock::new(ironclaw_safety::LeakDetector::new);
+
+/// Redact secrets from an LLM-emitted reasoning trace before it is stored or
+/// replayed into the next request.
+///
+/// The thinking trace is model output that is both **persisted** (LLM data is
+/// never deleted) and **fed back into the LLM** next turn, so it must pass the
+/// same leak scan as message content. Redaction (never blocking) is used so a
+/// secret in the trace removes the secret without aborting the turn. Clean
+/// traces keep their original allocation. See the architecture doc, Decision 7.
+fn redact_reasoning(reasoning: Option<String>) -> Option<String> {
+    reasoning.map(|trace| REASONING_LEAK_DETECTOR.redact_all(&trace).unwrap_or(trace))
+}
+
 /// Token the agent returns when it has nothing to say (e.g. in group chats).
 /// The dispatcher should check for this and suppress the message.
 pub const SILENT_REPLY_TOKEN: &str = "NO_REPLY";
@@ -424,7 +443,16 @@ pub struct ResponseMetadata {
 #[derive(Debug, Clone)]
 pub enum RespondResult {
     /// A text response (no tools needed).
-    Text(String),
+    Text {
+        text: String,
+        /// Provider-emitted reasoning artifacts for a pure-text turn (the
+        /// common no-tool shape). Mirrors the `reasoning` field on
+        /// [`RespondResult::ToolCalls`] so the trace can be persisted on the
+        /// turn and replayed into the next request — without it, a pure-text
+        /// turn would have nowhere to carry the trace (CTR-D5). Already
+        /// leak-scanned at the shared `respond_with_tools` stage.
+        reasoning: Option<String>,
+    },
     /// The model wants to call tools. Caller should execute them and call back.
     /// Includes the optional content from the assistant message (some models
     /// include explanatory text alongside tool calls).
@@ -754,7 +782,7 @@ Respond in JSON format:
     pub async fn respond(&self, context: &ReasoningContext) -> Result<String, LlmError> {
         let output = self.respond_with_tools(context).await?;
         match output.result {
-            RespondResult::Text(text) => Ok(text),
+            RespondResult::Text { text, .. } => Ok(text),
             RespondResult::ToolCalls {
                 tool_calls: calls, ..
             } => {
@@ -813,7 +841,17 @@ Respond in JSON format:
                 request.model = Some(model.clone());
             }
 
-            let response = self.llm.complete_with_tools(request).await?;
+            let mut response = self.llm.complete_with_tools(request).await?;
+            // Leak-scan the reasoning trace on the line right after the provider
+            // returns, before it is carried into RespondResult — where the agent
+            // loop both persists it and replays it into the next request. Both
+            // branches (tools here, no-tools below) follow this one rule:
+            // redact-at-source, immediately after the `complete*` call, so the
+            // "scanned exactly once before leaving the engine" invariant is
+            // uniform structure, not per-branch prose. This covers every
+            // reasoning-emitting provider (DeepSeek/Gemini/OpenRouter/Mistral),
+            // not just one. See the architecture doc, Decision 7.
+            response.reasoning = redact_reasoning(response.reasoning);
             let usage = TokenUsage {
                 input_tokens: response.input_tokens,
                 output_tokens: response.output_tokens,
@@ -920,7 +958,13 @@ Respond in JSON format:
                 cleaned
             };
             Ok(RespondOutput {
-                result: RespondResult::Text(final_text),
+                // `response.reasoning` was leak-scanned at the shared stage above
+                // (Decision 7); carry it so a pure-text turn persists + replays
+                // its trace (CTR-D5).
+                result: RespondResult::Text {
+                    text: final_text,
+                    reasoning: response.reasoning,
+                },
                 usage,
                 finish_reason: response.finish_reason,
                 metadata,
@@ -935,7 +979,12 @@ Respond in JSON format:
                 request.model = Some(model.clone());
             }
 
-            let response = self.llm.complete(request).await?;
+            let mut response = self.llm.complete(request).await?;
+            // Redact-at-source, mirroring the tools branch above: leak-scan the
+            // reasoning on the line right after the provider returns so the
+            // "scanned once before leaving the engine" invariant holds uniformly
+            // across both branches.
+            response.reasoning = redact_reasoning(response.reasoning);
             let pre_truncated = truncate_at_tool_tags(&response.content);
             let cleaned = clean_response(&pre_truncated);
             let metadata = if cleaned.trim().is_empty() {
@@ -955,7 +1004,10 @@ Respond in JSON format:
                 cleaned
             };
             Ok(RespondOutput {
-                result: RespondResult::Text(final_text),
+                result: RespondResult::Text {
+                    text: final_text,
+                    reasoning: response.reasoning,
+                },
                 usage: TokenUsage {
                     input_tokens: response.input_tokens,
                     output_tokens: response.output_tokens,
@@ -3855,7 +3907,7 @@ That's my plan."#;
 
         let output = reasoning.respond_with_tools(&context).await.unwrap();
         match output.result {
-            RespondResult::Text(text) => {
+            RespondResult::Text { text, .. } => {
                 assert_eq!(text, "Here is my analysis of the code.");
             }
             RespondResult::ToolCalls { .. } => {
@@ -3877,7 +3929,7 @@ That's my plan."#;
         let output = reasoning.respond_with_tools(&context).await.unwrap();
         let metadata = output.metadata;
         match output.result {
-            RespondResult::Text(text) => {
+            RespondResult::Text { text, .. } => {
                 assert_eq!(text, "I'm not sure how to respond to that.");
                 assert_eq!(metadata.anomaly, Some(ResponseAnomaly::EmptyTextResponse));
             }
@@ -3904,13 +3956,62 @@ That's my plan."#;
         let output = reasoning.respond_with_tools(&context).await.unwrap();
         let metadata = output.metadata;
         match output.result {
-            RespondResult::Text(text) => {
+            RespondResult::Text { text, .. } => {
                 assert_eq!(text, "I'm not sure how to respond to that.");
                 assert_eq!(metadata.anomaly, Some(ResponseAnomaly::EmptyToolCompletion));
             }
             RespondResult::ToolCalls { .. } => {
                 panic!("Expected fallback text, not tool calls");
             }
+        }
+    }
+
+    /// C11: a secret planted in the provider's reasoning trace must be redacted
+    /// before it is carried into `RespondResult` — the value the agent loop both
+    /// persists and replays into the next request. Drives the public
+    /// `respond_with_tools` caller (not the `redact_reasoning` helper alone).
+    #[tokio::test]
+    async fn reasoning_trace_is_leak_scanned_before_round_trip() {
+        use crate::testing::StubLlm;
+
+        let secret = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9_supersecretvalue";
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "tool_list".to_string(),
+            arguments: serde_json::json!({}),
+            reasoning: None,
+            signature: None,
+            arguments_parse_error: None,
+        };
+        let llm = Arc::new(
+            StubLlm::new("done")
+                .with_tool_call(tool_call)
+                .with_response_reasoning(format!("I will use Bearer {secret} to authenticate")),
+        );
+        let reasoning = Reasoning::new(llm);
+
+        let context = ReasoningContext::new()
+            .with_message(ChatMessage::user("list tools"))
+            .with_tools(vec![ToolDefinition {
+                name: "tool_list".to_string(),
+                description: "Lists tools".to_string(),
+                parameters: serde_json::json!({}),
+            }]);
+
+        let output = reasoning.respond_with_tools(&context).await.unwrap();
+        match output.result {
+            RespondResult::ToolCalls { reasoning, .. } => {
+                let reasoning = reasoning.expect("provider reasoning should be present");
+                assert!(
+                    reasoning.contains("[REDACTED]"),
+                    "reasoning trace must be redacted: {reasoning}"
+                );
+                assert!(
+                    !reasoning.contains(secret),
+                    "reasoning trace leaked the planted secret: {reasoning}"
+                );
+            }
+            RespondResult::Text { text: t, .. } => panic!("expected tool calls, got text: {t}"),
         }
     }
 
@@ -3969,7 +4070,7 @@ That's my plan."#;
         let output = reasoning.respond_with_tools(&context).await.unwrap();
         let metadata = output.metadata;
         match output.result {
-            RespondResult::Text(text) => {
+            RespondResult::Text { text, .. } => {
                 assert_eq!(text, "I'm not sure how to respond to that.");
                 assert_eq!(metadata.anomaly, Some(ResponseAnomaly::EmptyToolCompletion));
             }
@@ -4110,7 +4211,7 @@ That's my plan."#;
                 // Text before the tag should be preserved
                 assert_eq!(content.as_deref(), Some("Let me search for that."));
             }
-            RespondResult::Text(_) => {
+            RespondResult::Text { .. } => {
                 panic!("Expected recovered tool calls, got text");
             }
         }
@@ -4146,7 +4247,7 @@ That's my plan."#;
                     "Content should be None when only tool tags present"
                 );
             }
-            RespondResult::Text(_) => {
+            RespondResult::Text { .. } => {
                 panic!("Expected recovered tool calls, got text");
             }
         }

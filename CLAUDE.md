@@ -1,5 +1,9 @@
 # IronClaw Development Guide
 
+> **Local fork:** This clone carries local-only modifications not present in
+> upstream `nearai/ironclaw`. See [`CLAUDE-local.md`](CLAUDE-local.md) for the
+> fork situation, maintenance workflow, and the list of active local changes.
+
 **IronClaw** is a secure personal AI assistant — user-first security, self-expanding tools, defense in depth, multi-channel access with proactive background execution.
 
 ## Build & Test
