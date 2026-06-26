@@ -74,7 +74,7 @@ Audited; all items confirmed (built against the converged decisions, no drift).
 - [x] wire JSON model: `MistralMessageContent` (untagged) + `MistralContentChunk`
       (tagged), unknown `type` fails loud (**D8**) — `mistral.rs`.
 - **Acceptance:** **G1** (registry guard, extended in `registry.rs`), **C6/C7/C10b**
-  (parser fixtures in `mistral_tests.rs`). ✅
+  (parser fixtures in `mistral/tests.rs`). ✅
 
 ### WU2 — Capability registries ✅
 - [x] `supports_mistral_reasoning()` in `reasoning_models.rs` (**D4**) — patterns
@@ -86,7 +86,7 @@ Audited; all items confirmed (built against the converged decisions, no drift).
 - [x] `crates/ironclaw_llm/src/mistral.rs` `impl LlmProvider` (`complete` +
       `complete_with_tools`), reusing `tool_schema.rs` (`FlattenOnly`) +
       `sanitize_tool_messages`; **736 lines** (`<800`, **D10**), tests in sibling
-      `mistral_tests.rs` via `#[path]`.
+      `mistral/tests.rs` via `#[path]`.
 - [x] request build: `reasoning_effort_for()` gates via the WU2 helper (three
       states per D3); `chat_message_to_wire()` replays prior thinking as
       `[{thinking},{text}]`. Builder takes a `MistralRequestParams` struct (D10 —
@@ -98,7 +98,7 @@ Audited; all items confirmed (built against the converged decisions, no drift).
 - [x] factory arm `Mistral => create_mistral_from_registry(...)` + `mod mistral;`
       (`lib.rs`); also added the `Mistral` arm to the dedicated-config match in
       `resolution.rs` (non-exhaustive-match fix).
-- **Acceptance:** **C1–C5, C8, C9, C10** (`mistral_tests.rs`). ✅
+- **Acceptance:** **C1–C5, C8, C9, C10** (`mistral/tests.rs`). ✅
 
 ### WU4 — Config wiring + registry switch + overlay migration ✅
 - [x] typed `Option<MistralReasoningEffort>` on `RegistryProviderConfig`

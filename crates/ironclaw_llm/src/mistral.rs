@@ -731,5 +731,5 @@ fn usage_tokens(usage: &Option<MistralUsage>) -> (u32, u32) {
 }
 
 #[cfg(test)]
-#[path = "mistral_tests.rs"]
+#[path = "mistral/tests.rs"]
 mod tests;
