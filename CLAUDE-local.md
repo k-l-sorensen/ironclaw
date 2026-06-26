@@ -45,6 +45,24 @@ Conventional-Commit subject instead.
 
 ## Active local changes
 
+### Fork-release skill + tag-driven release convention — 2026-06-26
+
+- **What:** `.claude/skills/fork-release/SKILL.md` — a Claude Code skill that
+  guides cutting a *marked* release tag on this fork via cargo-dist, and that
+  doubles as the git-workflow maintenance checklist (remotes, `gh auth setup-git`
+  credential helper, branch tracking).
+- **Fork-marking convention (local-only):** fork releases use a prerelease
+  version suffix `-fork.<N>` (e.g. `0.29.1-fork.1`). cargo-dist requires the
+  `ironclaw` `[package]` version in `Cargo.toml` to equal the tag version, so a
+  fork release bumps that version line — **this diverges from upstream and will
+  conflict on `git rebase upstream/main`**. Resolution: take upstream's base
+  version, re-apply the `-fork.<N>` suffix.
+- **Why:** releases must never be pushed to `upstream` (nearai) and must be
+  visibly distinct from official upstream builds; the prerelease suffix also makes
+  cargo-dist auto-flag the GitHub Release as a pre-release.
+- **Hard rule:** tags/branches/releases go to `origin` (the fork) only; never
+  `git push upstream`, never `git push --tags`.
+
 ### Mistral reasoning — implemented (`feat(llm)` landed), live acceptance PASSED — 2026-06-24
 
 We want to use Mistral (largest EU provider) to its fullest, which mandates
