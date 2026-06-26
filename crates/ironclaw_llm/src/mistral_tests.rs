@@ -185,23 +185,6 @@ async fn c4_small_model_sends_param() {
     );
 }
 
-/// Documents the non-collapsed `Some(None)` → explicit `"none"` wire behavior
-/// (Decision 3). The env boundary does not currently produce this, but the
-/// provider must render it faithfully rather than collapsing it with omit.
-#[tokio::test]
-async fn some_none_renders_explicit_none() {
-    let body = request_json(
-        MEDIUM,
-        Some(MistralReasoningEffort::None),
-        vec![ChatMessage::user("hi")],
-        vec![],
-    );
-    assert!(
-        body.contains(r#""reasoning_effort":"none""#),
-        "Some(None) must send explicit none: {body}"
-    );
-}
-
 // ── C5: image attachment survives ChatMessage→wire on a vision model ────────
 
 #[tokio::test]

@@ -138,18 +138,17 @@ is reused unchanged.
 2. **One protocol for all Mistral traffic** — `ProviderProtocol::Mistral` handles
    both reasoning-on (array response) and reasoning-off (string response). No
    conditional dual-path.
-3. **Reasoning effort is a typed 2-variant enum, default on** —
-   `MistralReasoningEffort { High, None }` with `#[serde(rename_all="snake_case")]`
-   (emits exactly `"high"`/`"none"`). **Never a `bool`** (would force a
-   bool→magic-string `format!`, banned by `types.md`) and **never** the OpenAI
-   3-level scale. The env string is converted to this type at the binary boundary
-   only. The wire has **three** states, expressed as `Option<MistralReasoningEffort>`:
-   `Option::None` = **omit** the param (model-gated off, or unsupported model);
-   `Some(High)` = send `"high"`; `Some(None)` = send explicit `"none"`. Do not
-   collapse `Option::None` and `Some(None)` — they are distinct wire behaviors (C2
-   asserts omit, not an explicit `"none"`). Implementer note: the variant is named
-   `None` to mirror the wire value but shadows `Option::None` in match arms; `Off`
-   would read cleaner if the wire spelling is set via `#[serde(rename="none")]`.
+3. **Reasoning effort is a typed marker enum, default on** —
+   `MistralReasoningEffort { High }`, rendered to the wire via `wire_value()`
+   (`"high"`). Kept as an enum (rather than a `bool`, which would force a
+   bool→magic-string `format!`, banned by `types.md`) so a richer graded scale can
+   be added here if Mistral ever exposes one — it is **never** the OpenAI 3-level
+   scale today. The env string is converted to this type at the binary boundary
+   only. Mistral exposes reasoning as an on/off toggle: the only on-state is
+   `"high"`, and "off" is expressed by *omitting* the param. The wire therefore has
+   **two** states, expressed as `Option<MistralReasoningEffort>`: `Option::None` =
+   **omit** the param (off, model-gated off, or unsupported model); `Some(High)` =
+   send `"high"` (C2 asserts the off case omits the param, not an explicit value).
 4. **Model-gating via the existing registry, not the provider** —
    `reasoning_effort` is sent only for supported models (`mistral-small*`,
    `mistral-medium*`) via a new `supports_mistral_reasoning()` helper in

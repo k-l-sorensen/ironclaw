@@ -805,13 +805,13 @@ fn resolve_registry_provider(
 
     // Resolve Mistral `reasoning_effort` from env (default: on/high).
     //
-    // Three wire states are carried as `Option<MistralReasoningEffort>`:
+    // Two wire states are carried as `Option<MistralReasoningEffort>`:
     //   - `MISTRAL_REASONING=high|on|true|1` (or unset) → `Some(High)` → "high"
     //   - `MISTRAL_REASONING=off|none|false|0`          → `None`       → omit
     // The provider further gates `Some(_)` on model capability before sending,
     // so the toggle is safe even when a non-reasoning model is selected. "off"
-    // maps to `Option::None` (omit) rather than `Some(None)` so the wire body
-    // omits the param entirely, matching the architecture's C2 contract.
+    // maps to `Option::None` so the wire body omits the param entirely, matching
+    // the architecture's C2 contract.
     //
     // Gate on the resolved `protocol`, not the id string: a Mistral-protocol
     // provider registered under a non-`"mistral"` id (custom overlay entry,

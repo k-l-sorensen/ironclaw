@@ -105,11 +105,10 @@ impl MistralProvider {
 
     /// Resolve the `reasoning_effort` wire value for a given model.
     ///
-    /// Three states (Decision 3): `None` omits the param; a `Some(_)` toggle is
+    /// Two states (Decision 3): `None` omits the param; a `Some(_)` toggle is
     /// gated on model capability first (model-gate beats the toggle, so e.g.
-    /// `mistral-large` never receives the param even with reasoning on); when
-    /// supported, `High`→`"high"` / `None`→`"none"` are rendered verbatim
-    /// without collapsing the two states.
+    /// `mistral-large` never receives the param even with reasoning on). When
+    /// supported, the on-state renders as `"high"`; otherwise the param is omitted.
     fn reasoning_effort_for(&self, model: &str) -> Option<&'static str> {
         match self.reasoning {
             Some(effort) if supports_mistral_reasoning(model) => Some(effort.wire_value()),

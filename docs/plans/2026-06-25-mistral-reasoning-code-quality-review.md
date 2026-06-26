@@ -101,7 +101,7 @@ This also *reduces* the production footprint of a file that is over-budget (see
 
 - **Severity:** Medium
 - **Category:** Boundary / abstraction not earning its keep / stale contract
-- **Status:** ☐ open
+- **Status:** ☑ done
 
 ### Locations
 - `crates/ironclaw_llm/src/config.rs` — `enum MistralReasoningEffort { High, None }`,
@@ -249,3 +249,15 @@ the 1,500 soft line; its additions here are small and cohesive (two documented
   field access (−91 production lines, also satisfies Q3 for this PR). Two
   regression tests added (empty-thread default; distinct reasoning slots). Pure
   refactor — full agent unit suite (520 tests incl. CTR-1) green, zero clippy.
+- 2026-06-26 — **Q2 done** (option b): `refactor(llm): collapse dead Mistral
+  reasoning tri-state to two-state contract`. Deleted the unreachable
+  `MistralReasoningEffort::None` variant plus its `Display` impl and `FromStr`
+  impl (the latter's only caller was the resolver); inlined the on/off parse
+  into `resolve_mistral_reasoning_from_env` (`crates/ironclaw_llm/src/config.rs`).
+  `MistralReasoningEffort` is now a single-variant marker enum (`High`),
+  reserving room for a future graded scale. Removed the now-impossible
+  `some_none_renders_explicit_none` test; rewrote the enum / resolver /
+  `reasoning_effort_for` docstrings, the `src/config/llm.rs` "three wire states"
+  comment, and architecture Decision 3 to the two-state contract. No live-path
+  behavior change (`high`/unset → `"high"`, `off`/`none` → omit). Resolver
+  `off → omit` coverage retained in `src/config/llm.rs`.

@@ -67,26 +67,24 @@ impl std::fmt::Display for CacheRetention {
 
 /// Mistral `reasoning_effort` control.
 ///
-/// Mistral's reasoning is a two-state toggle (`"high"` / `"none"`), *not* the
-/// OpenAI low/medium/high scale. `High` emits the full thinking trace as an
-/// array-shaped response; `None` sends an explicit `"none"`.
+/// Mistral's reasoning is an on/off toggle, *not* the OpenAI low/medium/high
+/// scale. The only on-state Mistral exposes is `"high"`, which emits the full
+/// thinking trace as an array-shaped response; "off" is expressed by *omitting*
+/// the param rather than by an explicit value.
 ///
-/// Three wire behaviors are expressed as `Option<MistralReasoningEffort>` on
+/// Two wire behaviors are expressed as `Option<MistralReasoningEffort>` on
 /// [`RegistryProviderConfig`]:
-/// - `Option::None` — **omit** the param entirely (model-gated off, or an
-///   unsupported model). This is distinct from `Some(None)`.
+/// - `Option::None` — **omit** the param entirely (off, or an unsupported model).
 /// - `Some(High)` — send `reasoning_effort: "high"`.
-/// - `Some(None)` — send explicit `reasoning_effort: "none"`.
 ///
-/// The variant is named `None` to mirror the wire value (the explicit `"none"`
-/// Mistral accepts); use [`MistralReasoningEffort::wire_value`] to render it.
+/// Kept as an enum (rather than a `bool`) so a richer graded scale can be added
+/// here if Mistral ever exposes one; [`MistralReasoningEffort::wire_value`]
+/// renders the on-state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MistralReasoningEffort {
-    /// Full thinking trace (`reasoning_effort: "high"`). The default.
+    /// Full thinking trace (`reasoning_effort: "high"`). The only state; the default.
     #[default]
     High,
-    /// No thinking trace (explicit `reasoning_effort: "none"`).
-    None,
 }
 
 impl MistralReasoningEffort {
@@ -94,29 +92,7 @@ impl MistralReasoningEffort {
     pub fn wire_value(self) -> &'static str {
         match self {
             Self::High => "high",
-            Self::None => "none",
         }
-    }
-}
-
-impl std::str::FromStr for MistralReasoningEffort {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_lowercase().as_str() {
-            "high" | "on" | "true" | "1" => Ok(Self::High),
-            "off" | "none" | "false" | "0" => Ok(Self::None),
-            _ => Err(format!(
-                "invalid mistral reasoning '{}', expected one of: high, none, on, off, true, false, 1, 0",
-                s
-            )),
-        }
-    }
-}
-
-impl std::fmt::Display for MistralReasoningEffort {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.wire_value())
     }
 }
 
@@ -130,23 +106,25 @@ impl std::fmt::Display for MistralReasoningEffort {
 ///   - `"off"`/`"none"`/`"0"`/…  → `None` (omit the wire param)
 ///   - anything else             → warn + `Some(High)`
 ///
-/// "off" maps to `Option::None` (omit) rather than `Some(None)` so the wire
-/// body omits the param entirely, per the architecture's C2 contract. The
-/// provider further gates `Some(_)` on model capability before sending.
+/// "off" maps to `Option::None` so the wire body omits the param entirely, per
+/// the architecture's C2 contract. The provider further gates `Some(_)` on model
+/// capability before sending.
 ///
 /// The crate stays env-agnostic: callers read the env var at their own
 /// boundary and pass the raw `Option<String>` in.
 pub fn resolve_mistral_reasoning_from_env(raw: Option<String>) -> Option<MistralReasoningEffort> {
-    match raw {
-        None => Some(MistralReasoningEffort::High),
-        Some(raw) => match raw.parse::<MistralReasoningEffort>() {
-            Ok(MistralReasoningEffort::High) => Some(MistralReasoningEffort::High),
-            Ok(MistralReasoningEffort::None) => None,
-            Err(e) => {
-                tracing::warn!("Invalid MISTRAL_REASONING ({raw}): {e}; defaulting to high");
-                Some(MistralReasoningEffort::High)
-            }
-        },
+    let Some(raw) = raw else {
+        return Some(MistralReasoningEffort::High);
+    };
+    match raw.trim().to_lowercase().as_str() {
+        "high" | "on" | "true" | "1" => Some(MistralReasoningEffort::High),
+        "off" | "none" | "false" | "0" => None,
+        _ => {
+            tracing::warn!(
+                "Invalid MISTRAL_REASONING ({raw}); expected one of: high, none, on, off, true, false, 1, 0; defaulting to high"
+            );
+            Some(MistralReasoningEffort::High)
+        }
     }
 }
 
