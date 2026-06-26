@@ -12,6 +12,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(reborn-cli)* document the standalone `config init` atomic-write dependency on `tempfile` and call out the default runner cadence change to 5s heartbeats / 200ms polling (down from 10s / 2s).
 - *(reborn)* expose runtime poll settings and document the standalone turn-runner cadence change for callers using `TurnRunnerSettings::default()`.
 
+## [0.29.1-fork.1](https://github.com/k-l-sorensen/ironclaw/releases/tag/ironclaw-v0.29.1-fork.1) - 2026-06-26
+
+First marked release of the **k-l-sorensen/ironclaw fork** — an unofficial build,
+not produced by or affiliated with upstream `nearai/ironclaw`. Built on upstream
+`main` past the `0.29.1` tag plus the fork-only changes below. The `-fork.1`
+prerelease suffix flags it as a GitHub pre-release and keeps it distinct from
+official upstream releases. See `CLAUDE-local.md` for the full fork divergence list.
+
+### Added
+
+- *(llm)* custom Mistral provider with first-class `reasoning_effort` support, so
+  Mistral (largest EU provider) can run at `reasoning_effort=high` — a path
+  rig-core 0.30 could not parse on its own. Live acceptance passed.
+- *(skills)* `fork-release` skill and tag-driven release convention: a `-fork.N`
+  prerelease suffix that matches the cargo-dist tag trigger and auto-marks the
+  GitHub Release as a pre-release.
+
+### Changed
+
+- *(release)* repoint release generation from upstream to the fork — `Cargo.toml`
+  `repository`/`homepage`, the `msi` installer's `wix/main.wxs` `ARPHELPLINK`, and
+  the WASM-manifest download URLs in `release.yml` now resolve to
+  `k-l-sorensen/ironclaw`. `authors` and license are deliberately left as NEAR AI.
+- *(docs)* add a fork notice to `README` and local-fork status to `CLAUDE.md`.
+
+### CI / Release
+
+- *(deny)* ignore RUSTSEC-2026-0187 (lopdf DoS), tracked in fork issue #2.
+
 ## [0.29.1](https://github.com/nearai/ironclaw/compare/ironclaw-v0.29.0...ironclaw-v0.29.1) - 2026-06-04
 
 ### Added

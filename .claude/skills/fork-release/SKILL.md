@@ -106,23 +106,57 @@ git tag -l "$TAG"
 git ls-remote --tags origin "$TAG"
 ```
 
-### 3. Set the version + commit
+### 3. Set the version + update the changelog + commit
 
-cargo-dist demands the package version equal the tag version, so bump the
-`ironclaw` `[package]` version (root `Cargo.toml`) to the fork version:
+**3a. Bump the version.** cargo-dist demands the package version equal the tag
+version, so bump the `ironclaw` `[package]` version (root `Cargo.toml`) to the
+fork version:
 
 ```bash
 # Edit Cargo.toml [package] version -> the fork version, e.g.:
 #   version = "0.29.1-fork.1"
 # (Use the Edit tool; update only the ironclaw [package] version line.)
-
 cargo update -w 2>/dev/null || cargo check -q   # refresh the ironclaw entry in Cargo.lock
-git add Cargo.toml Cargo.lock
+```
+
+**3b. Add a `CHANGELOG.md` entry — REQUIRED, do not skip.** cargo-dist's `host`
+step generates the GitHub Release body from the `CHANGELOG.md` section whose
+heading matches the tag version. **If no `## [<VERSION>]` heading exists, it
+falls back to the nearest base-version section (`## [0.29.1]`) and publishes
+*upstream's* notes — with `nearai/ironclaw` PR links and none of the fork's
+changes.** (This is exactly what went wrong on the first `0.29.1-fork.1` build.)
+
+Insert a section for the fork version **between `## [Unreleased]` and the base
+version's section**, using the fork repo for the heading link:
+
+```markdown
+## [<VERSION>](https://github.com/k-l-sorensen/ironclaw/releases/tag/ironclaw-v<VERSION>) - <YYYY-MM-DD>
+
+First/Nth marked release of the **k-l-sorensen/ironclaw fork** — unofficial, not
+affiliated with upstream nearai/ironclaw. Built on upstream `main` past the
+`<base>` tag plus the fork-only changes below. See `CLAUDE-local.md` for the
+full divergence list.
+
+### Added / Changed / CI · Release
+- one bullet per fork-relevant change in this build (e.g. the Mistral
+  `reasoning_effort` provider, release repointing, new skills). Do NOT try to
+  enumerate the upstream commits the fork merged — link the lineage instead.
+```
+
+Derive the bullets from `git log --oneline --no-merges <base-tag>..HEAD` filtered
+to fork-authored commits (`chore(fork)`, `feat`/`fix` you added) and from the
+"Active local changes" list in `CLAUDE-local.md`.
+
+**3c. Commit both, push to the fork:**
+
+```bash
+git add Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "chore(fork): release ironclaw-v<VERSION> (fork build, not upstream)
 
 Marked fork release of k-l-sorensen/ironclaw. Prerelease suffix '-fork.<N>'
 keeps this distinct from upstream nearai/ironclaw and flags the GitHub
-Release as a pre-release.
+Release as a pre-release. Includes the matching CHANGELOG.md section so
+cargo-dist emits fork notes, not upstream's base-version notes.
 
 Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 git push origin main      # fork only
@@ -169,10 +203,22 @@ gh run watch  --repo k-l-sorensen/ironclaw $(gh run list --repo k-l-sorensen/iro
 gh release view "$TAG" --repo k-l-sorensen/ironclaw \
   --json tagName,isPrerelease,assets --jq \
   '{tag:.tagName, prerelease:.isPrerelease, assets:[.assets[].name]}'
+
+# Confirm the Release Notes are FORK notes, not upstream's base-version fallback.
+# This must print nothing — any hit means step 3b's changelog entry was missed:
+gh release view "$TAG" --repo k-l-sorensen/ironclaw --json body --jq '.body' \
+  | grep -n 'nearai/ironclaw/pull' && echo "BAD: upstream PR links in notes — fix CHANGELOG (step 3b) and re-tag"
 ```
 
-Confirm to the user: `isPrerelease: true`, and assets include
-`ironclaw-aarch64-unknown-linux-gnu.tar.gz` and `-musl.tar.gz`.
+Confirm to the user: `isPrerelease: true`; assets include
+`ironclaw-aarch64-unknown-linux-gnu.tar.gz` and `-musl.tar.gz`; and the release
+notes describe the **fork** changes (no `nearai/ironclaw/pull/...` links).
+
+> **If the notes are wrong on an already-published release** (changelog entry was
+> missed), you don't have to rebuild. Fix `CHANGELOG.md` on `main`, then patch the
+> live body in place, preserving the generated Install/Download sections:
+> save the current body, replace everything above `## Install ...` with the fork
+> notes, and `gh release edit "$TAG" --repo k-l-sorensen/ironclaw --notes-file <file>`.
 
 ---
 
