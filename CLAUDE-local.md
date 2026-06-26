@@ -60,6 +60,16 @@ Conventional-Commit subject instead.
 - **Why:** releases must never be pushed to `upstream` (nearai) and must be
   visibly distinct from official upstream builds; the prerelease suffix also makes
   cargo-dist auto-flag the GitHub Release as a pre-release.
+- **Release targeting repointed to the fork (local-only):** upstream hardcodes
+  `nearai/ironclaw` in release generation. We repointed it so fork releases are
+  self-consistent: `Cargo.toml` `repository`/`homepage` → `k-l-sorensen/ironclaw`
+  (cargo-dist bakes this into the generated installers), and the WASM-manifest
+  download URLs in `.github/workflows/release.yml` → `${{ github.repository }}`
+  (resolves to whoever runs the build — fork-safe and upstream-safe). `authors`
+  and the license are deliberately left as NEAR AI. The `Cargo.toml` change
+  conflicts on rebase like the version line; the `release.yml` change is
+  conflict-free. `docker.yml`'s `nearai/ironclaw-dind` dispatch is left as-is (it
+  no-ops on the fork: `continue-on-error` + gated on an app token we lack).
 - **Hard rule:** tags/branches/releases go to `origin` (the fork) only; never
   `git push upstream`, never `git push --tags`.
 
