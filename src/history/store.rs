@@ -118,17 +118,6 @@ impl Store {
         Ok(())
     }
 
-    /// Add a message to a conversation.
-    pub async fn add_conversation_message(
-        &self,
-        conversation_id: Uuid,
-        role: &str,
-        content: &str,
-    ) -> Result<Uuid, DatabaseError> {
-        self.add_conversation_message_with_reasoning(conversation_id, role, content, None)
-            .await
-    }
-
     /// Add a message to a conversation, carrying an optional reasoning trace.
     ///
     /// The reasoning trace (already leak-scanned) is persisted so it can be

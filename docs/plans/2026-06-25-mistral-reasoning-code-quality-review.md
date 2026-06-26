@@ -193,7 +193,7 @@ the 1,500 soft line; its additions here are small and cohesive (two documented
 
 - **Severity:** Low
 - **Category:** Wrapper/abstraction polish
-- **Status:** ☐ open
+- **Status:** ☑ done
 
 ### Items
 1. **Trait method duplication.** `ConversationStore` now requires both
@@ -271,3 +271,21 @@ the 1,500 soft line; its additions here are small and cohesive (two documented
   the Fix section is deliberately omitted. File remains 5,634 lines (test
   additions `+230` are excluded by the criterion and the `architecture.md` rule,
   which skips `#[cfg(test)]`). No production or test code changed for Q3.
+- 2026-06-26 — **Q4 done** (all three items): `refactor(db,llm,agent): de-dup
+  Q4 cleanups — trait-default message shim, symmetric reasoning redaction,
+  with_last_turn helper`. (1) `ConversationStore::add_conversation_message` is now
+  a provided default on the trait (`src/db/mod.rs`) delegating to
+  `add_conversation_message_with_reasoning(.., None)`; deleted the three
+  hand-copied `(.., None)` shims (`libsql/conversations.rs`, `postgres.rs`, the
+  now-dead inherent `history/store.rs::add_conversation_message`) plus the
+  redundant `session_summary.rs` test-mock override — the `None` shim lives once.
+  (2) `crates/ironclaw_llm/src/reasoning.rs` now redacts the reasoning trace
+  at-source in *both* branches (right after the `complete*` call), so the
+  "scanned exactly once before leaving the engine" invariant is uniform structure
+  rather than per-branch prose; the inline redaction at the no-tools return is
+  gone. (3) Added `ChatDelegate::with_last_turn(|t| …)` (mirrors the existing
+  `with_turn_usage`) and collapsed all four `lock → get_mut → last_turn_mut`
+  blocks in `dispatcher.rs` to it. Pure refactor, no behavior change — all three
+  backends compile (default / libsql-only / all-features), zero clippy,
+  `ironclaw_llm` reasoning (236), conversation-store (39), and dispatcher (77)
+  suites green.

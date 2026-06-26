@@ -842,9 +842,13 @@ Respond in JSON format:
             }
 
             let mut response = self.llm.complete_with_tools(request).await?;
-            // Leak-scan the reasoning trace at this shared stage before it is
-            // carried into RespondResult — where the agent loop both persists it
-            // and replays it into the next request. This covers every
+            // Leak-scan the reasoning trace on the line right after the provider
+            // returns, before it is carried into RespondResult — where the agent
+            // loop both persists it and replays it into the next request. Both
+            // branches (tools here, no-tools below) follow this one rule:
+            // redact-at-source, immediately after the `complete*` call, so the
+            // "scanned exactly once before leaving the engine" invariant is
+            // uniform structure, not per-branch prose. This covers every
             // reasoning-emitting provider (DeepSeek/Gemini/OpenRouter/Mistral),
             // not just one. See the architecture doc, Decision 7.
             response.reasoning = redact_reasoning(response.reasoning);
@@ -975,7 +979,12 @@ Respond in JSON format:
                 request.model = Some(model.clone());
             }
 
-            let response = self.llm.complete(request).await?;
+            let mut response = self.llm.complete(request).await?;
+            // Redact-at-source, mirroring the tools branch above: leak-scan the
+            // reasoning on the line right after the provider returns so the
+            // "scanned once before leaving the engine" invariant holds uniformly
+            // across both branches.
+            response.reasoning = redact_reasoning(response.reasoning);
             let pre_truncated = truncate_at_tool_tags(&response.content);
             let cleaned = clean_response(&pre_truncated);
             let metadata = if cleaned.trim().is_empty() {
@@ -995,11 +1004,9 @@ Respond in JSON format:
                 cleaned
             };
             Ok(RespondOutput {
-                // This branch (no tools) skips the shared redaction above, so
-                // leak-scan the reasoning here before it leaves the engine.
                 result: RespondResult::Text {
                     text: final_text,
-                    reasoning: redact_reasoning(response.reasoning),
+                    reasoning: response.reasoning,
                 },
                 usage: TokenUsage {
                     input_tokens: response.input_tokens,

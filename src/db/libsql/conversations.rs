@@ -42,16 +42,6 @@ impl ConversationStore for LibSqlBackend {
         Ok(())
     }
 
-    async fn add_conversation_message(
-        &self,
-        conversation_id: Uuid,
-        role: &str,
-        content: &str,
-    ) -> Result<Uuid, DatabaseError> {
-        self.add_conversation_message_with_reasoning(conversation_id, role, content, None)
-            .await
-    }
-
     async fn add_conversation_message_with_reasoning(
         &self,
         conversation_id: Uuid,

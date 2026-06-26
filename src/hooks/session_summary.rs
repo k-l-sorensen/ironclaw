@@ -238,15 +238,6 @@ mod tests {
             unimplemented!()
         }
 
-        async fn add_conversation_message(
-            &self,
-            _conversation_id: Uuid,
-            _role: &str,
-            _content: &str,
-        ) -> Result<Uuid, crate::error::DatabaseError> {
-            unimplemented!()
-        }
-
         async fn add_conversation_message_with_reasoning(
             &self,
             _conversation_id: Uuid,

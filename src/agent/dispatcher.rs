@@ -10,7 +10,7 @@ use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::agent::Agent;
-use crate::agent::session::{PendingApproval, PendingAuthPrompt, Session, ThreadState};
+use crate::agent::session::{PendingApproval, PendingAuthPrompt, Session, ThreadState, Turn};
 use crate::channels::{ChannelManager, IncomingMessage, StatusUpdate};
 use crate::context::JobContext;
 use crate::error::Error;
@@ -473,6 +473,16 @@ impl ChatDelegate<'_> {
             }
         }
     }
+
+    /// Run `f` against the active thread's last turn under the session lock,
+    /// collapsing the repeated `lock() → threads.get_mut() → last_turn_mut()`
+    /// block into one place. Returns `None` (and runs nothing) when the thread
+    /// or last turn is absent.
+    async fn with_last_turn<R>(&self, f: impl FnOnce(&mut Turn) -> R) -> Option<R> {
+        let mut sess = self.session.lock().await;
+        let turn = sess.threads.get_mut(&self.thread_id)?.last_turn_mut()?;
+        Some(f(turn))
+    }
 }
 
 #[async_trait]
@@ -837,12 +847,10 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         // non-empty trace so a final answer without reasoning doesn't clobber an
         // earlier tool-round trace.
         if reasoning.is_some() {
-            let mut sess = self.session.lock().await;
-            if let Some(thread) = sess.threads.get_mut(&self.thread_id)
-                && let Some(turn) = thread.last_turn_mut()
-            {
+            self.with_last_turn(|turn| {
                 turn.reasoning = reasoning;
-            }
+            })
+            .await;
         }
 
         // Strip internal "[Called tool ...]" text that can leak when legacy
@@ -942,10 +950,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 };
                 redacted_args.push(safe);
             }
-            let mut sess = self.session.lock().await;
-            if let Some(thread) = sess.threads.get_mut(&self.thread_id)
-                && let Some(turn) = thread.last_turn_mut()
-            {
+            self.with_last_turn(|turn| {
                 // Set turn-level narrative.
                 if turn.narrative.is_none() {
                     turn.narrative = narrative;
@@ -973,7 +978,8 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         Some(tc.id.clone()),
                     );
                 }
-            }
+            })
+            .await;
         }
 
         // === Phase 1: Preflight (sequential) ===
@@ -1253,14 +1259,10 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         &tc.id,
                         &error_msg,
                     );
-                    {
-                        let mut sess = self.session.lock().await;
-                        if let Some(thread) = sess.threads.get_mut(&self.thread_id)
-                            && let Some(turn) = thread.last_turn_mut()
-                        {
-                            turn.record_tool_error_for(&tc.id, result_content.clone());
-                        }
-                    }
+                    self.with_last_turn(|turn| {
+                        turn.record_tool_error_for(&tc.id, result_content.clone());
+                    })
+                    .await;
                     reason_ctx.messages.push(tool_message);
                 }
                 PreflightOutcome::Runnable => {
@@ -1389,21 +1391,14 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                         };
 
                     // Record sanitized result in thread (identity-based matching).
-                    {
-                        let mut sess = self.session.lock().await;
-                        if let Some(thread) = sess.threads.get_mut(&self.thread_id)
-                            && let Some(turn) = thread.last_turn_mut()
-                        {
-                            if is_tool_error {
-                                turn.record_tool_error_for(&tc.id, record_content.clone());
-                            } else {
-                                turn.record_tool_result_for(
-                                    &tc.id,
-                                    serde_json::json!(record_content),
-                                );
-                            }
+                    self.with_last_turn(|turn| {
+                        if is_tool_error {
+                            turn.record_tool_error_for(&tc.id, record_content.clone());
+                        } else {
+                            turn.record_tool_result_for(&tc.id, serde_json::json!(record_content));
                         }
-                    }
+                    })
+                    .await;
 
                     reason_ctx.messages.push(tool_message);
                 }
