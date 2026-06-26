@@ -283,7 +283,7 @@ does **not** meet the multi-turn requirement it was built for.
       it on the assistant **and** tool_calls rows. `ConversationMessage`
       (`crates/ironclaw_reborn_traces/src/conversation_message.rs`) gained `reasoning`;
       `reasoning TEXT` column added on **both** backends — PG `V31`
-      (`migrations/V31__conversation_messages_reasoning.sql` + `checksums.lock`), libSQL
+      (`migrations/V32__conversation_messages_reasoning.sql` + `checksums.lock`), libSQL
       base SCHEMA + incremental `v26` + idempotent marker. Threaded a new sibling trait
       method `add_conversation_message_with_reasoning` through `ConversationStore`
       (`src/db/mod.rs`), `Store` (`src/history/store.rs`), `postgres.rs`,

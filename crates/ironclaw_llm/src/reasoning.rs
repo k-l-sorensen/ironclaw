@@ -1132,6 +1132,7 @@ Respond with a JSON plan in this format:
              - Do not narrate routine, low-risk tool calls; just call the tool\n\
              - Narrate only when it helps: multi-step work, sensitive actions, or when the user asks\n\
              - For multi-step tasks, call independent tools in parallel when possible\n\
+             - Pass object and array parameters as structured values, not JSON-encoded strings\n\
              - If a tool fails, explain the error briefly and try an alternative approach"
                 .to_string()
         };
@@ -3476,6 +3477,10 @@ That's my plan."#;
         assert!(
             prompt.contains("Call tools when they would help"),
             "Prompt with tools should contain tool-calling guidance"
+        );
+        assert!(
+            prompt.contains("structured values, not JSON-encoded strings"),
+            "Prompt should tell models not to stringify nested object/list parameters"
         );
     }
 
