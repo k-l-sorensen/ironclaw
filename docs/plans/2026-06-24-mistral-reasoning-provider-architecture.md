@@ -587,3 +587,168 @@ green on the degraded path. CTR-1 must add a **request-body assertion** (mock se
 trace capture) that the turn-2 request actually contains a `thinking` chunk for the
 prior assistant message — "no 400" is not evidence of replay. This is **CTR-C5** in the
 verification matrix above.
+
+## SIG-1 — ThinkChunk `signature` replay (found 2026-06-27)
+
+**Status:** Architecture assessed · **impl deferred to a separate plan** (do not
+implement from this section alone). **Date:** 2026-06-27. **Scope:** the custom
+Mistral provider's reasoning capture/replay + the same CTR-1 persistence path it
+rides. Reborn parity is a check, not a rebuild (the precedent already exists there).
+
+### The finding
+
+Mistral's API returns a `signature` string on every `ThinkChunk` (reasoning block).
+Mistral's own Python SDK documents it verbatim — *"Signature to replay some
+reasoning blocks across turns"* — and types it `OptionalNullable[str]` (optional +
+nullable). It is the analogue of Anthropic's thinking `signature` and Gemini's
+`thought_signature`: an **opaque server-side continuity token** the provider
+expects echoed back so it can verify/trust a replayed reasoning block.
+
+The custom provider **drops it on both sides**:
+
+| Side | Site | Behavior |
+|---|---|---|
+| Capture | `crates/ironclaw_llm/src/mistral.rs` `MistralContentChunk::Thinking { thinking: Vec<MistralTextChunk> }` | No `signature` field and no `deny_unknown_fields` → the incoming `signature` is **silently discarded** on deserialize. `extract_content` flattens only the thinking text into `reasoning: Option<String>` and never sees it. |
+| Replay | `mistral.rs` `chat_message_to_wire` | Reconstructs a thinking chunk from the flat reasoning string with **no signature** — the "rebuild the message from the answer text" anti-pattern Mistral warns against, at the chunk level. |
+
+This **completes CTR-1's stated goal.** CTR-1 set out to replay the *full*
+ThinkChunk across turns; the signature is the missing piece of "full." The current
+code replays a signature-less, text-flattened approximation.
+
+**Empirical caveat (shapes the recommendation).** The live multi-turn test passes
+today — Mistral currently accepts signature-less replay (no HTTP 400). So this is a
+**fidelity / forward-insurance** gap, not a live defect. The docstring's word
+*"some"* implies selective future enforcement, and the CTR-1 "verification gap to
+close" above means we have **no positive evidence** that signature-less replay
+preserves reasoning quality (the multi-turn test uses no tools and only checks
+"non-empty + no 400").
+
+### Target architecture (C4 L3 — components)
+
+Carry the signature as a **typed sibling `reasoning_signature: Option<String>`**
+(NOT folded into the `reasoning` string), threaded through the same channel CTR-1
+established. SIG-1 adds **no new component** — it mirrors the `reasoning` field one
+layer at a time.
+
+```
+[ Mistral wire ]  content[i] = ThinkChunk{ thinking:[…], signature:"…" }   (NEW: capture signature)
+        │  mistral.rs extract_content → (content, reasoning, reasoning_signature)
+        ▼
+[ CompletionResponse / ToolCompletionResponse ]  + reasoning_signature      (NEW sibling of .reasoning)
+        │  redacted: reasoning only — signature is leak-scan-EXEMPT (SIG-D2)
+        ▼
+[ ChatMessage ]  + reasoning_signature   .with_reasoning_signature(…)       (NEW sibling channel)
+        ▼
+[ Turn ]  + reasoning_signature + tool_call_reasoning_signature             (first-class turn data, CTR-1 mirror)
+        │  persist (flat, length-capped) on the assistant / tool_calls row
+        ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  Dual-backend persistence  (NEW column, both backends)            │
+│   conversation_messages.reasoning_signature TEXT (PG V3x · libSQL) │
+│   ConversationMessage.reasoning_signature: Option<String>          │
+└───────────────────────────────────────────────────────────────────┘
+        │  hydrate
+        ▼
+[ SINGLE context-build gateway ]  .with_reasoning_signature(…) at the CTR-1 sites
+        ▼
+[ provider serialize ]  mistral.rs chat_message_to_wire re-emits signature on the rebuilt ThinkChunk
+  Non-Mistral providers: field stays None, inert (rig path replays via the reasoning string)
+```
+
+#### Components touched
+
+| Layer | File (repo-relative) | Change (described, not coded) |
+|---|---|---|
+| Wire deserialize | `crates/ironclaw_llm/src/mistral.rs` (`MistralContentChunk::Thinking`) | Add `#[serde(default, skip_serializing_if = "Option::is_none")] signature: Option<String>`; stay lenient (no `deny_unknown_fields`). Signature is on the **ThinkChunk**, not the inner `MistralTextChunk`. |
+| Wire parse | `mistral.rs` (`extract_content`) | Return the signature as a third value (answer, reasoning, reasoning_signature); first-non-null on multi-chunk (SIG-D4). |
+| Wire serialize / replay | `mistral.rs` (`chat_message_to_wire`) | Emit the captured signature on the rebuilt `Thinking` chunk. |
+| v1 channel | `crates/ironclaw_llm/src/provider.rs` | Add `reasoning_signature` to `ChatMessage`, `CompletionResponse`, `ToolCompletionResponse`; add a `with_reasoning_signature` setter. |
+| Provider construction sites | `crates/ironclaw_llm/src/rig_adapter.rs`, `nearai_chat.rs`, `bedrock.rs`, testing stubs, … | Compile-driven `reasoning_signature: None`. **Mistral-only; inert elsewhere** — the rig path replays via the reasoning string, and Gemini already smuggles its token inside that string. |
+| Turn + persist snapshot | `src/agent/session.rs` (`Turn`, `TurnPersistSnapshot`), `src/agent/dispatcher.rs`, `src/agent/thread_ops.rs` | Add `reasoning_signature` + `tool_call_reasoning_signature`, **named** (not positional) snapshot slots; set from the same source/guard as `reasoning`; re-attach on hydration at the CTR-1 gateway sites. |
+| ConversationMessage | `crates/ironclaw_reborn_traces/src/conversation_message.rs` | Add `reasoning_signature: Option<String>`. |
+| Store / DB trait + both backends | `src/db/mod.rs`, `src/history/store.rs`, `src/db/postgres.rs`, `src/db/libsql/conversations.rs` | Thread the column through write + read on **both** PostgreSQL and libSQL. |
+| Schema (dual-backend) | `migrations/V3x__conversation_messages_reasoning_signature.sql` + `src/db/libsql_migrations.rs` (base schema + incremental + `IDEMPOTENT_ADD_COLUMN_MIGRATIONS` marker) | `ADD COLUMN reasoning_signature TEXT;` — follow the CTR-1 `V32` / libSQL `v26` precedent; verify the next free PG version vs `origin/staging`. |
+| Reborn parity | `crates/ironclaw_reborn/src/model_gateway.rs`, `ironclaw_turns`, `ironclaw_threads` | **Check, not rebuild** — the typed `signature: Option<String>` field already exists on the Reborn tool-call records; verify the Mistral message-level signature lands there too. |
+
+### Reused — do NOT rebuild
+
+- **The CTR-1 plumbing** — field-threading path, named `TurnPersistSnapshot`,
+  dual-slot dispatcher handling (`reasoning` vs `tool_call_reasoning`), and the
+  dual-backend column-add pattern. `reasoning_signature` is a **mechanical mirror**
+  of `reasoning`, not net-new architecture.
+- **The Reborn `signature` precedent** — `ProviderToolCall` /
+  `ProviderToolCallReplay` / `ProviderToolCallReference`
+  (`crates/ironclaw_turns/src/run_profile/host.rs`) and
+  `ProviderToolCallReferenceEnvelope`
+  (`crates/ironclaw_threads/src/tool_result_reference.rs`) already carry
+  `signature: Option<String>` ("Opaque provider thought-signature metadata, not an
+  IronClaw auth signature", validated 4096-char cap). Adopt its exact shape and
+  length-only validation style.
+
+### Key architectural decisions
+
+- **SIG-D1 — Name it `reasoning_signature`, not `signature`.** Avoids collision
+  with the existing per-tool-call `ToolCall.signature` (set to `None` in
+  `mistral.rs`; Reborn `host.rs`). Reads as "signature of the reasoning block,"
+  parallel to how `reasoning` is the reasoning text.
+- **SIG-D2 — Sibling `Option<String>`, leak-scan-EXEMPT, length-capped (4096).**
+  The signature is an opaque token, not model prose. Routing it through
+  `redact_reasoning` / `LeakDetector::redact_all` could match-and-replace bytes
+  inside it → silent corruption → turn-2 400 or an ignored block. This is the
+  **decisive** reason it must be a separate field, **never concatenated into the
+  `reasoning` string**. Validate length only (reuse the
+  `validate_optional_provider_text(..., 4096)` style the Reborn precedent uses).
+- **SIG-D3 — Stay lenient serde; do NOT add `deny_unknown_fields`.** Add as
+  `#[serde(default)] Option<String>` so old/new Mistral payloads and any future
+  ThinkChunk fields keep deserializing. The existing loud-failure is on an unknown
+  chunk `type`, not on unknown fields *within* a chunk — keep it that way.
+- **SIG-D4 — One signature per message (accepted flatten boundary).** The channel
+  is flat `Option<String>` by CTR-1 design (CTR-D3); a single slot carries one
+  signature. Non-streaming Mistral chat returns one thinking block per message
+  (multi-chunk is the streaming-delta shape this provider does not use — "no
+  streaming support"), so take the **first non-null** signature deterministically
+  and document the single-block assumption in `extract_content`. A truly lossless
+  `Vec<{ text, signature }>` shape would require re-architecting the flat channel
+  end-to-end — **out of scope**.
+- **SIG-D5 — Increment analysis: full is the only non-asymmetric design.**
+  - *Capture-only* (parse + persist, no replay) is ≈95% of the cost for a
+    stored-but-never-read column → **dead data; rejected.**
+  - *Within-turn replay only* (carry on `ChatMessage`/`CompletionResponse`, stop
+    before `Turn`/DB) → a **live-vs-hydrated divergence** (an in-memory thread
+    replays the signature; the same thread reloaded from DB does not) → the
+    `architecture.md` "one divergent path is where the bug lives" smell →
+    **rejected.**
+  - **Full lossless** (capture + cross-turn replay + dual-backend persistence) is
+    the recommended target — the only increment with no asymmetry.
+
+### Pre-impl verification gate (SIG-G0)
+
+Because signature-less replay works today and the benefit is **unproven**, the
+architecture recommends a **verify-first spike before committing the full
+plumbing**: a controlled live A/B (multi-turn reasoning task, turn-2 request WITH
+the replayed signature vs WITHOUT) measuring whether Mistral's behavior/quality
+actually changes. If it measurably matters → build the full design. If not → the
+design stays documented as forward-insurance, and the cheap lenient-serde capture
+(SIG-D3) can be taken opportunistically. **This gate is the entry point for the
+separate impl plan.**
+
+### Verification matrix (SIG-C1…) — for the future impl pass
+
+Offline-first, mirroring the CTR-1 matrix; live = smoke.
+
+| # | Driver | Assert |
+|---|---|---|
+| SIG-C1 | response parser | array fixture with a `signature` on the thinking chunk → `reasoning_signature` captured (not dropped). |
+| SIG-C2 | request body (mock / trace capture) | `chat_message_to_wire` emits the captured signature on the rebuilt thinking chunk — a request-body assertion, **not** "no 400". |
+| SIG-C3 | dual-backend round-trip (`--features integration`) | persist a turn with a signature → reload → `reasoning_signature` intact on **PostgreSQL and libSQL**. |
+| SIG-C4 | hydration | `rebuild_chat_messages_from_db` re-attaches the signature after DB load. |
+| SIG-C5 | leak-scan exemption (SIG-D2) | a signature containing redactor-trigger bytes is persisted/replayed **unmodified**. |
+| SIG-C6 | lenient serde (SIG-D3) | a thinking chunk carrying an extra unknown field still deserializes. |
+
+### Out of scope (SIG-1)
+
+- `Vec<{ text, signature }>` lossless channel re-architecture (SIG-D4).
+- rig-adapter forwarding for non-Mistral providers — the signature is Mistral-only
+  and inert elsewhere; the only cost there is mechanical `None` initializers.
+- **Engine v2** — already permanently out of scope in this doc.
+- The actual code/impl plan and any code/migration/test — a **separate** document.
