@@ -627,6 +627,26 @@ impl LiveTestHarnessBuilder {
         // leaking secrets into the test database.
         hydrate_llm_secrets_into_env().await;
 
+        // Avoid OS-keychain dialogs during config resolution. The rig runs
+        // against an isolated temp DB, so unless the test seeds real (already
+        // encrypted) secret rows via `with_secrets(...)`, it has no need of the
+        // user's real master key. When no key is provided, inject an ephemeral
+        // one so `SecretsConfig::resolve()` takes the env branch instead of
+        // probing/persisting the OS keychain (which prompts every run for the
+        // unsigned test binary). `with_secrets(...)` rows are encrypted with the
+        // real key, so that path is left to resolve the real key as before.
+        if self.seeded_secret_names.is_empty()
+            && std::env::var("SECRETS_MASTER_KEY")
+                .ok()
+                .filter(|v| !v.is_empty())
+                .is_none()
+        {
+            ironclaw::config::set_runtime_env(
+                "SECRETS_MASTER_KEY",
+                &ironclaw::secrets::keychain::generate_master_key_hex(),
+            );
+        }
+
         // Resolve full config (reads LLM_BACKEND, ENGINE_V2, ALLOW_LOCAL_TOOLS, etc.)
         // This mirrors the exact config the real `ironclaw` binary would use.
         let mut config = ironclaw::config::Config::from_env().await.expect(
@@ -1075,12 +1095,26 @@ async fn hydrate_llm_secrets_into_env() {
         ("llm_mistral_api_key", "MISTRAL_API_KEY"),
     ];
 
-    // If all target env vars are already set, skip the DB work entirely.
-    if SECRET_TO_ENV
-        .iter()
-        .all(|(_, env)| std::env::var(env).ok().filter(|v| !v.is_empty()).is_some())
-    {
-        return;
+    // Only the selected `LLM_BACKEND` matters for a given run, so only that
+    // backend's key needs to come from the secrets store. Resolve the env var
+    // the active backend reads (None = a backend with no managed key here, e.g.
+    // ollama). Skip the keychain + DB hydration entirely when the active key is
+    // already in the environment (the caller passed it) or unneeded — touching
+    // the OS keychain here is what pops the macOS password dialog on every run,
+    // since the freshly-built test binary is never in the keychain ACL.
+    let active_env = match std::env::var("LLM_BACKEND").unwrap_or_default().as_str() {
+        "nearai" => Some("NEARAI_API_KEY"),
+        "anthropic" => Some("ANTHROPIC_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "mistral" => Some("MISTRAL_API_KEY"),
+        _ => None,
+    };
+    match active_env {
+        None => return,
+        Some(env) if std::env::var(env).ok().filter(|v| !v.is_empty()).is_some() => {
+            return;
+        }
+        _ => {}
     }
 
     let master_key = match resolve_master_key().await {
