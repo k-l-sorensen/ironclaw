@@ -452,6 +452,10 @@ pub enum RespondResult {
         /// turn would have nowhere to carry the trace (CTR-D5). Already
         /// leak-scanned at the shared `respond_with_tools` stage.
         reasoning: Option<String>,
+        /// Opaque reasoning-block signature (Mistral ThinkChunk `signature`).
+        /// Sibling of `reasoning`, persisted and replayed on the next request.
+        /// Not leak-scanned — an opaque token that must survive byte-for-byte.
+        reasoning_signature: Option<String>,
     },
     /// The model wants to call tools. Caller should execute them and call back.
     /// Includes the optional content from the assistant message (some models
@@ -465,6 +469,9 @@ pub enum RespondResult {
         /// the next turn — otherwise the provider rejects the follow-up
         /// request with HTTP 400. See #3201, #3225.
         reasoning: Option<String>,
+        /// Opaque reasoning-block signature (Mistral ThinkChunk `signature`).
+        /// Sibling of `reasoning`; not leak-scanned — an opaque token.
+        reasoning_signature: Option<String>,
     },
 }
 
@@ -866,6 +873,8 @@ Respond in JSON format:
                     clean_response(&pre_truncated)
                 });
                 let provider_reasoning = response.reasoning;
+                // Opaque reasoning-block signature — carried unredacted (SIG-D2).
+                let provider_reasoning_signature = response.reasoning_signature;
                 // Populate per-tool reasoning from the shared narrative when the
                 // provider did not supply per-tool rationale.
                 let tool_calls: Vec<ToolCall> = response
@@ -893,6 +902,7 @@ Respond in JSON format:
                         tool_calls,
                         content: narrative,
                         reasoning: provider_reasoning,
+                        reasoning_signature: provider_reasoning_signature,
                     },
                     usage,
                     finish_reason: response.finish_reason,
@@ -924,6 +934,7 @@ Respond in JSON format:
                         // reasoning artifacts — those would have been on the
                         // structured tool_calls path instead.
                         reasoning: response.reasoning,
+                        reasoning_signature: response.reasoning_signature,
                     },
                     usage,
                     finish_reason: response.finish_reason,
@@ -964,6 +975,7 @@ Respond in JSON format:
                 result: RespondResult::Text {
                     text: final_text,
                     reasoning: response.reasoning,
+                    reasoning_signature: response.reasoning_signature,
                 },
                 usage,
                 finish_reason: response.finish_reason,
@@ -1007,6 +1019,7 @@ Respond in JSON format:
                 result: RespondResult::Text {
                     text: final_text,
                     reasoning: response.reasoning,
+                    reasoning_signature: response.reasoning_signature,
                 },
                 usage: TokenUsage {
                     input_tokens: response.input_tokens,
@@ -4015,6 +4028,69 @@ That's my plan."#;
         }
     }
 
+    /// SIG-C5: the opaque reasoning signature is leak-scan EXEMPT (SIG-D2) — a
+    /// signature whose bytes would trip the redactor must pass through
+    /// `respond_with_tools` unmodified, while the reasoning trace is still
+    /// redacted. Drives the public caller, not the helper.
+    #[tokio::test]
+    async fn reasoning_signature_is_not_leak_scanned() {
+        use crate::testing::StubLlm;
+
+        // A signature value that embeds a JWT-shaped token the leak detector
+        // would redact. If it were routed through redact_all it would be
+        // corrupted; SIG-D2 forbids that — the signature must survive verbatim.
+        let signature = "sig_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9_supersecretvalue";
+        // A distinct planted secret in the reasoning trace to confirm the trace
+        // itself IS still redacted.
+        let trace_secret = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9_anothersecret";
+        let tool_call = ToolCall {
+            id: "call_1".to_string(),
+            name: "tool_list".to_string(),
+            arguments: serde_json::json!({}),
+            reasoning: None,
+            signature: None,
+            arguments_parse_error: None,
+        };
+        let llm = Arc::new(
+            StubLlm::new("done")
+                .with_tool_call(tool_call)
+                .with_response_reasoning(format!("I will use Bearer {trace_secret}"))
+                .with_response_reasoning_signature(signature),
+        );
+        let reasoning = Reasoning::new(llm);
+
+        let context = ReasoningContext::new()
+            .with_message(ChatMessage::user("list tools"))
+            .with_tools(vec![ToolDefinition {
+                name: "tool_list".to_string(),
+                description: "Lists tools".to_string(),
+                parameters: serde_json::json!({}),
+            }]);
+
+        let output = reasoning.respond_with_tools(&context).await.unwrap();
+        match output.result {
+            RespondResult::ToolCalls {
+                reasoning,
+                reasoning_signature,
+                ..
+            } => {
+                // Reasoning text is redacted...
+                let reasoning = reasoning.expect("provider reasoning should be present");
+                assert!(
+                    reasoning.contains("[REDACTED]"),
+                    "reasoning trace must be redacted: {reasoning}"
+                );
+                // ...but the opaque signature survives byte-for-byte.
+                assert_eq!(
+                    reasoning_signature.as_deref(),
+                    Some(signature),
+                    "reasoning signature must pass through unmodified (SIG-D2)"
+                );
+            }
+            RespondResult::Text { text: t, .. } => panic!("expected tool calls, got text: {t}"),
+        }
+    }
+
     #[tokio::test]
     async fn test_respond_with_tools_flags_empty_tool_completion_when_content_is_none() {
         use crate::{FinishReason, LlmProvider, ToolCompletionRequest, ToolCompletionResponse};
@@ -4053,6 +4129,7 @@ That's my plan."#;
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     reasoning: None,
+                    reasoning_signature: None,
                 })
             }
         }
@@ -4205,6 +4282,7 @@ That's my plan."#;
                 tool_calls,
                 content,
                 reasoning: _,
+                reasoning_signature: _,
             } => {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].name, "tool_list");
@@ -4239,6 +4317,7 @@ That's my plan."#;
                 tool_calls,
                 content,
                 reasoning: _,
+                reasoning_signature: _,
             } => {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].name, "tool_list");
@@ -4409,6 +4488,7 @@ That's my plan."#;
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
     }

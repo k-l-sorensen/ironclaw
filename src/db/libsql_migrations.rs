@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS conversation_messages (
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    reasoning TEXT
+    reasoning TEXT,
+    reasoning_signature TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_conversation_messages_conversation
@@ -1020,6 +1021,18 @@ WHERE key = 'wasm.default_fuel_limit'
 ALTER TABLE conversation_messages ADD COLUMN reasoning TEXT;
 "#,
     ),
+    (
+        27,
+        "conversation_messages_reasoning_signature",
+        // Persist the opaque reasoning-block signature (Mistral ThinkChunk
+        // `signature`) alongside the reasoning trace so the full ThinkChunk is
+        // replayed on the next user turn. Marked idempotent (see
+        // IDEMPOTENT_ADD_COLUMN_MIGRATIONS) because SQLite lacks
+        // ADD COLUMN IF NOT EXISTS. See SIG-1.
+        r#"
+ALTER TABLE conversation_messages ADD COLUMN reasoning_signature TEXT;
+"#,
+    ),
 ];
 
 /// Migrations whose ADD COLUMN should be skipped when the column already
@@ -1031,6 +1044,7 @@ const IDEMPOTENT_ADD_COLUMN_MIGRATIONS: &[(i64, &str, &str)] = &[
     (18, "dynamic_tools", "scope"),
     (22, "agent_jobs", "restart_params"),
     (26, "conversation_messages", "reasoning"),
+    (27, "conversation_messages", "reasoning_signature"),
 ];
 
 /// Check whether `table` already contains `column` via `pragma_table_info`.

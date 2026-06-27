@@ -223,6 +223,7 @@ async fn llm_complete(
         output_tokens: resp.output_tokens,
         finish_reason: format_finish_reason(resp.finish_reason),
         reasoning: resp.reasoning,
+        reasoning_signature: resp.reasoning_signature,
         cache_read_input_tokens: resp.cache_read_input_tokens,
         cache_creation_input_tokens: resp.cache_creation_input_tokens,
     }))
@@ -258,6 +259,7 @@ async fn llm_complete_with_tools(
         cache_read_input_tokens: resp.cache_read_input_tokens,
         cache_creation_input_tokens: resp.cache_creation_input_tokens,
         reasoning: resp.reasoning,
+        reasoning_signature: resp.reasoning_signature,
     }))
 }
 

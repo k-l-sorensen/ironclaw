@@ -74,6 +74,7 @@ impl LlmProvider for MockLlmProvider {
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -107,6 +108,7 @@ impl LlmProvider for MockLlmProvider {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         } else {
             Ok(ToolCompletionResponse {
@@ -118,6 +120,7 @@ impl LlmProvider for MockLlmProvider {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
     }
@@ -157,6 +160,7 @@ impl LlmProvider for FixedModelProvider {
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -175,6 +179,7 @@ impl LlmProvider for FixedModelProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: None,
+            reasoning_signature: None,
         })
     }
 

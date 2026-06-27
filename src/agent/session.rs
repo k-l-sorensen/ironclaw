@@ -407,6 +407,8 @@ impl Thread {
                 narrative: t.narrative.clone(),
                 reasoning: t.reasoning.clone(),
                 tool_call_reasoning: t.tool_call_reasoning.clone(),
+                reasoning_signature: t.reasoning_signature.clone(),
+                tool_call_reasoning_signature: t.tool_call_reasoning_signature.clone(),
             })
             .unwrap_or_default()
     }
@@ -581,7 +583,8 @@ impl Thread {
                 // (CTR-1 / F3).
                 messages.push(
                     ChatMessage::assistant_with_tool_calls(None, tool_calls)
-                        .with_reasoning(turn.tool_call_reasoning.clone()),
+                        .with_reasoning(turn.tool_call_reasoning.clone())
+                        .with_reasoning_signature(turn.tool_call_reasoning_signature.clone()),
                 );
 
                 // Individual tool result messages, truncated to limit context size.
@@ -607,9 +610,13 @@ impl Thread {
                 }
             }
             if let Some(ref response) = turn.response {
-                // Re-attach the turn's reasoning trace (CTR-1) — see above.
-                messages
-                    .push(ChatMessage::assistant(response).with_reasoning(turn.reasoning.clone()));
+                // Re-attach the turn's reasoning trace (CTR-1) + opaque signature
+                // (SIG-1) — see above.
+                messages.push(
+                    ChatMessage::assistant(response)
+                        .with_reasoning(turn.reasoning.clone())
+                        .with_reasoning_signature(turn.reasoning_signature.clone()),
+                );
             }
         }
         messages
@@ -777,6 +784,17 @@ pub struct Turn {
     /// having one slot last-write-wins and cross-stamp both messages (CTR-1 / F3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_reasoning: Option<String>,
+    /// Opaque reasoning-block signature (Mistral ThinkChunk `signature`) for the
+    /// final text answer's reasoning. Sibling of `reasoning`, replayed verbatim
+    /// so the provider can verify the replayed block. Never leak-scanned — an
+    /// opaque token.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
+    /// Opaque reasoning-block signature for the tool-call round's reasoning
+    /// (sibling of `tool_call_reasoning`). Distinct slot so each assistant
+    /// message replays its own signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_reasoning_signature: Option<String>,
     /// Transient image content parts for multimodal LLM input.
     /// Not serialized — images are only needed for the current LLM call.
     /// The text description in `user_input` persists for compaction/context.
@@ -798,6 +816,10 @@ pub(crate) struct TurnPersistSnapshot {
     pub(crate) reasoning: Option<String>,
     /// Tool-call round's reasoning trace.
     pub(crate) tool_call_reasoning: Option<String>,
+    /// Final assistant answer's opaque reasoning-block signature.
+    pub(crate) reasoning_signature: Option<String>,
+    /// Tool-call round's opaque reasoning-block signature.
+    pub(crate) tool_call_reasoning_signature: Option<String>,
 }
 
 impl Turn {
@@ -816,6 +838,8 @@ impl Turn {
             narrative: None,
             reasoning: None,
             tool_call_reasoning: None,
+            reasoning_signature: None,
+            tool_call_reasoning_signature: None,
             image_content_parts: Vec::new(),
         }
     }
@@ -2002,6 +2026,8 @@ mod tests {
         let mut thread = Thread::new(Uuid::new_v4(), None);
         let mut turn = Turn::new(0, "What is 17 * 23?");
         turn.reasoning = Some("17 * 23 = 391".to_string());
+        // SIG-1: the opaque reasoning signature rides alongside the trace.
+        turn.reasoning_signature = Some("opaque-sig-xyz".to_string());
         turn.conclude(TurnOutcome::Completed("391".to_string()));
         thread.turns.push(turn);
 
@@ -2011,6 +2037,11 @@ mod tests {
         assert_eq!(messages[1].role, ironclaw_llm::Role::Assistant);
         assert_eq!(messages[1].content, "391");
         assert_eq!(messages[1].reasoning.as_deref(), Some("17 * 23 = 391"));
+        // SIG-1: the signature is re-attached for replay on the next turn.
+        assert_eq!(
+            messages[1].reasoning_signature.as_deref(),
+            Some("opaque-sig-xyz")
+        );
     }
 
     /// CTR-C2 / F3: a tool-bearing turn replays the tool-call round's own

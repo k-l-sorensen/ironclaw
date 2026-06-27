@@ -1099,6 +1099,7 @@ fn engine_history_entry_to_message(
         content,
         created_at: timestamp,
         reasoning: None,
+        reasoning_signature: None,
     })
 }
 

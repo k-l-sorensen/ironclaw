@@ -143,6 +143,7 @@ impl LlmProvider for BedrockProvider {
             finish_reason: map_stop_reason(response.stop_reason()),
             cache_creation_input_tokens: 0,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
         })
     }
@@ -209,6 +210,7 @@ impl LlmProvider for BedrockProvider {
             finish_reason: map_stop_reason(response.stop_reason()),
             cache_creation_input_tokens: 0,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
         })
     }
@@ -1099,6 +1101,7 @@ mod tests {
                 tool_calls: None,
                 content_parts: Vec::new(),
                 reasoning: None,
+                reasoning_signature: None,
             },
         ];
 

@@ -724,6 +724,7 @@ impl LlmProvider for TraceLlm {
                         output_tokens,
                         finish_reason: FinishReason::Stop,
                         reasoning: None,
+                        reasoning_signature: None,
                         cache_read_input_tokens: 0,
                         cache_creation_input_tokens: 0,
                     });
@@ -764,6 +765,7 @@ impl LlmProvider for TraceLlm {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             }),
             TraceResponse::ToolCalls {
                 tool_calls,
@@ -790,6 +792,7 @@ impl LlmProvider for TraceLlm {
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     reasoning: None,
+                    reasoning_signature: None,
                 })
             }
             TraceResponse::UserInput { .. } => Err(LlmError::RequestFailed {

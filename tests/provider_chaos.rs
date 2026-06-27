@@ -89,6 +89,7 @@ impl LlmProvider for FlakeyProvider {
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -121,6 +122,7 @@ impl LlmProvider for FlakeyProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: None,
+            reasoning_signature: None,
         })
     }
 }
@@ -199,6 +201,7 @@ impl LlmProvider for GarbageProvider {
             output_tokens: 0,
             finish_reason: FinishReason::Unknown,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -218,6 +221,7 @@ impl LlmProvider for GarbageProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: None,
+            reasoning_signature: None,
         })
     }
 }
@@ -261,6 +265,7 @@ impl LlmProvider for ReliableProvider {
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -280,6 +285,7 @@ impl LlmProvider for ReliableProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: None,
+            reasoning_signature: None,
         })
     }
 }

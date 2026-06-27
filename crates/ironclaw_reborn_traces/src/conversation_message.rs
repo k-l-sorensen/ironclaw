@@ -15,4 +15,10 @@ pub struct ConversationMessage {
     /// the next user turn (CTR-1). `None` for user messages and for rows
     /// written before the `reasoning` column existed.
     pub reasoning: Option<String>,
+    /// Opaque reasoning-block signature (Mistral ThinkChunk `signature`) for an
+    /// assistant/tool_calls message. Persisted and replayed verbatim so the
+    /// provider can verify the replayed block; not leak-scanned, since it is an
+    /// opaque token. `None` for user messages and rows written before the
+    /// `reasoning_signature` column existed.
+    pub reasoning_signature: Option<String>,
 }

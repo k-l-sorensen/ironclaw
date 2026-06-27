@@ -273,6 +273,7 @@ impl LlmProvider for OpenAiCodexProvider {
             output_tokens: parsed.output_tokens,
             finish_reason: parsed.finish_reason,
             reasoning: parsed.reasoning,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -342,6 +343,7 @@ impl LlmProvider for OpenAiCodexProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: parsed.reasoning,
+            reasoning_signature: None,
         })
     }
 

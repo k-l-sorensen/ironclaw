@@ -838,6 +838,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         text: &str,
         _metadata: ironclaw_llm::ResponseMetadata,
         reasoning: Option<String>,
+        reasoning_signature: Option<String>,
         _reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
         // Record the (already leak-scanned) reasoning trace on the turn so it
@@ -845,10 +846,12 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         // Mistral requires the prior ThinkChunk, and DeepSeek/Gemini reject the
         // follow-up without the echo (CTR-1, #3201/#3225). Only overwrite with a
         // non-empty trace so a final answer without reasoning doesn't clobber an
-        // earlier tool-round trace.
+        // earlier tool-round trace. The opaque reasoning signature (SIG-1) rides
+        // along on the same slot, unredacted (SIG-D2).
         if reasoning.is_some() {
             self.with_last_turn(|turn| {
                 turn.reasoning = reasoning;
+                turn.reasoning_signature = reasoning_signature;
             })
             .await;
         }
@@ -866,6 +869,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         content: Option<String>,
         reason_ctx: &mut ReasoningContext,
         reasoning: Option<String>,
+        reasoning_signature: Option<String>,
     ) -> Result<Option<LoopOutcome>, Error> {
         // Extract and sanitize the narrative before consuming `content`.
         let narrative = content
@@ -880,17 +884,20 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             })
             .filter(|c| !c.trim().is_empty());
 
-        // Capture the reasoning trace for cross-turn persistence before it is
-        // moved into the within-turn context below (CTR-1).
+        // Capture the reasoning trace + signature for cross-turn persistence
+        // before they are moved into the within-turn context below (CTR-1/SIG-1).
         let turn_reasoning = reasoning.clone();
+        let turn_reasoning_signature = reasoning_signature.clone();
 
         // Add the assistant message with tool_calls to context.
         // OpenAI protocol requires this before tool-result messages.
         // Carry reasoning so the next request can echo it back — required for
         // DeepSeek thinking-mode and Gemini 2.5+ to validate the chain (#3201, #3225).
+        // The opaque reasoning signature rides along (SIG-1).
         reason_ctx.messages.push(
             ChatMessage::assistant_with_tool_calls(content, tool_calls.clone())
-                .with_reasoning(reasoning),
+                .with_reasoning(reasoning)
+                .with_reasoning_signature(reasoning_signature),
         );
 
         // Execute tools and add results to context
@@ -963,6 +970,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 // clobber an earlier one.
                 if turn_reasoning.is_some() {
                     turn.tool_call_reasoning = turn_reasoning;
+                    turn.tool_call_reasoning_signature = turn_reasoning_signature;
                 }
                 for (tc, safe_args) in tool_calls.iter().zip(redacted_args) {
                     let sanitized_rationale = tc.reasoning.as_ref().map(|r| {
@@ -1961,6 +1969,7 @@ mod tests {
                 output_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 reasoning: None,
+                reasoning_signature: None,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -1979,6 +1988,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
     }
@@ -2005,6 +2015,7 @@ mod tests {
                 output_tokens: 3,
                 finish_reason: FinishReason::Stop,
                 reasoning: None,
+                reasoning_signature: None,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -2023,6 +2034,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
     }
@@ -2049,6 +2061,7 @@ mod tests {
                 output_tokens: 0,
                 finish_reason: FinishReason::Stop,
                 reasoning: None,
+                reasoning_signature: None,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -2068,6 +2081,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     reasoning: None,
+                    reasoning_signature: None,
                 });
             }
 
@@ -2097,6 +2111,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
     }
@@ -3193,6 +3208,7 @@ mod tests {
                 output_tokens: 5,
                 finish_reason: FinishReason::Stop,
                 reasoning: None,
+                reasoning_signature: None,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -3213,6 +3229,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     reasoning: None,
+                    reasoning_signature: None,
                 });
             }
             // Tools available: always call one.
@@ -3232,6 +3249,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
     }
@@ -3515,6 +3533,7 @@ mod tests {
                 output_tokens: 2,
                 finish_reason: FinishReason::Stop,
                 reasoning: None,
+                reasoning_signature: None,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -3534,6 +3553,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     reasoning: None,
+                    reasoning_signature: None,
                 });
             }
             // Always call a tool that does not exist in the registry.
@@ -3553,6 +3573,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
     }
@@ -3582,6 +3603,7 @@ mod tests {
                 output_tokens: 1,
                 finish_reason: FinishReason::Stop,
                 reasoning: None,
+                reasoning_signature: None,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -3605,6 +3627,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
     }

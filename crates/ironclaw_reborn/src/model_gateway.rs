@@ -964,6 +964,7 @@ fn recover_textual_tool_calls_from_tool_response(
         cache_read_input_tokens: response.cache_read_input_tokens,
         cache_creation_input_tokens: response.cache_creation_input_tokens,
         reasoning: response.reasoning,
+        reasoning_signature: response.reasoning_signature,
     })
 }
 

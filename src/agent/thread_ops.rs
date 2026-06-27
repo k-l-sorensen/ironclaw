@@ -46,6 +46,10 @@ pub(super) struct PersistToolCallsInput<'a> {
     /// Already-redacted reasoning trace for this turn, persisted on the
     /// `tool_calls` row so it can be replayed after DB hydration (CTR-1).
     pub reasoning: Option<&'a str>,
+    /// Opaque reasoning-block signature for this turn's tool-call round,
+    /// persisted on the `tool_calls` row and replayed verbatim. Never
+    /// leak-scanned — an opaque token.
+    pub reasoning_signature: Option<&'a str>,
 }
 
 struct ProcessingLiveState<'a> {
@@ -889,6 +893,7 @@ impl Agent {
                     narrative: snapshot.narrative.as_deref(),
                     outcome: Some(trace_turn_outcome_success()),
                     reasoning: snapshot.tool_call_reasoning.as_deref(),
+                    reasoning_signature: snapshot.tool_call_reasoning_signature.as_deref(),
                 })
                 .await;
                 self.persist_assistant_response(
@@ -897,6 +902,7 @@ impl Agent {
                     &message.user_id,
                     &response,
                     snapshot.reasoning.as_deref(),
+                    snapshot.reasoning_signature.as_deref(),
                 )
                 .await;
 
@@ -987,6 +993,7 @@ impl Agent {
                     narrative: snapshot.narrative.as_deref(),
                     outcome: None,
                     reasoning: snapshot.tool_call_reasoning.as_deref(),
+                    reasoning_signature: snapshot.tool_call_reasoning_signature.as_deref(),
                 })
                 .await;
                 self.send_turn_cost_status(&message.channel, &message.metadata, &turn_usage)
@@ -1008,6 +1015,7 @@ impl Agent {
                     narrative: snapshot.narrative.as_deref(),
                     outcome: Some(trace_turn_outcome_failure(&error_message)),
                     reasoning: snapshot.tool_call_reasoning.as_deref(),
+                    reasoning_signature: snapshot.tool_call_reasoning_signature.as_deref(),
                 })
                 .await;
                 drop(sess);
@@ -1034,6 +1042,7 @@ impl Agent {
                     narrative: snapshot.narrative.as_deref(),
                     outcome: Some(trace_turn_outcome_failure(&error_message)),
                     reasoning: snapshot.tool_call_reasoning.as_deref(),
+                    reasoning_signature: snapshot.tool_call_reasoning_signature.as_deref(),
                 })
                 .await;
                 drop(sess);
@@ -1242,6 +1251,7 @@ impl Agent {
         user_id: &str,
         response: &str,
         reasoning: Option<&str>,
+        reasoning_signature: Option<&str>,
     ) {
         let store = match self.store() {
             Some(s) => Arc::clone(s),
@@ -1256,7 +1266,13 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message_with_reasoning(thread_id, "assistant", response, reasoning)
+            .add_conversation_message_with_reasoning(
+                thread_id,
+                "assistant",
+                response,
+                reasoning,
+                reasoning_signature,
+            )
             .await
         {
             tracing::warn!("Failed to persist assistant message: {}", e);
@@ -1490,6 +1506,7 @@ impl Agent {
             narrative,
             outcome,
             reasoning,
+            reasoning_signature,
         } = input;
 
         if tool_calls.is_empty() && outcome.is_none() {
@@ -1559,7 +1576,13 @@ impl Agent {
         }
 
         if let Err(e) = store
-            .add_conversation_message_with_reasoning(thread_id, "tool_calls", &content, reasoning)
+            .add_conversation_message_with_reasoning(
+                thread_id,
+                "tool_calls",
+                &content,
+                reasoning,
+                reasoning_signature,
+            )
             .await
         {
             tracing::warn!("Failed to persist tool calls: {}", e);
@@ -2440,6 +2463,7 @@ impl Agent {
                         narrative: snapshot.narrative.as_deref(),
                         outcome: Some(trace_turn_outcome_success()),
                         reasoning: snapshot.tool_call_reasoning.as_deref(),
+                        reasoning_signature: snapshot.tool_call_reasoning_signature.as_deref(),
                     })
                     .await;
                     self.persist_assistant_response(
@@ -2448,6 +2472,7 @@ impl Agent {
                         &message.user_id,
                         &response,
                         snapshot.reasoning.as_deref(),
+                        snapshot.reasoning_signature.as_deref(),
                     )
                     .await;
                     if !suggestions.is_empty() {
@@ -2525,6 +2550,7 @@ impl Agent {
                         narrative: snapshot.narrative.as_deref(),
                         outcome: None,
                         reasoning: snapshot.tool_call_reasoning.as_deref(),
+                        reasoning_signature: snapshot.tool_call_reasoning_signature.as_deref(),
                     })
                     .await;
                     self.send_turn_cost_status(&message.channel, &message.metadata, &turn_usage)
@@ -2546,6 +2572,7 @@ impl Agent {
                         narrative: snapshot.narrative.as_deref(),
                         outcome: Some(trace_turn_outcome_failure(&error_message)),
                         reasoning: snapshot.tool_call_reasoning.as_deref(),
+                        reasoning_signature: snapshot.tool_call_reasoning_signature.as_deref(),
                     })
                     .await;
                     drop(sess);
@@ -2576,6 +2603,7 @@ impl Agent {
                         narrative: snapshot.narrative.as_deref(),
                         outcome: Some(trace_turn_outcome_failure(&error_message)),
                         reasoning: snapshot.tool_call_reasoning.as_deref(),
+                        reasoning_signature: snapshot.tool_call_reasoning_signature.as_deref(),
                     })
                     .await;
                     drop(sess);
@@ -2608,6 +2636,10 @@ impl Agent {
                         thread.clear_pending_approval();
                         thread.conclude_turn(TurnOutcome::Completed(rejection.clone()));
                         let turn_reasoning = thread.turns.last().and_then(|t| t.reasoning.clone());
+                        let turn_reasoning_signature = thread
+                            .turns
+                            .last()
+                            .and_then(|t| t.reasoning_signature.clone());
                         // User message already persisted at turn start; save rejection response
                         self.persist_assistant_response(
                             thread_id,
@@ -2615,6 +2647,7 @@ impl Agent {
                             &message.user_id,
                             &rejection,
                             turn_reasoning.as_deref(),
+                            turn_reasoning_signature.as_deref(),
                         )
                         .await;
                     }
@@ -2660,6 +2693,10 @@ impl Agent {
                     thread.enter_auth_mode(ext_name.clone());
                     thread.conclude_turn(TurnOutcome::Completed(instructions.clone()));
                     let turn_reasoning = thread.turns.last().and_then(|t| t.reasoning.clone());
+                    let turn_reasoning_signature = thread
+                        .turns
+                        .last()
+                        .and_then(|t| t.reasoning_signature.clone());
                     // User message already persisted at turn start; save auth instructions
                     self.persist_assistant_response(
                         thread_id,
@@ -2667,6 +2704,7 @@ impl Agent {
                         &message.user_id,
                         &instructions,
                         turn_reasoning.as_deref(),
+                        turn_reasoning_signature.as_deref(),
                     )
                     .await;
                 }
@@ -3032,9 +3070,12 @@ fn rebuild_chat_messages_from_db(
         match msg.role.as_str() {
             "user" => result.push(ChatMessage::user(&msg.content)),
             "assistant" => result.push(
-                // Re-attach the persisted reasoning trace so it is replayed into
-                // the LLM on the next user turn after DB hydration (CTR-1).
-                ChatMessage::assistant(&msg.content).with_reasoning(msg.reasoning.clone()),
+                // Re-attach the persisted reasoning trace + opaque signature so
+                // they are replayed into the LLM on the next user turn after DB
+                // hydration (CTR-1 / SIG-1).
+                ChatMessage::assistant(&msg.content)
+                    .with_reasoning(msg.reasoning.clone())
+                    .with_reasoning_signature(msg.reasoning_signature.clone()),
             ),
             "tool_calls" => {
                 // Try to parse the enriched JSON and rebuild tool messages.
@@ -3086,10 +3127,12 @@ fn rebuild_chat_messages_from_db(
                         // The assistant text for tool_calls is always None here;
                         // the final assistant response comes as a separate
                         // "assistant" row after this tool_calls row. Re-attach the
-                        // persisted reasoning trace for cross-turn replay (CTR-1).
+                        // persisted reasoning trace + opaque signature for
+                        // cross-turn replay (CTR-1 / SIG-1).
                         result.push(
                             ChatMessage::assistant_with_tool_calls(None, tool_calls)
-                                .with_reasoning(msg.reasoning.clone()),
+                                .with_reasoning(msg.reasoning.clone())
+                                .with_reasoning_signature(msg.reasoning_signature.clone()),
                         );
 
                         // Emit tool_result messages for each call
@@ -3222,6 +3265,7 @@ mod tests {
                     output_tokens: 0,
                     finish_reason: ironclaw_llm::FinishReason::Stop,
                     reasoning: None,
+                    reasoning_signature: None,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 })
@@ -3240,6 +3284,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     reasoning: None,
+                    reasoning_signature: None,
                 })
             }
         }
@@ -3367,6 +3412,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
 
@@ -3392,6 +3438,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     reasoning: None,
+                    reasoning_signature: None,
                 });
             }
 
@@ -3406,6 +3453,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
     }
@@ -3489,6 +3537,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: None,
+                reasoning_signature: None,
             })
         }
 
@@ -3514,6 +3563,7 @@ mod tests {
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                     reasoning: Some(Self::TOOL_TRACE.to_string()),
+                    reasoning_signature: None,
                 });
             }
 
@@ -3526,6 +3576,7 @@ mod tests {
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
                 reasoning: Some(Self::FINAL_TRACE.to_string()),
+                reasoning_signature: None,
             })
         }
     }
@@ -4596,6 +4647,8 @@ mod tests {
     fn test_rebuild_chat_messages_reattaches_reasoning() {
         let mut assistant = make_db_msg("assistant", "The answer is 42.");
         assistant.reasoning = Some("first multiply, then add".to_string());
+        // SIG-C4: the opaque signature is hydrated from the DB row too.
+        assistant.reasoning_signature = Some("sig-answer".to_string());
         let tool_json = serde_json::json!({
             "calls": [{
                 "name": "shell",
@@ -4605,25 +4658,28 @@ mod tests {
         });
         let mut tool_calls = make_db_msg("tool_calls", &tool_json.to_string());
         tool_calls.reasoning = Some("I should run the check first".to_string());
+        tool_calls.reasoning_signature = Some("sig-tool".to_string());
 
         let messages = vec![make_db_msg("user", "Compute it"), tool_calls, assistant];
         let result = rebuild_chat_messages_from_db(&messages);
 
         // user + assistant_with_tool_calls + tool_result + assistant
         assert_eq!(result.len(), 4);
-        // tool-call assistant message carries its reasoning
+        // tool-call assistant message carries its reasoning + signature
         assert_eq!(result[1].role, ironclaw_llm::Role::Assistant);
         assert_eq!(
             result[1].reasoning.as_deref(),
             Some("I should run the check first")
         );
-        // final assistant message carries its reasoning
+        assert_eq!(result[1].reasoning_signature.as_deref(), Some("sig-tool"));
+        // final assistant message carries its reasoning + signature
         assert_eq!(result[3].role, ironclaw_llm::Role::Assistant);
         assert_eq!(result[3].content, "The answer is 42.");
         assert_eq!(
             result[3].reasoning.as_deref(),
             Some("first multiply, then add")
         );
+        assert_eq!(result[3].reasoning_signature.as_deref(), Some("sig-answer"));
     }
 
     #[test]
@@ -4911,6 +4967,7 @@ mod tests {
             content: content.to_string(),
             created_at: chrono::Utc::now(),
             reasoning: None,
+            reasoning_signature: None,
         }
     }
 

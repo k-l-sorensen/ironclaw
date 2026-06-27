@@ -1301,6 +1301,7 @@ impl<'a> JobDelegate<'a> {
             result: RespondResult::Text {
                 text: String::new(),
                 reasoning: None,
+                reasoning_signature: None,
             },
             usage: ironclaw_llm::TokenUsage::default(),
             finish_reason: ironclaw_llm::FinishReason::Stop,
@@ -1352,6 +1353,7 @@ impl<'a> JobDelegate<'a> {
             result: RespondResult::Text {
                 text: String::new(),
                 reasoning: None,
+                reasoning_signature: None,
             },
             usage: ironclaw_llm::TokenUsage::default(),
             finish_reason: ironclaw_llm::FinishReason::Stop,
@@ -1538,6 +1540,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
                         tool_calls,
                         content: reasoning_text,
                         reasoning: None,
+                        reasoning_signature: None,
                     },
                     usage: ironclaw_llm::TokenUsage::default(),
                     finish_reason: ironclaw_llm::FinishReason::ToolUse,
@@ -1597,6 +1600,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         text: &str,
         metadata: ResponseMetadata,
         _reasoning: Option<String>,
+        _reasoning_signature: Option<String>,
         reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
         let action = {
@@ -1708,6 +1712,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         content: Option<String>,
         reason_ctx: &mut ReasoningContext,
         reasoning: Option<String>,
+        reasoning_signature: Option<String>,
     ) -> Result<Option<LoopOutcome>, crate::error::Error> {
         {
             let mut recovery = self.recovery_state.lock().await;
@@ -1772,9 +1777,11 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         // Add assistant message with tool_calls (OpenAI protocol).
         // Carry reasoning for the next turn — DeepSeek thinking-mode and
         // Gemini 2.5+ reject the follow-up with HTTP 400 otherwise (#3201, #3225).
+        // The opaque reasoning signature rides along (SIG-1).
         reason_ctx.messages.push(
             ChatMessage::assistant_with_tool_calls(content, tool_calls.clone())
-                .with_reasoning(reasoning),
+                .with_reasoning(reasoning)
+                .with_reasoning_signature(reasoning_signature),
         );
 
         // Convert to ToolSelections
@@ -2568,6 +2575,7 @@ mod tests {
             .handle_text_response(
                 "Weekly review created in Notion and notification sent.",
                 ResponseMetadata::default(),
+                None,
                 None,
                 &mut reason_ctx,
             )

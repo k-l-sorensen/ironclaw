@@ -276,7 +276,7 @@ impl LlmProvider for MistralProvider {
             finish_reason,
         } = Self::first_choice(response)?;
 
-        let (content, reasoning) = extract_content(message.content)?;
+        let (content, reasoning, reasoning_signature) = extract_content(message.content)?;
         // For a plain completion the text chunk IS the answer; a reasoning-on
         // array with no text chunk means the answer was lost — fail loud
         // (EmptyResponse, retryable) rather than defaulting to "" (F6).
@@ -291,6 +291,7 @@ impl LlmProvider for MistralProvider {
             input_tokens,
             output_tokens,
             reasoning,
+            reasoning_signature,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -320,7 +321,7 @@ impl LlmProvider for MistralProvider {
         } = Self::first_choice(response)?;
 
         let tool_calls = parse_tool_calls(message.tool_calls);
-        let (content, reasoning) = extract_content(message.content)?;
+        let (content, reasoning, reasoning_signature) = extract_content(message.content)?;
 
         // Either a textual answer or at least one tool call is required; both
         // empty means the turn produced nothing usable (fail loud).
@@ -341,6 +342,7 @@ impl LlmProvider for MistralProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning,
+            reasoning_signature,
         })
     }
 
@@ -401,38 +403,50 @@ fn parse_json<R: DeserializeOwned>(text: &str) -> Result<R, LlmError> {
     })
 }
 
-/// Split Mistral's `message.content` into `(answer, reasoning_trace)`.
+/// `(answer, reasoning_trace, reasoning_signature)` returned by
+/// [`extract_content`]. Aliased to keep the function under clippy's
+/// type-complexity bar.
+type ExtractedContent = (Option<String>, Option<String>, Option<String>);
+
+/// Split Mistral's `message.content` into `(answer, reasoning_trace,
+/// reasoning_signature)`.
 ///
-/// - String content → `(Some(text), None)` (reasoning off).
+/// - String content → `(Some(text), None, None)` (reasoning off).
 /// - Array content → text chunk(s) concatenated as the answer, thinking
-///   chunk(s) flattened into the reasoning trace.
+///   chunk(s) flattened into the reasoning trace, and the first non-null
+///   ThinkChunk `signature` carried out as an opaque replay token.
 ///
-/// Returns `Ok((None, _))` only when there genuinely is no text chunk; callers
-/// decide whether that is an error. The thinking extraction never silently
-/// defaults to `""` (F6) — a malformed array surfaces through serde as an
-/// `InvalidResponse` before reaching here.
-fn extract_content(
-    content: Option<MistralMessageContent>,
-) -> Result<(Option<String>, Option<String>), LlmError> {
+/// Returns `Ok((None, _, _))` only when there genuinely is no text chunk;
+/// callers decide whether that is an error. A malformed array surfaces through
+/// serde as an `InvalidResponse` before reaching here.
+fn extract_content(content: Option<MistralMessageContent>) -> Result<ExtractedContent, LlmError> {
     match content {
-        None => Ok((None, None)),
-        Some(MistralMessageContent::Text(s)) => Ok((non_empty(s), None)),
+        None => Ok((None, None, None)),
+        Some(MistralMessageContent::Text(s)) => Ok((non_empty(s), None, None)),
         Some(MistralMessageContent::Chunks(chunks)) => {
             let mut answer = String::new();
             let mut thinking = String::new();
+            let mut signature: Option<String> = None;
             for chunk in chunks {
                 match chunk {
                     MistralContentChunk::Text { text } => answer.push_str(&text),
-                    MistralContentChunk::Thinking { thinking: parts } => {
+                    MistralContentChunk::Thinking {
+                        thinking: parts,
+                        signature: chunk_signature,
+                    } => {
                         for MistralTextChunk::Text { text } in parts {
                             thinking.push_str(&text);
+                        }
+                        // First non-null signature wins (SIG-D4 single-block).
+                        if signature.is_none() {
+                            signature = chunk_signature.filter(|s| !s.is_empty());
                         }
                     }
                     // Assistant responses don't carry image parts; ignore any.
                     MistralContentChunk::ImageUrl { .. } => {}
                 }
             }
-            Ok((non_empty(answer), non_empty(thinking)))
+            Ok((non_empty(answer), non_empty(thinking), signature))
         }
     }
 }
@@ -512,12 +526,15 @@ fn chat_message_to_wire(msg: ChatMessage, vision: bool) -> MistralMessage {
     });
 
     let reasoning = msg.reasoning.filter(|r| !r.trim().is_empty());
+    let reasoning_signature = msg.reasoning_signature.filter(|s| !s.is_empty());
 
     let content = if let Some(trace) = reasoning {
         // Multi-turn replay: reconstruct the full assistant message including
-        // the ThinkChunk, followed by the answer text chunk.
+        // the ThinkChunk (with its opaque signature, SIG-1), followed by the
+        // answer text chunk.
         let mut chunks = vec![MistralContentChunk::Thinking {
             thinking: vec![MistralTextChunk::Text { text: trace }],
+            signature: reasoning_signature,
         }];
         if !msg.content.is_empty() {
             chunks.push(MistralContentChunk::Text { text: msg.content });
@@ -639,12 +656,28 @@ enum MistralMessageContent {
 /// One content chunk. Tagged on `type`; an unknown `type` fails loud (no
 /// `#[serde(other)]` fallback) rather than being silently skipped (Decision 8 /
 /// C10b). `reference` / `file` / `audio` chunks are intentionally unsupported.
+///
+/// Unknown *fields within* a chunk stay lenient (no `deny_unknown_fields`) so
+/// old/new Mistral payloads and any future ThinkChunk fields keep deserializing
+/// (SIG-D3) — the loud failure is on an unknown chunk `type`, not on extra
+/// fields.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum MistralContentChunk {
-    Thinking { thinking: Vec<MistralTextChunk> },
-    Text { text: String },
-    ImageUrl { image_url: crate::ImageUrl },
+    Thinking {
+        thinking: Vec<MistralTextChunk>,
+        /// Opaque provider thought-signature metadata, not an IronClaw auth
+        /// signature. Echoed back on the next turn so Mistral can verify a
+        /// replayed reasoning block.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+    },
+    Text {
+        text: String,
+    },
+    ImageUrl {
+        image_url: crate::ImageUrl,
+    },
 }
 
 /// Inner element of a thinking chunk's `thinking` list (`{type:"text",text}`).

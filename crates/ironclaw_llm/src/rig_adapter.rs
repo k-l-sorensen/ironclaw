@@ -880,6 +880,7 @@ where
             output_tokens: saturate_u32(response.usage.output_tokens),
             finish_reason: finish,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),
             cache_creation_input_tokens: extract_cache_creation(&response.raw_response),
         };
@@ -968,6 +969,7 @@ where
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),
             cache_creation_input_tokens: extract_cache_creation(&response.raw_response),
             reasoning,
+            reasoning_signature: None,
         };
 
         if resp.cache_read_input_tokens > 0 {
@@ -1964,6 +1966,7 @@ mod tests {
             name: Some("search".to_string()),
             tool_calls: None,
             reasoning: None,
+            reasoning_signature: None,
         }];
         let (_preamble, history) = convert_messages(&messages);
         match &history[0] {
@@ -2208,6 +2211,7 @@ mod tests {
             name: Some("search".to_string()),
             tool_calls: None,
             reasoning: None,
+            reasoning_signature: None,
         };
         let messages = vec![assistant_msg, tool_result_msg];
         let (_preamble, history) = convert_messages(&messages);
@@ -2609,6 +2613,7 @@ mod tests {
             content: String::new(),
             tool_calls: None,
             reasoning: None,
+            reasoning_signature: None,
             tool_call_id: None,
             name: None,
             content_parts: vec![],
@@ -2630,6 +2635,7 @@ mod tests {
             content: String::new(),
             tool_calls: None,
             reasoning: None,
+            reasoning_signature: None,
             tool_call_id: None,
             name: None,
             content_parts: vec![],

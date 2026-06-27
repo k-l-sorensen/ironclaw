@@ -261,6 +261,7 @@ impl LlmProvider for GithubCopilotProvider {
                 .map(|u| u.completion_tokens)
                 .unwrap_or(0),
             reasoning: None,
+            reasoning_signature: None,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         })
@@ -349,6 +350,7 @@ impl LlmProvider for GithubCopilotProvider {
                 .unwrap_or(0),
             cache_creation_input_tokens: 0,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
         })
     }

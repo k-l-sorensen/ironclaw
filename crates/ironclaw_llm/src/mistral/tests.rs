@@ -238,7 +238,7 @@ fn c6_array_response_splits_reasoning_and_content() {
         {"type": "text", "text": "final answer"}
     ]))
     .unwrap();
-    let (text, reasoning) = extract_content(Some(content)).unwrap();
+    let (text, reasoning, _signature) = extract_content(Some(content)).unwrap();
     assert_eq!(text.as_deref(), Some("final answer"));
     assert_eq!(reasoning.as_deref(), Some("step one step two"));
 }
@@ -247,9 +247,10 @@ fn c6_array_response_splits_reasoning_and_content() {
 fn c7_string_response_has_no_reasoning() {
     let content: MistralMessageContent =
         serde_json::from_value(serde_json::json!("plain answer")).unwrap();
-    let (text, reasoning) = extract_content(Some(content)).unwrap();
+    let (text, reasoning, signature) = extract_content(Some(content)).unwrap();
     assert_eq!(text.as_deref(), Some("plain answer"));
     assert!(reasoning.is_none());
+    assert!(signature.is_none());
 }
 
 // ── C8: multi-turn replay reconstructs the ThinkChunk ───────────────────────
@@ -306,6 +307,56 @@ fn ctr_c5_turn_two_request_replays_prior_think_chunk() {
             .any(|c| c["type"] == "thinking" && c["thinking"][0]["text"] == "17 * 23 = 391"),
         "turn-2 request is missing the prior ThinkChunk: {chunks:?}"
     );
+}
+
+// ── SIG-1: ThinkChunk signature capture + replay + lenient serde ────────────
+
+/// SIG-C1: an array response whose thinking chunk carries a `signature` captures
+/// it into the third return value (not dropped on deserialize).
+#[test]
+fn sig_c1_array_response_captures_signature() {
+    let content: MistralMessageContent = serde_json::from_value(serde_json::json!([
+        {"type": "thinking", "thinking": [{"type": "text", "text": "reasoning"}], "signature": "opaque-sig-xyz"},
+        {"type": "text", "text": "answer"}
+    ]))
+    .unwrap();
+    let (text, reasoning, signature) = extract_content(Some(content)).unwrap();
+    assert_eq!(text.as_deref(), Some("answer"));
+    assert_eq!(reasoning.as_deref(), Some("reasoning"));
+    assert_eq!(signature.as_deref(), Some("opaque-sig-xyz"));
+}
+
+/// SIG-C2: `chat_message_to_wire` re-emits the captured signature on the rebuilt
+/// thinking chunk — a request-body assertion, not "no 400".
+#[test]
+fn sig_c2_wire_request_reemits_signature() {
+    let assistant = ChatMessage::assistant("the answer")
+        .with_reasoning(Some("prior reasoning trace".to_string()))
+        .with_reasoning_signature(Some("opaque-sig-xyz".to_string()));
+    let wire = chat_message_to_wire(assistant, false);
+    let json = serde_json::to_value(&wire).unwrap();
+    let chunks = json["content"]
+        .as_array()
+        .expect("replayed content must be an array");
+    assert_eq!(chunks[0]["type"], "thinking");
+    assert_eq!(
+        chunks[0]["signature"], "opaque-sig-xyz",
+        "rebuilt thinking chunk must carry the captured signature: {json}"
+    );
+}
+
+/// SIG-C6: a thinking chunk carrying an extra unknown field still deserializes
+/// (lenient serde, SIG-D3 — no `deny_unknown_fields`).
+#[test]
+fn sig_c6_lenient_serde_tolerates_unknown_fields() {
+    let content: MistralMessageContent = serde_json::from_value(serde_json::json!([
+        {"type": "thinking", "thinking": [{"type": "text", "text": "r"}], "signature": "s", "future_field": 42},
+        {"type": "text", "text": "answer"}
+    ]))
+    .expect("unknown fields within a chunk must not fail deserialization");
+    let (text, _reasoning, signature) = extract_content(Some(content)).unwrap();
+    assert_eq!(text.as_deref(), Some("answer"));
+    assert_eq!(signature.as_deref(), Some("s"));
 }
 
 // ── C9: complete_with_tools carries both reasoning_effort and tool schema ────

@@ -366,6 +366,7 @@ async fn gateway_rejects_empty_tool_capable_stop_response_without_text_only_retr
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
         reasoning: None,
+        reasoning_signature: None,
     }));
     let gateway = LlmProviderModelGateway::with_provider_identity(
         STATIC_PROVIDER_ID,
@@ -469,6 +470,7 @@ async fn gateway_preserves_structured_tool_calls_when_content_has_legacy_marker(
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
         reasoning: Some("response reasoning".to_string()),
+        reasoning_signature: None,
     }));
     let gateway = LlmProviderModelGateway::with_provider_identity(
         STATIC_PROVIDER_ID,
@@ -560,6 +562,7 @@ async fn gateway_repairs_oversized_provider_tool_arguments_before_registration()
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: Some("response reasoning".to_string()),
+            reasoning_signature: None,
         },
         ToolCompletionResponse {
             content: Some("Finished after repair.".to_string()),
@@ -570,6 +573,7 @@ async fn gateway_repairs_oversized_provider_tool_arguments_before_registration()
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: None,
+            reasoning_signature: None,
         },
     ]));
     let gateway = LlmProviderModelGateway::with_provider_identity(
@@ -2689,6 +2693,7 @@ impl LlmProvider for IgnoresModelOverrideProvider {
             output_tokens: 1,
             finish_reason: FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -2773,6 +2778,7 @@ impl RecordingLlmProvider {
                 output_tokens: 1,
                 finish_reason,
                 reasoning: None,
+                reasoning_signature: None,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             }))),
@@ -2833,6 +2839,7 @@ impl LlmProvider for BarrierRecordingLlmProvider {
             output_tokens: 1,
             finish_reason: FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -2867,6 +2874,7 @@ impl ToolAwareProvider {
                 output_tokens: 1,
                 finish_reason: FinishReason::Stop,
                 reasoning: None,
+                reasoning_signature: None,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })),
@@ -2884,6 +2892,7 @@ impl ToolAwareProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: Some("response reasoning".to_string()),
+            reasoning_signature: None,
         })
     }
 
@@ -2897,6 +2906,7 @@ impl ToolAwareProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: None,
+            reasoning_signature: None,
         })
     }
 

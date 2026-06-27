@@ -588,6 +588,7 @@ impl LlmProvider for NearAiChatProvider {
             input_tokens,
             output_tokens,
             reasoning: provider_reasoning,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -702,6 +703,7 @@ impl LlmProvider for NearAiChatProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning: provider_reasoning,
+            reasoning_signature: None,
         })
     }
 

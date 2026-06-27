@@ -99,6 +99,12 @@ pub struct ChatMessage {
     /// reasoning that was dropped (#3201, #3225).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Opaque provider thought-signature for the reasoning block, not an
+    /// IronClaw auth signature. Sibling of `reasoning` (never folded into it),
+    /// echoed back verbatim — not leak-scanned, since it is an opaque token.
+    /// Mistral-only; `None` for other providers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
 }
 
 impl ChatMessage {
@@ -112,6 +118,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             reasoning: None,
+            reasoning_signature: None,
         }
     }
 
@@ -125,6 +132,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             reasoning: None,
+            reasoning_signature: None,
         }
     }
 
@@ -140,6 +148,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             reasoning: None,
+            reasoning_signature: None,
         }
     }
 
@@ -153,6 +162,7 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             reasoning: None,
+            reasoning_signature: None,
         }
     }
 
@@ -173,6 +183,7 @@ impl ChatMessage {
                 Some(tool_calls)
             },
             reasoning: None,
+            reasoning_signature: None,
         }
     }
 
@@ -190,6 +201,15 @@ impl ChatMessage {
         self
     }
 
+    /// Attach the opaque reasoning-block signature to an assistant message so
+    /// it is replayed on the next turn. Unlike `with_reasoning`, the value is an
+    /// opaque token, so it is not trimmed or leak-scanned — only empty strings
+    /// are dropped.
+    pub fn with_reasoning_signature(mut self, signature: Option<String>) -> Self {
+        self.reasoning_signature = signature.filter(|s| !s.is_empty());
+        self
+    }
+
     /// Create a tool result message.
     pub fn tool_result(
         tool_call_id: impl Into<String>,
@@ -204,6 +224,7 @@ impl ChatMessage {
             name: Some(name.into()),
             tool_calls: None,
             reasoning: None,
+            reasoning_signature: None,
         }
     }
 }
@@ -270,6 +291,10 @@ pub struct CompletionResponse {
     /// Provider-emitted reasoning content, when the text-completion API returns
     /// a separate reasoning artifact.
     pub reasoning: Option<String>,
+    /// Opaque provider signature for the reasoning block (Mistral ThinkChunk
+    /// `signature`), echoed back on the next turn so the provider can verify a
+    /// replayed reasoning block. Mistral-only; `None` elsewhere.
+    pub reasoning_signature: Option<String>,
     /// Tokens read from the provider's server-side prompt cache (Anthropic).
     /// Zero when caching is not supported or on a cache miss.
     pub cache_read_input_tokens: u32,
@@ -492,6 +517,10 @@ pub struct ToolCompletionResponse {
     /// for the next turn — otherwise the provider rejects the follow-up with
     /// HTTP 400 (#3201, #3225). `None` when the model produced no reasoning.
     pub reasoning: Option<String>,
+    /// Opaque provider signature for the reasoning block (Mistral ThinkChunk
+    /// `signature`), echoed back on the next turn so the provider can verify a
+    /// replayed reasoning block. Mistral-only; `None` elsewhere.
+    pub reasoning_signature: Option<String>,
 }
 
 /// Metadata about a model returned by the provider's API.

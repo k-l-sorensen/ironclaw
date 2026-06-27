@@ -1587,6 +1587,7 @@ mod tests {
             output_tokens: 5,
             finish_reason: crate::FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         };
@@ -1601,6 +1602,7 @@ mod tests {
             output_tokens: 0,
             finish_reason: crate::FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         };
@@ -1615,6 +1617,7 @@ mod tests {
             output_tokens: 1,
             finish_reason: crate::FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         };
@@ -1630,6 +1633,7 @@ mod tests {
             output_tokens: 20,
             finish_reason: crate::FinishReason::Stop,
             reasoning: None,
+            reasoning_signature: None,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         };

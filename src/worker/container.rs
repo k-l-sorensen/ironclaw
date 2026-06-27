@@ -450,6 +450,7 @@ impl LoopDelegate for ContainerDelegate {
         text: &str,
         metadata: ResponseMetadata,
         _reasoning: Option<String>,
+        _reasoning_signature: Option<String>,
         reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
         let action = {
@@ -526,6 +527,7 @@ impl LoopDelegate for ContainerDelegate {
         content: Option<String>,
         reason_ctx: &mut ReasoningContext,
         reasoning: Option<String>,
+        reasoning_signature: Option<String>,
     ) -> Result<Option<LoopOutcome>, crate::error::Error> {
         {
             let mut recovery = self.recovery_state.lock().await;
@@ -544,10 +546,12 @@ impl LoopDelegate for ContainerDelegate {
         }
 
         // Add assistant message with tool_calls (OpenAI protocol).
-        // Carry reasoning for the next turn — see #3201, #3225.
+        // Carry reasoning for the next turn — see #3201, #3225. The opaque
+        // reasoning signature rides along (SIG-1).
         reason_ctx.messages.push(
             ChatMessage::assistant_with_tool_calls(content, tool_calls.clone())
-                .with_reasoning(reasoning),
+                .with_reasoning(reasoning)
+                .with_reasoning_signature(reasoning_signature),
         );
 
         // Execute tools sequentially (container context — no parallel execution)
