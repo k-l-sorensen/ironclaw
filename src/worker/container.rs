@@ -29,7 +29,9 @@ use crate::worker::autonomous_recovery::{
     EMPTY_TOOL_COMPLETION_NUDGE, FORCE_TEXT_RECOVERY_PROMPT,
 };
 use crate::worker::proxy_llm::ProxyLlmProvider;
-use ironclaw_llm::{ChatMessage, LlmProvider, Reasoning, ReasoningContext, ResponseMetadata};
+use ironclaw_llm::{
+    ChatMessage, LlmProvider, Reasoning, ReasoningBlock, ReasoningContext, ResponseMetadata,
+};
 use ironclaw_safety::SafetyLayer;
 
 /// Configuration for the worker runtime.
@@ -449,8 +451,7 @@ impl LoopDelegate for ContainerDelegate {
         &self,
         text: &str,
         metadata: ResponseMetadata,
-        _reasoning: Option<String>,
-        _reasoning_signature: Option<String>,
+        _reasoning: ReasoningBlock,
         reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
         let action = {
@@ -526,8 +527,7 @@ impl LoopDelegate for ContainerDelegate {
         tool_calls: Vec<ironclaw_llm::ToolCall>,
         content: Option<String>,
         reason_ctx: &mut ReasoningContext,
-        reasoning: Option<String>,
-        reasoning_signature: Option<String>,
+        reasoning: ReasoningBlock,
     ) -> Result<Option<LoopOutcome>, crate::error::Error> {
         {
             let mut recovery = self.recovery_state.lock().await;
@@ -546,12 +546,11 @@ impl LoopDelegate for ContainerDelegate {
         }
 
         // Add assistant message with tool_calls (OpenAI protocol).
-        // Carry reasoning for the next turn — see #3201, #3225. The opaque
-        // reasoning signature rides along (SIG-1).
+        // Carry the reasoning block for the next turn — see #3201, #3225. The
+        // opaque signature rides along inside it (SIG-1).
         reason_ctx.messages.push(
             ChatMessage::assistant_with_tool_calls(content, tool_calls.clone())
-                .with_reasoning(reasoning)
-                .with_reasoning_signature(reasoning_signature),
+                .with_reasoning(reasoning),
         );
 
         // Execute tools sequentially (container context — no parallel execution)

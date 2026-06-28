@@ -88,8 +88,7 @@ impl LlmProvider for FlakeyProvider {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -121,8 +120,7 @@ impl LlmProvider for FlakeyProvider {
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
         })
     }
 }
@@ -200,8 +198,7 @@ impl LlmProvider for GarbageProvider {
             input_tokens: 0,
             output_tokens: 0,
             finish_reason: FinishReason::Unknown,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -220,8 +217,7 @@ impl LlmProvider for GarbageProvider {
             finish_reason: FinishReason::Unknown,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
         })
     }
 }
@@ -264,8 +260,7 @@ impl LlmProvider for ReliableProvider {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -284,8 +279,7 @@ impl LlmProvider for ReliableProvider {
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
         })
     }
 }

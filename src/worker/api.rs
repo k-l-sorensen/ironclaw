@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::error::WorkerError;
 use ironclaw_llm::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, ToolCall,
+    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, ReasoningBlock, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
 };
 
@@ -252,8 +252,7 @@ impl WorkerHttpClient {
             input_tokens: proxy_resp.input_tokens,
             output_tokens: proxy_resp.output_tokens,
             finish_reason: parse_finish_reason(&proxy_resp.finish_reason),
-            reasoning: proxy_resp.reasoning,
-            reasoning_signature: proxy_resp.reasoning_signature,
+            reasoning: ReasoningBlock::new(proxy_resp.reasoning, proxy_resp.reasoning_signature),
             cache_read_input_tokens: proxy_resp.cache_read_input_tokens,
             cache_creation_input_tokens: proxy_resp.cache_creation_input_tokens,
         })
@@ -286,8 +285,7 @@ impl WorkerHttpClient {
             finish_reason: parse_finish_reason(&proxy_resp.finish_reason),
             cache_read_input_tokens: proxy_resp.cache_read_input_tokens,
             cache_creation_input_tokens: proxy_resp.cache_creation_input_tokens,
-            reasoning: proxy_resp.reasoning,
-            reasoning_signature: proxy_resp.reasoning_signature,
+            reasoning: ReasoningBlock::new(proxy_resp.reasoning, proxy_resp.reasoning_signature),
         })
     }
 

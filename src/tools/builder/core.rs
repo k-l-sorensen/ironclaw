@@ -771,7 +771,6 @@ Create alongside the .wasm file to grant capabilities:
                     tool_calls,
                     content,
                     reasoning: _,
-                    reasoning_signature: _,
                 } => {
                     tools_executed = true;
 

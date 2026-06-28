@@ -21,8 +21,8 @@ use self::nearai_tool_message_flattening::flatten_tool_messages;
 use crate::config::NearAiConfig;
 use crate::error::LlmError;
 use crate::provider::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, Role, ToolCall,
-    ToolCompletionRequest, ToolCompletionResponse,
+    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ReasoningBlock,
+    Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
 };
 
 #[path = "nearai_tool_message_flattening.rs"]
@@ -587,8 +587,7 @@ impl LlmProvider for NearAiChatProvider {
             finish_reason,
             input_tokens,
             output_tokens,
-            reasoning: provider_reasoning,
-            reasoning_signature: None,
+            reasoning: ReasoningBlock::new(provider_reasoning, None),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -702,8 +701,7 @@ impl LlmProvider for NearAiChatProvider {
             output_tokens,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: provider_reasoning,
-            reasoning_signature: None,
+            reasoning: ReasoningBlock::new(provider_reasoning, None),
         })
     }
 
@@ -2206,7 +2204,7 @@ mod tests {
 
         assert_eq!(response.content, None);
         assert_eq!(
-            response.reasoning.as_deref(),
+            response.reasoning.text.as_deref(),
             Some("Thinking Steps\n[] Inspect context.")
         );
         assert_eq!(response.tool_calls.len(), 1);

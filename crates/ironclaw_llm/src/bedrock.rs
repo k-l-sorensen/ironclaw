@@ -24,8 +24,8 @@ use rust_decimal::Decimal;
 use crate::config::BedrockConfig;
 use crate::error::LlmError;
 use crate::provider::{
-    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ModelMetadata, ToolCall,
-    ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
+    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ModelMetadata,
+    ReasoningBlock, ToolCall, ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
 };
 
 /// AWS Bedrock provider using the native Converse API.
@@ -142,8 +142,7 @@ impl LlmProvider for BedrockProvider {
             output_tokens,
             finish_reason: map_stop_reason(response.stop_reason()),
             cache_creation_input_tokens: 0,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ReasoningBlock::default(),
             cache_read_input_tokens: 0,
         })
     }
@@ -209,8 +208,7 @@ impl LlmProvider for BedrockProvider {
             output_tokens,
             finish_reason: map_stop_reason(response.stop_reason()),
             cache_creation_input_tokens: 0,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ReasoningBlock::default(),
             cache_read_input_tokens: 0,
         })
     }
@@ -1100,8 +1098,7 @@ mod tests {
                 name: Some("echo".to_string()),
                 tool_calls: None,
                 content_parts: Vec::new(),
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ReasoningBlock::default(),
             },
         ];
 

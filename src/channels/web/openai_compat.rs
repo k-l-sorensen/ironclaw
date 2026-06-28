@@ -251,8 +251,7 @@ pub fn convert_messages(messages: &[OpenAiMessage]) -> Result<Vec<ChatMessage>, 
                     tool_call_id: None,
                     name: m.name.clone(),
                     tool_calls: None,
-                    reasoning: None,
-                    reasoning_signature: None,
+                    reasoning: ironclaw_llm::ReasoningBlock::default(),
                 }),
             }
         })

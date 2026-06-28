@@ -15,7 +15,7 @@ use crate::config::GeminiOauthConfig;
 use crate::error::LlmError;
 use crate::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, LlmProvider,
-    ModelMetadata, Role, ToolCall, ToolDefinition,
+    ModelMetadata, ReasoningBlock, Role, ToolCall, ToolDefinition,
 };
 
 // Official Gemini CLI OAuth credentials (public, from google/gemini-cli).
@@ -2055,8 +2055,7 @@ impl GeminiOauthProvider {
                 finish_reason: stop_reason,
                 input_tokens,
                 output_tokens,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ReasoningBlock::default(),
                 cache_read_input_tokens: cached_content_tokens,
                 cache_creation_input_tokens: 0,
             },
@@ -2179,8 +2178,7 @@ impl LlmProvider for GeminiOauthProvider {
             tool_calls,
             cache_read_input_tokens: response.cache_read_input_tokens,
             cache_creation_input_tokens: response.cache_creation_input_tokens,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ReasoningBlock::default(),
         })
     }
 }

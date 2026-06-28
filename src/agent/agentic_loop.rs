@@ -13,8 +13,8 @@ use std::hash::{Hash, Hasher};
 use crate::agent::session::PendingApproval;
 use crate::error::Error;
 use ironclaw_llm::{
-    ChatMessage, FinishReason, Reasoning, ReasoningContext, RespondResult, ResponseMetadata,
-    ToolCall,
+    ChatMessage, FinishReason, Reasoning, ReasoningBlock, ReasoningContext, RespondResult,
+    ResponseMetadata, ToolCall,
 };
 
 /// Signal from the delegate indicating how the loop should proceed.
@@ -110,19 +110,15 @@ pub trait LoopDelegate: Send + Sync {
     /// Handle a text-only response from the LLM.
     /// Return `TextAction::Return` to exit the loop, `TextAction::Continue` to proceed.
     ///
-    /// `reasoning` is the provider's leak-scanned reasoning trace for this
-    /// text turn (CTR-D5). Delegates that persist turns record it so it is
-    /// replayed on subsequent user turns; delegates that don't may ignore it.
-    ///
-    /// `reasoning_signature` is the opaque reasoning-block signature (Mistral
-    /// ThinkChunk `signature`, SIG-1), carried alongside `reasoning` so it is
-    /// persisted and replayed unmodified (not leak-scanned, SIG-D2).
+    /// `reasoning` is the provider's reasoning block for this text turn — the
+    /// leak-scanned trace plus the opaque ThinkChunk signature (CTR-D5 / SIG-1).
+    /// Delegates that persist turns record it so it is replayed on subsequent
+    /// user turns; delegates that don't may ignore it.
     async fn handle_text_response(
         &self,
         text: &str,
         metadata: ResponseMetadata,
-        reasoning: Option<String>,
-        reasoning_signature: Option<String>,
+        reasoning: ReasoningBlock,
         reason_ctx: &mut ReasoningContext,
     ) -> TextAction;
 
@@ -137,8 +133,7 @@ pub trait LoopDelegate: Send + Sync {
         tool_calls: Vec<ironclaw_llm::ToolCall>,
         content: Option<String>,
         reason_ctx: &mut ReasoningContext,
-        reasoning: Option<String>,
-        reasoning_signature: Option<String>,
+        reasoning: ReasoningBlock,
     ) -> Result<Option<LoopOutcome>, Error>;
 
     /// Called when the LLM expresses tool intent without actually calling a tool.
@@ -266,7 +261,6 @@ pub async fn run_agentic_loop(
                 tool_calls,
                 content,
                 reasoning: _,
-                reasoning_signature: _,
             } => {
                 let names: Vec<&str> = tool_calls.iter().map(|tc| tc.name.as_str()).collect();
                 tracing::debug!(
@@ -279,11 +273,7 @@ pub async fn run_agentic_loop(
         }
 
         match output.result {
-            RespondResult::Text {
-                text,
-                reasoning,
-                reasoning_signature,
-            } => {
+            RespondResult::Text { text, reasoning } => {
                 // Tool intent nudge: if the LLM says "let me search..." without
                 // actually calling a tool, inject a nudge message.
                 if config.enable_tool_intent_nudge
@@ -298,15 +288,13 @@ pub async fn run_agentic_loop(
                         "LLM expressed tool intent without calling a tool, nudging"
                     );
                     delegate.on_tool_intent_nudge(&text, reason_ctx).await;
-                    // Carry reasoning so the next request can echo it back —
-                    // required for DeepSeek/Gemini to validate the chain (#3201,
-                    // #3225), same as the tool-call replay path. The opaque
-                    // reasoning signature rides along (SIG-1).
-                    reason_ctx.messages.push(
-                        ChatMessage::assistant(&text)
-                            .with_reasoning(reasoning.clone())
-                            .with_reasoning_signature(reasoning_signature.clone()),
-                    );
+                    // Carry the reasoning block so the next request can echo it
+                    // back — required for DeepSeek/Gemini to validate the chain
+                    // (#3201, #3225), same as the tool-call replay path. The
+                    // opaque signature rides along inside the block (SIG-1).
+                    reason_ctx
+                        .messages
+                        .push(ChatMessage::assistant(&text).with_reasoning(reasoning.clone()));
                     reason_ctx
                         .messages
                         .push(ChatMessage::user(ironclaw_llm::TOOL_INTENT_NUDGE));
@@ -323,13 +311,7 @@ pub async fn run_agentic_loop(
                 dup_tracker.reset();
 
                 match delegate
-                    .handle_text_response(
-                        &text,
-                        output.metadata,
-                        reasoning,
-                        reasoning_signature,
-                        reason_ctx,
-                    )
+                    .handle_text_response(&text, output.metadata, reasoning, reason_ctx)
                     .await
                 {
                     TextAction::Return(outcome) => return Ok(outcome),
@@ -340,7 +322,6 @@ pub async fn run_agentic_loop(
                 tool_calls,
                 content,
                 reasoning,
-                reasoning_signature,
             } => {
                 // If the response was truncated, tool call parameters are likely
                 // incomplete. Discard them and tell the LLM to try a different
@@ -379,13 +360,7 @@ pub async fn run_agentic_loop(
                 reason_ctx.last_tool_batch_all_failed = false;
 
                 if let Some(outcome) = delegate
-                    .execute_tool_calls(
-                        tool_calls,
-                        content,
-                        reason_ctx,
-                        reasoning,
-                        reasoning_signature,
-                    )
+                    .execute_tool_calls(tool_calls, content, reason_ctx, reasoning)
                     .await?
                 {
                     return Ok(outcome);
@@ -464,8 +439,7 @@ mod tests {
         RespondOutput {
             result: RespondResult::Text {
                 text: text.to_string(),
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ReasoningBlock::default(),
             },
             usage: zero_usage(),
             finish_reason: FinishReason::Stop,
@@ -478,8 +452,7 @@ mod tests {
             result: RespondResult::ToolCalls {
                 tool_calls: calls,
                 content: None,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ReasoningBlock::default(),
             },
             usage: zero_usage(),
             finish_reason: FinishReason::ToolUse,
@@ -568,8 +541,7 @@ mod tests {
             &self,
             text: &str,
             _metadata: ResponseMetadata,
-            _reasoning: Option<String>,
-            _reasoning_signature: Option<String>,
+            _reasoning: ReasoningBlock,
             _reason_ctx: &mut ReasoningContext,
         ) -> TextAction {
             TextAction::Return(LoopOutcome::Response(text.to_string()))
@@ -580,8 +552,7 @@ mod tests {
             _tool_calls: Vec<ToolCall>,
             _content: Option<String>,
             reason_ctx: &mut ReasoningContext,
-            _reasoning: Option<String>,
-            _reasoning_signature: Option<String>,
+            _reasoning: ReasoningBlock,
         ) -> Result<Option<LoopOutcome>, crate::error::Error> {
             self.tool_exec_count.fetch_add(1, Ordering::SeqCst);
             reason_ctx
@@ -755,8 +726,7 @@ mod tests {
                 Ok(RespondOutput {
                     result: RespondResult::Text {
                         text: "fallback".to_string(),
-                        reasoning: None,
-                        reasoning_signature: None,
+                        reasoning: ReasoningBlock::default(),
                     },
                     usage: zero_usage(),
                     finish_reason: FinishReason::Stop,
@@ -770,8 +740,7 @@ mod tests {
                 &self,
                 _: &str,
                 metadata: ResponseMetadata,
-                _: Option<String>,
-                _: Option<String>,
+                _: ReasoningBlock,
                 _: &mut ReasoningContext,
             ) -> TextAction {
                 assert_eq!(metadata.anomaly, Some(ResponseAnomaly::EmptyToolCompletion));
@@ -785,8 +754,7 @@ mod tests {
                 _: Vec<ToolCall>,
                 _: Option<String>,
                 _: &mut ReasoningContext,
-                _: Option<String>,
-                _: Option<String>,
+                _: ReasoningBlock,
             ) -> Result<Option<LoopOutcome>, crate::error::Error> {
                 Ok(None)
             }
@@ -837,8 +805,7 @@ mod tests {
                 &self,
                 _: &str,
                 _: ResponseMetadata,
-                _: Option<String>,
-                _: Option<String>,
+                _: ReasoningBlock,
                 ctx: &mut ReasoningContext,
             ) -> TextAction {
                 ctx.messages.push(ChatMessage::assistant("still working"));
@@ -849,8 +816,7 @@ mod tests {
                 _: Vec<ToolCall>,
                 _: Option<String>,
                 _: &mut ReasoningContext,
-                _: Option<String>,
-                _: Option<String>,
+                _: ReasoningBlock,
             ) -> Result<Option<LoopOutcome>, crate::error::Error> {
                 Ok(None)
             }
@@ -976,8 +942,7 @@ mod tests {
             result: RespondResult::ToolCalls {
                 tool_calls: vec![truncated_tool_call],
                 content: Some("I'll write the report.".to_string()),
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ReasoningBlock::default(),
             },
             usage: zero_usage(),
             finish_reason: FinishReason::Length, // response was truncated
@@ -1029,8 +994,7 @@ mod tests {
                     arguments_parse_error: None,
                 }],
                 content: None,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ReasoningBlock::default(),
             },
             usage: zero_usage(),
             finish_reason: FinishReason::Length,
@@ -1308,8 +1272,7 @@ mod tests {
                 &self,
                 text: &str,
                 _: ResponseMetadata,
-                _: Option<String>,
-                _: Option<String>,
+                _: ReasoningBlock,
                 ctx: &mut ReasoningContext,
             ) -> TextAction {
                 let count = self.text_response_count.fetch_add(1, Ordering::SeqCst);
@@ -1326,8 +1289,7 @@ mod tests {
                 _: Vec<ToolCall>,
                 _: Option<String>,
                 reason_ctx: &mut ReasoningContext,
-                _reasoning: Option<String>,
-                _reasoning_signature: Option<String>,
+                _reasoning: ReasoningBlock,
             ) -> Result<Option<LoopOutcome>, crate::error::Error> {
                 self.tool_exec_count.fetch_add(1, Ordering::SeqCst);
                 reason_ctx.messages.push(ChatMessage::user("tool error"));

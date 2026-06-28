@@ -63,7 +63,7 @@ use rust_decimal::Decimal;
 
 use crate::error::LlmError;
 use crate::provider::{
-    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCall,
+    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ReasoningBlock, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse,
 };
 
@@ -267,8 +267,10 @@ impl LlmProvider for StubLlm {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
-            reasoning: self.response_reasoning.clone(),
-            reasoning_signature: self.response_reasoning_signature.clone(),
+            reasoning: ReasoningBlock::new(
+                self.response_reasoning.clone(),
+                self.response_reasoning_signature.clone(),
+            ),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -290,8 +292,10 @@ impl LlmProvider for StubLlm {
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: self.response_reasoning.clone(),
-            reasoning_signature: self.response_reasoning_signature.clone(),
+            reasoning: ReasoningBlock::new(
+                self.response_reasoning.clone(),
+                self.response_reasoning_signature.clone(),
+            ),
         })
     }
 }

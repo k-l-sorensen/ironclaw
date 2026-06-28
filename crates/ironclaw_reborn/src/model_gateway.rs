@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use ironclaw_host_api::sha256_digest_token;
 use ironclaw_llm::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, ImageUrl,
-    LlmError, LlmProvider, Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
-    ToolDefinition, clean_response, contains_codex_text_tool_call_syntax,
+    LlmError, LlmProvider, ReasoningBlock, Role, ToolCall, ToolCompletionRequest,
+    ToolCompletionResponse, ToolDefinition, clean_response, contains_codex_text_tool_call_syntax,
     costs::{default_cost, model_cost},
     recover_codex_text_tool_calls_from_tool_names,
     vision_models::is_vision_model,
@@ -964,7 +964,6 @@ fn recover_textual_tool_calls_from_tool_response(
         cache_read_input_tokens: response.cache_read_input_tokens,
         cache_creation_input_tokens: response.cache_creation_input_tokens,
         reasoning: response.reasoning,
-        reasoning_signature: response.reasoning_signature,
     })
 }
 
@@ -1036,7 +1035,7 @@ async fn tool_response_to_host(
             .map(|tool_call| {
                 provider_tool_call_from_llm(
                     tool_call,
-                    response.reasoning.clone(),
+                    response.reasoning.text.clone(),
                     provider_turn_id.clone(),
                     replay_identity,
                 )
@@ -1061,7 +1060,7 @@ async fn tool_response_to_host(
         return Ok(HostManagedModelResponse::capability_calls_with_reasoning(
             candidates,
             response.content.unwrap_or_default(),
-            response.reasoning,
+            response.reasoning.text,
         )
         .with_usage(LoopModelUsage {
             input_tokens: response.input_tokens,
@@ -1084,7 +1083,7 @@ async fn tool_response_to_host(
             );
             Ok(HostManagedModelResponse::assistant_reply_with_reasoning(
                 content,
-                response.reasoning,
+                response.reasoning.text,
             )
             .with_usage(LoopModelUsage {
                 input_tokens: response.input_tokens,
@@ -1164,7 +1163,7 @@ fn response_to_host_reply(
             let content = clean_response(&response.content);
             Ok(HostManagedModelResponse::assistant_reply_with_reasoning(
                 content,
-                response.reasoning,
+                response.reasoning.text,
             )
             .with_usage(usage))
         }
@@ -1506,7 +1505,7 @@ fn provider_tool_roundtrip_messages(
             .map(|(provider_call, _)| provider_tool_call_from_reference(provider_call))
             .collect(),
     )
-    .with_reasoning(reasoning);
+    .with_reasoning(ReasoningBlock::new(reasoning, None));
     std::iter::once(assistant)
         .chain(
             provider_results

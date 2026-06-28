@@ -24,7 +24,7 @@ use crate::error::LlmError;
 use crate::github_copilot_auth::CopilotTokenManager;
 use crate::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, LlmProvider,
-    Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
+    ReasoningBlock, Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
     strip_unsupported_completion_params, strip_unsupported_tool_params,
 };
 
@@ -260,8 +260,7 @@ impl LlmProvider for GithubCopilotProvider {
                 .as_ref()
                 .map(|u| u.completion_tokens)
                 .unwrap_or(0),
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ReasoningBlock::default(),
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
         })
@@ -349,8 +348,7 @@ impl LlmProvider for GithubCopilotProvider {
                 .map(|u| u.completion_tokens)
                 .unwrap_or(0),
             cache_creation_input_tokens: 0,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ReasoningBlock::default(),
             cache_read_input_tokens: 0,
         })
     }

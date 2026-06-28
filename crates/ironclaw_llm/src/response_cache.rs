@@ -364,8 +364,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 finish_reason: FinishReason::Stop,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: crate::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -383,8 +382,7 @@ mod tests {
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: crate::ReasoningBlock::default(),
             })
         }
     }

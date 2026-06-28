@@ -10,7 +10,7 @@ use ironclaw_common::provider_transcript::strip_provider_transcript_artifact_lin
 use crate::error::LlmError;
 
 use crate::{
-    ChatMessage, CompletionRequest, FinishReason, LlmProvider, Role, ToolCall,
+    ChatMessage, CompletionRequest, FinishReason, LlmProvider, ReasoningBlock, Role, ToolCall,
     ToolCompletionRequest, ToolDefinition,
 };
 
@@ -21,7 +21,7 @@ use crate::{
 static REASONING_LEAK_DETECTOR: LazyLock<ironclaw_safety::LeakDetector> =
     LazyLock::new(ironclaw_safety::LeakDetector::new);
 
-/// Redact secrets from an LLM-emitted reasoning trace before it is stored or
+/// Redact secrets from an LLM-emitted reasoning block before it is stored or
 /// replayed into the next request.
 ///
 /// The thinking trace is model output that is both **persisted** (LLM data is
@@ -29,8 +29,16 @@ static REASONING_LEAK_DETECTOR: LazyLock<ironclaw_safety::LeakDetector> =
 /// same leak scan as message content. Redaction (never blocking) is used so a
 /// secret in the trace removes the secret without aborting the turn. Clean
 /// traces keep their original allocation. See the architecture doc, Decision 7.
-fn redact_reasoning(reasoning: Option<String>) -> Option<String> {
-    reasoning.map(|trace| REASONING_LEAK_DETECTOR.redact_all(&trace).unwrap_or(trace))
+///
+/// Only the trace is scanned — the opaque signature is exempt (SIG-D2). If the
+/// scan actually altered the trace, the signature no longer matches the block it
+/// vouches for, so [`ReasoningBlock::redacted`] drops it.
+fn redact_reasoning(reasoning: ReasoningBlock) -> ReasoningBlock {
+    reasoning.redacted(|trace| {
+        REASONING_LEAK_DETECTOR
+            .redact_all(trace)
+            .unwrap_or_else(|| trace.to_string())
+    })
 }
 
 /// Token the agent returns when it has nothing to say (e.g. in group chats).
@@ -445,17 +453,14 @@ pub enum RespondResult {
     /// A text response (no tools needed).
     Text {
         text: String,
-        /// Provider-emitted reasoning artifacts for a pure-text turn (the
-        /// common no-tool shape). Mirrors the `reasoning` field on
-        /// [`RespondResult::ToolCalls`] so the trace can be persisted on the
-        /// turn and replayed into the next request — without it, a pure-text
-        /// turn would have nowhere to carry the trace (CTR-D5). Already
-        /// leak-scanned at the shared `respond_with_tools` stage.
-        reasoning: Option<String>,
-        /// Opaque reasoning-block signature (Mistral ThinkChunk `signature`).
-        /// Sibling of `reasoning`, persisted and replayed on the next request.
-        /// Not leak-scanned — an opaque token that must survive byte-for-byte.
-        reasoning_signature: Option<String>,
+        /// Provider-emitted reasoning (trace + opaque signature) for a pure-text
+        /// turn (the common no-tool shape). Mirrors the `reasoning` field on
+        /// [`RespondResult::ToolCalls`] so it can be persisted on the turn and
+        /// replayed into the next request — without it, a pure-text turn would
+        /// have nowhere to carry the trace (CTR-D5). The trace is already
+        /// leak-scanned at the shared `respond_with_tools` stage; the signature
+        /// is exempt (opaque token).
+        reasoning: ReasoningBlock,
     },
     /// The model wants to call tools. Caller should execute them and call back.
     /// Includes the optional content from the assistant message (some models
@@ -463,15 +468,11 @@ pub enum RespondResult {
     ToolCalls {
         tool_calls: Vec<ToolCall>,
         content: Option<String>,
-        /// Provider-emitted reasoning artifacts (DeepSeek `reasoning_content`,
-        /// Gemini reasoning, OpenRouter `reasoning_details`). Must be attached
-        /// to the assistant `ChatMessage` the caller pushes into context for
-        /// the next turn — otherwise the provider rejects the follow-up
-        /// request with HTTP 400. See #3201, #3225.
-        reasoning: Option<String>,
-        /// Opaque reasoning-block signature (Mistral ThinkChunk `signature`).
-        /// Sibling of `reasoning`; not leak-scanned — an opaque token.
-        reasoning_signature: Option<String>,
+        /// Provider-emitted reasoning (trace + opaque signature). Must be
+        /// attached to the assistant `ChatMessage` the caller pushes into
+        /// context for the next turn — otherwise the provider rejects the
+        /// follow-up request with HTTP 400. See #3201, #3225.
+        reasoning: ReasoningBlock,
     },
 }
 
@@ -872,9 +873,8 @@ Respond in JSON format:
                     let pre_truncated = truncate_at_tool_tags(&c);
                     clean_response(&pre_truncated)
                 });
+                // Carries the redacted trace + unredacted opaque signature (SIG-D2).
                 let provider_reasoning = response.reasoning;
-                // Opaque reasoning-block signature — carried unredacted (SIG-D2).
-                let provider_reasoning_signature = response.reasoning_signature;
                 // Populate per-tool reasoning from the shared narrative when the
                 // provider did not supply per-tool rationale.
                 let tool_calls: Vec<ToolCall> = response
@@ -902,7 +902,6 @@ Respond in JSON format:
                         tool_calls,
                         content: narrative,
                         reasoning: provider_reasoning,
-                        reasoning_signature: provider_reasoning_signature,
                     },
                     usage,
                     finish_reason: response.finish_reason,
@@ -934,7 +933,6 @@ Respond in JSON format:
                         // reasoning artifacts — those would have been on the
                         // structured tool_calls path instead.
                         reasoning: response.reasoning,
-                        reasoning_signature: response.reasoning_signature,
                     },
                     usage,
                     finish_reason: response.finish_reason,
@@ -975,7 +973,6 @@ Respond in JSON format:
                 result: RespondResult::Text {
                     text: final_text,
                     reasoning: response.reasoning,
-                    reasoning_signature: response.reasoning_signature,
                 },
                 usage,
                 finish_reason: response.finish_reason,
@@ -1019,7 +1016,6 @@ Respond in JSON format:
                 result: RespondResult::Text {
                     text: final_text,
                     reasoning: response.reasoning,
-                    reasoning_signature: response.reasoning_signature,
                 },
                 usage: TokenUsage {
                     input_tokens: response.input_tokens,
@@ -4014,35 +4010,28 @@ That's my plan."#;
         let output = reasoning.respond_with_tools(&context).await.unwrap();
         match output.result {
             RespondResult::ToolCalls { reasoning, .. } => {
-                let reasoning = reasoning.expect("provider reasoning should be present");
+                let trace = reasoning
+                    .text
+                    .expect("provider reasoning should be present");
                 assert!(
-                    reasoning.contains("[REDACTED]"),
-                    "reasoning trace must be redacted: {reasoning}"
+                    trace.contains("[REDACTED]"),
+                    "reasoning trace must be redacted: {trace}"
                 );
                 assert!(
-                    !reasoning.contains(secret),
-                    "reasoning trace leaked the planted secret: {reasoning}"
+                    !trace.contains(secret),
+                    "reasoning trace leaked the planted secret: {trace}"
                 );
             }
             RespondResult::Text { text: t, .. } => panic!("expected tool calls, got text: {t}"),
         }
     }
 
-    /// SIG-C5: the opaque reasoning signature is leak-scan EXEMPT (SIG-D2) — a
-    /// signature whose bytes would trip the redactor must pass through
-    /// `respond_with_tools` unmodified, while the reasoning trace is still
-    /// redacted. Drives the public caller, not the helper.
-    #[tokio::test]
-    async fn reasoning_signature_is_not_leak_scanned() {
+    /// Spin up a `respond_with_tools` call whose provider returns the given
+    /// reasoning trace + signature alongside one tool call, and return the
+    /// captured `ReasoningBlock`. Drives the public caller, not the helper.
+    async fn reasoning_block_after_round_trip(trace: &str, signature: &str) -> ReasoningBlock {
         use crate::testing::StubLlm;
 
-        // A signature value that embeds a JWT-shaped token the leak detector
-        // would redact. If it were routed through redact_all it would be
-        // corrupted; SIG-D2 forbids that — the signature must survive verbatim.
-        let signature = "sig_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9_supersecretvalue";
-        // A distinct planted secret in the reasoning trace to confirm the trace
-        // itself IS still redacted.
-        let trace_secret = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9_anothersecret";
         let tool_call = ToolCall {
             id: "call_1".to_string(),
             name: "tool_list".to_string(),
@@ -4054,11 +4043,9 @@ That's my plan."#;
         let llm = Arc::new(
             StubLlm::new("done")
                 .with_tool_call(tool_call)
-                .with_response_reasoning(format!("I will use Bearer {trace_secret}"))
-                .with_response_reasoning_signature(signature),
+                .with_response_reasoning(trace.to_string())
+                .with_response_reasoning_signature(signature.to_string()),
         );
-        let reasoning = Reasoning::new(llm);
-
         let context = ReasoningContext::new()
             .with_message(ChatMessage::user("list tools"))
             .with_tools(vec![ToolDefinition {
@@ -4067,28 +4054,71 @@ That's my plan."#;
                 parameters: serde_json::json!({}),
             }]);
 
-        let output = reasoning.respond_with_tools(&context).await.unwrap();
-        match output.result {
-            RespondResult::ToolCalls {
-                reasoning,
-                reasoning_signature,
-                ..
-            } => {
-                // Reasoning text is redacted...
-                let reasoning = reasoning.expect("provider reasoning should be present");
-                assert!(
-                    reasoning.contains("[REDACTED]"),
-                    "reasoning trace must be redacted: {reasoning}"
-                );
-                // ...but the opaque signature survives byte-for-byte.
-                assert_eq!(
-                    reasoning_signature.as_deref(),
-                    Some(signature),
-                    "reasoning signature must pass through unmodified (SIG-D2)"
-                );
-            }
-            RespondResult::Text { text: t, .. } => panic!("expected tool calls, got text: {t}"),
+        match Reasoning::new(llm)
+            .respond_with_tools(&context)
+            .await
+            .unwrap()
+            .result
+        {
+            RespondResult::ToolCalls { reasoning, .. } => reasoning,
+            RespondResult::Text { text, .. } => panic!("expected tool calls, got text: {text}"),
         }
+    }
+
+    /// SIG-C5: the opaque reasoning signature is leak-scan EXEMPT (SIG-D2) — a
+    /// signature whose bytes would trip the redactor must pass through
+    /// `respond_with_tools` unmodified. The trace here is clean, so the block it
+    /// vouches for is unchanged and the signature is kept verbatim.
+    #[tokio::test]
+    async fn reasoning_signature_is_not_leak_scanned() {
+        // A signature value that embeds a JWT-shaped token the leak detector
+        // would redact if it were (wrongly) routed through the scan.
+        let signature = "sig_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9_supersecretvalue";
+        let reasoning =
+            reasoning_block_after_round_trip("Let me list the available tools.", signature).await;
+
+        // Clean trace passes through unchanged...
+        assert_eq!(
+            reasoning.text.as_deref(),
+            Some("Let me list the available tools."),
+            "a clean trace must not be altered"
+        );
+        // ...and the opaque signature survives byte-for-byte (not leak-scanned).
+        assert_eq!(
+            reasoning.signature.as_deref(),
+            Some(signature),
+            "reasoning signature must pass through unmodified (SIG-D2)"
+        );
+    }
+
+    /// SIG-D2 (finding #2): when the leak-scan actually redacts the trace, the
+    /// signature it was issued for no longer matches the replayed block, so it is
+    /// dropped — a signature-less replay is safe, a mismatched one risks a
+    /// "tampered block" rejection. Drives the public caller, not the helper.
+    #[tokio::test]
+    async fn reasoning_signature_dropped_when_trace_redacted() {
+        let signature = "sig_eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9_supersecretvalue";
+        // A planted secret in the trace forces redaction to alter the bytes.
+        let trace_secret = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9_anothersecret";
+        let reasoning = reasoning_block_after_round_trip(
+            &format!("I will use Bearer {trace_secret}"),
+            signature,
+        )
+        .await;
+
+        // The trace is redacted...
+        let trace = reasoning
+            .text
+            .expect("provider reasoning should be present");
+        assert!(
+            trace.contains("[REDACTED]"),
+            "reasoning trace must be redacted: {trace}"
+        );
+        // ...so the now-stale signature is dropped.
+        assert_eq!(
+            reasoning.signature, None,
+            "signature must be dropped once redaction alters the block it signs"
+        );
     }
 
     #[tokio::test]
@@ -4128,8 +4158,7 @@ That's my plan."#;
                     finish_reason: FinishReason::Stop,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
-                    reasoning: None,
-                    reasoning_signature: None,
+                    reasoning: ReasoningBlock::default(),
                 })
             }
         }
@@ -4282,7 +4311,6 @@ That's my plan."#;
                 tool_calls,
                 content,
                 reasoning: _,
-                reasoning_signature: _,
             } => {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].name, "tool_list");
@@ -4317,7 +4345,6 @@ That's my plan."#;
                 tool_calls,
                 content,
                 reasoning: _,
-                reasoning_signature: _,
             } => {
                 assert_eq!(tool_calls.len(), 1);
                 assert_eq!(tool_calls[0].name, "tool_list");
@@ -4487,8 +4514,7 @@ That's my plan."#;
                 finish_reason: self.finish_reason,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ReasoningBlock::default(),
             })
         }
     }

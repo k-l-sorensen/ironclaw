@@ -32,8 +32,9 @@ use crate::config::MistralReasoningEffort;
 use crate::costs;
 use crate::error::LlmError;
 use crate::provider::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, Role, ToolCall,
-    ToolCompletionRequest, ToolCompletionResponse, ToolDefinition, sanitize_tool_messages,
+    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ReasoningBlock,
+    Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
+    sanitize_tool_messages,
 };
 use crate::reasoning_models::supports_mistral_reasoning;
 use crate::tool_schema::{ToolSchemaPolicy, shape_tool_schema};
@@ -276,14 +277,14 @@ impl LlmProvider for MistralProvider {
             finish_reason,
         } = Self::first_choice(response)?;
 
-        let (content, reasoning, reasoning_signature) = extract_content(message.content)?;
+        let (content, reasoning) = extract_content(message.content)?;
         // For a plain completion the text chunk IS the answer; a reasoning-on
         // array with no text chunk means the answer was lost — fail loud
         // (EmptyResponse, retryable) rather than defaulting to "" (F6).
         let content = content.ok_or_else(|| LlmError::EmptyResponse {
             provider: PROVIDER.to_string(),
         })?;
-        emit_reasoning_trace(reasoning.as_deref());
+        emit_reasoning_trace(reasoning.text.as_deref());
 
         Ok(CompletionResponse {
             content,
@@ -291,7 +292,6 @@ impl LlmProvider for MistralProvider {
             input_tokens,
             output_tokens,
             reasoning,
-            reasoning_signature,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -321,7 +321,7 @@ impl LlmProvider for MistralProvider {
         } = Self::first_choice(response)?;
 
         let tool_calls = parse_tool_calls(message.tool_calls);
-        let (content, reasoning, reasoning_signature) = extract_content(message.content)?;
+        let (content, reasoning) = extract_content(message.content)?;
 
         // Either a textual answer or at least one tool call is required; both
         // empty means the turn produced nothing usable (fail loud).
@@ -330,7 +330,7 @@ impl LlmProvider for MistralProvider {
                 provider: PROVIDER.to_string(),
             });
         }
-        emit_reasoning_trace(reasoning.as_deref());
+        emit_reasoning_trace(reasoning.text.as_deref());
 
         let has_tool_calls = !tool_calls.is_empty();
         Ok(ToolCompletionResponse {
@@ -342,7 +342,6 @@ impl LlmProvider for MistralProvider {
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
             reasoning,
-            reasoning_signature,
         })
     }
 
@@ -403,26 +402,22 @@ fn parse_json<R: DeserializeOwned>(text: &str) -> Result<R, LlmError> {
     })
 }
 
-/// `(answer, reasoning_trace, reasoning_signature)` returned by
-/// [`extract_content`]. Aliased to keep the function under clippy's
-/// type-complexity bar.
-type ExtractedContent = (Option<String>, Option<String>, Option<String>);
-
-/// Split Mistral's `message.content` into `(answer, reasoning_trace,
-/// reasoning_signature)`.
+/// Split Mistral's `message.content` into `(answer, reasoning_block)`.
 ///
-/// - String content → `(Some(text), None, None)` (reasoning off).
-/// - Array content → text chunk(s) concatenated as the answer, thinking
-///   chunk(s) flattened into the reasoning trace, and the first non-null
-///   ThinkChunk `signature` carried out as an opaque replay token.
+/// - String content → `(Some(text), empty block)` (reasoning off).
+/// - Array content → text chunk(s) concatenated as the answer; thinking
+///   chunk(s) flattened into the block's trace, with the first non-null
+///   ThinkChunk `signature` carried as the block's opaque replay token.
 ///
-/// Returns `Ok((None, _, _))` only when there genuinely is no text chunk;
-/// callers decide whether that is an error. A malformed array surfaces through
-/// serde as an `InvalidResponse` before reaching here.
-fn extract_content(content: Option<MistralMessageContent>) -> Result<ExtractedContent, LlmError> {
+/// Returns `Ok((None, _))` only when there genuinely is no text chunk; callers
+/// decide whether that is an error. A malformed array surfaces through serde as
+/// an `InvalidResponse` before reaching here.
+fn extract_content(
+    content: Option<MistralMessageContent>,
+) -> Result<(Option<String>, ReasoningBlock), LlmError> {
     match content {
-        None => Ok((None, None, None)),
-        Some(MistralMessageContent::Text(s)) => Ok((non_empty(s), None, None)),
+        None => Ok((None, ReasoningBlock::default())),
+        Some(MistralMessageContent::Text(s)) => Ok((non_empty(s), ReasoningBlock::default())),
         Some(MistralMessageContent::Chunks(chunks)) => {
             let mut answer = String::new();
             let mut thinking = String::new();
@@ -446,7 +441,10 @@ fn extract_content(content: Option<MistralMessageContent>) -> Result<ExtractedCo
                     MistralContentChunk::ImageUrl { .. } => {}
                 }
             }
-            Ok((non_empty(answer), non_empty(thinking), signature))
+            Ok((
+                non_empty(answer),
+                ReasoningBlock::new(non_empty(thinking), signature),
+            ))
         }
     }
 }
@@ -525,10 +523,10 @@ fn chat_message_to_wire(msg: ChatMessage, vision: bool) -> MistralMessage {
             .collect()
     });
 
-    let reasoning = msg.reasoning.filter(|r| !r.trim().is_empty());
-    let reasoning_signature = msg.reasoning_signature.filter(|s| !s.is_empty());
+    let trace = msg.reasoning.text.filter(|r| !r.trim().is_empty());
+    let reasoning_signature = msg.reasoning.signature.filter(|s| !s.is_empty());
 
-    let content = if let Some(trace) = reasoning {
+    let content = if let Some(trace) = trace {
         // Multi-turn replay: reconstruct the full assistant message including
         // the ThinkChunk (with its opaque signature, SIG-1), followed by the
         // answer text chunk.

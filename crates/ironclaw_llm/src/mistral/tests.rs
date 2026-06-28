@@ -134,7 +134,7 @@ async fn c1_complete_sends_reasoning_effort_high() {
         .await
         .expect("completion succeeds");
     assert_eq!(resp.content, "the answer");
-    assert_eq!(resp.reasoning.as_deref(), Some("let me think"));
+    assert_eq!(resp.reasoning.text.as_deref(), Some("let me think"));
     assert_eq!(resp.input_tokens, 11);
     assert_eq!(resp.output_tokens, 7);
 
@@ -238,19 +238,18 @@ fn c6_array_response_splits_reasoning_and_content() {
         {"type": "text", "text": "final answer"}
     ]))
     .unwrap();
-    let (text, reasoning, _signature) = extract_content(Some(content)).unwrap();
+    let (text, reasoning) = extract_content(Some(content)).unwrap();
     assert_eq!(text.as_deref(), Some("final answer"));
-    assert_eq!(reasoning.as_deref(), Some("step one step two"));
+    assert_eq!(reasoning.text.as_deref(), Some("step one step two"));
 }
 
 #[test]
 fn c7_string_response_has_no_reasoning() {
     let content: MistralMessageContent =
         serde_json::from_value(serde_json::json!("plain answer")).unwrap();
-    let (text, reasoning, signature) = extract_content(Some(content)).unwrap();
+    let (text, reasoning) = extract_content(Some(content)).unwrap();
     assert_eq!(text.as_deref(), Some("plain answer"));
-    assert!(reasoning.is_none());
-    assert!(signature.is_none());
+    assert!(reasoning.is_empty());
 }
 
 // ── C8: multi-turn replay reconstructs the ThinkChunk ───────────────────────
@@ -259,7 +258,7 @@ fn c7_string_response_has_no_reasoning() {
 fn c8_multi_turn_replays_think_chunk() {
     // Turn-1 reasoning fed back via with_reasoning, as the agent loop does.
     let assistant = ChatMessage::assistant("the answer")
-        .with_reasoning(Some("prior reasoning trace".to_string()));
+        .with_reasoning(ReasoningBlock::from_text("prior reasoning trace"));
     let wire = chat_message_to_wire(assistant, false);
     let json = serde_json::to_value(&wire).unwrap();
     let content = &json["content"];
@@ -284,7 +283,7 @@ fn ctr_c5_turn_two_request_replays_prior_think_chunk() {
     // History as rebuilt for the second user turn.
     let history = vec![
         ChatMessage::user("What is 17 * 23?"),
-        ChatMessage::assistant("391").with_reasoning(Some("17 * 23 = 391".to_string())),
+        ChatMessage::assistant("391").with_reasoning(ReasoningBlock::from_text("17 * 23 = 391")),
         ChatMessage::user("Now multiply that by 3."),
     ];
 
@@ -320,19 +319,20 @@ fn sig_c1_array_response_captures_signature() {
         {"type": "text", "text": "answer"}
     ]))
     .unwrap();
-    let (text, reasoning, signature) = extract_content(Some(content)).unwrap();
+    let (text, reasoning) = extract_content(Some(content)).unwrap();
     assert_eq!(text.as_deref(), Some("answer"));
-    assert_eq!(reasoning.as_deref(), Some("reasoning"));
-    assert_eq!(signature.as_deref(), Some("opaque-sig-xyz"));
+    assert_eq!(reasoning.text.as_deref(), Some("reasoning"));
+    assert_eq!(reasoning.signature.as_deref(), Some("opaque-sig-xyz"));
 }
 
 /// SIG-C2: `chat_message_to_wire` re-emits the captured signature on the rebuilt
 /// thinking chunk — a request-body assertion, not "no 400".
 #[test]
 fn sig_c2_wire_request_reemits_signature() {
-    let assistant = ChatMessage::assistant("the answer")
-        .with_reasoning(Some("prior reasoning trace".to_string()))
-        .with_reasoning_signature(Some("opaque-sig-xyz".to_string()));
+    let assistant = ChatMessage::assistant("the answer").with_reasoning(ReasoningBlock::new(
+        Some("prior reasoning trace".to_string()),
+        Some("opaque-sig-xyz".to_string()),
+    ));
     let wire = chat_message_to_wire(assistant, false);
     let json = serde_json::to_value(&wire).unwrap();
     let chunks = json["content"]
@@ -354,9 +354,9 @@ fn sig_c6_lenient_serde_tolerates_unknown_fields() {
         {"type": "text", "text": "answer"}
     ]))
     .expect("unknown fields within a chunk must not fail deserialization");
-    let (text, _reasoning, signature) = extract_content(Some(content)).unwrap();
+    let (text, reasoning) = extract_content(Some(content)).unwrap();
     assert_eq!(text.as_deref(), Some("answer"));
-    assert_eq!(signature.as_deref(), Some("s"));
+    assert_eq!(reasoning.signature.as_deref(), Some("s"));
 }
 
 // ── C9: complete_with_tools carries both reasoning_effort and tool schema ────

@@ -691,13 +691,23 @@ layer at a time.
   with the existing per-tool-call `ToolCall.signature` (set to `None` in
   `mistral.rs`; Reborn `host.rs`). Reads as "signature of the reasoning block,"
   parallel to how `reasoning` is the reasoning text.
-- **SIG-D2 — Sibling `Option<String>`, leak-scan-EXEMPT, length-capped (4096).**
+- **SIG-D2 — leak-scan-EXEMPT, but dropped when the trace it signs is redacted.**
   The signature is an opaque token, not model prose. Routing it through
   `redact_reasoning` / `LeakDetector::redact_all` could match-and-replace bytes
-  inside it → silent corruption → turn-2 400 or an ignored block. This is the
-  **decisive** reason it must be a separate field, **never concatenated into the
-  `reasoning` string**. Validate length only (reuse the
-  `validate_optional_provider_text(..., 4096)` style the Reborn precedent uses).
+  inside it → silent corruption → turn-2 400 or an ignored block. So the
+  signature is **never concatenated into the `reasoning` string** and is **not**
+  itself leak-scanned. **Update (finding #2):** the signature is a continuity
+  token the provider issued for *those exact reasoning bytes*. When the trace's
+  own leak-scan actually alters the trace, the signature no longer matches the
+  replayed block, so it is **dropped** — a signature-less replay is safe, whereas
+  a signature that disagrees with its block can be rejected as tampered. A clean
+  (unaltered) trace keeps its signature verbatim.
+
+  **Structure (refactor):** the trace and signature are bundled into one
+  `ReasoningBlock { text, signature }` value object rather than threaded as two
+  parallel `Option<String>` siblings. The asymmetry above lives in exactly one
+  place — `ReasoningBlock::redacted` — and the persistence/wire edges flatten the
+  block back to two columns/fields.
 - **SIG-D3 — Stay lenient serde; do NOT add `deny_unknown_fields`.** Add as
   `#[serde(default)] Option<String>` so old/new Mistral payloads and any future
   ThinkChunk fields keep deserializing. The existing loud-failure is on an unknown
@@ -742,7 +752,8 @@ Offline-first, mirroring the CTR-1 matrix; live = smoke.
 | SIG-C2 | request body (mock / trace capture) | `chat_message_to_wire` emits the captured signature on the rebuilt thinking chunk — a request-body assertion, **not** "no 400". |
 | SIG-C3 | dual-backend round-trip (`--features integration`) | persist a turn with a signature → reload → `reasoning_signature` intact on **PostgreSQL and libSQL**. |
 | SIG-C4 | hydration | `rebuild_chat_messages_from_db` re-attaches the signature after DB load. |
-| SIG-C5 | leak-scan exemption (SIG-D2) | a signature containing redactor-trigger bytes is persisted/replayed **unmodified**. |
+| SIG-C5 | leak-scan exemption (SIG-D2) | a signature containing redactor-trigger bytes rides a **clean** trace through `respond_with_tools` **unmodified** (not itself scanned). |
+| SIG-C5b | redaction-drop (SIG-D2, finding #2) | when the trace IS redacted, the now-stale signature is **dropped**. |
 | SIG-C6 | lenient serde (SIG-D3) | a thinking chunk carrying an extra unknown field still deserializes. |
 
 ### Out of scope (SIG-1)

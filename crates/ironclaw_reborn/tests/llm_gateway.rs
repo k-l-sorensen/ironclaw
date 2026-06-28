@@ -365,8 +365,7 @@ async fn gateway_rejects_empty_tool_capable_stop_response_without_text_only_retr
         finish_reason: FinishReason::Stop,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
-        reasoning: None,
-        reasoning_signature: None,
+        reasoning: ironclaw_llm::ReasoningBlock::default(),
     }));
     let gateway = LlmProviderModelGateway::with_provider_identity(
         STATIC_PROVIDER_ID,
@@ -469,8 +468,7 @@ async fn gateway_preserves_structured_tool_calls_when_content_has_legacy_marker(
         finish_reason: FinishReason::ToolUse,
         cache_read_input_tokens: 0,
         cache_creation_input_tokens: 0,
-        reasoning: Some("response reasoning".to_string()),
-        reasoning_signature: None,
+        reasoning: ironclaw_llm::ReasoningBlock::from_text("response reasoning".to_string()),
     }));
     let gateway = LlmProviderModelGateway::with_provider_identity(
         STATIC_PROVIDER_ID,
@@ -561,8 +559,7 @@ async fn gateway_repairs_oversized_provider_tool_arguments_before_registration()
             finish_reason: FinishReason::ToolUse,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: Some("response reasoning".to_string()),
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::from_text("response reasoning".to_string()),
         },
         ToolCompletionResponse {
             content: Some("Finished after repair.".to_string()),
@@ -572,8 +569,7 @@ async fn gateway_repairs_oversized_provider_tool_arguments_before_registration()
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
         },
     ]));
     let gateway = LlmProviderModelGateway::with_provider_identity(
@@ -740,7 +736,10 @@ async fn gateway_reconstructs_provider_tool_roundtrip_from_tool_result_reference
     assert_eq!(requests[0].messages.len(), 2);
     let assistant = &requests[0].messages[0];
     assert_eq!(assistant.role, Role::Assistant);
-    assert_eq!(assistant.reasoning.as_deref(), Some("provider reasoning"));
+    assert_eq!(
+        assistant.reasoning.text.as_deref(),
+        Some("provider reasoning")
+    );
     let tool_calls = assistant.tool_calls.as_ref().expect("assistant tool call");
     assert_eq!(tool_calls[0].id, "call_1");
     assert_eq!(tool_calls[0].name, "demo__echo");
@@ -1100,7 +1099,10 @@ async fn gateway_reconstructs_multi_tool_provider_turn_from_grouped_result_refer
     assert_eq!(requests[0].messages.len(), 3);
     let assistant = &requests[0].messages[0];
     assert_eq!(assistant.role, Role::Assistant);
-    assert_eq!(assistant.reasoning.as_deref(), Some("provider reasoning"));
+    assert_eq!(
+        assistant.reasoning.text.as_deref(),
+        Some("provider reasoning")
+    );
     let tool_calls = assistant.tool_calls.as_ref().expect("assistant tool calls");
     assert_eq!(tool_calls.len(), 2);
     assert_eq!(tool_calls[0].id, "call_1");
@@ -1195,7 +1197,7 @@ async fn gateway_splits_adjacent_provider_tool_results_from_different_turns() {
     let first_assistant = &requests[0].messages[0];
     assert_eq!(first_assistant.role, Role::Assistant);
     assert_eq!(
-        first_assistant.reasoning.as_deref(),
+        first_assistant.reasoning.text.as_deref(),
         Some("first provider reasoning")
     );
     let first_tool_calls = first_assistant
@@ -1216,7 +1218,7 @@ async fn gateway_splits_adjacent_provider_tool_results_from_different_turns() {
     let second_assistant = &requests[0].messages[2];
     assert_eq!(second_assistant.role, Role::Assistant);
     assert_eq!(
-        second_assistant.reasoning.as_deref(),
+        second_assistant.reasoning.text.as_deref(),
         Some("second provider reasoning")
     );
     let second_tool_calls = second_assistant
@@ -2692,8 +2694,7 @@ impl LlmProvider for IgnoresModelOverrideProvider {
             input_tokens: 1,
             output_tokens: 1,
             finish_reason: FinishReason::Stop,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -2752,7 +2753,7 @@ impl RecordingLlmProvider {
             .expect("response configured")
             .as_mut()
             .expect("successful response configured")
-            .reasoning = Some(reasoning.to_string());
+            .reasoning = ironclaw_llm::ReasoningBlock::from_text(reasoning);
         provider
     }
 
@@ -2777,8 +2778,7 @@ impl RecordingLlmProvider {
                 input_tokens: 1,
                 output_tokens: 1,
                 finish_reason,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             }))),
@@ -2838,8 +2838,7 @@ impl LlmProvider for BarrierRecordingLlmProvider {
             input_tokens: 1,
             output_tokens: 1,
             finish_reason: FinishReason::Stop,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -2873,8 +2872,7 @@ impl ToolAwareProvider {
                 input_tokens: 1,
                 output_tokens: 1,
                 finish_reason: FinishReason::Stop,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })),
@@ -2891,8 +2889,7 @@ impl ToolAwareProvider {
             finish_reason: FinishReason::ToolUse,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: Some("response reasoning".to_string()),
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::from_text("response reasoning".to_string()),
         })
     }
 
@@ -2905,8 +2902,7 @@ impl ToolAwareProvider {
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: None,
-            reasoning_signature: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
         })
     }
 

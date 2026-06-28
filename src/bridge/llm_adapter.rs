@@ -632,8 +632,7 @@ fn thread_msg_to_chat(msg: &ThreadMessage) -> ChatMessage {
         tool_call_id: msg.action_call_id.clone(),
         name: msg.action_name.clone(),
         tool_calls: None,
-        reasoning: None,
-        reasoning_signature: None,
+        reasoning: ironclaw_llm::ReasoningBlock::default(),
     };
 
     // Convert action calls if present (assistant message with tool calls)
@@ -899,8 +898,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 finish_reason: ironclaw_llm::FinishReason::Stop,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -926,8 +924,7 @@ mod tests {
                 finish_reason: ironclaw_llm::FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -1046,8 +1043,7 @@ mod tests {
                     input_tokens: 3,
                     output_tokens: 2,
                     finish_reason: ironclaw_llm::FinishReason::Stop,
-                    reasoning: None,
-                    reasoning_signature: None,
+                    reasoning: ironclaw_llm::ReasoningBlock::default(),
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 })
@@ -1332,8 +1328,7 @@ mod tests {
                 finish_reason: ironclaw_llm::FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -1456,8 +1451,7 @@ mod tests {
                 input_tokens: 1,
                 output_tokens: 1,
                 finish_reason: ironclaw_llm::FinishReason::Stop,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -2163,8 +2157,7 @@ And also check the token price:\n\
                 finish_reason: ironclaw_llm::FinishReason::ToolUse,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -2253,8 +2246,7 @@ And also check the token price:\n\
                 input_tokens: 1000,
                 output_tokens: 500,
                 finish_reason: ironclaw_llm::FinishReason::Stop,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -2271,8 +2263,7 @@ And also check the token price:\n\
                 finish_reason: ironclaw_llm::FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
-                reasoning_signature: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -2381,8 +2372,7 @@ And also check the token price:\n\
                     input_tokens: 1000,
                     output_tokens: 500,
                     finish_reason: ironclaw_llm::FinishReason::Stop,
-                    reasoning: None,
-                    reasoning_signature: None,
+                    reasoning: ironclaw_llm::ReasoningBlock::default(),
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 })
@@ -2443,8 +2433,7 @@ And also check the token price:\n\
                     input_tokens: 10_000,
                     output_tokens: 5_000,
                     finish_reason: ironclaw_llm::FinishReason::Stop,
-                    reasoning: None,
-                    reasoning_signature: None,
+                    reasoning: ironclaw_llm::ReasoningBlock::default(),
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
                 })
@@ -2515,8 +2504,7 @@ And also check the token price:\n\
                     input_tokens: 10_000,
                     output_tokens: 500,
                     finish_reason: ironclaw_llm::FinishReason::Stop,
-                    reasoning: None,
-                    reasoning_signature: None,
+                    reasoning: ironclaw_llm::ReasoningBlock::default(),
                     cache_read_input_tokens: 2_000,
                     cache_creation_input_tokens: 1_000,
                 })

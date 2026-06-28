@@ -18,7 +18,7 @@ use uuid::Uuid;
 
 use crate::generated_images::GeneratedImageSentinel;
 use ironclaw_common::{ExtensionName, truncate_preview};
-use ironclaw_llm::{ChatMessage, ToolCall, generate_tool_call_id};
+use ironclaw_llm::{ChatMessage, ReasoningBlock, ToolCall, generate_tool_call_id};
 
 /// A session containing one or more threads.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -407,8 +407,6 @@ impl Thread {
                 narrative: t.narrative.clone(),
                 reasoning: t.reasoning.clone(),
                 tool_call_reasoning: t.tool_call_reasoning.clone(),
-                reasoning_signature: t.reasoning_signature.clone(),
-                tool_call_reasoning_signature: t.tool_call_reasoning_signature.clone(),
             })
             .unwrap_or_default()
     }
@@ -583,8 +581,7 @@ impl Thread {
                 // (CTR-1 / F3).
                 messages.push(
                     ChatMessage::assistant_with_tool_calls(None, tool_calls)
-                        .with_reasoning(turn.tool_call_reasoning.clone())
-                        .with_reasoning_signature(turn.tool_call_reasoning_signature.clone()),
+                        .with_reasoning(turn.tool_call_reasoning.clone()),
                 );
 
                 // Individual tool result messages, truncated to limit context size.
@@ -610,13 +607,10 @@ impl Thread {
                 }
             }
             if let Some(ref response) = turn.response {
-                // Re-attach the turn's reasoning trace (CTR-1) + opaque signature
-                // (SIG-1) — see above.
-                messages.push(
-                    ChatMessage::assistant(response)
-                        .with_reasoning(turn.reasoning.clone())
-                        .with_reasoning_signature(turn.reasoning_signature.clone()),
-                );
+                // Re-attach the turn's reasoning block (trace + opaque signature,
+                // CTR-1 / SIG-1) — see above.
+                messages
+                    .push(ChatMessage::assistant(response).with_reasoning(turn.reasoning.clone()));
             }
         }
         messages
@@ -774,27 +768,20 @@ pub struct Turn {
     /// cleaned, channel-facing text): this is the trace replayed verbatim into
     /// the next request so Mistral sees its prior ThinkChunk and DeepSeek/Gemini
     /// validate the chain (CTR-1). Persisted on the turn's assistant row.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
-    /// Reasoning trace that preceded this turn's tool-call round (the ThinkChunk
+    /// The final text answer's reasoning block (trace + opaque Mistral
+    /// signature). Re-attached so the next request replays the prior ThinkChunk
+    /// and DeepSeek/Gemini validate the chain (CTR-1 / SIG-1). Persisted on the
+    /// turn's assistant row.
+    #[serde(default, skip_serializing_if = "ReasoningBlock::is_empty")]
+    pub reasoning: ReasoningBlock,
+    /// Reasoning block that preceded this turn's tool-call round (the ThinkChunk
     /// emitted alongside the `tool_calls`), distinct from `reasoning` which is
-    /// the trace preceding the final text answer. Re-attached to the
+    /// the block preceding the final text answer. Re-attached to the
     /// `assistant_with_tool_calls` message and persisted on the `tool_calls`
     /// row, so each assistant message replays its own ThinkChunk rather than
     /// having one slot last-write-wins and cross-stamp both messages (CTR-1 / F3).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_reasoning: Option<String>,
-    /// Opaque reasoning-block signature (Mistral ThinkChunk `signature`) for the
-    /// final text answer's reasoning. Sibling of `reasoning`, replayed verbatim
-    /// so the provider can verify the replayed block. Never leak-scanned — an
-    /// opaque token.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_signature: Option<String>,
-    /// Opaque reasoning-block signature for the tool-call round's reasoning
-    /// (sibling of `tool_call_reasoning`). Distinct slot so each assistant
-    /// message replays its own signature.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_call_reasoning_signature: Option<String>,
+    #[serde(default, skip_serializing_if = "ReasoningBlock::is_empty")]
+    pub tool_call_reasoning: ReasoningBlock,
     /// Transient image content parts for multimodal LLM input.
     /// Not serialized — images are only needed for the current LLM call.
     /// The text description in `user_input` persists for compaction/context.
@@ -804,22 +791,18 @@ pub struct Turn {
 
 /// Owned, cloned snapshot of the fields the persistence layer reads off the
 /// most-recent turn. Replaces a positional tuple that was hand-destructured at
-/// 8 persist sites in `thread_ops.rs`; naming the fields makes the two adjacent
-/// `Option<String>` reasoning slots compiler-checked instead of swappable by
-/// position (Q1 / F3 — see `.claude/rules/types.md`).
+/// 8 persist sites in `thread_ops.rs`; naming the fields makes the two
+/// reasoning slots compiler-checked instead of swappable by position (Q1 / F3 —
+/// see `.claude/rules/types.md`).
 #[derive(Debug, Default, Clone)]
 pub(crate) struct TurnPersistSnapshot {
     pub(crate) turn_number: usize,
     pub(crate) tool_calls: Vec<TurnToolCall>,
     pub(crate) narrative: Option<String>,
-    /// Final assistant answer's reasoning trace.
-    pub(crate) reasoning: Option<String>,
-    /// Tool-call round's reasoning trace.
-    pub(crate) tool_call_reasoning: Option<String>,
-    /// Final assistant answer's opaque reasoning-block signature.
-    pub(crate) reasoning_signature: Option<String>,
-    /// Tool-call round's opaque reasoning-block signature.
-    pub(crate) tool_call_reasoning_signature: Option<String>,
+    /// Final assistant answer's reasoning block (trace + opaque signature).
+    pub(crate) reasoning: ReasoningBlock,
+    /// Tool-call round's reasoning block (trace + opaque signature).
+    pub(crate) tool_call_reasoning: ReasoningBlock,
 }
 
 impl Turn {
@@ -836,10 +819,8 @@ impl Turn {
             completed_at: None,
             error: None,
             narrative: None,
-            reasoning: None,
-            tool_call_reasoning: None,
-            reasoning_signature: None,
-            tool_call_reasoning_signature: None,
+            reasoning: ReasoningBlock::default(),
+            tool_call_reasoning: ReasoningBlock::default(),
             image_content_parts: Vec::new(),
         }
     }
@@ -1017,8 +998,8 @@ mod tests {
         assert_eq!(snapshot.turn_number, 0);
         assert!(snapshot.tool_calls.is_empty());
         assert_eq!(snapshot.narrative, None);
-        assert_eq!(snapshot.reasoning, None);
-        assert_eq!(snapshot.tool_call_reasoning, None);
+        assert!(snapshot.reasoning.is_empty());
+        assert!(snapshot.tool_call_reasoning.is_empty());
     }
 
     #[test]
@@ -1029,14 +1010,17 @@ mod tests {
         let mut thread = Thread::new(Uuid::new_v4(), None);
         thread.start_turn("Hello");
         let turn = thread.last_turn_mut().expect("turn exists");
-        turn.reasoning = Some("final-answer trace".to_string());
-        turn.tool_call_reasoning = Some("tool-call-round trace".to_string());
+        turn.reasoning = ReasoningBlock::from_text("final-answer trace");
+        turn.tool_call_reasoning = ReasoningBlock::from_text("tool-call-round trace");
         turn.narrative = Some("narrative text".to_string());
 
         let snapshot = thread.last_turn_snapshot();
-        assert_eq!(snapshot.reasoning.as_deref(), Some("final-answer trace"));
         assert_eq!(
-            snapshot.tool_call_reasoning.as_deref(),
+            snapshot.reasoning.text.as_deref(),
+            Some("final-answer trace")
+        );
+        assert_eq!(
+            snapshot.tool_call_reasoning.text.as_deref(),
             Some("tool-call-round trace")
         );
         assert_eq!(snapshot.narrative.as_deref(), Some("narrative text"));
@@ -2025,9 +2009,11 @@ mod tests {
     fn test_messages_reattaches_reasoning_text_turn() {
         let mut thread = Thread::new(Uuid::new_v4(), None);
         let mut turn = Turn::new(0, "What is 17 * 23?");
-        turn.reasoning = Some("17 * 23 = 391".to_string());
         // SIG-1: the opaque reasoning signature rides alongside the trace.
-        turn.reasoning_signature = Some("opaque-sig-xyz".to_string());
+        turn.reasoning = ReasoningBlock::new(
+            Some("17 * 23 = 391".to_string()),
+            Some("opaque-sig-xyz".to_string()),
+        );
         turn.conclude(TurnOutcome::Completed("391".to_string()));
         thread.turns.push(turn);
 
@@ -2036,10 +2022,10 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].role, ironclaw_llm::Role::Assistant);
         assert_eq!(messages[1].content, "391");
-        assert_eq!(messages[1].reasoning.as_deref(), Some("17 * 23 = 391"));
+        assert_eq!(messages[1].reasoning.text.as_deref(), Some("17 * 23 = 391"));
         // SIG-1: the signature is re-attached for replay on the next turn.
         assert_eq!(
-            messages[1].reasoning_signature.as_deref(),
+            messages[1].reasoning.signature.as_deref(),
             Some("opaque-sig-xyz")
         );
     }
@@ -2062,8 +2048,8 @@ mod tests {
         // Distinct traces: the thinking before the tool call vs. before the
         // final answer. The single-slot bug (F3) replayed the final answer's
         // trace onto both messages.
-        turn.tool_call_reasoning = Some("think before the tool".to_string());
-        turn.reasoning = Some("think before the answer".to_string());
+        turn.tool_call_reasoning = ReasoningBlock::from_text("think before the tool");
+        turn.reasoning = ReasoningBlock::from_text("think before the answer");
         turn.conclude(TurnOutcome::Completed("Build is clean.".to_string()));
         thread.turns.push(turn);
 
@@ -2073,14 +2059,14 @@ mod tests {
         // tool-call assistant message carries the tool-call round's trace.
         assert!(messages[1].tool_calls.is_some());
         assert_eq!(
-            messages[1].reasoning.as_deref(),
+            messages[1].reasoning.text.as_deref(),
             Some("think before the tool")
         );
         // final assistant message carries the final answer's trace — not the
         // tool-call trace.
         assert_eq!(messages[3].content, "Build is clean.");
         assert_eq!(
-            messages[3].reasoning.as_deref(),
+            messages[3].reasoning.text.as_deref(),
             Some("think before the answer")
         );
     }

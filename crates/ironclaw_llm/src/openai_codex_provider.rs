@@ -15,7 +15,8 @@ use tokio::sync::RwLock;
 use crate::error::LlmError;
 use crate::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, LlmProvider,
-    ModelMetadata, Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
+    ModelMetadata, ReasoningBlock, Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
+    ToolDefinition,
 };
 
 /// OpenAI Codex Responses API provider.
@@ -272,8 +273,7 @@ impl LlmProvider for OpenAiCodexProvider {
             input_tokens: parsed.input_tokens,
             output_tokens: parsed.output_tokens,
             finish_reason: parsed.finish_reason,
-            reasoning: parsed.reasoning,
-            reasoning_signature: None,
+            reasoning: ReasoningBlock::new(parsed.reasoning, None),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -342,8 +342,7 @@ impl LlmProvider for OpenAiCodexProvider {
             finish_reason,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: parsed.reasoning,
-            reasoning_signature: None,
+            reasoning: ReasoningBlock::new(parsed.reasoning, None),
         })
     }
 
