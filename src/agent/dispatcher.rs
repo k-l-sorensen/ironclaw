@@ -23,7 +23,7 @@ use crate::agent::agentic_loop::{
 use crate::generated_images::GeneratedImageSentinel;
 use crate::tools::permissions::{PermissionState, effective_permission};
 use crate::tools::redact_params;
-use ironclaw_llm::{ChatMessage, Reasoning, ReasoningContext, TokenUsage};
+use ironclaw_llm::{ChatMessage, Reasoning, ReasoningBlock, ReasoningContext, TokenUsage};
 
 fn selected_model_override(value: &serde_json::Value) -> Option<String> {
     ironclaw_llm::normalized_model_override(value.as_str()).map(str::to_string)
@@ -837,16 +837,17 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         &self,
         text: &str,
         _metadata: ironclaw_llm::ResponseMetadata,
-        reasoning: Option<String>,
+        reasoning: ReasoningBlock,
         _reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
-        // Record the (already leak-scanned) reasoning trace on the turn so it
-        // survives turn persistence and is replayed on the next user turn —
-        // Mistral requires the prior ThinkChunk, and DeepSeek/Gemini reject the
-        // follow-up without the echo (CTR-1, #3201/#3225). Only overwrite with a
-        // non-empty trace so a final answer without reasoning doesn't clobber an
-        // earlier tool-round trace.
-        if reasoning.is_some() {
+        // Record the reasoning block on the turn so it survives turn persistence
+        // and is replayed on the next user turn — Mistral requires the prior
+        // ThinkChunk, and DeepSeek/Gemini reject the follow-up without the echo
+        // (CTR-1, #3201/#3225). The trace is leak-scanned; the opaque signature
+        // rides along unredacted inside the block (SIG-1 / SIG-D2). Only overwrite
+        // with a non-empty trace so a final answer without reasoning doesn't
+        // clobber an earlier tool-round trace.
+        if reasoning.text.is_some() {
             self.with_last_turn(|turn| {
                 turn.reasoning = reasoning;
             })
@@ -865,7 +866,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
         tool_calls: Vec<ironclaw_llm::ToolCall>,
         content: Option<String>,
         reason_ctx: &mut ReasoningContext,
-        reasoning: Option<String>,
+        reasoning: ReasoningBlock,
     ) -> Result<Option<LoopOutcome>, Error> {
         // Extract and sanitize the narrative before consuming `content`.
         let narrative = content
@@ -880,14 +881,15 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
             })
             .filter(|c| !c.trim().is_empty());
 
-        // Capture the reasoning trace for cross-turn persistence before it is
-        // moved into the within-turn context below (CTR-1).
+        // Capture the reasoning block for cross-turn persistence before it is
+        // moved into the within-turn context below (CTR-1/SIG-1).
         let turn_reasoning = reasoning.clone();
 
         // Add the assistant message with tool_calls to context.
         // OpenAI protocol requires this before tool-result messages.
-        // Carry reasoning so the next request can echo it back — required for
-        // DeepSeek thinking-mode and Gemini 2.5+ to validate the chain (#3201, #3225).
+        // Carry the reasoning block so the next request can echo it back —
+        // required for DeepSeek thinking-mode and Gemini 2.5+ to validate the
+        // chain (#3201, #3225). The opaque signature rides along inside it (SIG-1).
         reason_ctx.messages.push(
             ChatMessage::assistant_with_tool_calls(content, tool_calls.clone())
                 .with_reasoning(reasoning),
@@ -961,7 +963,7 @@ impl<'a> LoopDelegate for ChatDelegate<'a> {
                 // last-write-wins slot (CTR-1 / F3). Only overwrite with a
                 // non-empty trace so a later round without reasoning doesn't
                 // clobber an earlier one.
-                if turn_reasoning.is_some() {
+                if turn_reasoning.text.is_some() {
                     turn.tool_call_reasoning = turn_reasoning;
                 }
                 for (tc, safe_args) in tool_calls.iter().zip(redacted_args) {
@@ -1960,7 +1962,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 finish_reason: FinishReason::Stop,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -1978,7 +1980,7 @@ mod tests {
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -2004,7 +2006,7 @@ mod tests {
                 input_tokens: 12,
                 output_tokens: 3,
                 finish_reason: FinishReason::Stop,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -2022,7 +2024,7 @@ mod tests {
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -2048,7 +2050,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 finish_reason: FinishReason::Stop,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -2067,7 +2069,7 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
-                    reasoning: None,
+                    reasoning: ironclaw_llm::ReasoningBlock::default(),
                 });
             }
 
@@ -2096,7 +2098,7 @@ mod tests {
                 finish_reason: FinishReason::ToolUse,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -3192,7 +3194,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 5,
                 finish_reason: FinishReason::Stop,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -3212,7 +3214,7 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
-                    reasoning: None,
+                    reasoning: ironclaw_llm::ReasoningBlock::default(),
                 });
             }
             // Tools available: always call one.
@@ -3231,7 +3233,7 @@ mod tests {
                 finish_reason: FinishReason::ToolUse,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -3514,7 +3516,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 2,
                 finish_reason: FinishReason::Stop,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -3533,7 +3535,7 @@ mod tests {
                     finish_reason: FinishReason::Stop,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
-                    reasoning: None,
+                    reasoning: ironclaw_llm::ReasoningBlock::default(),
                 });
             }
             // Always call a tool that does not exist in the registry.
@@ -3552,7 +3554,7 @@ mod tests {
                 finish_reason: FinishReason::ToolUse,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -3581,7 +3583,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 1,
                 finish_reason: FinishReason::Stop,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -3604,7 +3606,7 @@ mod tests {
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }

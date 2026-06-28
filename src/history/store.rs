@@ -118,24 +118,27 @@ impl Store {
         Ok(())
     }
 
-    /// Add a message to a conversation, carrying an optional reasoning trace.
+    /// Add a message to a conversation, carrying an optional reasoning trace and
+    /// its opaque reasoning-block signature.
     ///
-    /// The reasoning trace (already leak-scanned) is persisted so it can be
-    /// replayed into the LLM on the next user turn (CTR-1). `None` for user
-    /// messages and any caller that has no trace.
+    /// The reasoning trace (already leak-scanned) and the signature (an opaque
+    /// token, never leak-scanned) are persisted so they can be replayed into the
+    /// LLM on the next user turn. `None` for user messages and any caller that
+    /// has no trace.
     pub async fn add_conversation_message_with_reasoning(
         &self,
         conversation_id: Uuid,
         role: &str,
         content: &str,
         reasoning: Option<&str>,
+        reasoning_signature: Option<&str>,
     ) -> Result<Uuid, DatabaseError> {
         let conn = self.conn().await?;
         let id = Uuid::new_v4();
 
         conn.execute(
-            "INSERT INTO conversation_messages (id, conversation_id, role, content, reasoning) VALUES ($1, $2, $3, $4, $5)",
-            &[&id, &conversation_id, &role, &content, &reasoning],
+            "INSERT INTO conversation_messages (id, conversation_id, role, content, reasoning, reasoning_signature) VALUES ($1, $2, $3, $4, $5, $6)",
+            &[&id, &conversation_id, &role, &content, &reasoning, &reasoning_signature],
         )
         .await?;
 
@@ -2172,7 +2175,7 @@ impl Store {
         let rows = if let Some(before_ts) = before {
             conn.query(
                 r#"
-                SELECT id, role, content, created_at, reasoning
+                SELECT id, role, content, created_at, reasoning, reasoning_signature
                 FROM conversation_messages
                 WHERE conversation_id = $1 AND created_at < $2
                 ORDER BY created_at DESC
@@ -2184,7 +2187,7 @@ impl Store {
         } else {
             conn.query(
                 r#"
-                SELECT id, role, content, created_at, reasoning
+                SELECT id, role, content, created_at, reasoning, reasoning_signature
                 FROM conversation_messages
                 WHERE conversation_id = $1
                 ORDER BY created_at DESC
@@ -2208,6 +2211,7 @@ impl Store {
                 content: r.get("content"),
                 created_at: r.get("created_at"),
                 reasoning: r.get("reasoning"),
+                reasoning_signature: r.get("reasoning_signature"),
             })
             .collect();
         messages.reverse();
@@ -2253,7 +2257,7 @@ impl Store {
         let rows = conn
             .query(
                 r#"
-                SELECT id, role, content, created_at, reasoning
+                SELECT id, role, content, created_at, reasoning, reasoning_signature
                 FROM conversation_messages
                 WHERE conversation_id = $1
                 ORDER BY created_at ASC
@@ -2270,6 +2274,7 @@ impl Store {
                 content: r.get("content"),
                 created_at: r.get("created_at"),
                 reasoning: r.get("reasoning"),
+                reasoning_signature: r.get("reasoning_signature"),
             })
             .collect())
     }

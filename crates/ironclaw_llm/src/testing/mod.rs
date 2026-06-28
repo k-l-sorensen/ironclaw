@@ -63,7 +63,7 @@ use rust_decimal::Decimal;
 
 use crate::error::LlmError;
 use crate::provider::{
-    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ToolCall,
+    CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ReasoningBlock, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse,
 };
 
@@ -110,6 +110,9 @@ pub struct StubLlm {
     /// Provider-emitted reasoning trace returned on the response (e.g. to
     /// exercise the reasoning round-trip / leak-scan path). Default `None`.
     response_reasoning: Option<String>,
+    /// Opaque reasoning-block signature returned on the response (e.g. to
+    /// exercise the SIG-1 replay / leak-scan-exemption path). Default `None`.
+    response_reasoning_signature: Option<String>,
     /// Tool calls returned from `complete_with_tools`. Default empty (plain
     /// text response).
     tool_calls: Vec<ToolCall>,
@@ -126,6 +129,7 @@ impl StubLlm {
             error_kind: StubErrorKind::Transient,
             fault_injector: None,
             response_reasoning: None,
+            response_reasoning_signature: None,
             tool_calls: Vec::new(),
         }
     }
@@ -140,6 +144,7 @@ impl StubLlm {
             error_kind: StubErrorKind::Transient,
             fault_injector: None,
             response_reasoning: None,
+            response_reasoning_signature: None,
             tool_calls: Vec::new(),
         }
     }
@@ -154,6 +159,7 @@ impl StubLlm {
             error_kind: StubErrorKind::NonTransient,
             fault_injector: None,
             response_reasoning: None,
+            response_reasoning_signature: None,
             tool_calls: Vec::new(),
         }
     }
@@ -167,6 +173,12 @@ impl StubLlm {
     /// Set the provider-emitted reasoning trace returned on responses.
     pub fn with_response_reasoning(mut self, reasoning: impl Into<String>) -> Self {
         self.response_reasoning = Some(reasoning.into());
+        self
+    }
+
+    /// Set the opaque reasoning-block signature returned on responses (SIG-1).
+    pub fn with_response_reasoning_signature(mut self, signature: impl Into<String>) -> Self {
+        self.response_reasoning_signature = Some(signature.into());
         self
     }
 
@@ -255,7 +267,10 @@ impl LlmProvider for StubLlm {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
-            reasoning: self.response_reasoning.clone(),
+            reasoning: ReasoningBlock::new(
+                self.response_reasoning.clone(),
+                self.response_reasoning_signature.clone(),
+            ),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -277,7 +292,10 @@ impl LlmProvider for StubLlm {
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: self.response_reasoning.clone(),
+            reasoning: ReasoningBlock::new(
+                self.response_reasoning.clone(),
+                self.response_reasoning_signature.clone(),
+            ),
         })
     }
 }

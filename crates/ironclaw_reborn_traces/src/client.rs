@@ -418,6 +418,7 @@ mod tests {
             content: content.into(),
             created_at: Utc::now(),
             reasoning: None,
+            reasoning_signature: None,
         }
     }
 

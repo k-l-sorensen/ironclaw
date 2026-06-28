@@ -71,6 +71,82 @@ pub(crate) fn normalize_openai_image_detail(detail: Option<&str>) -> String {
     }
 }
 
+/// The reasoning a model emitted for one assistant message: the prose trace
+/// plus the provider's opaque continuity token for it.
+///
+/// The two values are captured, persisted, and replayed together — they are one
+/// block. Carrying them as a single value (rather than two parallel
+/// `Option<String>` fields threaded through every layer) means the "they travel
+/// as a pair" invariant is enforced by the type system, and a future reasoning
+/// metadata field extends this struct instead of adding a third parallel plumb.
+///
+/// The one place the two diverge is leak-scanning: [`text`](Self::text) is
+/// scanned before replay, [`signature`](Self::signature) is an opaque token that
+/// must survive byte-for-byte. That asymmetry is localized to
+/// [`ReasoningBlock::redacted`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningBlock {
+    /// Provider-emitted reasoning prose (DeepSeek `reasoning_content`, Gemini
+    /// thought parts, Mistral ThinkChunk text). Echoed back on the next request
+    /// — DeepSeek thinking-mode and Gemini 2.5+ reject the follow-up with HTTP
+    /// 400 when a prior assistant message dropped its reasoning (#3201, #3225).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Opaque provider thought-signature for the block (Mistral ThinkChunk
+    /// `signature`), not an IronClaw auth signature. Echoed back verbatim — not
+    /// leak-scanned, since it is an opaque token. Mistral-only; `None` elsewhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+impl ReasoningBlock {
+    /// Bundle an optional trace and signature into a block.
+    pub fn new(text: Option<String>, signature: Option<String>) -> Self {
+        Self { text, signature }
+    }
+
+    /// A block carrying only a reasoning trace (no signature) — convenience for
+    /// call sites (mostly tests) that have a literal trace string.
+    pub fn from_text(text: impl Into<String>) -> Self {
+        Self {
+            text: Some(text.into()),
+            signature: None,
+        }
+    }
+
+    /// True when neither a trace nor a signature is present. Used to skip
+    /// serialization and to short-circuit replay attachment.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_none() && self.signature.is_none()
+    }
+
+    /// Apply a leak-scan to the trace only. The signature is exempt from the
+    /// scan (an opaque token, never corrupted by the redactor) — but it is a
+    /// continuity token the provider issued *for these exact reasoning bytes*. If
+    /// the scan actually altered the trace, the signature no longer vouches for
+    /// the block being replayed, so it is dropped: a signature-less replay is
+    /// safe, whereas a signature that disagrees with its block can be rejected as
+    /// tampered (SIG-D2). A clean trace keeps its signature unchanged.
+    ///
+    /// This is the single site where the trace/signature asymmetry lives; every
+    /// other layer carries the block as one value.
+    pub fn redacted(self, redact: impl FnOnce(&str) -> String) -> Self {
+        match self.text {
+            Some(text) => {
+                let redacted = redact(&text);
+                // Drop the signature only when redaction changed the bytes it
+                // was issued against; an untouched trace keeps it.
+                let signature = (redacted == text).then_some(self.signature).flatten();
+                Self {
+                    text: Some(redacted),
+                    signature,
+                }
+            }
+            None => self,
+        }
+    }
+}
+
 /// A message in a conversation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -91,14 +167,14 @@ pub struct ChatMessage {
     /// to appear on the assistant message preceding tool result messages).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
-    /// Provider-emitted reasoning artifacts (DeepSeek's `reasoning_content`,
-    /// Gemini's `thought_signature` parts, OpenRouter's `reasoning_details`)
-    /// captured from the previous response. Required to be echoed back on
-    /// the next request — DeepSeek thinking-mode and Gemini 2.5+ both reject
-    /// the next turn with HTTP 400 when the prior assistant message had
-    /// reasoning that was dropped (#3201, #3225).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<String>,
+    /// Provider-emitted reasoning (DeepSeek's `reasoning_content`, Gemini's
+    /// `thought_signature` parts, Mistral's ThinkChunk text + signature)
+    /// captured from the previous response. Required to be echoed back on the
+    /// next request — DeepSeek thinking-mode and Gemini 2.5+ both reject the
+    /// next turn with HTTP 400 when the prior assistant message had reasoning
+    /// that was dropped (#3201, #3225).
+    #[serde(default, skip_serializing_if = "ReasoningBlock::is_empty")]
+    pub reasoning: ReasoningBlock,
 }
 
 impl ChatMessage {
@@ -111,7 +187,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
         }
     }
 
@@ -124,7 +200,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
         }
     }
 
@@ -139,7 +215,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
         }
     }
 
@@ -152,7 +228,7 @@ impl ChatMessage {
             tool_call_id: None,
             name: None,
             tool_calls: None,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
         }
     }
 
@@ -172,7 +248,7 @@ impl ChatMessage {
             } else {
                 Some(tool_calls)
             },
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
         }
     }
 
@@ -183,10 +259,14 @@ impl ChatMessage {
     /// The provider rejects the next turn with HTTP 400 when the prior
     /// assistant message had reasoning that wasn't echoed back. See #3201, #3225.
     ///
-    /// Empty / whitespace-only reasoning is dropped (treated as None) so we
-    /// don't send `reasoning_content: ""` and trip strict-mode validators.
-    pub fn with_reasoning(mut self, reasoning: Option<String>) -> Self {
-        self.reasoning = reasoning.filter(|r| !r.trim().is_empty());
+    /// Empty / whitespace-only reasoning text is dropped (treated as None) so we
+    /// don't send `reasoning_content: ""` and trip strict-mode validators. The
+    /// opaque signature rides along untrimmed (only an empty string is dropped).
+    pub fn with_reasoning(mut self, reasoning: ReasoningBlock) -> Self {
+        self.reasoning = ReasoningBlock {
+            text: reasoning.text.filter(|r| !r.trim().is_empty()),
+            signature: reasoning.signature.filter(|s| !s.is_empty()),
+        };
         self
     }
 
@@ -203,7 +283,7 @@ impl ChatMessage {
             tool_call_id: Some(tool_call_id.into()),
             name: Some(name.into()),
             tool_calls: None,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
         }
     }
 }
@@ -267,9 +347,9 @@ pub struct CompletionResponse {
     pub input_tokens: u32,
     pub output_tokens: u32,
     pub finish_reason: FinishReason,
-    /// Provider-emitted reasoning content, when the text-completion API returns
-    /// a separate reasoning artifact.
-    pub reasoning: Option<String>,
+    /// Provider-emitted reasoning (trace + opaque signature), when the
+    /// text-completion API returns a separate reasoning artifact.
+    pub reasoning: ReasoningBlock,
     /// Tokens read from the provider's server-side prompt cache (Anthropic).
     /// Zero when caching is not supported or on a cache miss.
     pub cache_read_input_tokens: u32,
@@ -486,12 +566,12 @@ pub struct ToolCompletionResponse {
     pub cache_read_input_tokens: u32,
     /// Tokens written to the provider's server-side prompt cache (Anthropic).
     pub cache_creation_input_tokens: u32,
-    /// Provider-emitted reasoning content (DeepSeek `reasoning_content`,
-    /// Gemini `thought_signature` parts, OpenRouter `reasoning_details`).
-    /// Callers MUST attach this to the assistant `ChatMessage` they store
-    /// for the next turn — otherwise the provider rejects the follow-up with
-    /// HTTP 400 (#3201, #3225). `None` when the model produced no reasoning.
-    pub reasoning: Option<String>,
+    /// Provider-emitted reasoning — trace (DeepSeek `reasoning_content`, Gemini
+    /// `thought_signature` parts) plus opaque signature (Mistral ThinkChunk
+    /// `signature`). Callers MUST attach this to the assistant `ChatMessage` they
+    /// store for the next turn — otherwise the provider rejects the follow-up
+    /// with HTTP 400 (#3201, #3225). Empty when the model produced no reasoning.
+    pub reasoning: ReasoningBlock,
 }
 
 /// Metadata about a model returned by the provider's API.

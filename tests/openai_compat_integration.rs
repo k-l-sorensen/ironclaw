@@ -73,7 +73,7 @@ impl LlmProvider for MockLlmProvider {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
-            reasoning: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -106,7 +106,7 @@ impl LlmProvider for MockLlmProvider {
                 finish_reason: FinishReason::ToolUse,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         } else {
             Ok(ToolCompletionResponse {
@@ -117,7 +117,7 @@ impl LlmProvider for MockLlmProvider {
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             })
         }
     }
@@ -156,7 +156,7 @@ impl LlmProvider for FixedModelProvider {
             input_tokens: 10,
             output_tokens: 5,
             finish_reason: FinishReason::Stop,
-            reasoning: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -174,7 +174,7 @@ impl LlmProvider for FixedModelProvider {
             finish_reason: FinishReason::Stop,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: None,
+            reasoning: ironclaw_llm::ReasoningBlock::default(),
         })
     }
 

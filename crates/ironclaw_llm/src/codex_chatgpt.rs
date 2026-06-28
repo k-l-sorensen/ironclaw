@@ -30,7 +30,7 @@ use crate::error::LlmError;
 
 use super::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, LlmProvider,
-    Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
+    ReasoningBlock, Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
 };
 
 /// Sanitize a tool name to match the Responses API pattern `^[a-zA-Z0-9_-]+$`.
@@ -957,7 +957,10 @@ impl LlmProvider for CodexChatGptProvider {
             input_tokens: result.input_tokens,
             output_tokens: result.output_tokens,
             finish_reason: FinishReason::Stop,
-            reasoning: crate::responses_reasoning::finish_summary(result.reasoning),
+            reasoning: ReasoningBlock::new(
+                crate::responses_reasoning::finish_summary(result.reasoning),
+                None,
+            ),
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
         })
@@ -1028,7 +1031,10 @@ impl LlmProvider for CodexChatGptProvider {
             finish_reason,
             cache_read_input_tokens: 0,
             cache_creation_input_tokens: 0,
-            reasoning: crate::responses_reasoning::finish_summary(result.reasoning),
+            reasoning: ReasoningBlock::new(
+                crate::responses_reasoning::finish_summary(result.reasoning),
+                None,
+            ),
         })
     }
 }

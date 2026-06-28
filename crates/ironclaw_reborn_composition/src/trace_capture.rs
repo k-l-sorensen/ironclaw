@@ -366,9 +366,11 @@ fn conversation_messages_from_records(records: &[ThreadMessageRecord]) -> Vec<Co
                     // Thread message records carry no timestamps; capture time
                     // is informational only (turn started_at metadata).
                     created_at: now,
-                    // CTR-1 field on the shared DTO; Reborn carries reasoning via
-                    // its own typed turn/thread records, not this capture path.
+                    // CTR-1 / SIG-1 fields on the shared DTO; Reborn carries
+                    // reasoning + signature via its own typed turn/thread
+                    // records, not this capture path.
                     reasoning: None,
+                    reasoning_signature: None,
                 });
             }
             MessageKind::ToolResultReference => {
@@ -407,6 +409,7 @@ fn flush_tool_calls(
         content,
         created_at: now,
         reasoning: None,
+        reasoning_signature: None,
     });
 }
 

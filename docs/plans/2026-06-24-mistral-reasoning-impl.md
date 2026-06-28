@@ -386,3 +386,63 @@ issue (the wasm target std is unavailable here), unrelated to CTR-1. Lands as on
   read back (tool-call reasoning *is* replayed via `ProviderToolCallReferenceEnvelope`).
   Closing it is a multi-crate Reborn change overlapping WU8–WU10, so it is folded into
   the Reborn follow-up rather than landed in this v1 pass.
+
+## SIG-1 — ThinkChunk `signature` replay (found 2026-06-27)
+
+**Status:** v1 **implemented** (offline gate green). **Date:** 2026-06-27. Architecture
+and decisions (SIG-D1–D5, SIG-C1…C6) live in the `-architecture` doc's **"SIG-1 —
+ThinkChunk `signature` replay"** section — cite, don't restate. Scope: the custom Mistral
+provider + the CTR-1 persistence path it rides; v1 agent loop only. Reborn parity is a
+check; the plain-assistant cross-turn drop stays folded into WU8–WU10 (per WU-CTR4).
+
+### The one-line problem
+
+Mistral returns an opaque `signature` on every ThinkChunk and expects it echoed back to
+verify a replayed reasoning block. The custom provider dropped it on both sides (silent
+discard on deserialize; rebuilt the chunk with no signature on replay), so CTR-1 replayed
+a signature-less, text-flattened approximation — not the *full* ThinkChunk. Signature-less
+replay works today (no HTTP 400), so this is fidelity / forward-insurance, not a live
+defect. Per the approved plan, the full lossless plumbing was built now (SIG-D5).
+
+### WU-SIG1 — Mistral wire capture + replay ☑
+- [x] `signature: Option<String>` on `MistralContentChunk::Thinking` (lenient serde,
+      SIG-D3); `extract_content` → 3-tuple, first-non-null signature (SIG-D4);
+      `chat_message_to_wire` re-emits it; both response structs carry it.
+- **Acceptance:** SIG-C1 (capture), SIG-C2 (wire re-emit), SIG-C6 (lenient serde) — pass.
+
+### WU-SIG2 — v1 channel + compile-driven `None` ☑
+- [x] `reasoning_signature` on `ChatMessage`/`CompletionResponse`/`ToolCompletionResponse`
+      + `with_reasoning_signature`; `None` at all non-Mistral construction sites (inert).
+
+### WU-SIG3 — `RespondResult` + leak-scan EXEMPT (SIG-D2) ☑
+- [x] `reasoning_signature` on `Text` + `ToolCalls`; carried through `respond_with_tools`
+      **around** `redact_reasoning` (never leak-scanned).
+- **Acceptance:** SIG-C5 (signature with redactor-trigger bytes survives verbatim) — pass.
+
+### WU-SIG4 — Turn capture + context rebuild ☑
+- [x] `reasoning_signature` + `tool_call_reasoning_signature` on `Turn`/`TurnPersistSnapshot`;
+      captured in `dispatcher.rs`; re-attached at both `Thread::messages()` sites; threaded
+      through the `LoopDelegate` methods (all delegates).
+- **Acceptance:** SIG-C2 caller-level (`Thread::messages()` reattaches) — pass.
+
+### WU-SIG5 — Persistence (dual-backend) + trace record ☑
+- [x] Widened `add_conversation_message_with_reasoning(..., reasoning_signature)` (trait +
+      Store + postgres + libsql, write + read); `ConversationMessage.reasoning_signature`;
+      threaded through `thread_ops.rs` persist + `rebuild_chat_messages_from_db`. Proxy DTOs
+      (`worker/api.rs`, `orchestrator/api.rs`) carry it too (parity with CTR-1).
+- **Acceptance:** SIG-C3 (libSQL round-trip), SIG-C4 (hydration reattach) — pass.
+
+### WU-SIG6 — Migrations (dual-backend) ☑
+- [x] PG `V33__conversation_messages_reasoning_signature.sql` + `checksums.lock`; libSQL
+      base schema + incremental `v27` + `IDEMPOTENT_ADD_COLUMN_MIGRATIONS` marker.
+
+### WU-SIG7 — Reborn parity check ☑ (check, not rebuild)
+- [x] Per-tool-call `signature` already round-trips (`ProviderToolCall`); the Mistral
+      message-level signature now flows through `model_gateway.rs` (carried on the recovered
+      `ToolCompletionResponse`). The plain-assistant cross-turn drop is the **same WU-CTR4
+      gap**, deferred to the Reborn follow-up (WU8–WU10).
+
+### WU-SIG8 — Gate + acceptance
+- Offline: SIG-C1/C2/C3/C5/C6 + caller-level reattach/hydration pass; `cargo fmt` clean.
+  Live A/B (SIG-G0) folded into the live multi-turn acceptance as an observation (the full
+  plumbing was built regardless, per the approved decision).

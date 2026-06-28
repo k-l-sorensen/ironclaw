@@ -244,6 +244,7 @@ mod tests {
             _role: &str,
             _content: &str,
             _reasoning: Option<&str>,
+            _reasoning_signature: Option<&str>,
         ) -> Result<Uuid, crate::error::DatabaseError> {
             unimplemented!()
         }
@@ -399,7 +400,7 @@ mod tests {
                 input_tokens: 0,
                 output_tokens: 0,
                 finish_reason: FinishReason::Stop,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
             })
@@ -576,6 +577,7 @@ mod tests {
                     content: "Hello".into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
@@ -583,6 +585,7 @@ mod tests {
                     content: "Hi".into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
             ],
         });
@@ -627,6 +630,7 @@ mod tests {
                     content: "Can you help me plan the project?".into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
@@ -634,6 +638,7 @@ mod tests {
                     content: "Sure! Let me outline the key milestones.".into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
@@ -641,6 +646,7 @@ mod tests {
                     content: "Focus on the backend first.".into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
@@ -649,6 +655,7 @@ mod tests {
                         .into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
             ],
         });
@@ -716,6 +723,7 @@ mod tests {
                     content: "First message".into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
@@ -723,6 +731,7 @@ mod tests {
                     content: "Reply one".into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
@@ -730,6 +739,7 @@ mod tests {
                     content: "Second message".into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
                 ConversationMessage {
                     id: Uuid::new_v4(),
@@ -737,6 +747,7 @@ mod tests {
                     content: "Reply two".into(),
                     created_at: Utc::now(),
                     reasoning: None,
+                    reasoning_signature: None,
                 },
             ],
         });

@@ -143,4 +143,24 @@ custom `ProviderProtocol::Mistral` that owns all Mistral traffic.
   migrating to Reborn requires the **WU-CTR4** / Reborn follow-up (WU8–WU10) to
   carry reasoning through that path.
 
+- **SIG-1 ThinkChunk `signature` replay — v1 implemented (2026-06-27).** The custom
+  Mistral provider dropped the opaque `signature` on every reasoning block on both
+  capture and replay, replaying a signature-less, text-flattened approximation of the
+  ThinkChunk. SIG-1 carries it end-to-end as a typed sibling `reasoning_signature:
+  Option<String>` (never folded into the `reasoning` string), a mechanical mirror of
+  the CTR-1 `reasoning` field: captured in `mistral.rs::extract_content`, re-emitted in
+  `chat_message_to_wire`, threaded through `ChatMessage`/`CompletionResponse`/
+  `ToolCompletionResponse` + `RespondResult` + `Turn`/`TurnPersistSnapshot` and the
+  `LoopDelegate` methods, persisted via the widened `add_conversation_message_with_reasoning`
+  (dual-backend column, PG `V33`/libSQL `v27`), and re-attached at the single
+  `Thread::messages()` / `rebuild_chat_messages_from_db` gateway. **Leak-scan EXEMPT**
+  (SIG-D2): the signature is an opaque token routed *around* `redact_reasoning` so the
+  redactor cannot corrupt it. Serde stays lenient (no `deny_unknown_fields`). Offline
+  tests SIG-C1/C2/C3/C5/C6 (+ caller-level reattach/hydration) pass. The detail lives in
+  the plan docs — do not restate here: the architecture doc's **SIG-1** section
+  (decisions SIG-D1–D5) and the impl doc's **SIG-1** section. **Scope: v1 agent loop**
+  (same as CTR-1). Reborn: the per-tool-call `signature` already round-trips, and the
+  Mistral message-level signature now flows through `model_gateway.rs`; the plain-assistant
+  cross-turn drop is the **same WU-CTR4 gap deferred to the Reborn follow-up (WU8–WU10)**.
+
 <!-- Add new local changes above this line, newest first. -->

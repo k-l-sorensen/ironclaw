@@ -8,7 +8,7 @@ use uuid::Uuid;
 
 use crate::error::WorkerError;
 use ironclaw_llm::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, ToolCall,
+    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, ReasoningBlock, ToolCall,
     ToolCompletionRequest, ToolCompletionResponse, ToolDefinition,
 };
 
@@ -54,6 +54,10 @@ pub struct ProxyCompletionResponse {
     pub finish_reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Opaque reasoning-block signature (Mistral ThinkChunk `signature`),
+    /// forwarded so the container worker can replay it on the next turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
     #[serde(default)]
     pub cache_read_input_tokens: u32,
     #[serde(default)]
@@ -88,6 +92,10 @@ pub struct ProxyToolCompletionResponse {
     /// before the next LLM call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Opaque reasoning-block signature (Mistral ThinkChunk `signature`),
+    /// forwarded alongside `reasoning` so the container worker replays it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
 }
 
 /// Completion result for the worker to report when done.
@@ -244,7 +252,7 @@ impl WorkerHttpClient {
             input_tokens: proxy_resp.input_tokens,
             output_tokens: proxy_resp.output_tokens,
             finish_reason: parse_finish_reason(&proxy_resp.finish_reason),
-            reasoning: proxy_resp.reasoning,
+            reasoning: ReasoningBlock::new(proxy_resp.reasoning, proxy_resp.reasoning_signature),
             cache_read_input_tokens: proxy_resp.cache_read_input_tokens,
             cache_creation_input_tokens: proxy_resp.cache_creation_input_tokens,
         })
@@ -277,7 +285,7 @@ impl WorkerHttpClient {
             finish_reason: parse_finish_reason(&proxy_resp.finish_reason),
             cache_read_input_tokens: proxy_resp.cache_read_input_tokens,
             cache_creation_input_tokens: proxy_resp.cache_creation_input_tokens,
-            reasoning: proxy_resp.reasoning,
+            reasoning: ReasoningBlock::new(proxy_resp.reasoning, proxy_resp.reasoning_signature),
         })
     }
 

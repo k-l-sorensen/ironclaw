@@ -27,7 +27,7 @@ use std::str::FromStr;
 use crate::costs;
 use crate::error::LlmError;
 use crate::provider::{
-    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider,
+    ChatMessage, CompletionRequest, CompletionResponse, FinishReason, LlmProvider, ReasoningBlock,
     ToolCall as IronToolCall, ToolCompletionRequest, ToolCompletionResponse,
     ToolDefinition as IronToolDefinition, strip_unsupported_completion_params,
     strip_unsupported_tool_params,
@@ -410,7 +410,7 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage
                     // it as the wire-format reasoning field on the next request.
                     // Without this, DeepSeek/Gemini reject the follow-up turn
                     // with HTTP 400. See #3201, #3225.
-                    if let Some(ref reasoning) = msg.reasoning
+                    if let Some(ref reasoning) = msg.reasoning.text
                         && !reasoning.is_empty()
                     {
                         contents.push(AssistantContent::Reasoning(rig::message::Reasoning::new(
@@ -446,7 +446,7 @@ fn convert_messages(messages: &[ChatMessage]) -> (Option<String>, Vec<RigMessage
                         // Shouldn't happen but fall back to text
                         history.push(RigMessage::assistant(&msg.content));
                     }
-                } else if let Some(ref reasoning) = msg.reasoning
+                } else if let Some(ref reasoning) = msg.reasoning.text
                     && !reasoning.is_empty()
                 {
                     // Assistant message with reasoning but no tool calls
@@ -879,7 +879,7 @@ where
             input_tokens: saturate_u32(response.usage.input_tokens),
             output_tokens: saturate_u32(response.usage.output_tokens),
             finish_reason: finish,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),
             cache_creation_input_tokens: extract_cache_creation(&response.raw_response),
         };
@@ -967,7 +967,7 @@ where
             finish_reason: finish,
             cache_read_input_tokens: saturate_u32(response.usage.cached_input_tokens),
             cache_creation_input_tokens: extract_cache_creation(&response.raw_response),
-            reasoning,
+            reasoning: ReasoningBlock::new(reasoning, None),
         };
 
         if resp.cache_read_input_tokens > 0 {
@@ -1963,7 +1963,7 @@ mod tests {
             tool_call_id: None,
             name: Some("search".to_string()),
             tool_calls: None,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
         }];
         let (_preamble, history) = convert_messages(&messages);
         match &history[0] {
@@ -2207,7 +2207,7 @@ mod tests {
             tool_call_id: None,
             name: Some("search".to_string()),
             tool_calls: None,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
         };
         let messages = vec![assistant_msg, tool_result_msg];
         let (_preamble, history) = convert_messages(&messages);
@@ -2608,7 +2608,7 @@ mod tests {
             role: crate::Role::Assistant,
             content: String::new(),
             tool_calls: None,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
             tool_call_id: None,
             name: None,
             content_parts: vec![],
@@ -2629,7 +2629,7 @@ mod tests {
             role: crate::Role::Assistant,
             content: String::new(),
             tool_calls: None,
-            reasoning: None,
+            reasoning: ReasoningBlock::default(),
             tool_call_id: None,
             name: None,
             content_parts: vec![],
@@ -2981,7 +2981,7 @@ mod tests {
 
         // --- IronClaw stores the assistant message + tool result ---
         let assistant = ChatMessage::assistant_with_tool_calls(text, tool_calls)
-            .with_reasoning(reasoning.clone());
+            .with_reasoning(ReasoningBlock::new(reasoning.clone(), None));
         let tool_result =
             ChatMessage::tool_result("call_abc123", "get_weather", "{\"temp_c\": 14}");
 
@@ -3044,13 +3044,14 @@ mod tests {
     /// empty reasoning fields, and an empty echo carries no signal anyway).
     #[test]
     fn chat_message_with_reasoning_drops_empty_input() {
-        let msg = ChatMessage::assistant("hi").with_reasoning(Some(String::new()));
-        assert!(msg.reasoning.is_none());
-        let msg = ChatMessage::assistant("hi").with_reasoning(Some("   ".to_string()));
-        assert!(msg.reasoning.is_none());
-        let msg = ChatMessage::assistant("hi").with_reasoning(None);
-        assert!(msg.reasoning.is_none());
-        let msg = ChatMessage::assistant("hi").with_reasoning(Some("real".to_string()));
-        assert_eq!(msg.reasoning.as_deref(), Some("real"));
+        let msg =
+            ChatMessage::assistant("hi").with_reasoning(ReasoningBlock::from_text(String::new()));
+        assert!(msg.reasoning.text.is_none());
+        let msg = ChatMessage::assistant("hi").with_reasoning(ReasoningBlock::from_text("   "));
+        assert!(msg.reasoning.text.is_none());
+        let msg = ChatMessage::assistant("hi").with_reasoning(ReasoningBlock::default());
+        assert!(msg.reasoning.text.is_none());
+        let msg = ChatMessage::assistant("hi").with_reasoning(ReasoningBlock::from_text("real"));
+        assert_eq!(msg.reasoning.text.as_deref(), Some("real"));
     }
 }

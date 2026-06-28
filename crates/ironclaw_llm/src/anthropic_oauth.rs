@@ -20,7 +20,7 @@ use crate::costs;
 use crate::error::LlmError;
 use crate::provider::{
     ChatMessage, CompletionRequest, CompletionResponse, ContentPart, FinishReason, LlmProvider,
-    Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
+    ReasoningBlock, Role, ToolCall, ToolCompletionRequest, ToolCompletionResponse,
     strip_unsupported_completion_params, strip_unsupported_tool_params,
 };
 
@@ -319,7 +319,7 @@ impl LlmProvider for AnthropicOAuthProvider {
             finish_reason,
             input_tokens: response.usage.input_tokens,
             output_tokens: response.usage.output_tokens,
-            reasoning: extracted.reasoning,
+            reasoning: ReasoningBlock::new(extracted.reasoning, None),
             cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
             cache_read_input_tokens: response.usage.cache_read_input_tokens,
         })
@@ -411,7 +411,7 @@ impl LlmProvider for AnthropicOAuthProvider {
             input_tokens: response.usage.input_tokens,
             output_tokens: response.usage.output_tokens,
             cache_creation_input_tokens: response.usage.cache_creation_input_tokens,
-            reasoning: extracted.reasoning,
+            reasoning: ReasoningBlock::new(extracted.reasoning, None),
             cache_read_input_tokens: response.usage.cache_read_input_tokens,
         })
     }

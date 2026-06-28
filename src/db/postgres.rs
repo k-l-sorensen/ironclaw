@@ -131,9 +131,16 @@ impl ConversationStore for PgBackend {
         role: &str,
         content: &str,
         reasoning: Option<&str>,
+        reasoning_signature: Option<&str>,
     ) -> Result<Uuid, DatabaseError> {
         self.store
-            .add_conversation_message_with_reasoning(conversation_id, role, content, reasoning)
+            .add_conversation_message_with_reasoning(
+                conversation_id,
+                role,
+                content,
+                reasoning,
+                reasoning_signature,
+            )
             .await
     }
 

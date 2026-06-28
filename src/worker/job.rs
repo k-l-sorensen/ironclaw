@@ -32,8 +32,8 @@ use crate::worker::autonomous_recovery::{
 };
 use ironclaw_common::{AppEvent, JobResultStatus};
 use ironclaw_llm::{
-    ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningContext, RespondResult,
-    ResponseMetadata, ToolCall, ToolSelection,
+    ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningBlock, ReasoningContext,
+    RespondResult, ResponseMetadata, ToolCall, ToolSelection,
 };
 use ironclaw_safety::SafetyLayer;
 
@@ -1300,7 +1300,7 @@ impl<'a> JobDelegate<'a> {
         Ok(ironclaw_llm::RespondOutput {
             result: RespondResult::Text {
                 text: String::new(),
-                reasoning: None,
+                reasoning: ReasoningBlock::default(),
             },
             usage: ironclaw_llm::TokenUsage::default(),
             finish_reason: ironclaw_llm::FinishReason::Stop,
@@ -1351,7 +1351,7 @@ impl<'a> JobDelegate<'a> {
         Some(ironclaw_llm::RespondOutput {
             result: RespondResult::Text {
                 text: String::new(),
-                reasoning: None,
+                reasoning: ReasoningBlock::default(),
             },
             usage: ironclaw_llm::TokenUsage::default(),
             finish_reason: ironclaw_llm::FinishReason::Stop,
@@ -1537,7 +1537,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
                     result: RespondResult::ToolCalls {
                         tool_calls,
                         content: reasoning_text,
-                        reasoning: None,
+                        reasoning: ReasoningBlock::default(),
                     },
                     usage: ironclaw_llm::TokenUsage::default(),
                     finish_reason: ironclaw_llm::FinishReason::ToolUse,
@@ -1596,7 +1596,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         &self,
         text: &str,
         metadata: ResponseMetadata,
-        _reasoning: Option<String>,
+        _reasoning: ReasoningBlock,
         reason_ctx: &mut ReasoningContext,
     ) -> TextAction {
         let action = {
@@ -1707,7 +1707,7 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         tool_calls: Vec<ironclaw_llm::ToolCall>,
         content: Option<String>,
         reason_ctx: &mut ReasoningContext,
-        reasoning: Option<String>,
+        reasoning: ReasoningBlock,
     ) -> Result<Option<LoopOutcome>, crate::error::Error> {
         {
             let mut recovery = self.recovery_state.lock().await;
@@ -1770,8 +1770,9 @@ impl<'a> LoopDelegate for JobDelegate<'a> {
         }
 
         // Add assistant message with tool_calls (OpenAI protocol).
-        // Carry reasoning for the next turn — DeepSeek thinking-mode and
+        // Carry the reasoning block for the next turn — DeepSeek thinking-mode and
         // Gemini 2.5+ reject the follow-up with HTTP 400 otherwise (#3201, #3225).
+        // The opaque signature rides along inside it (SIG-1).
         reason_ctx.messages.push(
             ChatMessage::assistant_with_tool_calls(content, tool_calls.clone())
                 .with_reasoning(reasoning),
@@ -2568,7 +2569,7 @@ mod tests {
             .handle_text_response(
                 "Weekly review created in Notion and notification sent.",
                 ResponseMetadata::default(),
-                None,
+                ReasoningBlock::default(),
                 &mut reason_ctx,
             )
             .await;

@@ -723,7 +723,7 @@ impl LlmProvider for TraceLlm {
                         input_tokens,
                         output_tokens,
                         finish_reason: FinishReason::Stop,
-                        reasoning: None,
+                        reasoning: ironclaw_llm::ReasoningBlock::default(),
                         cache_read_input_tokens: 0,
                         cache_creation_input_tokens: 0,
                     });
@@ -763,7 +763,7 @@ impl LlmProvider for TraceLlm {
                 finish_reason: FinishReason::Stop,
                 cache_read_input_tokens: 0,
                 cache_creation_input_tokens: 0,
-                reasoning: None,
+                reasoning: ironclaw_llm::ReasoningBlock::default(),
             }),
             TraceResponse::ToolCalls {
                 tool_calls,
@@ -789,7 +789,7 @@ impl LlmProvider for TraceLlm {
                     finish_reason: FinishReason::ToolUse,
                     cache_read_input_tokens: 0,
                     cache_creation_input_tokens: 0,
-                    reasoning: None,
+                    reasoning: ironclaw_llm::ReasoningBlock::default(),
                 })
             }
             TraceResponse::UserInput { .. } => Err(LlmError::RequestFailed {
