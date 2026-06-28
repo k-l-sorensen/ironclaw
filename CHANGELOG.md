@@ -12,6 +12,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(reborn-cli)* document the standalone `config init` atomic-write dependency on `tempfile` and call out the default runner cadence change to 5s heartbeats / 200ms polling (down from 10s / 2s).
 - *(reborn)* expose runtime poll settings and document the standalone turn-runner cadence change for callers using `TurnRunnerSettings::default()`.
 
+## [0.29.1-fork.2](https://github.com/k-l-sorensen/ironclaw/releases/tag/ironclaw-v0.29.1-fork.2) - 2026-06-28
+
+Second marked release of the **k-l-sorensen/ironclaw fork** — an unofficial build,
+not produced by or affiliated with upstream `nearai/ironclaw`. Built on upstream
+`main` past the `0.29.1` tag, on top of `0.29.1-fork.1`, plus the fork-only
+changes below. The `-fork.2` prerelease suffix flags it as a GitHub pre-release
+and keeps it distinct from official upstream releases. See `CLAUDE-local.md` for
+the full fork divergence list.
+
+### Added
+
+- *(llm)* replay Mistral `ThinkChunk` reasoning signatures across turns (SIG-1),
+  so signed reasoning context is carried forward on multi-turn Mistral
+  conversations instead of being dropped between turns.
+
+### Changed
+
+- *(llm)* bundle the reasoning trace and its signature into a single
+  `ReasoningBlock`, consolidating how reasoning is threaded through the turn loop.
+
+### Fixed
+
+- *(test)* stop the live test harness from triggering the OS keychain prompt.
+
 ## [0.29.1-fork.1](https://github.com/k-l-sorensen/ironclaw/releases/tag/ironclaw-v0.29.1-fork.1) - 2026-06-26
 
 First marked release of the **k-l-sorensen/ironclaw fork** — an unofficial build,
