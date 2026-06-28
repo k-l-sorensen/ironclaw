@@ -640,7 +640,7 @@ layer at a time.
 [ ChatMessage ]  + reasoning_signature   .with_reasoning_signature(…)       (NEW sibling channel)
         ▼
 [ Turn ]  + reasoning_signature + tool_call_reasoning_signature             (first-class turn data, CTR-1 mirror)
-        │  persist (flat, length-capped) on the assistant / tool_calls row
+        │  persist (flat, uncapped — mirrors the uncapped v1 reasoning text; see SIG-D2)
         ▼
 ┌───────────────────────────────────────────────────────────────────┐
 │  Dual-backend persistence  (NEW column, both backends)            │
@@ -682,8 +682,10 @@ layer at a time.
   `ProviderToolCallReferenceEnvelope`
   (`crates/ironclaw_threads/src/tool_result_reference.rs`) already carry
   `signature: Option<String>` ("Opaque provider thought-signature metadata, not an
-  IronClaw auth signature", validated 4096-char cap). Adopt its exact shape and
-  length-only validation style.
+  IronClaw auth signature", length-validated in that layer). Adopt its exact field
+  shape (typed `Option<String>`, leak-scan-exempt) — but **not** its length
+  validation on the v1 `ReasoningBlock`/`ChatMessage` path, which deliberately
+  stays uncapped to mirror the uncapped v1 reasoning text (see SIG-D2).
 
 ### Key architectural decisions
 
@@ -708,6 +710,30 @@ layer at a time.
   parallel `Option<String>` siblings. The asymmetry above lives in exactly one
   place — `ReasoningBlock::redacted` — and the persistence/wire edges flatten the
   block back to two columns/fields.
+
+  **Length cap — resolved doc-only (uncapped on v1 by design, 2026-06-28).** An
+  earlier draft of this section directed that the replayed signature be
+  "length-capped (4096)," reusing the Reborn precedent. The shipped v1 code does
+  not cap it: on the `ReasoningBlock`/`ChatMessage` path the signature is only
+  filtered for emptiness (`provider.rs` `with_reasoning`, `mistral.rs`
+  `extract_content`/`chat_message_to_wire`) and stored unbounded in `TEXT`. This
+  is **intentional and consistent**, not a regression: the sibling `reasoning`
+  *text* field is likewise uncapped on this v1 path. The 4096-byte validation
+  exists **only** in the Reborn typed-envelope layer
+  (`crates/ironclaw_threads/src/tool_result_reference.rs:145`,
+  `validate_optional_provider_text`, which *rejects* rather than truncates) — it
+  was never on the v1 path for either the reasoning text or the signature. The
+  cited "4096" is itself stale: the canonical
+  `ironclaw_safety::PROVIDER_METADATA_TEXT_MAX_BYTES` was raised to **16384** ("4
+  KiB truncated legitimate reasoning… forced retries"), and only the older
+  `tool_result_reference.rs` still hardcodes 4096 — so "reuse the 4096 precedent"
+  was not a clean target. The residual exposure (an opaque token replayed
+  verbatim and stored unbounded) is a small storage / echo-amplification surface,
+  **accepted** here for parity with the uncapped v1 reasoning text. If a cap is
+  ever wanted, the contained fix is to **drop** (not truncate, not reject) an
+  over-length signature inside `ReasoningBlock` using the `ironclaw_safety` 16384
+  constant — a signature-less replay is safe per this decision's own
+  drop-on-redaction logic.
 - **SIG-D3 — Stay lenient serde; do NOT add `deny_unknown_fields`.** Add as
   `#[serde(default)] Option<String>` so old/new Mistral payloads and any future
   ThinkChunk fields keep deserializing. The existing loud-failure is on an unknown
