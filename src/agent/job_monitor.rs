@@ -97,30 +97,10 @@ pub fn spawn_job_monitor_with_context(
                             }
                         }
                         AppEvent::JobResult { status, .. } => {
-                            // Transition in-memory state so the job frees its
-                            // max_jobs slot and query tools show the final state.
-                            if let Some(ref cm) = context_manager {
-                                let target = if status.is_success() {
-                                    JobState::Completed
-                                } else {
-                                    JobState::Failed
-                                };
-                                let reason = if status.is_success() {
-                                    None
-                                } else {
-                                    Some(format!("Container finished: {}", status))
-                                };
-                                let _ = cm
-                                    .update_context(job_id, |ctx| {
-                                        let _ = ctx.transition_to(target, reason);
-                                    })
-                                    .await;
-                            }
-
-                            // Persist the terminal `sandbox_jobs` DB row. The
-                            // sync path does this in the poll loop; the
-                            // detached path only reaches the DB here.
-                            persist_sandbox_terminal_status(&store, job_id, status);
+                            // Record the terminal status in-memory (frees the
+                            // max_jobs slot) and in the DB (detached path).
+                            finalize_terminal_job(job_id, status, context_manager.as_ref(), &store)
+                                .await;
 
                             let mut msg = IncomingMessage::new(
                                 route.channel.clone(),
@@ -183,24 +163,7 @@ pub fn spawn_completion_watcher(
                 Ok((ev_job_id, _user_id, AppEvent::JobResult { status, .. }))
                     if ev_job_id == job_id =>
                 {
-                    let target = if status.is_success() {
-                        JobState::Completed
-                    } else {
-                        JobState::Failed
-                    };
-                    let reason = if status.is_success() {
-                        None
-                    } else {
-                        Some(format!("Container finished: {}", status))
-                    };
-                    let _ = context_manager
-                        .update_context(job_id, |ctx| {
-                            let _ = ctx.transition_to(target, reason);
-                        })
-                        .await;
-                    // Persist the terminal `sandbox_jobs` DB row (detached
-                    // path — see `spawn_job_monitor_with_context`).
-                    persist_sandbox_terminal_status(&store, job_id, status);
+                    finalize_terminal_job(job_id, status, Some(&context_manager), &store).await;
                     tracing::debug!(
                         job_id = %short_id,
                         status = %status,
@@ -228,6 +191,36 @@ pub fn spawn_completion_watcher(
     })
 }
 
+/// Record a job's terminal status everywhere it must land: the in-memory
+/// `ContextManager` (frees the `max_jobs` slot and updates query tools) and
+/// the `sandbox_jobs` DB row (detached path — the sync `wait=true` poll loop
+/// covers its own persist). Keeping both writes behind one call stops a
+/// future edit from updating one and desyncing the other.
+async fn finalize_terminal_job(
+    job_id: Uuid,
+    status: JobResultStatus,
+    context_manager: Option<&Arc<ContextManager>>,
+    store: &Option<Arc<dyn Database>>,
+) {
+    let reason = (!status.is_success()).then(|| format!("Container finished: {status}"));
+
+    if let Some(cm) = context_manager {
+        let target = if status.is_success() {
+            JobState::Completed
+        } else {
+            JobState::Failed
+        };
+        let reason = reason.clone();
+        let _ = cm
+            .update_context(job_id, |ctx| {
+                let _ = ctx.transition_to(target, reason);
+            })
+            .await;
+    }
+
+    persist_sandbox_terminal_status(store, job_id, status, reason);
+}
+
 /// Persist the terminal `sandbox_jobs` DB row for a detached job.
 ///
 /// The sync (`wait=true`) path writes this via `SandboxJobTool::update_status`
@@ -240,16 +233,12 @@ fn persist_sandbox_terminal_status(
     store: &Option<Arc<dyn Database>>,
     job_id: Uuid,
     status: JobResultStatus,
+    reason: Option<String>,
 ) {
     let Some(store) = store.clone() else {
         return;
     };
     tokio::spawn(async move {
-        let reason = if status.is_success() {
-            None
-        } else {
-            Some(format!("Container finished: {}", status))
-        };
         if let Err(e) = store
             .update_sandbox_job_status(
                 job_id,
