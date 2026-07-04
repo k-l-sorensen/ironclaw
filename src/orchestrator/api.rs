@@ -24,7 +24,9 @@ use crate::worker::api::{
     CompletionReport, CredentialResponse, JobDescription, ProxyCompletionRequest,
     ProxyCompletionResponse, ProxyToolCompletionRequest, ProxyToolCompletionResponse, StatusUpdate,
 };
-use ironclaw_common::{AppEvent, resolve_result_status};
+use ironclaw_common::{
+    AppEvent, ResolvedResultStatus, ResultStatusSource, resolve_result_status_with_source,
+};
 use ironclaw_llm::{CompletionRequest, LlmProvider, ToolCompletionRequest};
 
 /// A follow-up prompt queued for a Claude Code bridge.
@@ -392,7 +394,17 @@ async fn job_event_handler(
             // which defaults to `Failed` only when neither field is usable so
             // a malformed terminal event cannot register as success. See
             // #2678 (the field-name gap that mislabeled every worker job).
-            let status = resolve_result_status(&payload.data);
+            let ResolvedResultStatus { status, source } =
+                resolve_result_status_with_source(&payload.data);
+            // Trust-boundary signal: a worker container sent a terminal event
+            // with neither a parseable `status` nor a `success` bool.
+            if let ResultStatusSource::Defaulted { raw_status } = &source {
+                tracing::warn!(
+                    job_id = %job_id_str,
+                    raw_status = raw_status.as_deref().unwrap_or(""),
+                    "unknown job result status from container; defaulting to Failed"
+                );
+            }
             AppEvent::JobResult {
                 job_id: job_id_str,
                 status,
