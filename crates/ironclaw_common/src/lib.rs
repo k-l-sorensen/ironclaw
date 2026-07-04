@@ -27,7 +27,7 @@ pub use attachment_format::{
 };
 pub use event::{
     AppEvent, CodeExecutionFailureCategory, JobResultStatus, OnboardingStateDto, PlanStepDto,
-    SelfImprovementPhase, ToolDecisionDto,
+    SelfImprovementPhase, ToolDecisionDto, resolve_result_status,
 };
 pub use identity::{
     CredentialName, ExtensionName, ExternalThreadId, ExternalThreadIdError,

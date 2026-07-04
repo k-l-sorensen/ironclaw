@@ -118,6 +118,43 @@ impl std::str::FromStr for JobResultStatus {
     }
 }
 
+/// Resolve the terminal [`JobResultStatus`] from a `result` event payload.
+///
+/// Sandbox `result` events are a producer/consumer contract across a trust
+/// boundary (container → orchestrator), and producers have historically
+/// disagreed on the field name: the typed producers emit a snake_case
+/// `status` string, while the container worker emits a `success` boolean.
+/// This helper is the single tolerant reader for both consumer sites
+/// (`orchestrator::api::job_event_handler`, `worker::job`), so a producer
+/// that only sets one of the two fields is still classified correctly:
+///
+/// 1. If `status` parses as a [`JobResultStatus`], use it.
+/// 2. Otherwise fall back to the `success` bool (`true` → `Completed`,
+///    `false` → `Failed`).
+/// 3. If neither is usable, default to `Failed` — a malformed terminal
+///    event must not register as success.
+///
+/// Regression origin: #2678 migrated the consumers to the `status` enum and
+/// hardened the missing case to `Failed`, but left the container producer
+/// emitting only `success`, so every detached worker job was mislabeled
+/// `Failed`. The `success`-fallback arm here closes that gap defensively in
+/// addition to the producer fix.
+pub fn resolve_result_status(data: &serde_json::Value) -> JobResultStatus {
+    if let Some(status) = data
+        .get("status")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<JobResultStatus>().ok())
+    {
+        return status;
+    }
+
+    match data.get("success").and_then(|v| v.as_bool()) {
+        Some(true) => JobResultStatus::Completed,
+        Some(false) => JobResultStatus::Failed,
+        None => JobResultStatus::Failed,
+    }
+}
+
 /// A single step in a plan progress update (SSE DTO).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStepDto {
@@ -1230,5 +1267,61 @@ mod tests {
         assert!(JobResultStatus::Completed.is_success());
         assert!(!JobResultStatus::Failed.is_success());
         assert!(!JobResultStatus::Cancelled.is_success());
+    }
+
+    #[test]
+    fn resolve_result_status_prefers_status_field() {
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "completed"})),
+            JobResultStatus::Completed
+        );
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "failed"})),
+            JobResultStatus::Failed
+        );
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "stuck"})),
+            JobResultStatus::Stuck
+        );
+        // `status` wins even when `success` disagrees — the typed field is
+        // authoritative.
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "completed", "success": false})),
+            JobResultStatus::Completed
+        );
+    }
+
+    #[test]
+    fn resolve_result_status_falls_back_to_success_bool() {
+        // The exact pre-fix container payload: `success` only, no `status`.
+        // This is the bug repro (#2678) — it must classify as Completed, not
+        // the default-Failed the missing-`status` path used to produce.
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"success": true, "message": "Hello World"})),
+            JobResultStatus::Completed
+        );
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"success": false, "message": "boom"})),
+            JobResultStatus::Failed
+        );
+    }
+
+    #[test]
+    fn resolve_result_status_defaults_failed_when_unusable() {
+        // Neither a parseable `status` nor a `success` bool: a malformed
+        // terminal event must never silently register as success.
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({})),
+            JobResultStatus::Failed
+        );
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "garbage"})),
+            JobResultStatus::Failed
+        );
+        // Unparseable `status` still falls through to the `success` bool.
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "", "success": true})),
+            JobResultStatus::Completed
+        );
     }
 }
