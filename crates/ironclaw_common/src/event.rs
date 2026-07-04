@@ -145,18 +145,66 @@ impl std::str::FromStr for JobResultStatus {
 /// `worker::container`), which retired the `success`-only path; the fallback
 /// arm remains only as the trust-boundary guard described above.
 pub fn resolve_result_status(data: &serde_json::Value) -> JobResultStatus {
-    if let Some(status) = data
-        .get("status")
-        .and_then(|v| v.as_str())
-        .and_then(|s| s.parse::<JobResultStatus>().ok())
+    resolve_result_status_with_source(data).status
+}
+
+/// Which tier of [`resolve_result_status_with_source`] produced the verdict.
+///
+/// Exposed so the two trust-boundary consumers can log when a container sent a
+/// terminal event we couldn't understand — the pure resolver stays silent, and
+/// the `job_id`-aware call sites emit the warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultStatusSource {
+    /// `status` parsed cleanly into a known variant. The live path — no log.
+    ParsedStatus,
+    /// `status` was absent or unparseable; the legacy `success` bool decided
+    /// the outcome. The documented defensive path — no log.
+    SuccessBool,
+    /// Neither `status` nor `success` was usable; defaulted to `Failed`. A
+    /// malformed terminal event — callers should log. `raw_status` is the
+    /// unparseable `status` string the producer sent, or `None` if it was
+    /// absent entirely.
+    Defaulted { raw_status: Option<String> },
+}
+
+/// A resolved [`JobResultStatus`] plus the [`ResultStatusSource`] provenance
+/// that produced it.
+pub struct ResolvedResultStatus {
+    pub status: JobResultStatus,
+    pub source: ResultStatusSource,
+}
+
+/// Like [`resolve_result_status`], but also reports the [`ResultStatusSource`]
+/// so callers can log unrecognized producer payloads. Resolution semantics are
+/// identical — this is the single implementation that `resolve_result_status`
+/// wraps.
+pub fn resolve_result_status_with_source(data: &serde_json::Value) -> ResolvedResultStatus {
+    let raw = data.get("status").and_then(|v| v.as_str());
+    if let Some(raw) = raw
+        && let Ok(status) = raw.parse::<JobResultStatus>()
     {
-        return status;
+        return ResolvedResultStatus {
+            status,
+            source: ResultStatusSource::ParsedStatus,
+        };
     }
 
+    // `status` absent or unparseable — fall back to the `success` bool.
     match data.get("success").and_then(|v| v.as_bool()) {
-        Some(true) => JobResultStatus::Completed,
-        Some(false) => JobResultStatus::Failed,
-        None => JobResultStatus::Failed,
+        Some(true) => ResolvedResultStatus {
+            status: JobResultStatus::Completed,
+            source: ResultStatusSource::SuccessBool,
+        },
+        Some(false) => ResolvedResultStatus {
+            status: JobResultStatus::Failed,
+            source: ResultStatusSource::SuccessBool,
+        },
+        None => ResolvedResultStatus {
+            status: JobResultStatus::Failed,
+            source: ResultStatusSource::Defaulted {
+                raw_status: raw.map(str::to_string),
+            },
+        },
     }
 }
 
@@ -1327,6 +1375,42 @@ mod tests {
         assert_eq!(
             resolve_result_status(&serde_json::json!({"status": "", "success": true})),
             JobResultStatus::Completed
+        );
+    }
+
+    #[test]
+    fn resolve_result_status_with_source_reports_provenance() {
+        use ResultStatusSource::*;
+        // Clean parse and the success-bool fallback stay quiet.
+        assert_eq!(
+            resolve_result_status_with_source(&serde_json::json!({"status": "completed"})).source,
+            ParsedStatus
+        );
+        assert_eq!(
+            resolve_result_status_with_source(&serde_json::json!({"success": true})).source,
+            SuccessBool
+        );
+        // Garbage `status`, no bool → Defaulted, carrying the raw string to log.
+        // This is the regression guard: the refactor to `resolve_result_status`
+        // dropped the warn! this provenance re-enables.
+        assert_eq!(
+            resolve_result_status_with_source(&serde_json::json!({"status": "wat"})).source,
+            Defaulted {
+                raw_status: Some("wat".to_string())
+            }
+        );
+        // Nothing usable at all → Defaulted with no raw status.
+        assert_eq!(
+            resolve_result_status_with_source(&serde_json::json!({})).source,
+            Defaulted { raw_status: None }
+        );
+        // Garbage `status` recovered by a valid bool → SuccessBool (stays quiet).
+        assert_eq!(
+            resolve_result_status_with_source(
+                &serde_json::json!({"status": "wat", "success": true})
+            )
+            .source,
+            SuccessBool
         );
     }
 }

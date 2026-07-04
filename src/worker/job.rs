@@ -30,7 +30,10 @@ use crate::worker::autonomous_recovery::{
     AutonomousRecoveryAction, AutonomousRecoveryState, EMPTY_TOOL_COMPLETION_FAILURE,
     EMPTY_TOOL_COMPLETION_NUDGE, FORCE_TEXT_RECOVERY_PROMPT,
 };
-use ironclaw_common::{AppEvent, JobResultStatus, resolve_result_status};
+use ironclaw_common::{
+    AppEvent, JobResultStatus, ResolvedResultStatus, ResultStatusSource,
+    resolve_result_status_with_source,
+};
 use ironclaw_llm::{
     ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningBlock, ReasoningContext,
     RespondResult, ResponseMetadata, ToolCall, ToolSelection,
@@ -208,7 +211,17 @@ impl Worker {
                     // legacy `success` bool for producer drift; defaults to
                     // `Failed` only when neither is usable). Same reader the
                     // container→orchestrator path uses. See #2678.
-                    let status = resolve_result_status(&data);
+                    let ResolvedResultStatus { status, source } =
+                        resolve_result_status_with_source(&data);
+                    // Trust-boundary signal: a container sent a terminal event
+                    // with neither a parseable `status` nor a `success` bool.
+                    if let ResultStatusSource::Defaulted { raw_status } = &source {
+                        tracing::warn!(
+                            job_id = %job_id_str,
+                            raw_status = raw_status.as_deref().unwrap_or(""),
+                            "unknown job result status from container; defaulting to Failed"
+                        );
+                    }
                     Some(AppEvent::JobResult {
                         job_id: job_id_str,
                         status,
