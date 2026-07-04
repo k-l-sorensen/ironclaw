@@ -24,7 +24,7 @@ use crate::worker::api::{
     CompletionReport, CredentialResponse, JobDescription, ProxyCompletionRequest,
     ProxyCompletionResponse, ProxyToolCompletionRequest, ProxyToolCompletionResponse, StatusUpdate,
 };
-use ironclaw_common::{AppEvent, JobResultStatus};
+use ironclaw_common::{AppEvent, resolve_result_status};
 use ironclaw_llm::{CompletionRequest, LlmProvider, ToolCompletionRequest};
 
 /// A follow-up prompt queued for a Claude Code bridge.
@@ -386,24 +386,13 @@ async fn job_event_handler(
                 .to_string(),
         },
         "result" => {
-            // JSON payloads from sandbox containers are a trust
-            // boundary — parse the wire string into the typed enum and
-            // fall back to `Failed` (not `Completed`) on unknown values
-            // so a mis-labeled container run cannot silently register
-            // as success.
-            let raw_status = payload
-                .data
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let status = raw_status.parse::<JobResultStatus>().unwrap_or_else(|_| {
-                tracing::warn!(
-                    job_id = %job_id,
-                    raw_status = %raw_status,
-                    "unknown job result status from container; defaulting to Failed"
-                );
-                JobResultStatus::Failed
-            });
+            // JSON payloads from sandbox containers are a trust boundary and
+            // producers disagree on the field name (`status` vs the legacy
+            // `success` bool). Resolve through the shared tolerant reader,
+            // which defaults to `Failed` only when neither field is usable so
+            // a malformed terminal event cannot register as success. See
+            // #2678 (the field-name gap that mislabeled every worker job).
+            let status = resolve_result_status(&payload.data);
             AppEvent::JobResult {
                 job_id: job_id_str,
                 status,
@@ -601,6 +590,7 @@ mod tests {
     use crate::orchestrator::auth::TokenStore;
     use crate::orchestrator::job_manager::{ContainerJobConfig, ContainerJobManager};
     use crate::testing::StubLlm;
+    use ironclaw_common::JobResultStatus;
 
     use super::*;
 
@@ -1156,6 +1146,77 @@ mod tests {
         let (_recv_id, _recv_uid, event) = rx.recv().await.unwrap();
         // Unknown event types fall through to JobStatus
         assert!(matches!(event, AppEvent::JobStatus { .. }));
+    }
+
+    /// Drive the real `job_event_handler` with a `result` payload and return
+    /// the broadcast status. Mirrors the container→orchestrator wire path.
+    async fn result_event_status(data: serde_json::Value) -> JobResultStatus {
+        let (tx, mut rx) = broadcast::channel(16);
+        let token_store = TokenStore::new();
+        let jm = ContainerJobManager::new(ContainerJobConfig::default(), token_store.clone());
+        let state = OrchestratorState {
+            llm: Arc::new(StubLlm::default()),
+            job_manager: Arc::new(jm),
+            token_store: token_store.clone(),
+            job_event_tx: Some(tx),
+            prompt_queue: Arc::new(Mutex::new(HashMap::new())),
+            store: None,
+            secrets_store: None,
+            job_owner_cache: Arc::new(std::sync::RwLock::new(HashMap::new())),
+        };
+
+        let job_id = Uuid::new_v4();
+        let token = token_store.create_token(job_id).await;
+        let router = OrchestratorApi::router(state);
+
+        let payload = serde_json::json!({ "event_type": "result", "data": data });
+        let req = Request::builder()
+            .method("POST")
+            .uri(format!("/worker/{}/event", job_id))
+            .header("Authorization", format!("Bearer {}", token))
+            .header("Content-Type", "application/json")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        match rx.recv().await.unwrap().2 {
+            AppEvent::JobResult { status, .. } => status,
+            other => panic!("Expected JobResult, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn job_event_result_success_bool_maps_to_completed() {
+        // The exact pre-fix container payload: `success` only, no `status`
+        // (#2678 regression). Before the tolerant reader this mislabeled
+        // every worker job `Failed`; now it must resolve to `Completed`.
+        let status =
+            result_event_status(serde_json::json!({ "success": true, "message": "Hello World" }))
+                .await;
+        assert_eq!(status, JobResultStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn job_event_result_status_field_maps_to_completed() {
+        // The post-fix container payload carries both fields.
+        let status = result_event_status(
+            serde_json::json!({ "status": "completed", "success": true, "message": "done" }),
+        )
+        .await;
+        assert_eq!(status, JobResultStatus::Completed);
+    }
+
+    #[tokio::test]
+    async fn job_event_result_failure_maps_to_failed() {
+        // Failure arm via the `success` bool alone.
+        let status =
+            result_event_status(serde_json::json!({ "success": false, "message": "boom" })).await;
+        assert_eq!(status, JobResultStatus::Failed);
+        // And a malformed payload defaults to Failed, never success.
+        let status = result_event_status(serde_json::json!({})).await;
+        assert_eq!(status, JobResultStatus::Failed);
     }
 
     // -- Status update test --

@@ -20,9 +20,12 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
+use chrono::Utc;
+
 use crate::channels::IncomingMessage;
 use crate::context::{ContextManager, JobState};
-use ironclaw_common::AppEvent;
+use crate::db::Database;
+use ironclaw_common::{AppEvent, JobResultStatus};
 
 /// Route context for forwarding job monitor events back to the user's channel.
 #[derive(Debug, Clone)]
@@ -48,7 +51,7 @@ pub fn spawn_job_monitor(
     inject_tx: mpsc::Sender<IncomingMessage>,
     route: JobMonitorRoute,
 ) -> JoinHandle<()> {
-    spawn_job_monitor_with_context(job_id, event_rx, inject_tx, route, None)
+    spawn_job_monitor_with_context(job_id, event_rx, inject_tx, route, None, None)
 }
 
 /// Like `spawn_job_monitor`, but also transitions the job's in-memory state
@@ -60,6 +63,7 @@ pub fn spawn_job_monitor_with_context(
     inject_tx: mpsc::Sender<IncomingMessage>,
     route: JobMonitorRoute,
     context_manager: Option<Arc<ContextManager>>,
+    store: Option<Arc<dyn Database>>,
 ) -> JoinHandle<()> {
     let short_id = job_id.to_string()[..8].to_string();
 
@@ -113,6 +117,11 @@ pub fn spawn_job_monitor_with_context(
                                     .await;
                             }
 
+                            // Persist the terminal `sandbox_jobs` DB row. The
+                            // sync path does this in the poll loop; the
+                            // detached path only reaches the DB here.
+                            persist_sandbox_terminal_status(&store, job_id, status);
+
                             let mut msg = IncomingMessage::new(
                                 route.channel.clone(),
                                 route.user_id.clone(),
@@ -164,6 +173,7 @@ pub fn spawn_completion_watcher(
     job_id: Uuid,
     mut event_rx: broadcast::Receiver<(Uuid, String, AppEvent)>,
     context_manager: Arc<ContextManager>,
+    store: Option<Arc<dyn Database>>,
 ) -> JoinHandle<()> {
     let short_id = job_id.to_string()[..8].to_string();
 
@@ -188,6 +198,9 @@ pub fn spawn_completion_watcher(
                             let _ = ctx.transition_to(target, reason);
                         })
                         .await;
+                    // Persist the terminal `sandbox_jobs` DB row (detached
+                    // path — see `spawn_job_monitor_with_context`).
+                    persist_sandbox_terminal_status(&store, job_id, status);
                     tracing::debug!(
                         job_id = %short_id,
                         status = %status,
@@ -213,6 +226,47 @@ pub fn spawn_completion_watcher(
             }
         }
     })
+}
+
+/// Persist the terminal `sandbox_jobs` DB row for a detached job.
+///
+/// The sync (`wait=true`) path writes this via `SandboxJobTool::update_status`
+/// in its poll loop; the detached (`wait=false`) path never polls, so the
+/// monitor is the only place the terminal status reaches the DB. Without it
+/// the `/api/jobs` row stays `in_progress`/`running` forever even after the
+/// job finishes (handoff §11). Fire-and-forget with a `warn!` on failure,
+/// matching the sync-path `update_status`/`persist_status` convention.
+fn persist_sandbox_terminal_status(
+    store: &Option<Arc<dyn Database>>,
+    job_id: Uuid,
+    status: JobResultStatus,
+) {
+    let Some(store) = store.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let reason = if status.is_success() {
+            None
+        } else {
+            Some(format!("Container finished: {}", status))
+        };
+        if let Err(e) = store
+            .update_sandbox_job_status(
+                job_id,
+                status.as_str(),
+                Some(status.is_success()),
+                reason.as_deref(),
+                None,
+                Some(Utc::now()),
+            )
+            .await
+        {
+            tracing::warn!(
+                job_id = %job_id,
+                "Failed to persist sandbox job terminal status: {}", e
+            );
+        }
+    });
 }
 
 #[cfg(test)]
@@ -424,6 +478,7 @@ mod tests {
             inject_tx,
             test_route(),
             Some(Arc::clone(&cm)),
+            None,
         );
 
         // Send completion event
@@ -473,6 +528,7 @@ mod tests {
             inject_tx,
             test_route(),
             Some(Arc::clone(&cm)),
+            None,
         );
 
         // Send failure event
@@ -514,7 +570,7 @@ mod tests {
             .unwrap();
 
         let (event_tx, _) = broadcast::channel::<(Uuid, String, AppEvent)>(16);
-        let handle = spawn_completion_watcher(job_id, event_tx.subscribe(), Arc::clone(&cm));
+        let handle = spawn_completion_watcher(job_id, event_tx.subscribe(), Arc::clone(&cm), None);
 
         event_tx
             .send((
@@ -536,5 +592,95 @@ mod tests {
 
         let ctx = cm.get_context(job_id).await.unwrap();
         assert_eq!(ctx.state, JobState::Completed);
+    }
+
+    // === Regression (handoff §11): detached path must persist the DB row ===
+    // The sync path writes `sandbox_jobs` in its poll loop; the detached path
+    // only reaches the DB through the monitor. Before this fix the `/api/jobs`
+    // row stayed `running`/`in_progress` forever even after the job finished.
+    #[cfg(feature = "libsql")]
+    #[tokio::test]
+    async fn test_monitor_persists_terminal_status_to_db() {
+        use crate::context::ContextManager;
+        use crate::db::Database;
+        use crate::db::libsql::LibSqlBackend;
+        use crate::history::SandboxJobRecord;
+
+        // File-backed (not `:memory:`) so the monitor's persist task, which
+        // opens its own connection, shares state with this one. In-memory
+        // libSQL databases don't share across connections (see db/CLAUDE.md).
+        let dir = tempfile::tempdir().unwrap();
+        let backend = LibSqlBackend::new_local(&dir.path().join("test.db"))
+            .await
+            .unwrap();
+        backend.run_migrations().await.unwrap();
+        let store: Arc<dyn Database> = Arc::new(backend);
+
+        let cm = Arc::new(ContextManager::new(5));
+        let job_id = Uuid::new_v4();
+        cm.register_sandbox_job(job_id, "user-1", "Say hello", "desc")
+            .await
+            .unwrap();
+
+        // Seed a `running` sandbox_jobs row, as `create_job` does at start.
+        store
+            .save_sandbox_job(&SandboxJobRecord {
+                id: job_id,
+                task: "Say hello".to_string(),
+                status: "running".to_string(),
+                user_id: "user-1".to_string(),
+                project_dir: "workspace".to_string(),
+                success: None,
+                failure_reason: None,
+                created_at: Utc::now(),
+                started_at: Some(Utc::now()),
+                completed_at: None,
+                credential_grants_json: "[]".to_string(),
+                mcp_servers: None,
+                max_iterations: None,
+            })
+            .await
+            .unwrap();
+
+        let (event_tx, _) = broadcast::channel::<(Uuid, String, AppEvent)>(16);
+        let handle = spawn_completion_watcher(
+            job_id,
+            event_tx.subscribe(),
+            Arc::clone(&cm),
+            Some(Arc::clone(&store)),
+        );
+
+        // The exact detached success signal.
+        event_tx
+            .send((
+                job_id,
+                "test-user".to_string(),
+                AppEvent::JobResult {
+                    job_id: job_id.to_string(),
+                    status: JobResultStatus::Completed,
+                    session_id: None,
+                    fallback_deliverable: None,
+                },
+            ))
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("watcher should exit")
+            .expect("watcher should not panic");
+
+        // DB persistence is fire-and-forget on a spawned task — poll briefly.
+        let mut persisted = None;
+        for _ in 0..40 {
+            let row = store.get_sandbox_job(job_id).await.unwrap().unwrap();
+            if row.status == "completed" {
+                persisted = Some(row);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let row =
+            persisted.expect("sandbox job row should flip to `completed`, not stay `running`");
+        assert_eq!(row.success, Some(true));
     }
 }
