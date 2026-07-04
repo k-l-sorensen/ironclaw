@@ -1052,10 +1052,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 reason: s,
             })?;
 
+        // Emit via the typed enum so the wire string stays in sync with
+        // `JobResultStatus::Completed::as_str()` — no string-literal drift.
         self.log_event(
             "result",
             serde_json::json!({
-                "status": "completed",
+                "status": JobResultStatus::Completed,
                 "success": true,
                 "message": "Job completed successfully",
             }),
@@ -1083,10 +1085,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 reason: s,
             })?;
 
+        // Emit via the typed enum so the wire string stays in sync with
+        // `JobResultStatus::Failed::as_str()` — no string-literal drift.
         self.log_event(
             "result",
             serde_json::json!({
-                "status": "failed",
+                "status": JobResultStatus::Failed,
                 "success": false,
                 "message": format!("Execution failed: {}", reason),
             }),

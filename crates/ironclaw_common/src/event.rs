@@ -120,25 +120,30 @@ impl std::str::FromStr for JobResultStatus {
 
 /// Resolve the terminal [`JobResultStatus`] from a `result` event payload.
 ///
-/// Sandbox `result` events are a producer/consumer contract across a trust
-/// boundary (container → orchestrator), and producers have historically
-/// disagreed on the field name: the typed producers emit a snake_case
-/// `status` string, while the container worker emits a `success` boolean.
-/// This helper is the single tolerant reader for both consumer sites
-/// (`orchestrator::api::job_event_handler`, `worker::job`), so a producer
-/// that only sets one of the two fields is still classified correctly:
+/// `status` is the **canonical** field. Every current producer emits it:
+/// `worker::container` and `worker::job` emit the typed [`JobResultStatus`]
+/// (`worker::job` also still sets a redundant `success` bool), and the legacy
+/// `worker::claude_bridge` / `worker::acp_bridge` emit a `status` string
+/// (`"completed"` / `"error"`, the latter handled by the `FromStr` alias). So
+/// arm 1 below is the live path for all live producers. This helper is the
+/// single reader for both consumer sites
+/// (`orchestrator::api::job_event_handler`, `worker::job`):
 ///
-/// 1. If `status` parses as a [`JobResultStatus`], use it.
+/// 1. If `status` parses as a [`JobResultStatus`], use it. Live path for
+///    every current producer.
 /// 2. Otherwise fall back to the `success` bool (`true` → `Completed`,
-///    `false` → `Failed`).
+///    `false` → `Failed`). This is a defensive net for a producer that
+///    regresses to `success`-only across the container → orchestrator trust
+///    boundary — NOT an active code path today.
 /// 3. If neither is usable, default to `Failed` — a malformed terminal
 ///    event must not register as success.
 ///
 /// Regression origin: #2678 migrated the consumers to the `status` enum and
 /// hardened the missing case to `Failed`, but left the container producer
 /// emitting only `success`, so every detached worker job was mislabeled
-/// `Failed`. The `success`-fallback arm here closes that gap defensively in
-/// addition to the producer fix.
+/// `Failed`. The container producer now emits `status` too (see
+/// `worker::container`), which retired the `success`-only path; the fallback
+/// arm remains only as the trust-boundary guard described above.
 pub fn resolve_result_status(data: &serde_json::Value) -> JobResultStatus {
     if let Some(status) = data
         .get("status")
