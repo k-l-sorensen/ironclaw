@@ -31,6 +31,7 @@ Multi-provider LLM integration with circuit breaker, retry, failover, and respon
 | `anthropic_oauth.rs` | Anthropic OAuth provider (Claude.ai subscription / OAuth tokens, fallback when no API key) |
 | `gemini_oauth.rs` | Gemini OAuth provider (Cloud OAuth credentials → `generativelanguage.googleapis.com`) |
 | `github_copilot.rs` | GitHub Copilot Chat provider (uses dedicated reqwest client, not `RigAdapter`) |
+| `mistral.rs` | Mistral provider (dedicated reqwest client, not `RigAdapter`); owns the array-shaped `reasoning_effort=high` response and maps the thinking chunk onto the shared `reasoning_details` channel |
 | `github_copilot_auth.rs` | Copilot session-token exchange and refresh (`CopilotTokenManager`) |
 | `host.rs` | Host-side trait surface: `SessionDb`, `SessionSecrets`, `SessionRenewer`, `SessionKeyPersistor` (binary supplies adapters in `src/llm_host.rs`) |
 | `runtime.rs` | `SwappableLlmProvider` + `LlmReloadHandle` for hot-reloading the provider chain on settings change |
@@ -54,6 +55,7 @@ Set via `LLM_BACKEND` env var:
 | `nearai` (default) | NEAR AI Chat Completions | `NEARAI_SESSION_TOKEN` or `NEARAI_API_KEY` |
 | `openai` | OpenAI | `OPENAI_API_KEY` |
 | `anthropic` | Anthropic | `ANTHROPIC_API_KEY` |
+| `mistral` | Mistral (`reasoning_effort=high` on Medium 3.5 / Small 4) | `MISTRAL_API_KEY`, `MISTRAL_MODEL`, `MISTRAL_REASONING` |
 | `github_copilot` | GitHub Copilot Chat API | `GITHUB_COPILOT_TOKEN`, `GITHUB_COPILOT_MODEL` |
 | `ollama` | Ollama local | `OLLAMA_BASE_URL` |
 | `openai_compatible` | Any OpenAI-compatible endpoint | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` |
@@ -99,6 +101,35 @@ The setup wizard supports GitHub device login or manual token paste.
 rotate this client ID at any time. If GitHub publishes an official third-party client
 ID, migrate to it immediately. Advanced users can override headers via
 `GITHUB_COPILOT_EXTRA_HEADERS`.
+
+## Mistral Provider Notes
+
+`mistral` uses a dedicated `MistralProvider` (`mistral.rs`) with a direct
+`reqwest` client rather than `RigAdapter`, because at `reasoning_effort=high`
+Mistral models `message.content` as an **array of typed chunks**
+(`[{type:"thinking"},{type:"text"}]`). rig-core's OpenAI-compat client — and rig
+0.33's dedicated Mistral client, which drops reasoning — model content as a
+`String` and fail to deserialize it (`did not match any variant of untagged enum
+ApiResponse`), so the provider owns the wire JSON.
+
+Key behaviors:
+
+- **`reasoning_effort` is on/off, not low/medium/high.** Config carries
+  `Option<MistralReasoningEffort>` (`Some(High)` → send `"high"`; `None` → omit).
+  `MISTRAL_REASONING` (default `high`) is read at the binary env boundary
+  (`src/config/llm.rs`) via `resolve_mistral_reasoning_from_env`; the crate stays
+  env-agnostic.
+- **Model-gated.** `supports_mistral_reasoning` (`reasoning_models.rs`) gates the
+  param to `mistral-small` / `mistral-medium` / `magistral`; the model gate beats
+  the toggle, so `mistral-large`/tiny/nemo never receive it.
+- **Reuses the shared reasoning channel.** The thinking chunk maps to
+  `ReasoningDetail::Text { text, signature }` on `reasoning_details` (the same seam
+  DeepSeek/Gemini/OpenRouter use — no Mistral-specific reasoning type). The opaque
+  ThinkChunk signature rides in `Text.signature` and is replayed on the next turn.
+- **Base URL is hardcoded** (`https://api.mistral.ai/v1`) and not operator-overridable
+  (SSRF surface); tests inject a loopback via the `#[cfg(test)]` constructor.
+- **Known gap:** `cost_per_token()` returns $0 because `costs::is_local_model`
+  matches `mistral*` — tracked as a fork follow-up (see `TODO` in `mistral.rs`).
 
 ## NEAR AI Provider Gotchas
 

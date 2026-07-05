@@ -25,7 +25,7 @@ ironclaw onboard --provider-only
 | OpenAI                | `openai`            | `OPENAI_API_KEY`       | GPT models                      |
 | Google Gemini         | `gemini_oauth`      | OAuth (browser)        | Gemini models; function calling |
 | io.net                | `ionet`             | `IONET_API_KEY`        | Intelligence API                |
-| Mistral               | `mistral`           | `MISTRAL_API_KEY`      | Mistral models                  |
+| Mistral               | `mistral`           | `MISTRAL_API_KEY`      | Mistral models; `reasoning_effort=high` on Medium 3.5 / Small 4 |
 | Yandex AI Studio      | `yandex`            | `YANDEX_API_KEY`       | YandexGPT models                |
 | MiniMax               | `minimax`           | `MINIMAX_API_KEY`      | MiniMax-M2.7 models             |
 | Cloudflare Workers AI | `cloudflare`        | `CLOUDFLARE_API_KEY`   | Access to Workers AI            |
@@ -176,6 +176,35 @@ To use the China mainland endpoint, set:
 ```env
 MINIMAX_BASE_URL=https://api.minimaxi.com/v1
 ```
+
+---
+
+## Mistral
+
+[Mistral AI](https://console.mistral.ai) — the largest EU model provider. Routed
+through a dedicated provider (not the generic OpenAI-compat path) so that
+`reasoning_effort=high` works: at high effort Mistral returns `message.content`
+as an array of typed chunks (a thinking chunk + the answer), which the generic
+path cannot deserialize.
+
+```env
+LLM_BACKEND=mistral
+MISTRAL_API_KEY=...
+MISTRAL_MODEL=mistral-medium-latest   # default (Medium 3.5); or mistral-small-latest (Small 4)
+MISTRAL_REASONING=high                # high (default) | none
+```
+
+Reasoning support:
+
+- **`reasoning_effort` is on/off**, not the OpenAI low/medium/high scale.
+  `MISTRAL_REASONING=high` (the default) sends the full thinking trace;
+  `none`/`off` omits the parameter.
+- Only **Mistral Medium 3.5** (`mistral-medium-2604`) and **Mistral Small 4**
+  (`mistral-small-2603`, aliased by `magistral-small-latest`) accept it.
+  `mistral-large`, `mistral-tiny`, and `mistral-nemo` omit it automatically.
+- The thinking trace (and its opaque signature) rides the shared
+  `reasoning_details` channel and is replayed on the next turn, so multi-turn
+  reasoning stays coherent.
 
 ---
 
