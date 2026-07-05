@@ -46,6 +46,30 @@ Conventional-Commit subject instead.
 
 ## Active local changes
 
+### Mistral `reasoning_effort=high` on upstream's native `reasoning_details`
+
+- **What:** a dedicated `crates/ironclaw_llm/src/mistral.rs` provider
+  (`ProviderProtocol::Mistral`) that owns Mistral's wire JSON so it can parse the
+  `reasoning_effort=high` array-shaped response (`[{thinking},{text}]`) that
+  rig-core 0.33 cannot. The thinking chunk (+ opaque signature) is mapped onto
+  **upstream's shared `reasoning_details` channel** (`ReasoningDetail::Text {
+  text, signature }`) — the same seam DeepSeek/Gemini/OpenRouter use — and
+  replayed on the next turn. Supporting pieces: `MistralReasoningEffort` +
+  `resolve_mistral_reasoning_from_env` (`config.rs`), `supports_mistral_reasoning`
+  gate (`reasoning_models.rs`), factory dispatch (`lib.rs`), `providers.json`
+  switch (`open_ai_completions` → `mistral`, default model → `mistral-medium-latest`),
+  `MISTRAL_REASONING` env boundary (`src/config/llm.rs`), offline parser matrix
+  (`mistral/tests.rs`) + live smoke test (`tests/e2e_live_mistral_reasoning.rs`).
+- **Why:** implements fork issue #8 per
+  `docs/plans/2026-07-05-mistral-reasoning-native-arch.md`. This is the
+  re-architecture that replaces the retired custom stack below: it reuses
+  upstream's `reasoning_details` end-to-end, so there is **no** `ReasoningBlock` /
+  CTR-1 / SIG-1 carry and **no** new DB migration. Scope: Mistral Medium 3.5
+  (`mistral-medium-2604`) and Small 4 (`mistral-small-2603`).
+- **Known gap (tracked):** `costs::is_local_model` matches `mistral*`, so hosted
+  Mistral currently bills as $0 — fork follow-up issue; see the `TODO` in
+  `mistral.rs::cost_per_token`.
+
 ### Fork-release skill + tag-driven release convention
 
 - **What:** `.claude/skills/fork-release/SKILL.md` — a Claude Code skill that
@@ -112,15 +136,16 @@ in **[fork issue #8](https://github.com/k-l-sorensen/ironclaw/issues/8)**. The
 full pre-catch-up state (all Mistral code + tests) is preserved at the
 `backup/main-pre-catchup` tag.
 
-**Status (2026-07-05): approved C4 L3 architecture, implementation not yet
-started.** The re-architecture now has an approved component-level design —
-`docs/plans/2026-07-05-mistral-reasoning-native-arch.md` — which supersedes the
-2026-06-24 design. Key outcome: upstream's `reasoning_details` is reused
-end-to-end, so the re-arch is **one thin `MistralProvider`** at the wire boundary
-(translating Mistral's chunk array onto `ReasoningDetail::Text{text,signature}`)
-plus a `ProviderProtocol::Mistral` variant, a `supports_mistral_reasoning()` gate,
-and `providers.json` config — **no** `ReasoningBlock`/CTR-1/SIG-1 rebuild, **no**
-new DB migrations. Scope: `reasoning_effort=high` for Mistral Medium 3.5
+**Status (2026-07-05): IMPLEMENTED** on the approved design
+(`docs/plans/2026-07-05-mistral-reasoning-native-arch.md`, which supersedes the
+2026-06-24 design). See the **"Mistral `reasoning_effort=high` on upstream's
+native `reasoning_details`"** entry under *Active local changes* above for the
+shipped shape. Key outcome as designed: upstream's `reasoning_details` is reused
+end-to-end — **one thin `MistralProvider`** at the wire boundary (translating
+Mistral's chunk array onto `ReasoningDetail::Text{text,signature}`) plus a
+`ProviderProtocol::Mistral` variant, a `supports_mistral_reasoning()` gate, and
+`providers.json` config — **no** `ReasoningBlock`/CTR-1/SIG-1 rebuild, **no** new
+DB migrations. Scope: `reasoning_effort=high` for Mistral Medium 3.5
 (`mistral-medium-2604`) and Mistral Small 4 (`mistral-small-2603`).
 
 **Reference material retained in-tree to seed the re-architecture** (so it need
