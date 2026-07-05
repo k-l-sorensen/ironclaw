@@ -112,11 +112,25 @@ in **[fork issue #8](https://github.com/k-l-sorensen/ironclaw/issues/8)**. The
 full pre-catch-up state (all Mistral code + tests) is preserved at the
 `backup/main-pre-catchup` tag.
 
+**Status (2026-07-05): approved C4 L3 architecture, implementation not yet
+started.** The re-architecture now has an approved component-level design —
+`docs/plans/2026-07-05-mistral-reasoning-native-arch.md` — which supersedes the
+2026-06-24 design. Key outcome: upstream's `reasoning_details` is reused
+end-to-end, so the re-arch is **one thin `MistralProvider`** at the wire boundary
+(translating Mistral's chunk array onto `ReasoningDetail::Text{text,signature}`)
+plus a `ProviderProtocol::Mistral` variant, a `supports_mistral_reasoning()` gate,
+and `providers.json` config — **no** `ReasoningBlock`/CTR-1/SIG-1 rebuild, **no**
+new DB migrations. Scope: `reasoning_effort=high` for Mistral Medium 3.5
+(`mistral-medium-2604`) and Mistral Small 4 (`mistral-small-2603`).
+
 **Reference material retained in-tree to seed the re-architecture** (so it need
 not be reinvented):
 
 - `docs/providers/mistral-reasoning.md` — provider-agnostic API research + the
   rig-core parse blocker (still valid).
+- `docs/plans/2026-07-05-mistral-reasoning-native-arch.md` — the **current
+  approved** C4 L3 architecture (native `reasoning_details` path, model catalog,
+  components, rule-compliance, acceptance criteria).
 - `docs/plans/2026-06-24-mistral-reasoning-provider-architecture.md` — the
   superseded design (bannered), **plus the acceptance criteria** the re-arch must
   re-satisfy (clean round-trip, multi-turn replay).
