@@ -12,6 +12,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - *(reborn-cli)* document the standalone `config init` atomic-write dependency on `tempfile` and call out the default runner cadence change to 5s heartbeats / 200ms polling (down from 10s / 2s).
 - *(reborn)* expose runtime poll settings and document the standalone turn-runner cadence change for callers using `TurnRunnerSettings::default()`.
 
+## [0.29.1-fork.3](https://github.com/k-l-sorensen/ironclaw/releases/tag/ironclaw-v0.29.1-fork.3) - 2026-07-05
+
+Third marked release of the **k-l-sorensen/ironclaw fork** — an unofficial build,
+not produced by or affiliated with upstream `nearai/ironclaw`. Built on upstream
+`main` past the `0.29.1` tag, on top of `0.29.1-fork.2`, plus the fork-only
+changes below. The `-fork.3` prerelease suffix flags it as a GitHub pre-release
+and keeps it distinct from official upstream releases. See `CLAUDE-local.md` for
+the full fork divergence list.
+
+### Fixed
+
+- *(worker)* detached (`wait=false`) worker-mode jobs no longer mislabel a
+  successful run as `failed`. Since the `JobResultStatus` enum migration (#2678)
+  the host consumers read a typed `status` string and defaulted the missing
+  value to `Failed`, but the container worker's terminal `result` event emitted
+  only a `success` bool — the exact intersection this fork's Mistral deployment
+  runs in (`claude_code` disabled → worker mode; jobs fired detached). The
+  container worker now emits a typed `status` alongside the legacy `success`
+  bool, and both consumer sites (`orchestrator/api.rs`, `worker/job.rs`) resolve
+  through one shared `resolve_result_status()` in `ironclaw_common` — prefer
+  `status`, fall back to the `success` bool, default `Failed` only when neither
+  is usable.
+- *(worker)* the detached-job monitor now persists the terminal `sandbox_jobs`
+  row via `update_sandbox_job_status`, so `/api/jobs` no longer lingers
+  `in_progress` forever after a detached job finishes.
+
+### Changed
+
+- *(worker)* restore the "unknown job result status" warning through a
+  `ResultStatusSource` provenance so a garbage container payload is logged
+  rather than silently resolving to `Failed`, and collapse the duplicated
+  terminal-finalization logic into a single helper.
+
 ## [0.29.1-fork.2](https://github.com/k-l-sorensen/ironclaw/releases/tag/ironclaw-v0.29.1-fork.2) - 2026-06-28
 
 Second marked release of the **k-l-sorensen/ironclaw fork** — an unofficial build,
