@@ -109,6 +109,23 @@ reasoning carry** and adopted upstream's system.
 
 Re-architecting Mistral support onto upstream's native reasoning path is tracked
 in **[fork issue #8](https://github.com/k-l-sorensen/ironclaw/issues/8)**. The
-pre-catch-up state is preserved at the `backup/main-pre-catchup` tag.
+full pre-catch-up state (all Mistral code + tests) is preserved at the
+`backup/main-pre-catchup` tag.
+
+**Reference material retained in-tree to seed the re-architecture** (so it need
+not be reinvented):
+
+- `docs/providers/mistral-reasoning.md` — provider-agnostic API research + the
+  rig-core parse blocker (still valid).
+- `docs/plans/2026-06-24-mistral-reasoning-provider-architecture.md` — the
+  superseded design (bannered), **plus the acceptance criteria** the re-arch must
+  re-satisfy (clean round-trip, multi-turn replay).
+- `docs/plans/2026-06-24-mistral-reasoning-impl.md` — superseded work breakdown,
+  kept for the edge cases it enumerates.
+- `scripts/test-mistral-reasoning.sh` — raw Mistral API probe (no code coupling).
+
+The retired tests — `tests/e2e_live_mistral_reasoning.rs` (behavioral acceptance)
+and `crates/ironclaw_llm/src/mistral/tests.rs` (offline parser matrix, C1–C12) —
+live at the backup tag; their intent is captured in the acceptance criteria above.
 
 <!-- Add new local changes above the "Retired" section, newest first. -->
