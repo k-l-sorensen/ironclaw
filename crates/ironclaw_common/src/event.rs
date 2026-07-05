@@ -118,6 +118,96 @@ impl std::str::FromStr for JobResultStatus {
     }
 }
 
+/// Resolve the terminal [`JobResultStatus`] from a `result` event payload.
+///
+/// `status` is the **canonical** field. Every current producer emits it:
+/// `worker::container` and `worker::job` emit the typed [`JobResultStatus`]
+/// (`worker::job` also still sets a redundant `success` bool), and the legacy
+/// `worker::claude_bridge` / `worker::acp_bridge` emit a `status` string
+/// (`"completed"` / `"error"`, the latter handled by the `FromStr` alias). So
+/// arm 1 below is the live path for all live producers. This helper is the
+/// single reader for both consumer sites
+/// (`orchestrator::api::job_event_handler`, `worker::job`):
+///
+/// 1. If `status` parses as a [`JobResultStatus`], use it. Live path for
+///    every current producer.
+/// 2. Otherwise fall back to the `success` bool (`true` → `Completed`,
+///    `false` → `Failed`). This is a defensive net for a producer that
+///    regresses to `success`-only across the container → orchestrator trust
+///    boundary — NOT an active code path today.
+/// 3. If neither is usable, default to `Failed` — a malformed terminal
+///    event must not register as success.
+///
+/// Regression origin: #2678 migrated the consumers to the `status` enum and
+/// hardened the missing case to `Failed`, but left the container producer
+/// emitting only `success`, so every detached worker job was mislabeled
+/// `Failed`. The container producer now emits `status` too (see
+/// `worker::container`), which retired the `success`-only path; the fallback
+/// arm remains only as the trust-boundary guard described above.
+pub fn resolve_result_status(data: &serde_json::Value) -> JobResultStatus {
+    resolve_result_status_with_source(data).status
+}
+
+/// Which tier of [`resolve_result_status_with_source`] produced the verdict.
+///
+/// Exposed so the two trust-boundary consumers can log when a container sent a
+/// terminal event we couldn't understand — the pure resolver stays silent, and
+/// the `job_id`-aware call sites emit the warning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultStatusSource {
+    /// `status` parsed cleanly into a known variant. The live path — no log.
+    ParsedStatus,
+    /// `status` was absent or unparseable; the legacy `success` bool decided
+    /// the outcome. The documented defensive path — no log.
+    SuccessBool,
+    /// Neither `status` nor `success` was usable; defaulted to `Failed`. A
+    /// malformed terminal event — callers should log. `raw_status` is the
+    /// unparseable `status` string the producer sent, or `None` if it was
+    /// absent entirely.
+    Defaulted { raw_status: Option<String> },
+}
+
+/// A resolved [`JobResultStatus`] plus the [`ResultStatusSource`] provenance
+/// that produced it.
+pub struct ResolvedResultStatus {
+    pub status: JobResultStatus,
+    pub source: ResultStatusSource,
+}
+
+/// Like [`resolve_result_status`], but also reports the [`ResultStatusSource`]
+/// so callers can log unrecognized producer payloads. Resolution semantics are
+/// identical — this is the single implementation that `resolve_result_status`
+/// wraps.
+pub fn resolve_result_status_with_source(data: &serde_json::Value) -> ResolvedResultStatus {
+    let raw = data.get("status").and_then(|v| v.as_str());
+    if let Some(raw) = raw
+        && let Ok(status) = raw.parse::<JobResultStatus>()
+    {
+        return ResolvedResultStatus {
+            status,
+            source: ResultStatusSource::ParsedStatus,
+        };
+    }
+
+    // `status` absent or unparseable — fall back to the `success` bool.
+    match data.get("success").and_then(|v| v.as_bool()) {
+        Some(true) => ResolvedResultStatus {
+            status: JobResultStatus::Completed,
+            source: ResultStatusSource::SuccessBool,
+        },
+        Some(false) => ResolvedResultStatus {
+            status: JobResultStatus::Failed,
+            source: ResultStatusSource::SuccessBool,
+        },
+        None => ResolvedResultStatus {
+            status: JobResultStatus::Failed,
+            source: ResultStatusSource::Defaulted {
+                raw_status: raw.map(str::to_string),
+            },
+        },
+    }
+}
+
 /// A single step in a plan progress update (SSE DTO).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanStepDto {
@@ -1230,5 +1320,97 @@ mod tests {
         assert!(JobResultStatus::Completed.is_success());
         assert!(!JobResultStatus::Failed.is_success());
         assert!(!JobResultStatus::Cancelled.is_success());
+    }
+
+    #[test]
+    fn resolve_result_status_prefers_status_field() {
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "completed"})),
+            JobResultStatus::Completed
+        );
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "failed"})),
+            JobResultStatus::Failed
+        );
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "stuck"})),
+            JobResultStatus::Stuck
+        );
+        // `status` wins even when `success` disagrees — the typed field is
+        // authoritative.
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "completed", "success": false})),
+            JobResultStatus::Completed
+        );
+    }
+
+    #[test]
+    fn resolve_result_status_falls_back_to_success_bool() {
+        // The exact pre-fix container payload: `success` only, no `status`.
+        // This is the bug repro (#2678) — it must classify as Completed, not
+        // the default-Failed the missing-`status` path used to produce.
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"success": true, "message": "Hello World"})),
+            JobResultStatus::Completed
+        );
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"success": false, "message": "boom"})),
+            JobResultStatus::Failed
+        );
+    }
+
+    #[test]
+    fn resolve_result_status_defaults_failed_when_unusable() {
+        // Neither a parseable `status` nor a `success` bool: a malformed
+        // terminal event must never silently register as success.
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({})),
+            JobResultStatus::Failed
+        );
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "garbage"})),
+            JobResultStatus::Failed
+        );
+        // Unparseable `status` still falls through to the `success` bool.
+        assert_eq!(
+            resolve_result_status(&serde_json::json!({"status": "", "success": true})),
+            JobResultStatus::Completed
+        );
+    }
+
+    #[test]
+    fn resolve_result_status_with_source_reports_provenance() {
+        use ResultStatusSource::*;
+        // Clean parse and the success-bool fallback stay quiet.
+        assert_eq!(
+            resolve_result_status_with_source(&serde_json::json!({"status": "completed"})).source,
+            ParsedStatus
+        );
+        assert_eq!(
+            resolve_result_status_with_source(&serde_json::json!({"success": true})).source,
+            SuccessBool
+        );
+        // Garbage `status`, no bool → Defaulted, carrying the raw string to log.
+        // This is the regression guard: the refactor to `resolve_result_status`
+        // dropped the warn! this provenance re-enables.
+        assert_eq!(
+            resolve_result_status_with_source(&serde_json::json!({"status": "wat"})).source,
+            Defaulted {
+                raw_status: Some("wat".to_string())
+            }
+        );
+        // Nothing usable at all → Defaulted with no raw status.
+        assert_eq!(
+            resolve_result_status_with_source(&serde_json::json!({})).source,
+            Defaulted { raw_status: None }
+        );
+        // Garbage `status` recovered by a valid bool → SuccessBool (stays quiet).
+        assert_eq!(
+            resolve_result_status_with_source(
+                &serde_json::json!({"status": "wat", "success": true})
+            )
+            .source,
+            SuccessBool
+        );
     }
 }

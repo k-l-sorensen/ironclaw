@@ -29,6 +29,7 @@ use crate::worker::autonomous_recovery::{
     EMPTY_TOOL_COMPLETION_NUDGE, FORCE_TEXT_RECOVERY_PROMPT,
 };
 use crate::worker::proxy_llm::ProxyLlmProvider;
+use ironclaw_common::JobResultStatus;
 use ironclaw_llm::{
     ChatMessage, LlmProvider, Reasoning, ReasoningBlock, ReasoningContext, ResponseMetadata,
 };
@@ -214,6 +215,10 @@ Work independently to complete this job. When finished, your final message MUST 
                 self.post_event(
                     "result",
                     serde_json::json!({
+                        // Emit both the typed `status` (what the consumers
+                        // read post-#2678) and the legacy `success` bool.
+                        // Mirrors the in-process producer in `worker/job.rs`.
+                        "status": JobResultStatus::Completed,
                         "success": true,
                         "message": truncate_for_preview(&output, 2000),
                     }),
@@ -233,6 +238,7 @@ Work independently to complete this job. When finished, your final message MUST 
                 self.post_event(
                     "result",
                     serde_json::json!({
+                        "status": JobResultStatus::Failed,
                         "success": false,
                         "message": format!("Execution failed: {}", msg),
                     }),
@@ -251,6 +257,7 @@ Work independently to complete this job. When finished, your final message MUST 
                 self.post_event(
                     "result",
                     serde_json::json!({
+                        "status": JobResultStatus::Failed,
                         "success": false,
                         "message": reason,
                     }),
@@ -281,6 +288,7 @@ Work independently to complete this job. When finished, your final message MUST 
                 self.post_event(
                     "result",
                     serde_json::json!({
+                        "status": JobResultStatus::Failed,
                         "success": false,
                         "message": format!("Execution failed: {}", e),
                     }),
@@ -299,6 +307,7 @@ Work independently to complete this job. When finished, your final message MUST 
                 self.post_event(
                     "result",
                     serde_json::json!({
+                        "status": JobResultStatus::Failed,
                         "success": false,
                         "message": "Execution timed out",
                     }),

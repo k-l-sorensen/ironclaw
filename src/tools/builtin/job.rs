@@ -531,6 +531,7 @@ impl CreateJobTool {
                         itx.clone(),
                         route,
                         Some(self.context_manager.clone()),
+                        self.store.clone(),
                     );
                 } else {
                     // No routing metadata — can't inject messages, but still
@@ -539,6 +540,7 @@ impl CreateJobTool {
                         job_id,
                         etx.subscribe(),
                         self.context_manager.clone(),
+                        self.store.clone(),
                     );
                 }
             }

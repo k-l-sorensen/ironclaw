@@ -30,7 +30,10 @@ use crate::worker::autonomous_recovery::{
     AutonomousRecoveryAction, AutonomousRecoveryState, EMPTY_TOOL_COMPLETION_FAILURE,
     EMPTY_TOOL_COMPLETION_NUDGE, FORCE_TEXT_RECOVERY_PROMPT,
 };
-use ironclaw_common::{AppEvent, JobResultStatus};
+use ironclaw_common::{
+    AppEvent, JobResultStatus, ResolvedResultStatus, ResultStatusSource,
+    resolve_result_status_with_source,
+};
 use ironclaw_llm::{
     ActionPlan, ChatMessage, LlmProvider, Reasoning, ReasoningBlock, ReasoningContext,
     RespondResult, ResponseMetadata, ToolCall, ToolSelection,
@@ -203,20 +206,22 @@ impl Worker {
                         .to_string(),
                 }),
                 "result" => {
-                    // JSON payloads from sandbox containers are a trust
-                    // boundary — parse the wire string into the typed
-                    // enum and fall back to `Failed` (not `Completed`)
-                    // on unknown values so a mis-labeled container run
-                    // cannot silently register as success.
-                    let raw_status = data.get("status").and_then(|v| v.as_str()).unwrap_or("");
-                    let status = raw_status.parse::<JobResultStatus>().unwrap_or_else(|_| {
+                    // Resolve through the shared tolerant reader (accepts the
+                    // typed `status` this delegate emits, and falls back to the
+                    // legacy `success` bool for producer drift; defaults to
+                    // `Failed` only when neither is usable). Same reader the
+                    // container→orchestrator path uses. See #2678.
+                    let ResolvedResultStatus { status, source } =
+                        resolve_result_status_with_source(&data);
+                    // Trust-boundary signal: a container sent a terminal event
+                    // with neither a parseable `status` nor a `success` bool.
+                    if let ResultStatusSource::Defaulted { raw_status } = &source {
                         tracing::warn!(
-                            job_id = %job_id,
-                            raw_status = %raw_status,
+                            job_id = %job_id_str,
+                            raw_status = raw_status.as_deref().unwrap_or(""),
                             "unknown job result status from container; defaulting to Failed"
                         );
-                        JobResultStatus::Failed
-                    });
+                    }
                     Some(AppEvent::JobResult {
                         job_id: job_id_str,
                         status,
@@ -1060,10 +1065,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 reason: s,
             })?;
 
+        // Emit via the typed enum so the wire string stays in sync with
+        // `JobResultStatus::Completed::as_str()` — no string-literal drift.
         self.log_event(
             "result",
             serde_json::json!({
-                "status": "completed",
+                "status": JobResultStatus::Completed,
                 "success": true,
                 "message": "Job completed successfully",
             }),
@@ -1091,10 +1098,12 @@ Report when the job is complete or if you encounter issues you cannot resolve."#
                 reason: s,
             })?;
 
+        // Emit via the typed enum so the wire string stays in sync with
+        // `JobResultStatus::Failed::as_str()` — no string-literal drift.
         self.log_event(
             "result",
             serde_json::json!({
-                "status": "failed",
+                "status": JobResultStatus::Failed,
                 "success": false,
                 "message": format!("Execution failed: {}", reason),
             }),
