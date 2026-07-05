@@ -223,7 +223,8 @@ pub fn build_llm_config_from_resolved_provider(
             | ProviderProtocol::GithubCopilot
             | ProviderProtocol::DeepSeek
             | ProviderProtocol::Gemini
-            | ProviderProtocol::OpenRouter => {
+            | ProviderProtocol::OpenRouter
+            | ProviderProtocol::Mistral => {
                 return Err(LlmError::RequestFailed {
                     provider: dedicated.provider_id,
                     reason: "registry provider protocol resolved as dedicated config".to_string(),
@@ -512,6 +513,7 @@ fn is_registry_protocol(protocol: ProviderProtocol) -> bool {
             | ProviderProtocol::DeepSeek
             | ProviderProtocol::Gemini
             | ProviderProtocol::OpenRouter
+            | ProviderProtocol::Mistral
     )
 }
 

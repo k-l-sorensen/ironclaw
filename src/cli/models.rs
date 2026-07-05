@@ -201,6 +201,7 @@ async fn try_fetch_models(provider_id: &str, config_path: Option<&Path>) -> Opti
             refresh_token: None,
             auth_path: None,
             cache_retention: Default::default(),
+            mistral_reasoning: None,
             unsupported_params: def.unsupported_params.clone(),
         });
     }

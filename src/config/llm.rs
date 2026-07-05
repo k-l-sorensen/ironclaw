@@ -591,6 +591,9 @@ fn resolve_custom_provider(
         refresh_token: None,
         auth_path: None,
         cache_retention: CacheRetention::default(),
+        // Custom overlay providers are not the built-in Mistral entry; reasoning
+        // is resolved only on the `Mistral` protocol in `resolve_registry_provider`.
+        mistral_reasoning: None,
         unsupported_params: Vec::new(),
     })
 }
@@ -803,6 +806,22 @@ fn resolve_registry_provider(
         CacheRetention::default()
     };
 
+    // Resolve Mistral `reasoning_effort` from env (default: on/high).
+    //
+    // Two wire states are carried as `Option<MistralReasoningEffort>`:
+    //   - `MISTRAL_REASONING=high|on|true|1` (or unset) → `Some(High)` → "high"
+    //   - `MISTRAL_REASONING=off|none|false|0`          → `None`       → omit
+    //
+    // Gate on the resolved `protocol`, not the id string: a Mistral-protocol
+    // provider registered under a non-`"mistral"` id (custom overlay entry)
+    // must still default reasoning on. The provider further gates `Some(_)` on
+    // model capability (`supports_mistral_reasoning`) before sending.
+    let mistral_reasoning = if protocol == ProviderProtocol::Mistral {
+        ironclaw_llm::resolve_mistral_reasoning_from_env(optional_env("MISTRAL_REASONING")?)
+    } else {
+        None
+    };
+
     Ok(RegistryProviderConfig {
         protocol,
         provider_id: canonical_id.to_string(),
@@ -815,6 +834,7 @@ fn resolve_registry_provider(
         refresh_token: codex_refresh_token,
         auth_path: codex_auth_path,
         cache_retention,
+        mistral_reasoning,
         unsupported_params,
     })
 }
@@ -2820,6 +2840,123 @@ mod tests {
         assert_eq!(
             cfg.backend, "anthropic",
             "pure resolve must not auto-fall-back; that is resolve_with_fallback's job"
+        );
+    }
+
+    // ── Mistral reasoning env→config boundary (test through the caller) ──────
+
+    /// Drive the env→config boundary for Mistral reasoning through the public
+    /// `resolve()` caller: assert the `MISTRAL_REASONING` env value maps to the
+    /// right `Option<MistralReasoningEffort>` on the resolved
+    /// `RegistryProviderConfig`. A predicate-only test on
+    /// `resolve_mistral_reasoning_from_env` would not prove the resolver gates
+    /// on the Mistral protocol and threads the value onto the config.
+    fn resolve_mistral_reasoning(value: Option<&str>) -> Option<MistralReasoningEffort> {
+        let _guard = lock_env();
+        clear_openai_compatible_env();
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::set_var("LLM_BACKEND", "mistral");
+            std::env::set_var("MISTRAL_API_KEY", TEST_API_KEY);
+            match value {
+                Some(v) => std::env::set_var("MISTRAL_REASONING", v),
+                None => std::env::remove_var("MISTRAL_REASONING"),
+            }
+        }
+
+        let settings = Settings::default();
+        let cfg = crate::config::llm::resolve(&settings).expect("resolve should succeed");
+        let provider = cfg.provider.expect("mistral should have provider config");
+        assert_eq!(provider.protocol, ProviderProtocol::Mistral);
+        assert_eq!(provider.provider_id, "mistral");
+        let reasoning = provider.mistral_reasoning;
+
+        // SAFETY: Under ENV_MUTEX.
+        unsafe {
+            std::env::remove_var("LLM_BACKEND");
+            std::env::remove_var("MISTRAL_API_KEY");
+            std::env::remove_var("MISTRAL_REASONING");
+        }
+        reasoning
+    }
+
+    #[test]
+    fn mistral_reasoning_defaults_to_high_when_unset() {
+        assert_eq!(
+            resolve_mistral_reasoning(None),
+            Some(MistralReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn mistral_reasoning_high_and_on_resolve_to_some_high() {
+        assert_eq!(
+            resolve_mistral_reasoning(Some("high")),
+            Some(MistralReasoningEffort::High)
+        );
+        assert_eq!(
+            resolve_mistral_reasoning(Some("on")),
+            Some(MistralReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn mistral_reasoning_off_and_none_omit_the_param() {
+        // "off"/"none" omit the wire param entirely → Option::None.
+        assert_eq!(resolve_mistral_reasoning(Some("off")), None);
+        assert_eq!(resolve_mistral_reasoning(Some("none")), None);
+    }
+
+    #[test]
+    fn mistral_reasoning_invalid_warns_and_defaults_to_high() {
+        assert_eq!(
+            resolve_mistral_reasoning(Some("medium")),
+            Some(MistralReasoningEffort::High)
+        );
+    }
+
+    /// Regression: a Mistral-protocol provider registered under a
+    /// non-`"mistral"` id must still default reasoning to `Some(High)`. The gate
+    /// keys on the resolved `protocol`, not the id string, so a custom overlay /
+    /// renamed Mistral entry is not silently left reasoning-off. Drives the
+    /// caller (`resolve_registry_provider`), not the helper.
+    #[test]
+    fn mistral_reasoning_gates_on_protocol_not_id_string() {
+        let _guard = lock_env();
+        clear_openai_compatible_env();
+        // SAFETY: Under ENV_MUTEX — ensure no stale toggle leaks in.
+        unsafe {
+            std::env::remove_var("MISTRAL_REASONING");
+        }
+
+        let def = ironclaw_llm::registry::ProviderDefinition {
+            id: "custom-mistral".to_string(),
+            aliases: Vec::new(),
+            protocol: ProviderProtocol::Mistral,
+            default_base_url: Some("https://api.mistral.ai/v1".to_string()),
+            base_url_env: None,
+            base_url_required: false,
+            api_key_env: None,
+            api_key_required: false,
+            model_env: "CUSTOM_MISTRAL_MODEL".to_string(),
+            default_model: "mistral-large-latest".to_string(),
+            description: "test-only renamed Mistral provider".to_string(),
+            extra_headers_env: None,
+            setup: None,
+            unsupported_params: Vec::new(),
+        };
+        let registry = ProviderRegistry::new(vec![def]);
+        let settings = Settings::default();
+
+        let provider = resolve_registry_provider("custom-mistral", &registry, &settings)
+            .expect("custom Mistral provider should resolve");
+
+        assert_eq!(provider.provider_id, "custom-mistral");
+        assert_eq!(provider.protocol, ProviderProtocol::Mistral);
+        assert_eq!(
+            provider.mistral_reasoning,
+            Some(MistralReasoningEffort::High),
+            "Mistral-protocol provider under a non-\"mistral\" id must default reasoning on"
         );
     }
 }

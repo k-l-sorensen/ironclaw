@@ -84,6 +84,16 @@ pub enum ProviderProtocol {
     /// tool calling on every reasoning model OpenRouter exposes (Claude with
     /// thinking, OpenAI o-series, DeepSeek-R1, Gemini 2.5+, Qwen QwQ, …).
     OpenRouter,
+    /// Mistral AI API. Routes through IronClaw's dedicated `MistralProvider`
+    /// (`crate::mistral`), which owns the request/response JSON so it can parse
+    /// Mistral's `reasoning_effort=high` response — an **array of typed chunks**
+    /// (`[{type:"thinking"},{type:"text"}]`) that rig-core's `String`-typed
+    /// content model (both the generic OpenAI-compat client and rig 0.33's
+    /// dedicated Mistral client, which drops reasoning) cannot deserialize. It
+    /// splits the thinking chunk onto the shared `reasoning_details` channel and
+    /// replays the prior `ThinkChunk` on the next turn, which Mistral requires
+    /// to stay coherent multi-turn.
+    Mistral,
     /// AWS Bedrock native Converse API (via `aws-sdk-bedrockruntime`).
     /// Reads its config from [`crate::config::LlmConfig::bedrock`].
     /// Feature-gated behind `--features bedrock`.
@@ -844,6 +854,16 @@ mod tests {
              strips reasoning_details and tool-call signatures, breaking \
              every thinking-mode model OpenRouter exposes (Claude with \
              thinking, OpenAI o-series, DeepSeek-R1, Gemini 2.5+, Qwen QwQ)",
+        );
+
+        let mistral = by_id("mistral").expect("mistral entry must exist");
+        assert_eq!(
+            mistral.protocol,
+            ProviderProtocol::Mistral,
+            "mistral must use the dedicated Mistral protocol — OpenAiCompletions \
+             cannot deserialize the reasoning_effort=high array-shaped content \
+             response and fails every turn with `did not match any variant of \
+             untagged enum ApiResponse`",
         );
     }
 
