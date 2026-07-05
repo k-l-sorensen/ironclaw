@@ -182,7 +182,7 @@
         <!--<Icon Id='ProductICO' SourceFile='wix\Product.ico'/>-->
         <!--<Property Id='ARPPRODUCTICON' Value='ProductICO' />-->
 
-        <Property Id='ARPHELPLINK' Value='https://github.com/nearai/ironclaw'/>
+        <Property Id='ARPHELPLINK' Value='https://github.com/k-l-sorensen/ironclaw'/>
         
         <UI>
             <UIRef Id='WixUI_FeatureTree'/>
