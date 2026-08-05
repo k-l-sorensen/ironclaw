@@ -1,3 +1,16 @@
+> **Fork notice.** This is a personal fork of [nearai/ironclaw](https://github.com/nearai/ironclaw).
+> It tracks upstream closely and carries a small set of local-only changes
+> (fork-release tooling, an advisory ignore) documented in
+> [`CLAUDE-local.md`](CLAUDE-local.md). All credit for the original work goes
+> to the upstream authors; the original license (MIT OR Apache-2.0) is retained
+> unchanged. A custom Mistral `reasoning_effort` provider previously lived here
+> but was retired pending re-architecture against upstream's native reasoning
+> system — see the fork's issues.
+> Fork-specific issues → [this fork's issues](https://github.com/k-l-sorensen/ironclaw/issues).
+> Core issues → [upstream](https://github.com/nearai/ironclaw/issues).
+
+---
+
 <p align="center">
   <img src="ironclaw.png?v=2" alt="IronClaw" width="200"/>
 </p>
