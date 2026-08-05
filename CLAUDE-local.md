@@ -60,6 +60,48 @@ Conventional-Commit subject instead.
 
 ## Active local changes
 
+### Mistral `reasoning_effort=high` on upstream's native `reasoning_details`
+
+- **What:** a dedicated `crates/ironclaw_llm/src/mistral.rs` provider
+  (`ProviderProtocol::Mistral`) that owns Mistral's wire JSON so it can parse
+  the `reasoning_effort=high` array-shaped response (`[{thinking},{text}]`)
+  that rig-core 0.33 cannot. The thinking chunk (+ opaque signature) is mapped
+  onto **upstream's shared `reasoning_details` channel**
+  (`ReasoningDetail::Text { text, signature }`) — the same seam
+  DeepSeek/Gemini/OpenRouter use — and replayed on the next turn. Supporting
+  pieces: `MistralReasoningEffort` + `resolve_mistral_reasoning_from_env`
+  (`config.rs`), `supports_mistral_reasoning` gate (`reasoning_models.rs`),
+  `ProviderProtocol::Mistral` + factory dispatch (`registry.rs`/`lib.rs`),
+  `MISTRAL_REASONING` env wiring in `apply_registry_provider_env`
+  (`resolution.rs` — `ironclaw_llm` now owns its full env→config resolution
+  itself; there's no more binary-crate env-reading split, since `ironclaw_cli`
+  is architecturally forbidden from depending on `ironclaw_llm` directly),
+  `crates/ironclaw_llm/assets/providers.json` switch (`open_ai_completions` →
+  `mistral`, default model → `mistral-medium-latest`), offline parser matrix
+  (`mistral/tests.rs`), and a live contract test
+  (`tests/reborn_live_mistral_reasoning_contract.rs` — the old
+  `tests/e2e_live_mistral_reasoning.rs` depended on a v1 agent-loop harness
+  deleted with the monolith; this one calls `MistralProvider` directly,
+  modeled on `tests/reborn_live_github_pat_contract.rs`).
+- **Why:** implements fork issue #8 per
+  `docs/plans/2026-07-05-mistral-reasoning-native-arch.md`. Re-landed on the
+  2026-08-05 catch-up (upstream 0.29.1-era → 1.1.0-rc.1) from the original
+  `152c010bc4`; still no upstream native Mistral reasoning support at the new
+  base either, so this remains needed. No `ReasoningBlock`/CTR-1/SIG-1 carry,
+  no DB migration. Scope: Mistral Medium 3.5 (`mistral-medium-2604`) and Small
+  4 (`mistral-small-2603`).
+- **Re-landing deviations (2026-08-05):** cost lookup moved crates
+  (`crate::costs` → `ironclaw_common::llm_costs`, since `ironclaw_llm` no
+  longer owns cost tables); added an explicit `provider_id()` override (the
+  `LlmProvider` trait grew this method upstream, matching the
+  `github_copilot.rs` pattern); two `retry::is_retryable` test assertions
+  pinned to this tree's current policy (`InvalidResponse`/`EmptyResponse` are
+  now non-retryable, a policy change upstream made independently of this
+  carry).
+- **Known gap (tracked):** `ironclaw_common::llm_costs::is_local_model`
+  matches `mistral*`, so hosted Mistral currently bills as $0 — fork
+  follow-up issue; see the `TODO` in `mistral.rs::cost_per_token`.
+
 ### Fork-release skill + tag-driven release convention
 
 - **What:** `.claude/skills/fork-release/SKILL.md` — a Claude Code skill that
@@ -128,17 +170,15 @@ and `providers.json` config; no `ReasoningBlock`/CTR-1/SIG-1 rebuild, no new DB
 migrations. Scope: `reasoning_effort=high` for Mistral Medium 3.5
 (`mistral-medium-2604`) and Mistral Small 4 (`mistral-small-2603`).
 
-**Status (2026-08-05): pending re-landing on this catch-up.** The 608-commit
-2026-08-05 catch-up branched fresh off `upstream/main` rather than rebasing
-(see "Maintenance workflow" above), so the implemented provider above needs to
-be re-created against the new tree, not just carried — the integration points
-moved (`src/config/llm.rs` and `src/cli/models.rs`, where the env plumbing
-lived, no longer exist; `providers.json` moved from repo root to
-`crates/ironclaw_llm/assets/providers.json`). The design and acceptance
-criteria in `docs/plans/2026-07-05-mistral-reasoning-native-arch.md` still
-hold — confirmed upstream still has no native Mistral reasoning support at the
-new base either. Once re-landed, move this entry back to *Active local
-changes* above.
+**Status (2026-08-05): re-landed** on the 608-commit upstream catch-up (which
+branched fresh off `upstream/main` rather than rebasing — see "Maintenance
+workflow" above — so the provider was re-created against the new tree, not
+carried; the old integration points, `src/config/llm.rs` and
+`src/cli/models.rs`, no longer exist, and `providers.json` moved to
+`crates/ironclaw_llm/assets/providers.json`). See the **"Mistral
+`reasoning_effort=high` on upstream's native `reasoning_details`"** entry
+under *Active local changes* above for the current shape and the specific
+re-landing deviations.
 
 **Reference material retained in-tree to seed the re-architecture** (so it need
 not be reinvented):
