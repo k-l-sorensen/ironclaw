@@ -50,14 +50,18 @@ reasoning:
    `String`; Mistral's `reasoning_effort=high` response is an **array of typed chunks**, so it
    fails to deserialize — `JsonError: did not match any variant of untagged enum ApiResponse`
    (every turn fails, retried, then errors).
-2. **rig-core 0.33's dedicated Mistral client** (`providers/mistral/completion.rs`) also models
+2. **rig-core's dedicated Mistral client** (`providers/mistral/completion.rs`) also models
    assistant `content` as a plain `String`, **silently drops** `AssistantContent::Reasoning` on
    send, and **never parses** reasoning on receive. Switching Mistral to a rig-mistral protocol
-   does not rescue it.
+   does not rescue it. This spans the pinned **0.33 through current (0.39)** — see §5 for the
+   verified current-rig state (the earlier hard `panic!`/deserialize failure became a *silent
+   skip*: crash-avoidance, not support).
 
 **Conclusion.** IronClaw must own the Mistral request/response at the wire boundary — but only to
 *translate* Mistral's chunk array onto upstream's existing `reasoning_details` seam. One thin new
-component; everything downstream is inherited.
+component; everything downstream is inherited. (The medium-term option of moving that translation
+into rig-core itself is assessed in §5 — it does not change View A's shape, only its eventual
+retirement path.)
 
 ---
 
@@ -203,14 +207,79 @@ close a gap in) the flow of `reasoning_details` through Reborn's persistence and
 
 ---
 
-## 5. Decisions
+## 5. rig-core — verified current state (2026-07-05) & the upstream-fix option
 
-- **D-BUILD (build, don't upgrade).** Own the Mistral wire via `MistralProvider`. A rig-core bump
-  does not rescue this — 0.33's Mistral client drops/no-ops reasoning and models content as a
-  `String`; the retired doc already checked the latest rig-core and confirmed no native
-  array-`content` parsing. **Pre-work gate:** before implementation, re-confirm the current-latest
-  rig-core still lacks Mistral array-`content` + reasoning round-trip; if that ever lands upstream,
-  reduce this to a dependency bump + protocol switch.
+Verified directly against a local rig checkout at **v0.39.0 +62 commits** (well ahead of the
+pinned **0.33**), because "is this rig's job?" changes the eventual retirement path of View A's
+`MistralProvider`. Findings:
+
+**a. Latest rig no longer crashes — but still does not *support* Mistral reasoning.** The
+0.30-era behaviour the research doc records (hard `panic!` in the dedicated client; the generic
+`open_ai_completions` path failing with `JsonError: did not match any variant of untagged enum
+ApiResponse`) is gone. In current rig (`crates/rig-core/src/providers/mistral/completion.rs`):
+
+- **Receive:** `mistral_content_value_to_text` flattens the chunk array but keeps **only
+  `type:"text"` parts**; `TryFrom<CompletionResponse>` never emits `AssistantContent::Reasoning`.
+  → the thinking trace is **silently discarded on the way in**.
+- **Send/replay:** `AssistantContent::Reasoning(_) => { /* silently skip */ }`, locked by a test
+  (`test_assistant_reasoning_is_skipped_in_message_conversion`). → the `ThinkChunk` is **not
+  round-tripped**, the exact multi-turn degradation §2 warns about.
+- **Request:** `MistralCompletionRequest` has **no `reasoning_effort` field** — it can only be
+  smuggled via `additional_params`, with no small/medium gating.
+
+So a bare rig bump would swap "every turn errors" for "reasoning quietly thrown away" — it clears
+the blocker but does **not** deliver `reasoning_effort=high` "to the fullest." This confirms
+**D-BUILD**: View A ships regardless.
+
+**b. But rig's *core* model is already Mistral-reasoning-capable — only the provider file is
+unwired.** This is the material update to the retired doc's "no native support" note:
+
+- `completion::message::ReasoningContent::Text { text, signature: Option<String> }` +
+  `Reasoning { id, content }` (`crates/rig-core/src/completion/message.rs`) already model reasoning
+  text **with an opaque provider signature** — a field-for-field peer of IronClaw's
+  `ReasoningDetail::Text { text, signature }`. Nothing in rig's core needs to change.
+- **DeepSeek already round-trips reasoning through that abstraction** in the same rig
+  (`providers/deepseek.rs`: receive → `AssistantContent::reasoning`, send → `reasoning_content`).
+  Mistral is simply **not wired to the same pattern** — a per-provider gap, not an
+  architecture gap.
+
+**c. Implication — the clean upstream fix is a well-scoped rig PR, not a fork carry.** Mirror
+DeepSeek in `providers/mistral/completion.rs`: parse `thinking` chunks →
+`ReasoningContent::Text { text, signature }` on receive, reconstruct them on send, and add a
+first-class `reasoning_effort` request field. Because rig's types already exist, this is a
+provider-file change, not a core-model change — genuinely upstreamable.
+
+**d. Recommended posture — phased, upstream-in-parallel (does not alter View A):**
+
+1. **Now:** ship `MistralProvider` (§3). It is the only path that delivers reasoning today, and it
+   already has the acceptance spec (§7).
+2. **In parallel:** open the rig PR from (c). This is the architecturally correct home and reduces
+   the ~1,400-line fork carry the fork-catch-up notes flag as a maintenance cost.
+3. **After it lands + IronClaw bumps rig:** collapse `MistralProvider` to a thin config shim —
+   `reasoning_effort` gating to small/medium + mapping rig's `AssistantContent::Reasoning` onto
+   `ReasoningDetails`. That mapping seam **already exists** (`rig_adapter.rs::rig_reasoning_to_iron`,
+   `:640`), so the collapse is small and low-risk. This is exactly the "reduce to a dependency bump
+   + protocol switch" outcome D-BUILD's gate anticipates.
+
+**e. One caveat if upstreaming.** IronClaw surfaces reasoning through its own `ReasoningDetails`
+channel, not rig's `AssistantContent::Reasoning` end-to-end; the collapse relies on the existing
+`rig_adapter.rs` mapping carrying signatures faithfully (it already handles Gemini
+`thought_signature`, so the seam is proven). Verify `ReasoningContent::Text.signature` survives that
+map before deleting any custom parsing.
+
+---
+
+## 6. Decisions
+
+- **D-BUILD (build now, upstream in parallel).** Own the Mistral wire via `MistralProvider` — a
+  bare rig-core bump does not rescue this (current rig, incl. 0.33 and 0.39, models content as a
+  `String` and silently drops/no-ops reasoning on both receive and send; §5a). **This decision is
+  unchanged.** What §5 refines is the *gate*: the clean long-term home is a rig PR wiring
+  `providers/mistral/completion.rs` to the reasoning types that already exist in rig's core
+  (`ReasoningContent::Text { text, signature }`) — the way DeepSeek already does (§5b/c). **Pre-work
+  gate:** re-confirm current-latest rig-core still lacks the Mistral reasoning round-trip; if that
+  PR lands (ours or upstream's) and IronClaw bumps rig, collapse `MistralProvider` to a config shim
+  per §5d — a dependency bump + protocol switch, not a rewrite.
 - **D-DEFAULT (reasoning default-on, default model Medium 3.5).** Per the user: `providers.json`
   default reasoning `high`, `default_model` → `mistral-medium-latest`. Large stays available
   (non-reasoning); `supports_mistral_reasoning` gates whether `reasoning_effort` is sent.
@@ -219,7 +288,7 @@ close a gap in) the flow of `reasoning_details` through Reborn's persistence and
 - **D-REUSE (map onto upstream).** Translate `ThinkChunk` → `ReasoningDetail::Text{text,signature}`;
   do not mirror or re-declare the upstream reasoning types (`type-placement.md`).
 
-## 6. Acceptance criteria (preserved from the retired live test)
+## 7. Acceptance criteria (preserved from the retired live test)
 
 Implementation-independent; the acceptance spec for #8 (from the retired
 `tests/e2e_live_mistral_reasoning.rs`, preserved at tag `backup/main-pre-catchup`):
@@ -235,7 +304,7 @@ Implementation-independent; the acceptance spec for #8 (from the retired
    MISTRAL_API_KEY=… cargo test …`. The offline parser matrix (cases C1–C12) enumerates the
    response shapes that must parse; recover it from the backup tag.
 
-## 7. Rule-compliance constraints (`.claude/rules/`)
+## 8. Rule-compliance constraints (`.claude/rules/`)
 
 | Rule | Constraint baked into the design |
 |---|---|
@@ -247,9 +316,10 @@ Implementation-independent; the acceptance spec for #8 (from the retired
 | `testing.md` | Tiers: offline parser matrix at **Unit** (`cargo test`); live multi-turn replay at **Live** (`cargo test --features integration -- --ignored`, `IRONCLAW_LIVE_TEST=1`). **Test through the caller:** `supports_mistral_reasoning()` gates whether `reasoning_effort` is sent, so assert at the request-build call site that a Small 4 / Medium 3.5 request **carries** `reasoning_effort=high` and a `mistral-large` request **omits** it — a predicate-only unit test is insufficient. |
 | `doc-hygiene.md` | No developer-local absolute paths in this or any committed doc. |
 
-## 8. Out of scope
+## 9. Out of scope
 
-- rig-core bump (revisit only if upstream rig lands native Mistral reasoning — see D-BUILD gate).
+- rig-core bump (revisit only if the Mistral reasoning round-trip lands upstream — see §5d and the
+  D-BUILD gate; the phased upstream PR is a *parallel* track, not a blocker for View A).
 - `prompt_mode` (risks layering Mistral's own system prompt over IronClaw's).
 - New DB columns / migrations for reasoning (superseded by upstream `reasoning_details`).
 - TUI streaming of the thinking trace.
@@ -264,3 +334,7 @@ Implementation-independent; the acceptance spec for #8 (from the retired
 - `docs/providers/mistral-reasoning.md` — provider-agnostic API research (still valid).
 - Mistral reasoning docs: `docs.mistral.ai/studio-api/conversations/reasoning`.
 - `scripts/test-mistral-reasoning.sh` — raw-API probe confirming `reasoning_effort=high` behaviour.
+- rig-core (upstream, §5 findings): `rig-core/src/providers/mistral/completion.rs` (unwired
+  Mistral path), `rig-core/src/providers/deepseek.rs` (working reasoning round-trip to mirror),
+  `rig-core/src/completion/message.rs` (`ReasoningContent::Text { text, signature }` — the target
+  types already exist). Verified at rig `v0.39.0 +62`.
