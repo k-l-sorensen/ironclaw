@@ -131,6 +131,46 @@ Conventional-Commit subject instead.
 - **Hard rule:** tags/branches/releases go to `origin` (the fork) only; never
   `git push upstream`, never `git push --tags`.
 
+### GitHub Actions disable list
+
+- **What:** on a personal single-user fork with zero Actions secrets, upstream's
+  scheduled/publish workflows either spam failure emails or can never succeed.
+  Disabled via `gh workflow disable <file> -R k-l-sorensen/ironclaw`
+  (GitHub-level toggle, **not** a file edit — keeps the workflow YAML
+  unmodified and rebase/reset-and-reapply-safe). Reverse with
+  `gh workflow enable`.
+- **Disable (cron/push-to-main, will auto-fire and fail without secrets):**
+  `docker.yml`* (Docker Hub push, no `DOCKER_REGISTRY_*`), `live-canary.yml`
+  (3h schedule), `nightly-deep-ci.yml` (daily schedule), `coverage.yml`
+  (Codecov, no token), `nightly-watchdog.yml` (daily schedule — **new as of
+  the 2026-08-05 catch-up**, same rationale as `nightly-deep-ci.yml`), and
+  `main-ci-slack-alerts.yml` (**new as of the 2026-08-05 catch-up** —
+  `workflow_run`-triggered off our own CI failing, and the job itself
+  hard-fails, not skips, when `MAIN_CI_SLACK_WEBHOOK_URLS`/`SLACK_WEBHOOK_URL`
+  are unset — the exact "fires precisely when something already failed, then
+  fails again" pattern that motivated disabling the others).
+  \* `docker.yml` no longer has a standalone trigger on this tree — it's
+  `workflow_call`-only, invoked by `ironclaw-release.yml` during a release;
+  nothing to disable directly, the inertness (no Docker secrets) carries
+  through unchanged.
+- **Self-gated, no action needed:** `release-plz.yml`
+  (`if: github.repository_owner == 'nearai'`), `codebase-graph-refresh.yml`
+  (`if: github.repository == 'nearai/ironclaw'`, **new as of the 2026-08-05
+  catch-up**).
+- **Dormant by trigger, no action needed:** `sccache-dist-smoke.yml`,
+  `rebuild-release-image.yml`, `cut-ironclaw-release.yml` (upstream's own
+  App-token-gated release tooling, see above), `live-canary-command.yml` /
+  `nearai-bench.yml` (`issue_comment`), `nearai-bench-tests.yml`
+  (path-scoped to the bench workflow files themselves).
+- **Keep enabled:** PR-triggered CI (`code_style`, `platform-and-compat`,
+  `reborn-*`, `history-check.yml` — **new as of the 2026-08-05 catch-up**, a
+  PR-triggered repo-hygiene check with no external secrets — `pr-label-*`)
+  and `ironclaw-release.yml` (the intentional tag-driven fork release).
+- **Action item:** the disable list above reflects the workflow set as of the
+  2026-08-05 catch-up; the actual `gh workflow disable` calls need re-running
+  once this branch's workflow files are live on `origin` (GitHub only lets you
+  disable a workflow once it has run/registered on that repo).
+
 ### Advisory ignore: `RUSTSEC-2026-0187` (lopdf DoS)
 
 - **What:** `deny.toml` ignores `RUSTSEC-2026-0187` (lopdf stack-overflow DoS via
