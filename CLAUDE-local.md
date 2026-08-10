@@ -146,12 +146,18 @@ Conventional-Commit subject instead.
   doubles as the git-workflow maintenance checklist (remotes, `gh auth setup-git`
   credential helper, branch tracking).
 - **Fork-marking convention (local-only):** fork releases use a prerelease
-  version suffix `-fork.<N>` (e.g. `0.29.1-fork.4`, `1.1.0-rc.1-fork.1`).
-  cargo-dist requires the `ironclaw` `[package]` version to equal the tag
-  version, so a fork release bumps that version line — **this diverges from
-  upstream and will conflict on `git rebase upstream/main`** (or need
-  re-applying on a reset-and-reapply catch-up). Resolution: take upstream's
-  base version, re-apply the `-fork.<N>` suffix, reset `N` to 1 on a new base.
+  version suffix `-mistral-fork.<N>` (e.g. `1.1.0-rc.1-mistral-fork.1`).
+  **Changed 2026-08-10** from the earlier generic `-fork.<N>` (used for
+  `0.29.1-fork.1`/`.2`/`.3`) to brand the suffix after the fork's flagship
+  divergence (the custom Mistral `reasoning_effort=high` provider, above) —
+  chosen deliberately over the literal `-mistral-fork`/`-mistral-fork-v2` the
+  user first proposed, to keep the dot-incrementing `.<N>` pattern that's easy
+  to bump and unambiguous to parse. cargo-dist requires the `ironclaw`
+  `[package]` version to equal the tag version, so a fork release bumps that
+  version line — **this diverges from upstream and will conflict on `git
+  rebase upstream/main`** (or need re-applying on a reset-and-reapply
+  catch-up). Resolution: take upstream's base version, re-apply the
+  `-mistral-fork.<N>` suffix, reset `N` to 1 on a new base.
 - **Release targeting repointed to the fork (local-only):** upstream hardcodes
   `nearai/ironclaw` in release generation. We repoint `repository`/`homepage`
   → `k-l-sorensen/ironclaw` on the sole dist-able package,

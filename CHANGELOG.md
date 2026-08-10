@@ -63,6 +63,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   previously admitted only through subject routes must be re-admitted by
   listing them there. Legacy saved subject-route values are inert.
 
+## [1.1.0-rc.1-mistral-fork.1](https://github.com/k-l-sorensen/ironclaw/releases/tag/ironclaw-v1.1.0-rc.1-mistral-fork.1) - 2026-08-10
+
+First marked release of the **k-l-sorensen/ironclaw fork** — unofficial, not
+affiliated with upstream nearai/ironclaw. Built on upstream `1.1.0-rc.1` plus
+the fork-only changes below. See `CLAUDE-local.md` for the full divergence
+list.
+
+### Added
+
+- Re-landed the custom Mistral `reasoning_effort=high` provider on top of
+  upstream's native reasoning system
+  ([fork issue #8](https://github.com/k-l-sorensen/ironclaw/issues/8)).
+
+### Fixed
+
+- Hosted Mistral models are now priced instead of billed as $0
+  ([fork issue #9](https://github.com/k-l-sorensen/ironclaw/issues/9), PR #13).
+
+### Security
+
+- Dropped the stale `RUSTSEC-2026-0187` (lopdf DoS) advisory ignore now that
+  lopdf is patched at 0.42.0
+  ([fork issue #2](https://github.com/k-l-sorensen/ironclaw/issues/2), PR #12).
+
+### CI · Release
+
+- Repointed `ironclaw_cli` release metadata (homepage/repository) to the fork
+  so cargo-dist publishes against `k-l-sorensen/ironclaw`.
+- Adopted the `<base>-mistral-fork.<N>` version/tag convention for fork
+  releases going forward (this release is `.1`).
+
 ## [1.1.0-rc.1] - 2026-08-03
 
 First release candidate since 1.0.0. The headline work is extension reach —

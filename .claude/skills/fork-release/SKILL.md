@@ -53,18 +53,36 @@ Nothing here runs on normal pushes/PRs. On a **public** fork the runners
 Mark every fork release with a **prerelease suffix** on the version:
 
 ```
-<base-version>-fork.<N>        e.g.  1.1.0-rc.1-fork.1, 1.1.0-rc.1-fork.2, 1.1.0-fork.1
+<base-version>-mistral-fork.<N>   e.g.  1.1.0-rc.1-mistral-fork.1, 1.1.0-rc.1-mistral-fork.2, 1.1.0-mistral-fork.1
 ```
 
 This does three things at once:
-- Keeps the tag matching the cargo-dist trigger glob (the trailing `*` covers `-fork.N`).
+- Keeps the tag matching the cargo-dist trigger glob (the trailing `*` covers `-mistral-fork.N`).
 - Makes the version semver-prerelease, so cargo-dist **auto-flags the GitHub
   Release as a pre-release** — distinct from upstream's clean `ironclaw-v0.29.1`.
-- States the fork lineage in the version string itself.
+- States the fork lineage in the version string itself, branded after the
+  fork's flagship divergence (the custom Mistral `reasoning_effort=high`
+  provider — see `CLAUDE-local.md` "Active local changes").
 
 `<base-version>` is whatever upstream version you forked from / are building on.
 Increment `<N>` for each fork release of the same base; bump the base when you
 rebase onto a newer upstream version.
+
+> **History:** the first three fork releases (`0.29.1-fork.1`/`.2`/`.3`) used a
+> generic `-fork.<N>` suffix before the `-mistral-fork.<N>` convention was
+> adopted 2026-08-10. Don't reuse the generic form for new releases.
+>
+> **Choosing `<base-version>`:** it's the version currently in
+> `crates/app/ironclaw_cli/Cargo.toml` / the top non-`Unreleased` `CHANGELOG.md`
+> heading — i.e. whatever our `main` actually contains, not necessarily
+> upstream's latest tag. Upstream cuts weekly release branches
+> (`release/<version>`) off an `-rc.N` point and backports a handful of
+> hotfixes onto *that branch only*; those commits often never reach
+> `upstream/main` under any hash. Since this fork only ever tracks and catches
+> up against `upstream/main`, a final `x.y.0` tag existing upstream does not
+> mean our fork contains it — check with `git merge-base --is-ancestor
+> <upstream-tag> HEAD` before assuming a later base than the one in
+> `Cargo.toml`.
 
 ---
 
@@ -110,7 +128,7 @@ git status -sb         # working tree must be clean before tagging
 ### 2. Choose the fork version
 
 Ask the user for the base version (default: current `ironclaw` package version)
-and the fork increment `N`. Compute `VERSION = <base>-fork.<N>` and
+and the fork increment `N`. Compute `VERSION = <base>-mistral-fork.<N>` and
 `TAG = ironclaw-v<VERSION>`.
 
 ```bash
@@ -172,8 +190,8 @@ to fork-authored commits (`chore(fork)`, `feat`/`fix` you added) and from the
 git add crates/app/ironclaw_cli/Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "chore(fork): release ironclaw-v<VERSION> (fork build, not upstream)
 
-Marked fork release of k-l-sorensen/ironclaw. Prerelease suffix '-fork.<N>'
-keeps this distinct from upstream nearai/ironclaw and flags the GitHub
+Marked fork release of k-l-sorensen/ironclaw. Prerelease suffix
+'-mistral-fork.<N>' keeps this distinct from upstream nearai/ironclaw and flags the GitHub
 Release as a pre-release. Includes the matching CHANGELOG.md section so
 cargo-dist emits fork notes, not upstream's base-version notes.
 
@@ -183,8 +201,8 @@ git push origin main      # fork only
 
 > **Upstream-merge caveat:** the version line (in `crates/app/ironclaw_cli/Cargo.toml`)
 > will conflict when you later merge a newer upstream. Resolve by taking
-> upstream's base version and re-applying the `-fork.<N>` suffix. Note this in
-> `CLAUDE-local.md` under active local changes.
+> upstream's base version and re-applying the `-mistral-fork.<N>` suffix. Note
+> this in `CLAUDE-local.md` under active local changes.
 
 ### 4. Create the marked, annotated tag
 
@@ -266,6 +284,6 @@ Common repairs:
 
 - Never push tags, branches, or releases to `upstream` (nearai). The fork owns its releases.
 - Never use `git push --tags` here; push the single intended tag by full ref.
-- Every fork release version carries the `-fork.<N>` suffix and an annotated tag
+- Every fork release version carries the `-mistral-fork.<N>` suffix and an annotated tag
   whose message states it is an unofficial fork build.
 - Record any new fork-only divergence (version scheme, branch tracking change) in `CLAUDE-local.md`.
