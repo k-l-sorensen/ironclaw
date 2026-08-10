@@ -93,6 +93,15 @@ rebase onto a newer upstream version.
 > mean our fork contains it — check with `git merge-base --is-ancestor
 > <upstream-tag> HEAD` before assuming a later base than the one in
 > `Cargo.toml`.
+>
+> **Going forward:** `CLAUDE-local.md` → "Catch-up cadence: sync to upstream
+> releases, not intermediate `main` commits" is now the standing policy —
+> catch-ups stop at `git merge-base ironclaw-v<latest-non-rc-version>
+> upstream/main`, not `upstream/main`'s tip, specifically so a release's
+> `<base-version>` cleanly names a real upstream release instead of an
+> arbitrary in-flight point. This release (`1.1.0-rc.1-mistral-fork.1`) predates
+> that policy and was deliberately left as-is rather than rebuilt against it —
+> the next catch-up is where it takes effect.
 
 ---
 

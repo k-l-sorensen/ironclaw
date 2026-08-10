@@ -76,6 +76,45 @@ resolving — the merge can surface files the original port forgot entirely
 got re-carried, see the Mistral entry below) — then push the merge commit to
 the same PR branch rather than force-pushing over `main`.
 
+### Catch-up cadence: sync to upstream releases, not intermediate `main` commits
+
+- **Rule (2026-08-10):** when catching up, stop at the commit on `upstream/main`
+  that corresponds to upstream's most recently *published* release — not
+  whatever `upstream/main`'s tip happens to be that day. `main` is a moving
+  target with no natural stopping point; a named release is.
+- **Why:** discovered while cutting the `1.1.0-rc.1-mistral-fork.1` release.
+  Upstream's release tags (`ironclaw-v<X.Y.Z>`, `ironclaw-v<X.Y.Z>-rc.N`) are
+  cut onto a dedicated `release/<version>` branch and **never merge back into
+  `main`** — confirmed with `git branch -r --contains ironclaw-v1.1.0` (lists
+  only `upstream/release/1.1.0-rc.1` and `upstream/release/1.1.1`, not
+  `upstream/main`) and `git merge-base --is-ancestor ironclaw-v1.1.0-rc.1
+  upstream/main` (fails). By the time of our 2026-08-10 catch-up (to
+  `4e05a033d`), `upstream/main` had already moved **83 commits** past the point
+  where the `1.1.0-rc.1`/`1.1.0` release branch was cut — none of that gap is
+  "the next release," it's ordinary in-flight development with no release
+  boundary yet. A fork release cut from that point can't honestly claim to be
+  "upstream v1.1.0 + fork edits" — it's "v1.1.0's branch point plus 83
+  unrelated commits plus fork edits," a materially different (and undocumented)
+  set of upstream content.
+- **How to apply — finding the stop point:** a release tag's *commit* isn't on
+  `main`, but `git merge-base` still finds where the branches diverged, which
+  is the right stop point for a `main`-tracking catch-up:
+  ```bash
+  git fetch upstream --tags
+  git merge-base ironclaw-v<latest-non-rc-version> upstream/main
+  ```
+  Catch up `main` to that commit (not `upstream/main`'s tip), using the routine
+  or large-scale playbook above as the commit-gap size dictates. This is a
+  **fork release doesn't have to wait for a fork catch-up** to happen the same
+  day, either — cut the release from the merge-base point directly, then catch
+  `main` up to it separately if/when there's other reason to.
+- **Note the gap, don't chase it:** the 3 commits that exist *only* on the
+  release branch (hotfix backports never merged to `main`, e.g. the 1.0→1.1
+  migration-state-preservation fix) are real content our `main`-tracking fork
+  will never receive through a normal catch-up. If one of those specifically
+  matters, it needs an explicit cherry-pick from the release branch, called out
+  in the fork issue/PR — don't assume `main` catch-up covers it.
+
 ### Commit convention
 
 The repo (and we, for our carry commits) use **Conventional Commits** —
