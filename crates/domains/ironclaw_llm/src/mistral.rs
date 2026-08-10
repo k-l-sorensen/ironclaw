@@ -265,9 +265,6 @@ impl LlmProvider for MistralProvider {
     }
 
     fn cost_per_token(&self) -> (Decimal, Decimal) {
-        // TODO(fork #9): `ironclaw_common::llm_costs::is_local_model` matches
-        // `mistral*` and returns zero, so hosted Mistral currently bills as $0.
-        // Add real Medium 3.5 / Small 4 pricing + tighten the local heuristic.
         costs::model_cost(&self.active_model_name()).unwrap_or_else(costs::default_cost)
     }
 
