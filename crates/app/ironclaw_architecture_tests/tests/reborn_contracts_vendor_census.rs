@@ -29,7 +29,7 @@
 //!
 //! Running it turns up a **second** LLM-vendor surface in the contracts family
 //! that D-E did not know about: `ironclaw_common::llm_costs`, a per-model price
-//! table naming **9 distinct vendors across 91 occurrences** (`claude`, `gpt`,
+//! table naming **9 distinct vendors across 94 occurrences** (`claude`, `gpt`,
 //! `sonnet`, `opus`, `haiku`, `codex`, `mistral`, `deepseek`, `llama`). It is
 //! invisible to the specificity scanner for the same reason `operator_llm` is,
 //! which is precisely why nobody had seen it. This gate does not delete it —
@@ -159,13 +159,17 @@ const CENSUS: &[CensusScope] = &[
     },
     CensusScope {
         path: "crates/ironclaw_common/src/llm_costs.rs",
-        occurrences: 91,
+        occurrences: 94,
         distinct_vendors: 9,
         basis: "UNSANCTIONED RESIDUE, found by this census (#7150): a per-model price \
                 table in the contracts family that D-E's 'nowhere else' does not cover \
                 and the specificity scanner cannot see. Frozen and shrink-only pending \
                 an owner decision — the model-cost table is a candidate to move beside \
-                the llm providers, which §8.2 already sanctions for vendor names",
+                the llm providers, which §8.2 already sanctions for vendor names. \
+                Re-ratcheted 91→94 (fork k-l-sorensen/ironclaw#9): added real hosted \
+                Mistral Medium 3.5 / Small 4 pricing rows for the already-sanctioned \
+                `mistral` vendor — no new distinct vendor, just more occurrences of one \
+                already counted; the prior heuristic was pricing hosted Mistral at $0.",
     },
     CensusScope {
         path: "crates/ironclaw_prompt_envelope/src/lib.rs",
