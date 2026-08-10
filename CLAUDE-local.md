@@ -162,9 +162,17 @@ Conventional-Commit subject instead.
   `nearai/ironclaw` in release generation. We repoint `repository`/`homepage`
   → `k-l-sorensen/ironclaw` on the sole dist-able package,
   **`crates/app/ironclaw_cli/Cargo.toml`** (cargo-dist bakes this into the
-  generated installers, including the WiX MSI's ARPHELPLINK — cargo-dist 0.31
-  generates the WiX config directly from package metadata, there's no separate
-  `wix/main.wxs` template to patch anymore). The release workflow itself is
+  generated installers, including the WiX MSI's ARPHELPLINK). **Correction
+  (2026-08-10):** `crates/app/ironclaw_cli/wix/main.wxs` *is* a committed,
+  generated file — cargo-dist 0.31's `plan` job (`dist host --steps=create`)
+  diffs it against what it would regenerate from package metadata and fails
+  the whole release build if they've drifted. The first
+  `1.1.0-rc.1-mistral-fork.1` build failed exactly this way: the metadata
+  repoint above landed, but the committed `main.wxs` still had `ARPHELPLINK`
+  pointing at `nearai/ironclaw`. Fixed with a direct one-line text patch (no
+  `dist`/`cargo-dist` CLI installed locally to run `dist init`); the
+  fork-release skill's preflight now greps for stale `nearai/ironclaw`
+  references in that directory before tagging. The release workflow itself is
   `.github/workflows/ironclaw-release.yml` (renamed from `release.yml`
   upstream at some point past our old base). `authors` and the license are
   deliberately left as NEAR AI. Upstream's new `cut-ironclaw-release.yml` is

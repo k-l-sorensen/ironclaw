@@ -32,9 +32,19 @@ target in `targets = [...]` (including `aarch64-unknown-linux-gnu` and
 `.tar.gz` archives + installers, and publishes a GitHub Release. **cargo-dist
 requires the tag's version to equal the `ironclaw` package version in
 `crates/app/ironclaw_cli/Cargo.toml`** — so the version bump and the tag must agree.
-There is no separate `wix/main.wxs` template to patch — cargo-dist 0.31
-generates the WiX config (including the ARPHELPLINK help link) directly from
-`[package.metadata.wix]` plus the package's `homepage`/`repository`.
+**`crates/app/ironclaw_cli/wix/main.wxs` is a committed, generated file — cargo-dist
+0.31 checks it against what it *would* generate from `[package.metadata.wix]`
+plus the package's `homepage`/`repository`, and fails the `plan` job
+(`dist host --steps=create`) if they've drifted.** Confirmed the hard way:
+the first `1.1.0-rc.1-mistral-fork.1` build failed here because the
+committed file still had `ARPHELPLINK` pointing at
+`https://github.com/nearai/ironclaw` after the fork's homepage/repository
+repoint (below) — the metadata changed but the generated file wasn't
+regenerated to match. No `dist`/`cargo-dist` CLI is installed locally on this
+machine, so the practical fix is a direct text patch of the drifted line(s) —
+`grep -rn 'nearai/ironclaw' crates/app/ironclaw_cli/wix/` finds them — rather
+than running `dist init`. Re-check this file whenever `homepage`/`repository`/
+`authors`/version-adjacent metadata on the `ironclaw` package changes.
 
 Nothing here runs on normal pushes/PRs. On a **public** fork the runners
 (`ubuntu-*`, `ubuntu-*-arm`, `macos-*`, `windows-*`) are **free**.
@@ -116,6 +126,13 @@ git config --get-all credential.'https://github.com'.helper | grep -q 'gh auth' 
 git switch main
 git fetch origin
 git status -sb         # working tree must be clean before tagging
+
+# 1e. Committed WiX file must already point at the fork, not upstream —
+# this is a *build-time* cargo-dist drift check (see "How releases work
+# here"), so catch it here rather than from a failed tag-push build.
+grep -rn 'nearai/ironclaw' crates/app/ironclaw_cli/wix/ \
+  && { echo "ABORT: wix/main.wxs still references nearai/ironclaw — patch the drifted line(s) before tagging"; exit 1; } \
+  || echo "OK: wix/main.wxs has no stale nearai/ironclaw references"
 ```
 
 > **Branch-tracking note:** local `main` historically tracks `upstream/main`,
