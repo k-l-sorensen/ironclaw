@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<!-- Fork-only entries (k-l-sorensen/ironclaw). Not upstream. -->
+
+## [0.29.1-fork.4] — fork build (not upstream)
+
+### Changed
+
+- Caught the fork up to upstream `nearai/ironclaw` (~203 commits). Local carry
+  reduced to: fork-release tooling, the worker job-status fix, and the
+  `RUSTSEC-2026-0187` advisory ignore.
+
+### Removed
+
+- Retired the custom Mistral `reasoning_effort` provider and its reasoning-replay
+  threading (CTR-1 / SIG-1 / `ReasoningBlock`). Upstream shipped a more general
+  native reasoning system (`reasoning` + `reasoning_details`) that supersedes it.
+  Re-architecture tracked in [fork issue #8](https://github.com/k-l-sorensen/ironclaw/issues/8);
+  pre-catch-up state preserved at tag `backup/main-pre-catchup`. Solution-independent
+  reference material (API research, design rationale, acceptance criteria, raw API
+  probe) retained in-tree under `docs/providers/`, `docs/plans/`, and `scripts/`.
+
 ## [Unreleased]
 
 ### Added

@@ -96,7 +96,7 @@ Conventional-Commit subject instead.
   deleted with the monolith; this one calls `MistralProvider` directly,
   modeled on `tests/reborn_live_github_pat_contract.rs`).
 - **Why:** implements fork issue #8 per
-  `docs/plans/2026-07-05-mistral-reasoning-native-arch.md`. Re-landed on the
+  `docs/internal/plans/2026-07-05-mistral-reasoning-native-arch.md`. Re-landed on the
   2026-08-05 catch-up (upstream 0.29.1-era → 1.1.0-rc.1) from the original
   `152c010bc4`; still no upstream native Mistral reasoning support at the new
   base either, so this remains needed. No `ReasoningBlock`/CTR-1/SIG-1 carry,
@@ -249,21 +249,26 @@ re-landing deviations.
 **Status (2026-08-10): re-applied**, path-only, onto upstream's WS7
 family-directory reorg (`crates/ironclaw_llm` → `crates/domains/ironclaw_llm`).
 No logic changes; see the "2026-08-10 catch-up" note under *Active local
-changes* above.
+changes* above. This same catch-up also relocated the reference docs below:
+upstream's `docs/ publication boundary` work (commit `50311eab4` in this
+range, enforced by `scripts/ci/docs_publication_boundary.py`) retired
+`docs/plans/` entirely in favor of `docs/internal/plans/`, and flagged our
+`docs/providers/mistral-reasoning.md` as an unfenced page (neither public-nav'd
+nor under `internal/`) — moved to `docs/internal/research/mistral-reasoning.md`.
 
 **Reference material retained in-tree to seed the re-architecture** (so it need
 not be reinvented):
 
-- `docs/providers/mistral-reasoning.md` — provider-agnostic API research + the
-  rig-core parse blocker (still valid).
-- `docs/plans/2026-07-05-mistral-reasoning-native-arch.md` — the **current
-  approved** C4 L3 architecture (native `reasoning_details` path, model catalog,
-  components, rule-compliance, acceptance criteria).
-- `docs/plans/2026-06-24-mistral-reasoning-provider-architecture.md` — the
-  superseded design (bannered), **plus the acceptance criteria** the re-arch must
-  re-satisfy (clean round-trip, multi-turn replay).
-- `docs/plans/2026-06-24-mistral-reasoning-impl.md` — superseded work breakdown,
-  kept for the edge cases it enumerates.
+- `docs/internal/research/mistral-reasoning.md` — provider-agnostic API
+  research + the rig-core parse blocker (still valid).
+- `docs/internal/plans/2026-07-05-mistral-reasoning-native-arch.md` — the
+  **current approved** C4 L3 architecture (native `reasoning_details` path,
+  model catalog, components, rule-compliance, acceptance criteria).
+- `docs/internal/plans/2026-06-24-mistral-reasoning-provider-architecture.md`
+  — the superseded design (bannered), **plus the acceptance criteria** the
+  re-arch must re-satisfy (clean round-trip, multi-turn replay).
+- `docs/internal/plans/2026-06-24-mistral-reasoning-impl.md` — superseded
+  work breakdown, kept for the edge cases it enumerates.
 - `scripts/test-mistral-reasoning.sh` — raw Mistral API probe (no code coupling).
 
 The retired tests — `tests/e2e_live_mistral_reasoning.rs` (behavioral acceptance)
