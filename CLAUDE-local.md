@@ -215,14 +215,6 @@ Conventional-Commit subject instead.
   once this branch's workflow files are live on `origin` (GitHub only lets you
   disable a workflow once it has run/registered on that repo).
 
-### Advisory ignore: `RUSTSEC-2026-0187` (lopdf DoS)
-
-- **What:** `deny.toml` ignores `RUSTSEC-2026-0187` (lopdf stack-overflow DoS via
-  deeply nested PDF objects), reachable through `pdf-extract` document text
-  extraction (`crates/domains/ironclaw_extractors`). Fork-tracked in issue #2.
-- **Why:** unblocks `cargo deny` on the fork (which has no upstream CI secrets).
-  Remove once `pdf-extract`/`lopdf` is bumped or extraction input is sandboxed.
-
 ## Retired local changes
 
 ### Custom Mistral `reasoning_effort` provider + reasoning replay (CTR-1 / SIG-1 / ReasoningBlock)
@@ -310,5 +302,42 @@ touched) was deleted too — with no successor naming found anywhere in
 Dropped outright rather than re-homed; if the same class of bug resurfaces in
 Reborn's job/sandbox lane, it needs a fresh fix against that code, not a port
 of this one.
+
+### Advisory ignore: `RUSTSEC-2026-0187` (lopdf DoS)
+
+**Resolved in the 2026-08-10 catch-up cleanup.** `deny.toml` carried an
+`ignore` entry for `RUSTSEC-2026-0187` (lopdf stack-overflow DoS via deeply
+nested PDF objects, reachable through `pdf-extract` document text extraction
+in `crates/domains/ironclaw_extractors`), added on 2026-06-26 to unblock
+`cargo deny` while `lopdf` was still on the vulnerable `0.34.0`. Fork-tracked
+in [issue #2](https://github.com/k-l-sorensen/ironclaw/issues/2).
+
+By the 2026-08-05 and 2026-08-10 catch-ups, ordinary upstream dependency
+movement had already carried `lopdf` to `0.42.0` — the advisory's patched
+version (affected range `<= 0.41.0`, fixed `>= 0.42.0`; the fix adds a
+max-nesting-depth check so the parser now returns an `Err` instead of
+aborting). Both catch-ups reapplied the `ignore` entry anyway, unchanged,
+without checking the pinned version against the advisory's fixed threshold —
+the reapply commit messages note "lopdf is still pinned at 0.42.0" as if that
+meant still-vulnerable, when 0.42.0 was already the fix. The entry sat dead
+for two catch-ups before this cleanup removed it and confirmed `cargo deny
+check advisories` passes clean without it.
+
+**Fork-carry pitfall:** an `ignore` entry surviving a rebase/re-carry
+unchanged is not evidence it's still needed — a later catch-up can bump the
+offending dependency past an advisory's fix as a side effect of unrelated
+upstream work. Before reapplying an advisory ignore during a catch-up, check
+the ignored advisory's patched-version threshold against the dependency's
+*current* `Cargo.lock` pin, not just whether the version number looks
+unchanged from the last carry.
+
+The residual reachability point from the original issue still holds
+structurally — attachment bytes reach `extract_pdf`
+(`crates/domains/ironclaw_extractors/src/lib.rs`) with only an
+attachment-level `max_bytes` cap upstream of it, no PDF-specific
+timeout/sandbox in `ironclaw_extractors` itself — but the actual crash vector
+(unbounded recursion aborting the process) is now handled inside `lopdf`
+itself, which is what the advisory's fix does. No further app-level guard
+was judged necessary to close #2.
 
 <!-- Add new local changes above the "Retired" section, newest first. -->
