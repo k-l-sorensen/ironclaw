@@ -6,8 +6,8 @@ rust-version.workspace = true
 description = "Secure personal AI assistant that protects your data and expands its capabilities on the fly"
 authors = ["NEAR AI <support@near.ai>"]
 license = "MIT OR Apache-2.0"
-homepage = "https://github.com/nearai/ironclaw"
-repository = "https://github.com/nearai/ironclaw"
+homepage = "https://github.com/k-l-sorensen/ironclaw"
+repository = "https://github.com/k-l-sorensen/ironclaw"
 publish = false
 
 [package.metadata.ironclaw]
