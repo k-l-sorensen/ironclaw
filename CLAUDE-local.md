@@ -58,6 +58,24 @@ carry itself needed no logic changes, only path updates (`ironclaw_llm` →
 This confirms the trigger is "structural renames," independent of raw commit
 count — a two-digit commit gap can still warrant the worktree approach.
 
+**Landing a large-scale catch-up branch will show conflicts on the PR —
+this is expected, not a sign the port was done wrong.** The catch-up branch
+is built fresh off `upstream/main`, so it shares no history with `main`'s own
+carry commits past the old merge-base; `main` still has the pre-reorg carry
+sitting on the old paths. GitHub's merge preview (and a plain `git merge`)
+will show every file the carry touches as conflicting — `main`'s old-path
+version vs. the branch's already-relocated version — even though there is no
+real disagreement, just two paths for the same superseded content. Resolve by
+merging `main` into the catch-up branch locally (`git merge origin/main`) and
+taking "ours" (the catch-up branch) for every such conflict, since it is the
+supersede-set; genuine identical-content conflicts (git's rename tracking
+failing to match a file across two independently-authored paths to the same
+destination) resolve either way. Re-run the doc/lint/test gates after
+resolving — the merge can surface files the original port forgot entirely
+(the 2026-08-10 catch-up caught this way that the Mistral reference docs never
+got re-carried, see the Mistral entry below) — then push the merge commit to
+the same PR branch rather than force-pushing over `main`.
+
 ### Commit convention
 
 The repo (and we, for our carry commits) use **Conventional Commits** —
