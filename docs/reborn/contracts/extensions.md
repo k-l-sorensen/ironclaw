@@ -2,7 +2,7 @@
 
 **Status:** Draft implementation contract
 **Date:** 2026-04-24
-**Depends on:** `docs/reborn/contracts/host-api.md`, `docs/reborn/contracts/filesystem.md`, `crates/ironclaw_host_api`, `crates/ironclaw_filesystem`
+**Depends on:** `docs/reborn/contracts/host-api.md`, `docs/reborn/contracts/filesystem.md`, `crates/contracts/ironclaw_host_api`, `crates/substrates/ironclaw_filesystem`
 
 ---
 
@@ -196,12 +196,20 @@ Rules:
 
 ## 4. Manifest schema
 
-Production manifests use `schema_version = "reborn.extension_manifest.v2"`.
-The older top-level `parameters_schema` manifest shape is no longer parsed on
-production discovery paths.
+Production manifests author `schema_version = "reborn.extension_manifest.v3"`
+(`crates/extensions/ironclaw_extension_registry/src/v3.rs`), which lowers into
+the v2 resolved model this contract describes. Already-installed v2 manifests
+still parse as the legacy compatibility format; the older top-level
+`parameters_schema` manifest shape is no longer parsed on production discovery
+paths. The v3 authoring surface (`[[tools]]`, `[channel]`, `[auth.<vendor>]`,
+`[mcp]`) is specified in `docs/reborn/extension-runtime/overview.md` §3;
+`origin_gate_matrix` is defined by `OriginGateMatrix` in
+`crates/contracts/ironclaw_host_api/src/capability.rs` and documented in
+`docs/extensions/building-a-tool.md`.
 
-Every manifest — host-bundled exactly as installed — declares its sections
-through `[[host_api]]` contracts; tools live under
+In the legacy v2 authoring format shown in the examples below — which no
+shipped package uses any more — a manifest declares its sections through
+`[[host_api]]` contracts; tools live under
 `[[host_api]] id = "ironclaw.capability_provider/v1"`. Top-level
 `[[capabilities]]` is rejected for every manifest source.
 
@@ -490,9 +498,9 @@ Rules:
   authority namespace, not the extension id: several extensions (gmail,
   google-drive, ...) may share one provider (`google`).
 
-Tests: `crates/ironclaw_extension_registry/tests/manifest_v2_contract.rs`
+Tests: `crates/extensions/ironclaw_extension_registry/tests/manifest_v2_contract.rs`
 (capability surface projection block) and
-`crates/ironclaw_extension_registry/tests/product_adapter_manifest_ingestion.rs`
+`crates/extensions/ironclaw_extension_registry/tests/product_adapter_manifest_ingestion.rs`
 (channel-surface projection through the real product-adapter contract). Run:
 `cargo test -p ironclaw_extension_registry --test manifest_v2_contract` and
 `cargo test -p ironclaw_extension_registry --test product_adapter_manifest_ingestion`.

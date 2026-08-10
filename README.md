@@ -3,9 +3,9 @@
 > (fork-release tooling, an advisory ignore) documented in
 > [`CLAUDE-local.md`](CLAUDE-local.md). All credit for the original work goes
 > to the upstream authors; the original license (MIT OR Apache-2.0) is retained
-> unchanged. A custom Mistral `reasoning_effort` provider previously lived here
-> but was retired pending re-architecture against upstream's native reasoning
-> system — see the fork's issues.
+> unchanged. A custom Mistral `reasoning_effort` provider lives here, layered on
+> upstream's native `reasoning_details` channel — see
+> [fork issue #8](https://github.com/k-l-sorensen/ironclaw/issues/8).
 > Fork-specific issues → [this fork's issues](https://github.com/k-l-sorensen/ironclaw/issues).
 > Core issues → [upstream](https://github.com/nearai/ironclaw/issues).
 
@@ -165,7 +165,7 @@ Source builds require Rust 1.96+ and Node.js 22+ with Corepack/pnpm.
 git clone https://github.com/nearai/ironclaw.git
 cd ironclaw
 corepack enable pnpm
-cargo install --locked --path crates/ironclaw_cli
+cargo install --locked --path crates/app/ironclaw_cli
 ```
 
 </details>

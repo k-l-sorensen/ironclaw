@@ -19,7 +19,7 @@ ignore = [
     # private-key operation is exposed by this dependency.
     "RUSTSEC-2023-0071",
     # lopdf stack-overflow DoS via deeply nested PDF objects, reachable through
-    # pdf-extract document text extraction (crates/ironclaw_extractors).
+    # pdf-extract document text extraction (crates/domains/ironclaw_extractors).
     # FORK-tracked: https://github.com/k-l-sorensen/ironclaw/issues/2
     # Remove once pdf-extract/lopdf is bumped or extraction input is guarded/sandboxed.
     "RUSTSEC-2026-0187",

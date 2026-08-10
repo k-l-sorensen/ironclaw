@@ -7,8 +7,8 @@ use std::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ironclaw_assistant::{
-    ActionPhase, IdempotencyDecision, IdempotencyLedger, ProductConversationRouteKind,
-    ProductInboundAction, ProductSurfaceFailure, ResolveBindingRequest, ResolvedBinding,
+    ActionPhase, IdempotencyDecision, IdempotencyLedger, ProductInboundAction,
+    ProductSurfaceFailure,
 };
 use ironclaw_filesystem::{DiskFilesystem, FilesystemError, RootFilesystem, ScopedFilesystem};
 use ironclaw_host_api::{
@@ -20,6 +20,9 @@ use ironclaw_host_api::{
 };
 use ironclaw_product_contracts::action::ActionFingerprintKey;
 use ironclaw_product_contracts::binding::ProductBindingResolver;
+use ironclaw_product_contracts::binding::{
+    ProductConversationRouteKind, ResolveBindingRequest, ResolvedBinding,
+};
 use ironclaw_product_contracts::error::ProductOperationFailure;
 use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
@@ -197,11 +200,9 @@ where
             return Ok(stored.binding);
         }
 
+        // A run acts as the user who invoked it: the actor is the binding's
+        // only identity on every route kind (no shared-route subject).
         let actor_user_id = user_id_for_binding(&self.scope.tenant_id, &request)?;
-        let subject_user_id = match request.route_kind {
-            ProductConversationRouteKind::Direct => Some(actor_user_id.clone()),
-            ProductConversationRouteKind::Shared => Some(self.scope.user_id.clone()),
-        };
         let binding_key = binding_key(&self.scope, &request)?;
         let reply_target_binding_ref =
             ironclaw_turns::ReplyTargetBindingRef::new(format!("reply:harness-{binding_key}"))
@@ -211,7 +212,6 @@ where
         let binding = ResolvedBinding {
             tenant_id: self.scope.tenant_id.clone(),
             actor_user_id,
-            subject_user_id,
             thread_id: thread_id_for_binding(&self.scope, &request)?,
             agent_id: Some(self.agent_id.clone()),
             project_id: self.project_id.clone(),
@@ -418,9 +418,9 @@ struct StoredHarnessReplyTarget {
     tenant_id: TenantId,
     actor_user_id: UserId,
     thread_id: ThreadId,
-    adapter_id: ironclaw_assistant::ProductAdapterId,
-    installation_id: ironclaw_assistant::AdapterInstallationId,
-    external_conversation_ref: ironclaw_assistant::ExternalConversationRef,
+    adapter_id: ironclaw_host_api::product_adapter::ProductAdapterId,
+    installation_id: ironclaw_host_api::product_adapter::AdapterInstallationId,
+    external_conversation_ref: ironclaw_extension_contracts::external::ExternalConversationRef,
     route_kind: ProductConversationRouteKind,
 }
 

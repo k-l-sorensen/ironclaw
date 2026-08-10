@@ -46,6 +46,18 @@ replaying old commit hashes. Safety tags (`safety/<branch>-pre-catchup`) were
 cut on both `main` and the feature branch first. See fork issue tracking for
 the specific catch-up if one exists.
 
+The **2026-08-10 catch-up** (upstream 19b1fb715 → 4e05a033d, 68 commits) hit
+the same large-scale trigger on a much smaller commit count: upstream's WS7
+"family directory moves" (#7206, #7212) reorganized the entire `crates/` tree
+into family subdirectories (`crates/app/`, `crates/contracts/`,
+`crates/domains/`, `crates/events/`, `crates/extensions/`, `crates/kernel/`,
+`crates/lanes/`, `crates/loop/`, `crates/product/`, `crates/substrates/`) —
+4,589 renames across 2,729+ files. Same worktree-branch playbook applied; the
+carry itself needed no logic changes, only path updates (`ironclaw_llm` →
+`crates/domains/ironclaw_llm`, `ironclaw_cli` → `crates/app/ironclaw_cli`).
+This confirms the trigger is "structural renames," independent of raw commit
+count — a two-digit commit gap can still warrant the worktree approach.
+
 ### Commit convention
 
 The repo (and we, for our carry commits) use **Conventional Commits** —
@@ -62,7 +74,7 @@ Conventional-Commit subject instead.
 
 ### Mistral `reasoning_effort=high` on upstream's native `reasoning_details`
 
-- **What:** a dedicated `crates/ironclaw_llm/src/mistral.rs` provider
+- **What:** a dedicated `crates/domains/ironclaw_llm/src/mistral.rs` provider
   (`ProviderProtocol::Mistral`) that owns Mistral's wire JSON so it can parse
   the `reasoning_effort=high` array-shaped response (`[{thinking},{text}]`)
   that rig-core 0.33 cannot. The thinking chunk (+ opaque signature) is mapped
@@ -76,15 +88,15 @@ Conventional-Commit subject instead.
   (`resolution.rs` — `ironclaw_llm` now owns its full env→config resolution
   itself; there's no more binary-crate env-reading split, since `ironclaw_cli`
   is architecturally forbidden from depending on `ironclaw_llm` directly),
-  `crates/ironclaw_llm/assets/providers.json` switch (`open_ai_completions` →
-  `mistral`, default model → `mistral-medium-latest`), offline parser matrix
-  (`mistral/tests.rs`), and a live contract test
+  `crates/domains/ironclaw_llm/assets/providers.json` switch
+  (`open_ai_completions` → `mistral`, default model → `mistral-medium-latest`),
+  offline parser matrix (`mistral/tests.rs`), and a live contract test
   (`tests/reborn_live_mistral_reasoning_contract.rs` — the old
   `tests/e2e_live_mistral_reasoning.rs` depended on a v1 agent-loop harness
   deleted with the monolith; this one calls `MistralProvider` directly,
   modeled on `tests/reborn_live_github_pat_contract.rs`).
 - **Why:** implements fork issue #8 per
-  `docs/plans/2026-07-05-mistral-reasoning-native-arch.md`. Re-landed on the
+  `docs/internal/plans/2026-07-05-mistral-reasoning-native-arch.md`. Re-landed on the
   2026-08-05 catch-up (upstream 0.29.1-era → 1.1.0-rc.1) from the original
   `152c010bc4`; still no upstream native Mistral reasoning support at the new
   base either, so this remains needed. No `ReasoningBlock`/CTR-1/SIG-1 carry,
@@ -98,6 +110,13 @@ Conventional-Commit subject instead.
   pinned to this tree's current policy (`InvalidResponse`/`EmptyResponse` are
   now non-retryable, a policy change upstream made independently of this
   carry).
+- **2026-08-10 catch-up:** pure path move, no logic change. `ironclaw_llm`
+  relocated to `crates/domains/ironclaw_llm` under upstream's WS7
+  family-directory reorg. The crate's own `CLAUDE.md`/`AGENTS.md` are now
+  symlink pointers (upstream's guidance-unification work landed in this same
+  range); the file-map and sub-owner-map entries for `mistral.rs` /
+  `mistral/tests.rs` now live in `crates/domains/ironclaw_llm/CONTRACT.md`
+  instead (enforced by `tests/module_charter.rs`).
 - **Known gap (tracked):** `ironclaw_common::llm_costs::is_local_model`
   matches `mistral*`, so hosted Mistral currently bills as $0 — fork
   follow-up issue; see the `TODO` in `mistral.rs::cost_per_token`.
@@ -118,7 +137,7 @@ Conventional-Commit subject instead.
 - **Release targeting repointed to the fork (local-only):** upstream hardcodes
   `nearai/ironclaw` in release generation. We repoint `repository`/`homepage`
   → `k-l-sorensen/ironclaw` on the sole dist-able package,
-  **`crates/ironclaw_cli/Cargo.toml`** (cargo-dist bakes this into the
+  **`crates/app/ironclaw_cli/Cargo.toml`** (cargo-dist bakes this into the
   generated installers, including the WiX MSI's ARPHELPLINK — cargo-dist 0.31
   generates the WiX config directly from package metadata, there's no separate
   `wix/main.wxs` template to patch anymore). The release workflow itself is
@@ -128,6 +147,9 @@ Conventional-Commit subject instead.
   their own App-token-gated release tooling — not usable by, or relevant to,
   the fork; a direct annotated-tag push still triggers `ironclaw-release.yml`
   as before.
+- **2026-08-10 catch-up:** `ironclaw_cli` moved to `crates/app/ironclaw_cli`
+  under upstream's WS7 family-directory reorg; every path reference in the
+  skill and in this section was updated accordingly. No behavior change.
 - **Hard rule:** tags/branches/releases go to `origin` (the fork) only; never
   `git push upstream`, never `git push --tags`.
 
@@ -166,6 +188,10 @@ Conventional-Commit subject instead.
   `reborn-*`, `history-check.yml` — **new as of the 2026-08-05 catch-up**, a
   PR-triggered repo-hygiene check with no external secrets — `pr-label-*`)
   and `ironclaw-release.yml` (the intentional tag-driven fork release).
+- **2026-08-10 catch-up:** workflow file set is unchanged in this range (all
+  12 touched `.github/workflows/*` files in the 68-commit diff are
+  modifications, zero adds/removes/renames) — this disable list's content
+  stays accurate as-is.
 - **Action item:** the disable list above reflects the workflow set as of the
   2026-08-05 catch-up; the actual `gh workflow disable` calls need re-running
   once this branch's workflow files are live on `origin` (GitHub only lets you
@@ -175,7 +201,7 @@ Conventional-Commit subject instead.
 
 - **What:** `deny.toml` ignores `RUSTSEC-2026-0187` (lopdf stack-overflow DoS via
   deeply nested PDF objects), reachable through `pdf-extract` document text
-  extraction. Fork-tracked in issue #2.
+  extraction (`crates/domains/ironclaw_extractors`). Fork-tracked in issue #2.
 - **Why:** unblocks `cargo deny` on the fork (which has no upstream CI secrets).
   Remove once `pdf-extract`/`lopdf` is bumped or extraction input is sandboxed.
 
@@ -220,19 +246,29 @@ carried; the old integration points, `src/config/llm.rs` and
 under *Active local changes* above for the current shape and the specific
 re-landing deviations.
 
+**Status (2026-08-10): re-applied**, path-only, onto upstream's WS7
+family-directory reorg (`crates/ironclaw_llm` → `crates/domains/ironclaw_llm`).
+No logic changes; see the "2026-08-10 catch-up" note under *Active local
+changes* above. This same catch-up also relocated the reference docs below:
+upstream's `docs/ publication boundary` work (commit `50311eab4` in this
+range, enforced by `scripts/ci/docs_publication_boundary.py`) retired
+`docs/plans/` entirely in favor of `docs/internal/plans/`, and flagged our
+`docs/providers/mistral-reasoning.md` as an unfenced page (neither public-nav'd
+nor under `internal/`) — moved to `docs/internal/research/mistral-reasoning.md`.
+
 **Reference material retained in-tree to seed the re-architecture** (so it need
 not be reinvented):
 
-- `docs/providers/mistral-reasoning.md` — provider-agnostic API research + the
-  rig-core parse blocker (still valid).
-- `docs/plans/2026-07-05-mistral-reasoning-native-arch.md` — the **current
-  approved** C4 L3 architecture (native `reasoning_details` path, model catalog,
-  components, rule-compliance, acceptance criteria).
-- `docs/plans/2026-06-24-mistral-reasoning-provider-architecture.md` — the
-  superseded design (bannered), **plus the acceptance criteria** the re-arch must
-  re-satisfy (clean round-trip, multi-turn replay).
-- `docs/plans/2026-06-24-mistral-reasoning-impl.md` — superseded work breakdown,
-  kept for the edge cases it enumerates.
+- `docs/internal/research/mistral-reasoning.md` — provider-agnostic API
+  research + the rig-core parse blocker (still valid).
+- `docs/internal/plans/2026-07-05-mistral-reasoning-native-arch.md` — the
+  **current approved** C4 L3 architecture (native `reasoning_details` path,
+  model catalog, components, rule-compliance, acceptance criteria).
+- `docs/internal/plans/2026-06-24-mistral-reasoning-provider-architecture.md`
+  — the superseded design (bannered), **plus the acceptance criteria** the
+  re-arch must re-satisfy (clean round-trip, multi-turn replay).
+- `docs/internal/plans/2026-06-24-mistral-reasoning-impl.md` — superseded
+  work breakdown, kept for the edge cases it enumerates.
 - `scripts/test-mistral-reasoning.sh` — raw Mistral API probe (no code coupling).
 
 The retired tests — `tests/e2e_live_mistral_reasoning.rs` (behavioral acceptance)

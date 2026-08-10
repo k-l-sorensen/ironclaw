@@ -24,14 +24,14 @@ ironclaw**[0-9]+.[0-9]+.[0-9]+*
 On a matching tag, cargo-dist reads `[workspace.metadata.dist]` in the root
 `Cargo.toml` (workspace-wide dist settings — targets, installers, tag
 namespace), and `[package.metadata.dist]` / `[package.metadata.wix]` in
-`crates/ironclaw_cli/Cargo.toml` (the sole dist-able package — since the v1
+`crates/app/ironclaw_cli/Cargo.toml` (the sole dist-able package — since the v1
 monolith was deleted upstream, the root package is now `ironclaw_integration_tests`,
 `dist = false`, and only hosts the integration test suite). It builds every
 target in `targets = [...]` (including `aarch64-unknown-linux-gnu` and
 `aarch64-unknown-linux-musl` natively on `ubuntu-24.04-arm` runners), packages
 `.tar.gz` archives + installers, and publishes a GitHub Release. **cargo-dist
 requires the tag's version to equal the `ironclaw` package version in
-`crates/ironclaw_cli/Cargo.toml`** — so the version bump and the tag must agree.
+`crates/app/ironclaw_cli/Cargo.toml`** — so the version bump and the tag must agree.
 There is no separate `wix/main.wxs` template to patch — cargo-dist 0.31
 generates the WiX config (including the ARPHELPLINK help link) directly from
 `[package.metadata.wix]` plus the package's `homepage`/`repository`.
@@ -115,7 +115,7 @@ and the fork increment `N`. Compute `VERSION = <base>-fork.<N>` and
 
 ```bash
 # Current ironclaw package version (the base, unless rebasing onto newer upstream):
-grep -m1 -A1 '^\[package\]' crates/ironclaw_cli/Cargo.toml | grep '^version' # e.g. version = "1.1.0-rc.1"
+grep -m1 -A1 '^\[package\]' crates/app/ironclaw_cli/Cargo.toml | grep '^version' # e.g. version = "1.1.0-rc.1"
 
 # Make sure the tag doesn't already exist locally or on the fork:
 git tag -l "$TAG"
@@ -126,12 +126,12 @@ git ls-remote --tags origin "$TAG"
 
 **3a. Bump the version.** cargo-dist demands the package version equal the tag
 version, so bump the `ironclaw` `[package]` version in
-`crates/ironclaw_cli/Cargo.toml` (not the root `Cargo.toml` — that package is
+`crates/app/ironclaw_cli/Cargo.toml` (not the root `Cargo.toml` — that package is
 `ironclaw_integration_tests`, `dist = false`, and carries no release version)
 to the fork version:
 
 ```bash
-# Edit crates/ironclaw_cli/Cargo.toml [package] version -> the fork version, e.g.:
+# Edit crates/app/ironclaw_cli/Cargo.toml [package] version -> the fork version, e.g.:
 #   version = "1.1.0-rc.1-fork.1"
 # (Use the Edit tool; update only the ironclaw [package] version line.)
 cargo update -w 2>/dev/null || cargo check -q   # refresh the ironclaw entry in Cargo.lock
@@ -169,7 +169,7 @@ to fork-authored commits (`chore(fork)`, `feat`/`fix` you added) and from the
 **3c. Commit both, push to the fork:**
 
 ```bash
-git add crates/ironclaw_cli/Cargo.toml Cargo.lock CHANGELOG.md
+git add crates/app/ironclaw_cli/Cargo.toml Cargo.lock CHANGELOG.md
 git commit -m "chore(fork): release ironclaw-v<VERSION> (fork build, not upstream)
 
 Marked fork release of k-l-sorensen/ironclaw. Prerelease suffix '-fork.<N>'
@@ -181,7 +181,7 @@ Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>"
 git push origin main      # fork only
 ```
 
-> **Upstream-merge caveat:** the version line (in `crates/ironclaw_cli/Cargo.toml`)
+> **Upstream-merge caveat:** the version line (in `crates/app/ironclaw_cli/Cargo.toml`)
 > will conflict when you later merge a newer upstream. Resolve by taking
 > upstream's base version and re-applying the `-fork.<N>` suffix. Note this in
 > `CLAUDE-local.md` under active local changes.
