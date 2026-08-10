@@ -506,8 +506,14 @@ ci = "github"
 tag-namespace = "ironclaw"
 # Install build-only prerequisites before cargo-dist compiles each target.
 github-build-setup = "../dist-build-setup.yml"
-# The installers to generate for each app
-installers = ["shell", "powershell", "msi"]
+# The installers to generate for each app.
+# Fork-only (local carry): dropped "msi" — WiX's MSI-version mapper only
+# handles a version with a single dotted prerelease group ("name.N"), and any
+# fork release built on an upstream -rc.N base plus our -mistral-fork.N suffix
+# produces two ("rc.1-mistral-fork.1"), which aborts the entire Windows build
+# job (not just the MSI step) and blocks the release for every platform. See
+# CLAUDE-local.md "Fork-release skill + tag-driven release convention".
+installers = ["shell", "powershell"]
 # Publish jobs to run in CI
 publish-jobs = []
 # Target platforms to build apps for (Rust target-triple syntax)

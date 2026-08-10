@@ -218,6 +218,24 @@ Conventional-Commit subject instead.
   their own App-token-gated release tooling — not usable by, or relevant to,
   the fork; a direct annotated-tag push still triggers `ironclaw-release.yml`
   as before.
+- **MSI installer dropped (local-only, 2026-08-10):** root `Cargo.toml`
+  `[workspace.metadata.dist] installers` is `["shell", "powershell"]`, not
+  upstream's `["shell", "powershell", "msi"]`. WiX's MSI-version mapper only
+  handles a version with one dotted prerelease group (`name.N`, e.g.
+  `1.2.3-prerelease.4` → `1.2.3.4`). A fork release built on an upstream
+  `-rc.N` base plus our `-mistral-fork.N` suffix produces *two*
+  (`1.1.0-rc.1-mistral-fork.1` → prerelease `rc.1-mistral-fork.1`, three
+  dot-separated identifiers), which WiX rejects — and since `dist build` runs
+  archive + shell + powershell + msi as one command per target, the MSI
+  failure aborted the *entire* Windows job (no `.zip`, no install scripts
+  either), which in turn blocked `host`/`announce` and lost the release for
+  all 8 platforms, not just Windows. Hit on the first
+  `1.1.0-rc.1-mistral-fork.1` build attempt; fixed by dropping `msi` rather
+  than reworking the version scheme. **Revisit once releases are cut from a
+  clean (non-`-rc.N`) base** per the catch-up-cadence policy above — a version
+  like `1.1.0-mistral-fork.1` has only one dotted prerelease group and should
+  satisfy WiX, so `msi` may be safe to re-add then; verify with a real build
+  before assuming it, not by inspection alone.
 - **2026-08-10 catch-up:** `ironclaw_cli` moved to `crates/app/ironclaw_cli`
   under upstream's WS7 family-directory reorg; every path reference in the
   skill and in this section was updated accordingly. No behavior change.
