@@ -236,6 +236,19 @@ Conventional-Commit subject instead.
   like `1.1.0-mistral-fork.1` has only one dotted prerelease group and should
   satisfy WiX, so `msi` may be safe to re-add then; verify with a real build
   before assuming it, not by inspection alone.
+- **Windows target dropped (local-only, 2026-08-10):** root `Cargo.toml`
+  `[workspace.metadata.dist] targets` no longer includes
+  `x86_64-pc-windows-msvc` (the `github-custom-runners` → `windows-2022`
+  mapping is left in place so re-adding is one line). After the `msi` fix
+  above unblocked the Windows *build*, cargo-dist's own release smoke test
+  (`ironclaw.exe extension search --json`) failed at runtime:
+  `filesystem backend error during write_file at
+  /projects/system/skills/.ironclaw-reborn-bundled.lock: permission denied` —
+  a Unix-style absolute path that doesn't resolve sensibly on Windows. This is
+  **not fork-caused** (no runtime/filesystem code changed this session) and
+  most likely reproduces on a vanilla upstream Windows build too. Tracked in
+  [fork issue #14](https://github.com/k-l-sorensen/ironclaw/issues/14); all 7
+  non-Windows targets built and passed cleanly. Re-add the target once fixed.
 - **2026-08-10 catch-up:** `ironclaw_cli` moved to `crates/app/ironclaw_cli`
   under upstream's WS7 family-directory reorg; every path reference in the
   skill and in this section was updated accordingly. No behavior change.
