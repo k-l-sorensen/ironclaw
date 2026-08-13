@@ -75,6 +75,12 @@ pub fn model_cost(model_id: &str) -> Option<(Decimal, Decimal)> {
         | "claude-3-5-haiku-latest" => Some((dec!(0.0000008), dec!(0.000004))),
         "claude-3-haiku-20240307" => Some((dec!(0.00000025), dec!(0.00000125))),
 
+        // Mistral -- hosted API (direct, not Ollama-tagged). Placed before the
+        // `is_local_model` fallback so exact pricing always wins regardless of
+        // that heuristic (fork #9: hosted Mistral was billing as free).
+        "mistral-medium-latest" | "mistral-medium-2604" => Some((dec!(0.0000015), dec!(0.0000075))),
+        "mistral-small-latest" | "mistral-small-2603" => Some((dec!(0.00000015), dec!(0.0000006))),
+
         // Ollama / local models -- free
         _ if is_local_model(id) => Some((Decimal::ZERO, Decimal::ZERO)),
 
@@ -219,10 +225,15 @@ impl RunCost {
 }
 
 /// Heuristic to detect local/self-hosted models (Ollama, llama.cpp, etc.).
+///
+/// Deliberately does NOT match a bare `mistral*` prefix: Mistral's hosted API
+/// (Medium 3.5, Small 4, ...) uses unprefixed, untagged ids like
+/// `mistral-medium-latest`, and would otherwise price as free (fork #9).
+/// Ollama-style local Mistral pulls are still caught by the generic
+/// `:latest` / `:instruct` tag checks below, same as any other local family.
 fn is_local_model(model_id: &str) -> bool {
     let lower = model_id.to_lowercase();
     lower.starts_with("llama")
-        || lower.starts_with("mistral")
         || lower.starts_with("mixtral")
         || lower.starts_with("phi")
         || lower.starts_with("gemma")
@@ -266,6 +277,30 @@ mod tests {
         let (input, output) = model_cost("mistral:latest").unwrap();
         assert_eq!(input, Decimal::ZERO);
         assert_eq!(output, Decimal::ZERO);
+    }
+
+    #[test]
+    fn test_hosted_mistral_models_bill_nonzero() {
+        // Regression for fork #9: hosted Mistral API models were billing at
+        // $0 because `is_local_model` matched any `mistral*` prefix.
+        let (input, output) = model_cost("mistral-medium-latest").unwrap();
+        assert_eq!(input, dec!(0.0000015));
+        assert_eq!(output, dec!(0.0000075));
+        assert!(output > input);
+
+        let (input, output) = model_cost("mistral-small-latest").unwrap();
+        assert_eq!(input, dec!(0.00000015));
+        assert_eq!(output, dec!(0.0000006));
+        assert!(output > input);
+    }
+
+    #[test]
+    fn test_untagged_unknown_mistral_model_is_not_free() {
+        // An untagged, unrecognized hosted Mistral id (no `:latest` /
+        // `:instruct` Ollama tag) must not resolve to the local/free branch
+        // — it should fall through to `None` so callers apply `default_cost`
+        // (fork #9: the old `starts_with("mistral")` heuristic zeroed this).
+        assert!(model_cost("mistral-large-latest").is_none());
     }
 
     #[test]

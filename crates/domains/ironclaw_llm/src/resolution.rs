@@ -235,7 +235,8 @@ pub fn build_llm_config_from_resolved_provider(
             | ProviderProtocol::GithubCopilot
             | ProviderProtocol::DeepSeek
             | ProviderProtocol::Gemini
-            | ProviderProtocol::OpenRouter => {
+            | ProviderProtocol::OpenRouter
+            | ProviderProtocol::Mistral => {
                 return Err(LlmError::RequestFailed {
                     provider: dedicated.provider_id,
                     reason: "registry provider protocol resolved as dedicated config".to_string(),
@@ -427,6 +428,22 @@ fn apply_registry_provider_env(config: &mut RegistryProviderConfig) -> Result<()
             }
         }
     }
+
+    if config.protocol == ProviderProtocol::Mistral {
+        // Resolve Mistral `reasoning_effort` from env (default: on/high).
+        //
+        // Two wire states are carried as `Option<MistralReasoningEffort>`:
+        //   - `MISTRAL_REASONING=high|on|true|1` (or unset) → `Some(High)` → "high"
+        //   - `MISTRAL_REASONING=off|none|false|0`          → `None`       → omit
+        //
+        // Gate on the resolved `protocol`, not the id string: a Mistral-protocol
+        // provider registered under a non-`"mistral"` id (custom overlay entry)
+        // must still default reasoning on. The provider further gates `Some(_)`
+        // on model capability (`supports_mistral_reasoning`) before sending.
+        config.mistral_reasoning =
+            crate::config::resolve_mistral_reasoning_from_env(nonempty_env("MISTRAL_REASONING"));
+    }
+
     Ok(())
 }
 
@@ -532,6 +549,7 @@ fn is_registry_protocol(protocol: ProviderProtocol) -> bool {
             | ProviderProtocol::DeepSeek
             | ProviderProtocol::Gemini
             | ProviderProtocol::OpenRouter
+            | ProviderProtocol::Mistral
     )
 }
 
@@ -955,5 +973,101 @@ mod tests {
         };
         assert_eq!(dedicated.model, "Qwen/Qwen3.5-122B-A10B");
         assert_eq!(dedicated.base_url, "https://private.near.ai");
+    }
+
+    // ── Mistral reasoning env→config boundary (test through the caller) ──────
+
+    const MISTRAL_ENV_VARS: &[&str] = &[
+        "LLM_BACKEND",
+        "MISTRAL_API_KEY",
+        "MISTRAL_MODEL",
+        "MISTRAL_REASONING",
+    ];
+
+    /// Drive the env→config boundary for Mistral reasoning through the public
+    /// `resolve_provider_config_from_env` caller: assert the `MISTRAL_REASONING`
+    /// env value maps to the right `Option<MistralReasoningEffort>` on the
+    /// resolved `RegistryProviderConfig`. A predicate-only test on
+    /// `resolve_mistral_reasoning_from_env` would not prove
+    /// `apply_registry_provider_env` gates on the Mistral protocol and threads
+    /// the value onto the config.
+    fn resolve_mistral_reasoning(
+        value: Option<&str>,
+    ) -> Option<crate::config::MistralReasoningEffort> {
+        let _env_lock = ironclaw_common::env_helpers::lock_env();
+        let env = EnvGuard::clear(MISTRAL_ENV_VARS);
+        env.set("LLM_BACKEND", "mistral");
+        env.set("MISTRAL_API_KEY", "test-key");
+        if let Some(value) = value {
+            env.set("MISTRAL_REASONING", value);
+        }
+
+        let resolved = resolve_provider_config_from_env(None)
+            .expect("env resolution should succeed")
+            .expect("mistral backend should resolve from env");
+        let ResolvedProviderConfig::Registry(config) = resolved else {
+            panic!("mistral must resolve as a registry provider config");
+        };
+        assert_eq!(config.protocol, ProviderProtocol::Mistral);
+        assert_eq!(config.provider_id, "mistral");
+        config.mistral_reasoning
+    }
+
+    #[test]
+    fn mistral_reasoning_defaults_to_high_when_unset() {
+        assert_eq!(
+            resolve_mistral_reasoning(None),
+            Some(crate::config::MistralReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn mistral_reasoning_high_and_on_resolve_to_some_high() {
+        assert_eq!(
+            resolve_mistral_reasoning(Some("high")),
+            Some(crate::config::MistralReasoningEffort::High)
+        );
+        assert_eq!(
+            resolve_mistral_reasoning(Some("on")),
+            Some(crate::config::MistralReasoningEffort::High)
+        );
+    }
+
+    #[test]
+    fn mistral_reasoning_off_and_none_omit_the_param() {
+        // "off"/"none" omit the wire param entirely → Option::None.
+        assert_eq!(resolve_mistral_reasoning(Some("off")), None);
+        assert_eq!(resolve_mistral_reasoning(Some("none")), None);
+    }
+
+    #[test]
+    fn mistral_reasoning_invalid_warns_and_defaults_to_high() {
+        assert_eq!(
+            resolve_mistral_reasoning(Some("medium")),
+            Some(crate::config::MistralReasoningEffort::High)
+        );
+    }
+
+    /// A non-Mistral registry provider must never carry a Mistral reasoning
+    /// toggle — `apply_registry_provider_env` must gate strictly on
+    /// `ProviderProtocol::Mistral`.
+    #[test]
+    fn non_mistral_registry_provider_leaves_reasoning_none() {
+        let _env_lock = ironclaw_common::env_helpers::lock_env();
+        let env = EnvGuard::clear(CHAIN_ENV_VARS);
+        env.set("LLM_BACKEND", "openai");
+        env.set("OPENAI_API_KEY", "test-key");
+
+        let resolved = resolve_provider_config_from_env(None)
+            .expect("env resolution should succeed")
+            .expect("openai backend should resolve from env");
+        let ResolvedProviderConfig::Registry(config) = resolved else {
+            panic!("openai must resolve as a registry provider config");
+        };
+        assert_eq!(config.mistral_reasoning, None);
+
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+        }
     }
 }

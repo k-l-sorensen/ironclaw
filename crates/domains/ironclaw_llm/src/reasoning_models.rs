@@ -127,6 +127,21 @@ pub fn supports_anthropic_enabled_thinking(model: &str) -> bool {
         .any(|p| lower.contains(p))
 }
 
+/// Mistral models that accept the `reasoning_effort` parameter.
+///
+/// Reasoning rides on the general small/medium models (Mistral Small 4,
+/// Mistral Medium 3.5) — the standalone Magistral models are deprecated and
+/// `magistral-small-latest` now aliases Mistral Small 4. `mistral-large`,
+/// `mistral-tiny`, and `mistral-nemo` do **not** support it, so the provider
+/// omits `reasoning_effort` for them even when the toggle is on.
+const MISTRAL_REASONING_PATTERNS: &[&str] = &["mistral-small", "mistral-medium", "magistral"];
+
+/// Returns `true` when *model* accepts Mistral's `reasoning_effort` parameter.
+pub fn supports_mistral_reasoning(model: &str) -> bool {
+    let lower = model.to_ascii_lowercase();
+    MISTRAL_REASONING_PATTERNS.iter().any(|p| lower.contains(p))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +245,31 @@ mod tests {
         assert!(!has_native_thinking("glm-4-air"));
         assert!(!has_native_thinking("glm-4v"));
         assert!(!has_native_thinking("step-3-mini"));
+    }
+
+    // ── supports_mistral_reasoning tests ──
+
+    #[test]
+    fn mistral_small_and_medium_support_reasoning() {
+        // Aliases and dated ids for Mistral Small 4 / Medium 3.5.
+        assert!(supports_mistral_reasoning("mistral-small-latest"));
+        assert!(supports_mistral_reasoning("mistral-small-2603"));
+        assert!(supports_mistral_reasoning("mistral-medium-latest"));
+        assert!(supports_mistral_reasoning("mistral-medium-2604"));
+        // magistral-small-latest now aliases Mistral Small 4.
+        assert!(supports_mistral_reasoning("magistral-small-latest"));
+        // Case-insensitive.
+        assert!(supports_mistral_reasoning("Mistral-Medium-2604"));
+    }
+
+    #[test]
+    fn mistral_large_tiny_nemo_do_not_support_reasoning() {
+        assert!(!supports_mistral_reasoning("mistral-large-latest"));
+        assert!(!supports_mistral_reasoning("mistral-tiny"));
+        assert!(!supports_mistral_reasoning("mistral-nemo"));
+        assert!(!supports_mistral_reasoning("mistral-7b"));
+        // Non-Mistral models never match.
+        assert!(!supports_mistral_reasoning("gpt-4o"));
+        assert!(!supports_mistral_reasoning(""));
     }
 }
