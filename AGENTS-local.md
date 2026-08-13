@@ -13,6 +13,7 @@ All commits, tags, branches, and releases must go to `origin` (github.com/k-l-so
 - **Release convention**: Tag-driven cargo-dist with `-mistral-fork.N` suffix (see fork-release skill)
 - **Branch tracking**: `main` follows fork (`origin/main`), not upstream
 - **WiX files**: Committed `wix/main.wxs` must reference fork, not upstream (checked in fork-release skill)
+- **PR workflow**: Use feature branches and PRs to trigger GitHub Actions checks, even on this fork
 
 ## Git Workflow Maintenance
 
