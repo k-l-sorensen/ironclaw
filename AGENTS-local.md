@@ -14,6 +14,7 @@ All commits, tags, branches, and releases must go to `origin` (github.com/k-l-so
 - **Branch tracking**: `main` follows fork (`origin/main`), not upstream
 - **WiX files**: Committed `wix/main.wxs` must reference fork, not upstream (checked in fork-release skill)
 - **PR workflow**: Use feature branches and PRs to trigger GitHub Actions checks, even on this fork
+- **gh CLI default**: Continuously verify `gh repo view` shows k-l-sorensen/ironclaw; set with `gh repo set-default k-l-sorensen/ironclaw` if needed
 
 ## Git Workflow Maintenance
 
