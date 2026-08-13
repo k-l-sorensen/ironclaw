@@ -508,11 +508,23 @@ ci = "github"
 tag-namespace = "ironclaw"
 # Install build-only prerequisites before cargo-dist compiles each target.
 github-build-setup = "../dist-build-setup.yml"
-# The installers to generate for each app
-installers = ["shell", "powershell", "msi"]
+# The installers to generate for each app.
+# Fork-only (local carry): dropped "msi" — WiX's MSI-version mapper only
+# handles a version with a single dotted prerelease group ("name.N"), and any
+# fork release built on an upstream -rc.N base plus our -mistral-fork.N suffix
+# produces two ("rc.1-mistral-fork.1"), which aborts the entire Windows build
+# job (not just the MSI step) and blocks the release for every platform. See
+# CLAUDE-local.md "Fork-release skill + tag-driven release convention".
+installers = ["shell", "powershell"]
 # Publish jobs to run in CI
 publish-jobs = []
-# Target platforms to build apps for (Rust target-triple syntax)
+# Target platforms to build apps for (Rust target-triple syntax).
+# Fork-only (local carry): x86_64-pc-windows-msvc dropped 2026-08-10 — the
+# packaged binary's own release smoke test fails on Windows with a permission
+# error writing a Unix-style absolute path (/projects/system/skills/...),
+# unrelated to any fork change (version string, wix, installers). Tracked in
+# fork issue #14; re-add once fixed. github-custom-runners below keeps the
+# windows-2022 mapping so re-adding is a one-line change.
 targets = [
     "aarch64-apple-darwin",
     "aarch64-unknown-linux-gnu",
@@ -520,7 +532,6 @@ targets = [
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-gnu",
     "x86_64-unknown-linux-musl",
-    "x86_64-pc-windows-msvc",
 ]
 # The archive format to use for windows builds (defaults .zip)
 windows-archive = ".tar.gz"

@@ -1,0 +1,119 @@
+name: Upstream Release Watch
+
+# Fork-only workflow (not upstream). Nightly check for a published upstream
+# (nearai/ironclaw) release this fork hasn't caught up to yet.
+#
+# Per CLAUDE-local.md "Catch-up cadence: sync to upstream releases, not
+# intermediate main commits", a catch-up targets the merge-base of the latest
+# non-rc ironclaw-v<X.Y.Z> tag with upstream/main — not upstream/main's tip,
+# which is a moving target with no natural stopping point. This workflow only
+# detects and reports that gap; it deliberately does not attempt the catch-up
+# itself. Large-scale catch-ups routinely need conflict judgment (see
+# CLAUDE-local.md "Maintenance workflow") a bot can't safely make, so the
+# output here is a tracking issue, not a PR.
+
+on:
+  schedule:
+    - cron: "0 7 * * *" # daily 07:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-release-watch
+  cancel-in-progress: false
+
+jobs:
+  check-upstream-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Compare against the latest published upstream release
+        id: check
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/nearai/ironclaw.git 2>/dev/null \
+            || git remote set-url upstream https://github.com/nearai/ironclaw.git
+          git fetch upstream --tags --quiet
+
+          # Final releases only: ironclaw-vX.Y.Z — no -rc./-fork./-mistral- suffix.
+          latest_tag="$(git for-each-ref --format='%(refname:short)' 'refs/tags/ironclaw-v*' \
+            | grep -E '^ironclaw-v[0-9]+\.[0-9]+\.[0-9]+$' \
+            | sort -V | tail -1)"
+
+          if [ -z "$latest_tag" ]; then
+            echo "No upstream final-release tags found; nothing to check."
+            echo "should_open=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Release tags are cut onto a dedicated release/<version> branch and
+          # never merge back into upstream/main (verified 2026-08-10 for
+          # 1.1.0/1.1.0-rc.1) — merge-base finds the point on main's own line
+          # where that branch diverged, which is the fork's actual catch-up
+          # target.
+          catchup_point="$(git merge-base "$latest_tag" upstream/main)"
+
+          if git merge-base --is-ancestor "$catchup_point" HEAD; then
+            echo "Already caught up to $latest_tag (merge-base $catchup_point is an ancestor of HEAD)."
+            echo "should_open=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "Fork main is behind $latest_tag (merge-base $catchup_point not yet in HEAD)."
+          echo "should_open=true" >> "$GITHUB_OUTPUT"
+          echo "latest_tag=$latest_tag" >> "$GITHUB_OUTPUT"
+          echo "catchup_point=$catchup_point" >> "$GITHUB_OUTPUT"
+
+      - name: Open (or leave alone) the catch-up tracking issue
+        if: steps.check.outputs.should_open == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST_TAG: ${{ steps.check.outputs.latest_tag }}
+          CATCHUP_POINT: ${{ steps.check.outputs.catchup_point }}
+        run: |
+          set -euo pipefail
+          title="Catch up to upstream ${LATEST_TAG}"
+
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --label fork-catchup --search "in:title \"${LATEST_TAG}\"" \
+            --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            echo "Issue #$existing already tracks ${LATEST_TAG}; nothing to do."
+            exit 0
+          fi
+
+          # One printf per line rather than a multi-line string or heredoc:
+          # a heredoc's terminator must sit at column 0 with zero leading
+          # whitespace, which is incompatible with YAML's block-literal
+          # style requiring every line here to carry this step's base
+          # indentation — confirmed the hard way (a first draft's unindented
+          # heredoc body broke YAML parsing; indenting it to satisfy YAML
+          # then broke the heredoc terminator match instead).
+          body_file="$(mktemp)"
+          {
+            printf '%s\n' "Upstream (\`nearai/ironclaw\`) has published **${LATEST_TAG}**, which this fork's \`main\` hasn't caught up to."
+            printf '\n'
+            printf '%s\n' "Per \`CLAUDE-local.md\` → \"Catch-up cadence: sync to upstream releases, not intermediate \`main\` commits\", the catch-up target is the merge-base of the release tag with \`upstream/main\`, not \`upstream/main\`'s tip:"
+            printf '\n'
+            printf '%s\n' '```'
+            printf '%s\n' "git fetch upstream --tags"
+            printf '%s\n' "git merge-base ${LATEST_TAG} upstream/main"
+            printf '%s\n' "# -> ${CATCHUP_POINT}"
+            printf '%s\n' '```'
+            printf '\n'
+            printf '%s\n' "Follow the routine or large-scale catch-up playbook in \`CLAUDE-local.md\` → \"Maintenance workflow\" depending on the size/shape of the gap between \`main\` and \`${CATCHUP_POINT}\`."
+            printf '\n'
+            printf '%s\n' "Opened automatically by \`.github/workflows/upstream-release-watch.yml\`. Close once \`main\` contains \`${CATCHUP_POINT}\` (this workflow won't reopen it, but will open a fresh issue for the *next* release if a new one ships before this one is closed)."
+          } > "$body_file"
+
+          gh issue create --repo "$GITHUB_REPOSITORY" \
+            --title "$title" \
+            --label fork-catchup \
+            --body-file "$body_file"
