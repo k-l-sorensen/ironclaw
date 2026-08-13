@@ -1,5 +1,9 @@
 # IronClaw — Claude Code adapter
 
+> **Local fork:** This clone carries local-only modifications not present in
+> upstream `nearai/ironclaw`. See [`CLAUDE-local.md`](CLAUDE-local.md) for the
+> fork situation, maintenance workflow, and the list of active local changes.
+
 @AGENTS.md
 
 Everything above (from `AGENTS.md`) is the canonical, tool-neutral contract.

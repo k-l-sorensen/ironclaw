@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+<!-- Fork-only entries (k-l-sorensen/ironclaw). Not upstream. -->
+
+## [0.29.1-fork.4] — fork build (not upstream)
+
+### Changed
+
+- Caught the fork up to upstream `nearai/ironclaw` (~203 commits). Local carry
+  reduced to: fork-release tooling, the worker job-status fix, and the
+  `RUSTSEC-2026-0187` advisory ignore.
+
+### Removed
+
+- Retired the custom Mistral `reasoning_effort` provider and its reasoning-replay
+  threading (CTR-1 / SIG-1 / `ReasoningBlock`). Upstream shipped a more general
+  native reasoning system (`reasoning` + `reasoning_details`) that supersedes it.
+  Re-architecture tracked in [fork issue #8](https://github.com/k-l-sorensen/ironclaw/issues/8);
+  pre-catch-up state preserved at tag `backup/main-pre-catchup`. Solution-independent
+  reference material (API research, design rationale, acceptance criteria, raw API
+  probe) retained in-tree under `docs/providers/`, `docs/plans/`, and `scripts/`.
+
 ## [Unreleased]
 
 ### Added
@@ -60,6 +80,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   presence-based — there is nothing to configure, and adding the bot to a
   channel is what admits it (see "Changed" above). Saved values for any of
   these retired handles are inert, and new saves fail closed as unknown fields.
+
+## [1.1.0-rc.1-mistral-fork.1](https://github.com/k-l-sorensen/ironclaw/releases/tag/ironclaw-v1.1.0-rc.1-mistral-fork.1) - 2026-08-10
+
+First marked release of the **k-l-sorensen/ironclaw fork** — unofficial, not
+affiliated with upstream nearai/ironclaw. Built on upstream `1.1.0-rc.1` plus
+the fork-only changes below. See `CLAUDE-local.md` for the full divergence
+list.
+
+### Added
+
+- Re-landed the custom Mistral `reasoning_effort=high` provider on top of
+  upstream's native reasoning system
+  ([fork issue #8](https://github.com/k-l-sorensen/ironclaw/issues/8)).
+
+### Fixed
+
+- Hosted Mistral models are now priced instead of billed as $0
+  ([fork issue #9](https://github.com/k-l-sorensen/ironclaw/issues/9), PR #13).
+
+### Security
+
+- Dropped the stale `RUSTSEC-2026-0187` (lopdf DoS) advisory ignore now that
+  lopdf is patched at 0.42.0
+  ([fork issue #2](https://github.com/k-l-sorensen/ironclaw/issues/2), PR #12).
+
+### CI · Release
+
+- Repointed `ironclaw_cli` release metadata (homepage/repository) to the fork
+  so cargo-dist publishes against `k-l-sorensen/ironclaw`.
+- Adopted the `<base>-mistral-fork.<N>` version/tag convention for fork
+  releases going forward (this release is `.1`).
 
 ## [1.1.0-rc.1] - 2026-08-03
 
