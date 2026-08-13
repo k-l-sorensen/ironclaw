@@ -582,7 +582,10 @@ fn release_ci_compiles_reborn_for_all_supported_targets() {
     assert!(
         workspace_manifest.contains("packages = [\"ironclaw\"]")
             && workspace_manifest.contains("github-build-setup = \"../dist-build-setup.yml\"")
-            && workspace_manifest.contains("installers = [\"shell\", \"powershell\", \"msi\"]")
+            // Fork-only (local carry): "msi" dropped 2026-08-10 — WiX's version
+            // mapper rejects the fork's double prerelease suffix. See
+            // CLAUDE-local.md "Fork-release skill + tag-driven release convention".
+            && workspace_manifest.contains("installers = [\"shell\", \"powershell\"]")
             && workspace_manifest.contains("tag-namespace = \"ironclaw\"")
             && workspace_manifest.contains("pr-run-mode = \"skip\""),
         "cargo-dist must select only the canonical Reborn package and generate the supported installers without claiming the unavailable npm package name"
@@ -594,7 +597,9 @@ fn release_ci_compiles_reborn_for_all_supported_targets() {
         "x86_64-apple-darwin",
         "x86_64-unknown-linux-gnu",
         "x86_64-unknown-linux-musl",
-        "x86_64-pc-windows-msvc",
+        // Fork-only (local carry): x86_64-pc-windows-msvc dropped 2026-08-10 —
+        // the packaged binary's own release smoke test fails on Windows
+        // (fork issue #14). See CLAUDE-local.md.
     ] {
         assert!(
             workspace_manifest.contains(&format!("    \"{target}\",")),
