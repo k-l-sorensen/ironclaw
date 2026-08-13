@@ -9,7 +9,7 @@ description: Guide cutting a *marked* release tag on this fork (k-l-sorensen/iro
 > (1) pushed only to the fork (`origin`), never `upstream`, and (2) visibly
 > marked as a fork build so they are never mistaken for an official upstream
 > release. Both are enforced below. Fork-specific divergences are tracked in
-> `CLAUDE-local.md`.
+> `AGENTS-local.md`.
 
 ## How releases work here
 
@@ -72,36 +72,14 @@ This does three things at once:
   Release as a pre-release** — distinct from upstream's clean `ironclaw-v0.29.1`.
 - States the fork lineage in the version string itself, branded after the
   fork's flagship divergence (the custom Mistral `reasoning_effort=high`
-  provider — see `CLAUDE-local.md` "Active local changes").
+  provider — see `AGENTS-local.md` "Active local changes").
 
 `<base-version>` is whatever upstream version you forked from / are building on.
 Increment `<N>` for each fork release of the same base; bump the base when you
 rebase onto a newer upstream version.
 
-> **History:** the first three fork releases (`0.29.1-fork.1`/`.2`/`.3`) used a
-> generic `-fork.<N>` suffix before the `-mistral-fork.<N>` convention was
-> adopted 2026-08-10. Don't reuse the generic form for new releases.
->
-> **Choosing `<base-version>`:** it's the version currently in
-> `crates/app/ironclaw_cli/Cargo.toml` / the top non-`Unreleased` `CHANGELOG.md`
-> heading — i.e. whatever our `main` actually contains, not necessarily
-> upstream's latest tag. Upstream cuts weekly release branches
-> (`release/<version>`) off an `-rc.N` point and backports a handful of
-> hotfixes onto *that branch only*; those commits often never reach
-> `upstream/main` under any hash. Since this fork only ever tracks and catches
-> up against `upstream/main`, a final `x.y.0` tag existing upstream does not
-> mean our fork contains it — check with `git merge-base --is-ancestor
-> <upstream-tag> HEAD` before assuming a later base than the one in
-> `Cargo.toml`.
->
-> **Going forward:** `CLAUDE-local.md` → "Catch-up cadence: sync to upstream
-> releases, not intermediate `main` commits" is now the standing policy —
-> catch-ups stop at `git merge-base ironclaw-v<latest-non-rc-version>
-> upstream/main`, not `upstream/main`'s tip, specifically so a release's
-> `<base-version>` cleanly names a real upstream release instead of an
-> arbitrary in-flight point. This release (`1.1.0-rc.1-mistral-fork.1`) predates
-> that policy and was deliberately left as-is rather than rebuilt against it —
-> the next catch-up is where it takes effect.
+> **Policy:** `AGENTS-local.md` → "Catch-up cadence: sync to upstream releases, not
+> intermediate `main` commits".
 
 ---
 
@@ -149,7 +127,7 @@ grep -rn 'nearai/ironclaw' crates/app/ironclaw_cli/wix/ \
 > a feature PR into the fork's main, sync with `git pull origin main`. If the
 > user wants `main` to follow the fork by default, offer:
 > `git branch --set-upstream-to=origin/main main` (this is a fork-workflow
-> change — confirm before doing it, and record it in `CLAUDE-local.md`).
+> change — confirm before doing it, and record it in `AGENTS-local.md`).
 
 ### 2. Choose the fork version
 
@@ -197,7 +175,8 @@ version's section**, using the fork repo for the heading link:
 
 First/Nth marked release of the **k-l-sorensen/ironclaw fork** — unofficial, not
 affiliated with upstream nearai/ironclaw. Built on upstream `main` past the
-`<base>` tag plus the fork-only changes below. See `CLAUDE-local.md` for the
+`<base>` tag plus the fork-only changes below.   See `AGENTS-local.md` for the
+
 full divergence list.
 
 ### Added / Changed / CI · Release
@@ -208,7 +187,7 @@ full divergence list.
 
 Derive the bullets from `git log --oneline --no-merges <base-tag>..HEAD` filtered
 to fork-authored commits (`chore(fork)`, `feat`/`fix` you added) and from the
-"Active local changes" list in `CLAUDE-local.md`.
+"Active local changes" list in `AGENTS-local.md`.
 
 **3c. Commit both, push to the fork:**
 
@@ -228,7 +207,7 @@ git push origin main      # fork only
 > **Upstream-merge caveat:** the version line (in `crates/app/ironclaw_cli/Cargo.toml`)
 > will conflict when you later merge a newer upstream. Resolve by taking
 > upstream's base version and re-applying the `-mistral-fork.<N>` suffix. Note
-> this in `CLAUDE-local.md` under active local changes.
+> this in `AGENTS-local.md` under active local changes.
 
 ### 4. Create the marked, annotated tag
 
@@ -286,30 +265,10 @@ notes describe the **fork** changes (no `nearai/ironclaw/pull/...` links).
 
 ---
 
-## Git-workflow maintenance (run anytime, not just at release)
-
-Use this checklist when the user asks to "fix git settings" or a push misbehaves:
-
-```bash
-git remote -v                                   # origin=fork, upstream=nearai
-git remote get-url origin | grep k-l-sorensen   # origin must be the fork
-git config --get-all credential.'https://github.com'.helper  # should be 'gh auth git-credential'
-gh auth status                                  # gh logged in, scope includes 'repo'/'workflow'
-git branch -vv                                  # see what each branch tracks
-```
-
-Common repairs:
-- **Push hangs / asks for a password** → `gh auth setup-git` (routes HTTPS auth through gh).
-- **Wrong origin** → `git remote set-url origin https://github.com/k-l-sorensen/ironclaw.git`.
-- **Missing upstream** → `git remote add upstream https://github.com/nearai/ironclaw.git`.
-- **`main` should follow the fork** → `git branch --set-upstream-to=origin/main main`.
-- **Accidental tag created** → delete locally and on the fork:
-  `git tag -d "$TAG" && git push origin :refs/tags/"$TAG"`.
-
 ## Hard rules
 
 - Never push tags, branches, or releases to `upstream` (nearai). The fork owns its releases.
 - Never use `git push --tags` here; push the single intended tag by full ref.
 - Every fork release version carries the `-mistral-fork.<N>` suffix and an annotated tag
   whose message states it is an unofficial fork build.
-- Record any new fork-only divergence (version scheme, branch tracking change) in `CLAUDE-local.md`.
+- Record any new fork-only divergence (version scheme, branch tracking change) in `AGENTS-local.md`.
